@@ -38,9 +38,36 @@ export class A2AError extends Error {
   }
 }
 
+// The EXTERNAL caller (phase 4) — a project API key with the `a2a` scope (plan §3.4, DR-6). A key
+// is a PROJECT, not a xell: it may see and address only the agents its project owns, and its task
+// views carry no xell ids, no tokens, no internal counts (the ticketing API's id-scrub precedent,
+// lib/ticket-intake.js externalView). `id` is deliberately null — the read methods scope by
+// project (projectXellIds below) and the write methods stamp the message's provenance as
+// `ext:<project name>` rather than fabricate a xell.
+export function externalCaller(auth) {
+  return {
+    kind: 'external',
+    id: null,
+    project_id: auth.project.id,
+    project_name: auth.project.name,
+    key: auth.key,
+    slug: `ext:${auth.project.name}`,
+    manager_xell_id: null,
+  };
+}
+
+// Every non-retired xell of one project — the whole of what an external caller may see and address
+// ("an A2A-scoped key sees and may address only agents its project owns", plan §3.4).
+async function projectXellIds(projectId) {
+  const rows = await q(`SELECT id FROM xell WHERE project_id=$1 AND status <> 'retired'`, [projectId]);
+  return new Set(rows.map((r) => r.id));
+}
+
 // Who may the caller READ as an AGENT (the directory + the per-agent cards)? Everyone reads
 // itself; a worker may additionally read its manager; a manager may read its crew (plan §3.4).
+// An external caller reads the agents its project owns.
 export async function cardVisibleXellIds(caller) {
+  if (caller.kind === 'external') return projectXellIds(caller.project_id);
   const ids = new Set([caller.id]);
   if (caller.manager_xell_id) ids.add(caller.manager_xell_id);
   const rows = await q(`SELECT id FROM xell WHERE manager_xell_id=$1 AND status <> 'retired'`, [caller.id]);
@@ -52,8 +79,9 @@ export async function cardVisibleXellIds(caller) {
 // must name it as a participant); a manager may additionally read its crew's conversations. This
 // is deliberately narrower than cardVisible: "a worker may read its manager" means it may ADDRESS
 // its manager, not that it may read all of the manager's conversations — A2A adds no reach that
-// messagesForXell does not have.
+// messagesForXell does not have. An external caller's tasks involve its project's agents.
 export async function taskVisibleXellIds(caller) {
+  if (caller.kind === 'external') return projectXellIds(caller.project_id);
   const ids = new Set([caller.id]);
   if (isManager(caller)) {
     const rows = await q(`SELECT id FROM xell WHERE manager_xell_id=$1 AND status <> 'retired'`, [caller.id]);

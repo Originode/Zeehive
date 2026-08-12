@@ -86,7 +86,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
-import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask,
+import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask, externalCaller,
          dispatchA2A, agentCardFor, directoryFor } from '../lib/a2a-read.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
@@ -2931,13 +2931,14 @@ router.get('/stream', async (req, res) => {
 // path preserved. New URLs are minted as direct ports and never come here.
 router.use('/xell-web/:slug', webappRedirect);
 
-// ── A2A READ + WRITE SIDE (P2 + P3) — docs/a2a-protocol-plan.md §3, DR-2/DR-5 ──
+// ── A2A READ + WRITE SIDE (P2 + P3 + P4) — docs/a2a-protocol-plan.md §3, DR-2/DR-5/DR-6 ──
 // The fleet speaks A2A v1.0 at ONE place — this router, mounted at the ORIGIN ROOT in index.js
 // (NOT under /api), because the well-known card is RFC 8615 origin-root and the /a2a/v1 paths are
-// the wire contract. P2 read + P3 write are internal-only: every authenticated route resolves the
-// caller from its xell token exactly like /api/xell/self/* (resolveSelf above), and crew scoping
-// is unchanged — a worker may address its manager, a manager its crew. External zhk_ keys are
-// PHASE 4.
+// the wire contract. P2 read + P3 write authenticate the INTERNAL caller from its xell token
+// exactly like /api/xell/self/* (resolveSelf), and crew scoping is unchanged — a worker may
+// address its manager, a manager its crew. P4 (external interop) adds the EXTERNAL caller: a
+// project API key (`Bearer zhk_…`, or X-Zeehive-Api-Key for parity) with the `a2a` scope, which
+// may see and address only the agents its project owns (plan §3.4, DR-6).
 //
 // The read/write-model half (task projection, cards, SendMessage/CancelTask) lives in
 // lib/a2a-read.js; the pure shapes live in lib/a2a.js. This router is the HTTP surface only:
@@ -2948,6 +2949,42 @@ function a2aBase(req) {
   // The base a card points at is wherever the caller reached us — a card must be usable by the
   // client that asked for it, not baked to a host the caller may not be able to see.
   return `${req.protocol}://${req.get('host')}`;
+}
+
+// The A2A auth gate — TWO credentials, exactly the two that already exist (DR-6, "A2A grants no
+// new reach"). An INTERNAL caller (a zee through its verbs) presents the xell token and resolves
+// like /api/xell/self/*; an EXTERNAL caller (a deployed project's server) presents a project API
+// key with the `a2a` scope. A body naming a project is REFUSED rather than ignored — the project
+// comes from the KEY, the same construction as the ticketing API's extAuth above, and silence
+// would let a caller believe the field did something.
+async function resolveA2ACaller(req, res) {
+  const m = /^Bearer\s+(.+)$/i.exec((req.get('authorization') || '').trim());
+  const bearer = m ? m[1].trim() : '';
+  const keyHeader = (req.get('x-zeehive-api-key') || '').trim();
+  if (bearer.startsWith('zhk_') || keyHeader) {
+    const presented = bearer.startsWith('zhk_') ? bearer : keyHeader;
+    let out;
+    try {
+      out = await authenticateApiKey(presented, { scope: 'a2a', ip: req.ip || req.socket?.remoteAddress || null });
+    } catch (err) {
+      // The gate itself failed (the meta-DB is unreachable, say). That is OURS, not the caller's,
+      // and it must be a 503 rather than a 401 — an integration told "unknown key" would revoke a
+      // perfectly good credential and re-mint it.
+      res.status(503).json({ ok: false,
+        error: `the A2A API could not check your key right now: ${String(err?.message || err)}. Your key is fine — retry.` });
+      return null;
+    }
+    if (!out.ok) { res.status(out.status || 401).json({ ok: false, error: out.reason }); return null; }
+    if (req.body && (req.body.project || req.body.project_id)) {
+      res.status(400).json({ ok: false,
+        error: 'do not send a project — an A2A key acts for its OWN project, and naming one here '
+          + `would be ignored. This key acts for "${out.project.name}".` });
+      return null;
+    }
+    return externalCaller(out);
+  }
+  // Internal xell token — resolveSelf writes its own 401/409 for a missing/unknown/retired token.
+  return resolveSelf(req, res);
 }
 
 function rpcResult(res, id, result) {
@@ -2966,7 +3003,7 @@ a2aRouter.get('/.well-known/agent-card.json', async (req, res) => {
 // ── the directory — live agents the caller's credential may see, each with its card URL ──
 a2aRouter.get('/a2a/v1/agents', async (req, res) => {
   try {
-    const caller = await resolveSelf(req, res); if (!caller) return;
+    const caller = await resolveA2ACaller(req, res); if (!caller) return;
     res.json(await directoryFor(caller, a2aBase(req)));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2975,7 +3012,7 @@ a2aRouter.get('/a2a/v1/agents', async (req, res) => {
 // 404 for a slug the caller may not see or that names no live xell — never confirm existence.
 a2aRouter.get('/a2a/v1/agents/:slug/card', async (req, res) => {
   try {
-    const caller = await resolveSelf(req, res); if (!caller) return;
+    const caller = await resolveA2ACaller(req, res); if (!caller) return;
     const visible = await cardVisibleXellIds(caller);
     const agent = await one(`SELECT * FROM xell WHERE slug=$1 AND status <> 'retired'`, [req.params.slug]);
     if (!agent || !visible.has(agent.id)) { res.status(404).json({ error: `no agent card for "${req.params.slug}"` }); return; }
@@ -2990,7 +3027,7 @@ a2aRouter.get('/a2a/v1/agents/:slug/card', async (req, res) => {
 // -32009 for wrong/missing — checked BEFORE method dispatch, per DR-5 "implemented from day one").
 a2aRouter.post('/a2a/v1/agents/:slug', async (req, res) => {
   try {
-    const caller = await resolveSelf(req, res); if (!caller) return;
+    const caller = await resolveA2ACaller(req, res); if (!caller) return;
     // The :slug is the agent being ADDRESSED; the caller must be able to read its card. Task data
     // is scoped separately by the caller's own conversation visibility (taskVisibleXellIds).
     const cardVisible = await cardVisibleXellIds(caller);
