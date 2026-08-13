@@ -177,10 +177,12 @@ export default function BackupsPanel({ backup, projectId }) {
   // Pause/resume. No confirm: it is one reversible flag, and the person hitting it is usually
   // watching a failing backup re-run itself every ten minutes — the fastest thing they can reach
   // wins. While paused the scheduler starts no new backup and "Back up now" is refused.
+  // The project id is EXPLICIT here: the server defaults a missing project to the FIRST project
+  // in the DB (usually Zeehive itself), so omitting it would pause the wrong project's backups.
   const [togglingPause, setTogglingPause] = useState(false);
   const togglePause = async () => {
     setTogglingPause(true);
-    try { await setBackupPaused(!paused); }
+    try { await setBackupPaused(!paused, projectId); }
     catch (e) { showAlert(e.message || 'Pause failed', { variant: 'error' }); }
     setTogglingPause(false);
   };

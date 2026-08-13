@@ -78,6 +78,11 @@ try {
   console.log('\n── setBackupPaused is validated ──');
   await threw(() => m.setBackupPaused({ project: projId, paused: 'yes' }), /boolean/,
     'a non-boolean paused is refused');
+  // THE BUG THAT SHIPPED: the console toggle omitted the project id, and the old default paused the
+  // FIRST project in the DB (Zeehive) while the operator looked at omnibiz — an invisible stop-switch
+  // on the wrong database. A missing project is now a loud refusal, never a guess.
+  await threw(() => m.setBackupPaused({ paused: true }), /project is required/,
+    'a pause without a project is REFUSED (never silently defaults to the first project)');
 
   await q(`DELETE FROM db_snapshot WHERE project_id=$1`, [projId]);
   await q(`DELETE FROM pool_config WHERE project_id=$1`, [projId]);

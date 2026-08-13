@@ -1150,8 +1150,13 @@ export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_
 // human can reach when they see a failing backup re-run itself every ten minutes. An in-flight
 // backup is not interrupted (that is Cancel); restore/delete/duplicate are untouched.
 export async function setBackupPaused({ project, paused }) {
-  const proj = project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
-  if (!proj) throw new Error('no project');
+  // A pause is PER-PROJECT, and a paused project stops ALL its backups silently — so it must never
+  // default to "the first project" the way the read-only settings do. That default shipped a bug:
+  // the console's ⏸ toggle omitted the project id and paused the FIRST project (Zeehive itself)
+  // while the operator was looking at omnibiz — an invisible stop-switch on the wrong database.
+  // A missing project here is a caller bug and is REFUSED loudly, never routed to a guess.
+  if (!project) throw new Error('project is required — a backup pause is per-project and must not be defaulted');
+  const proj = project;
   if (typeof paused !== 'boolean') throw new Error('paused must be a boolean');
   const row = await one(
     `UPDATE pool_config SET backup_paused=$2 WHERE project_id=$1

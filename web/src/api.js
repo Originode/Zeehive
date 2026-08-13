@@ -953,9 +953,9 @@ export async function setBackupConfig(body) {
 // Pause/resume this project's backups — the stop-switch for a retry storm. While paused, the
 // scheduler starts no new backup (policy OR retry) and "Back up now" is refused, until a human
 // flips it back. An in-flight backup is not interrupted (that's Cancel); restore/delete are untouched.
-export async function setBackupPaused(paused) {
+export async function setBackupPaused(paused, projectId) {
   const r = await fetch('/api/backups/pause', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paused }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paused, project: projectId }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `pause failed (${r.status})`);
