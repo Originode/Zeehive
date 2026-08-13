@@ -214,6 +214,41 @@ async function sharedDb(projectId, tier) {
     [projectId, tier]);
 }
 
+// Does this project's registered production database resolve to the managing instance's own
+// meta-DB? When ZEEHIVE orchestrates ITSELF the answer is yes: the prod row's DSN is the same
+// postgres the queenzee is connected to. That is the structural reason a WRITABLE
+// db-shared-prod bind is refused — a nested queenzee handed that DSN would reconcile (and reap)
+// live xells. READ-ONLY (db-prod-readonly, a minted SELECT-only role) is the legitimate exemption;
+// prod DATA *writes* go through `zee seed` (queenzee runs landed SQL; the zee never holds the DSN).
+//
+// Compared via sameDatabase (host:port+dbname), never string equality — localhost spellings differ.
+// Used by attachXellDb (attach-time refusal), selfProdRequest (refuse the ask before a human is
+// bothered) and decideProdBind (refuse confirm so a leftover pending ask cannot half-confirm).
+export async function projectProdIsManagingMeta(projectId) {
+  const target = await sharedDb(projectId, 'prod');
+  if (!target) return { isMeta: false, dsn: null };
+  const dbid = await dbIdentity(projectId);
+  const dsn = target.conn_ref || derivedTcpDsn(target, dbid);
+  if (!dsn) return { isMeta: false, dsn: null };
+  return { isMeta: sameDatabase(dsn, config.databaseUrl), dsn };
+}
+
+// The ONE refusal sentence for a writable bind to the managing meta-DB. Attach, the zee's
+// `zee prod` ask, and the human confirm button all use this so the door they are pointed at
+// (zee seed) is the same one in every surface — the previous attach-only message named only the
+// READ path (manager) and the throwaway copies, and left zees (and humans) without the write path.
+export function managingMetaWritableRefusal(slug, dsn = null) {
+  const masked = String(dsn || config.databaseUrl).replace(/:[^:@/]+@/, ':***@');
+  return `REFUSING to bind ${slug} to production: this project's production database `
+    + `IS the managing instance's own meta-DB (${masked}). `
+    + 'A writable xell on the orchestrator\'s own database would let a nested queenzee reap live '
+    + 'xells. To CHANGE rows in production: write an idempotent file under server/sql/seeds/, '
+    + '`zee land`, then `zee seed --file <name>.sql --reason "…"` — a human reads the SQL and the '
+    + 'queenzee runs it; you never hold the live DSN. To READ production: dispatch as a MANAGER '
+    + '(db-prod-readonly). To work against a prod-shaped copy without touching live: db-isolated '
+    + '(own db from the latest prod dump), db-clone, or db-shared-dev.';
+}
+
 // ── db-clone: a per-xell DATABASE inside the shared dev postgres ──────────────
 //
 // CREATE DATABASE … TEMPLATE is a file-level copy: schema AND data, in seconds, zero extra
@@ -598,16 +633,14 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   // reconcile fails every boot, and the zee is stuck in an env-alert with nothing it can do.
   // A worker must never hold the orchestrator's own meta-DB writable; only the manager's
   // db-prod-readonly binding (a minted SELECT-only role) legitimately points at it. So REFUSE the
-  // attach here, with the same reason the §6.2 guard gives — a clear error beats a broken xell.
+  // attach here — a clear error beats a broken xell. The message names `zee seed` as the write
+  // path (projectProdIsManagingMeta / managingMetaWritableRefusal) so attach, ask and confirm
+  // all point at the same door.
   if (mode === 'db-shared-prod') {
     const dbid = await dbIdentity(xell.project_id);
     const targetDsn = target?.conn_ref || derivedTcpDsn(target, dbid);
     if (targetDsn && sameDatabase(targetDsn, config.databaseUrl)) {
-      throw new Error(`REFUSING to bind ${xell.slug} to production: this project's production database `
-        + `IS the managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}). `
-        + 'A writable xell on the orchestrator\'s own database would let a nested queenzee reap live '
-        + 'xells. Use db-isolated (own db from the latest prod dump), db-clone, or db-shared-dev — '
-        + 'or dispatch the xell as a MANAGER (db-prod-readonly) if reading production read-only is the job.');
+      throw new Error(managingMetaWritableRefusal(xell.slug, targetDsn));
     }
   }
 
