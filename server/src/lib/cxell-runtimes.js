@@ -42,6 +42,12 @@
 // (a deliberately bogus one then returns the honest `invalid_api_key`). So the queenzee installs the
 // credential into the cage before the agent starts (lib/cxell.js prepareCxellAuth).
 //
+// `grok` is the SECOND exception, and it is not a bug in the CLI — it is a second CREDENTIAL SHAPE.
+// An `xai-…` API key is env-only exactly as before, but a SuperGrok / Business SEAT is a signed-in
+// session, and the vendor's headless door for it (`grok login --device-auth`) writes a FILE:
+// ~/.grok/auth.json. Its env var GROK_AUTH does not accept that file's shape (measured 2026-08-13),
+// so the queenzee installs the file the same way it installs codex's, from the same env.
+//
 // Rules for one of these commands: it reads the key from the ENV the exec already carries (never
 // interpolate a token into a command line — it would land in `ps`, in the docker argv and in logs),
 // it is idempotent (it runs at every spawn and before every resume), and it prints AUTH_OK /
@@ -135,6 +141,43 @@ const deepseekModel = (model) => safeModel(vendorModel(model)) || process.env.DE
 // (measured on 0.2.118), and the CLI REJECTS an id it does not know — so this is sent explicitly
 // rather than omitted, and GROK_DEFAULT_MODEL is the knob for the day that id moves upstream.
 const grokModel = (model) => safeModel(vendorModel(model)) || process.env.GROK_DEFAULT_MODEL || 'grok-4.5';
+
+// ── A GROK CREDENTIAL IS ONE OF TWO THINGS, AND THEY ARE NOT INTERCHANGEABLE ─────────────────────
+// An `xai-…` API key spends PREPAID xAI API credits. A SuperGrok / Business seat is not an API key
+// at all — it is a signed-in SESSION, and the vendor's own door for a headless box (no browser) is
+// `grok login --device-auth`, which writes that session to ~/.grok/auth.json. Same CLI, different
+// pool, and the CLI's own instruction when it has neither is that exact command.
+//
+// The two must never be mixed: xAI's guidance is to UNSET XAI_API_KEY when using the seat, because
+// the key takes precedence and the seat is then silently not used — a cage that quietly bills a
+// prepaid balance while a human believes it is on their subscription. So the adapter branches on
+// the SHAPE of the credential (below), and a session cage gets no XAI_API_KEY at all.
+//
+// MEASURED on grok 0.2.118 in this cage (2026-08-13), by feeding the CLI candidate files and
+// reading its own parse errors back off `--debug-file`:
+//   • ~/.grok/auth.json is a JSON OBJECT keyed by auth SCOPE (a device/browser login writes
+//     "https://accounts.x.ai/sign-in"; an API key lands under "xai::api_key"), each entry an object
+//     whose REQUIRED fields are `key`, `auth_mode` (one of grok | web_login | oidc | external |
+//     api_key — the CLI names the whole enum when it rejects one), `create_time` (RFC 3339) and
+//     `user_id`. Extra fields (refresh_token, expires_at, email, …) are accepted and preserved.
+//   • the env var `GROK_AUTH` is NOT that door: it parses as a different (undocumented) struct and
+//     every auth.json shape fed to it logs "GROK_AUTH set but failed to parse as JSON, falling back
+//     to file". So the FILE is the vendor's documented and working transport, and the queenzee
+//     installs it into the cage the way it installs codex's — authSetupCmd, credential from the env.
+// The predicate is deliberately LOOSE at the tail (the repo's rule for credential shapes): a shape
+// tweak upstream must cost a missed catch, never a locked-out human.
+export function grokSessionCredential(token) {
+  const t = String(token || '').trim();
+  if (!t.startsWith('{')) return null;                    // an xai-… API key, or nothing
+  let o;
+  try { o = JSON.parse(t); } catch { return null; }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  const entries = Object.values(o);
+  const usable = entries.length > 0 && entries.every(
+    (e) => e && typeof e === 'object' && typeof e.key === 'string' && e.key.trim()
+           && typeof e.auth_mode === 'string' && e.auth_mode.trim());
+  return usable ? o : null;
+}
 
 // The reader for a CLI whose output IS the normalized contract already: one JSON event per line,
 // parsed and passed through, and no synthesized result on close (a run that printed none stays an
@@ -361,9 +404,12 @@ const ADAPTERS = {
   //     the Anthropic Messages API wire format"). So it reads with claude's parser and
   //     usageFrom() counts its turn with no translation. NB the OTHER NDJSON format,
   //     `streaming-json`, is native ACP session updates and is NOT this shape.
-  //   • XAI_API_KEY alone authenticates (the init event reports apiKeySource "user"), so there is
-  //     nothing to install — no authSetupCmd — and a bad key ends the turn with its own error
-  //     result ("API error … Incorrect API key provided"), never a hang.
+  //   • XAI_API_KEY alone authenticates an API-KEY account (the init event reports apiKeySource
+  //     "user"), and a bad key ends the turn with its own error result ("API error … Incorrect API
+  //     key provided"), never a hang. A SEAT (SuperGrok / Business) is the other credential and it
+  //     is a FILE, not an env var — see grokSessionCredential above and authSetupCmd below.
+  //   • with NEITHER, a turn ends with the CLI's own instruction rather than a hang: "Not signed
+  //     in. To authenticate without a browser, run: grok login --device-code …" (measured today).
   //   • no first-run gauntlet: a run in a fresh HOME writes ~/.grok and proceeds, so like kimi it
   //     declares no firstRunSeedCmd rather than being handed a speculative config.
   //   • the model is validated CLIENT-side — an id the CLI does not know ends the turn before the
@@ -384,12 +430,55 @@ const ADAPTERS = {
       // permissionMode bypassPermissions), same stance as every other runtime here
       + ` -p "$(cat)" -m ${safeModel(grokModel(model))}`
       + ' --output-format streaming-messages-json --always-approve',
+    // TWO credential shapes, one adapter (grokSessionCredential above says which): an `xai-…` API
+    // key rides in as XAI_API_KEY exactly as before, while a device-auth SESSION rides in as
+    // GROK_AUTH_JSON — a carrier var the CLI does not read, installed into ~/.grok/auth.json by
+    // authSetupCmd below. A session cage deliberately gets NO XAI_API_KEY: the key wins over the
+    // seat, so setting both would spend prepaid credits while a human believes the subscription
+    // is being used.
     env: ({ token } = {}) => ({
-      XAI_API_KEY: token,
+      ...(grokSessionCredential(token) ? { GROK_AUTH_JSON: token } : { XAI_API_KEY: token }),
       // documented container knob: no background update check inside a throwaway cage
       GROK_DISABLE_AUTOUPDATER: '1',
     }),
+    // The nudge path's LEGACY fallback only (it reads ZEE_PROVIDER_GROK_TOKEN first, which carries
+    // either shape) — so it stays the API-key var: a session is not a token to hand a CLI.
     tokenEnvKey: 'XAI_API_KEY',
+    // INSTALL A SEAT SESSION — the codex situation, for the opposite reason. codex needs a file
+    // because its env is not read; grok needs one because the vendor's device-code login IS a file
+    // (~/.grok/auth.json) and its env door, GROK_AUTH, does not accept that file's shape (measured).
+    // Called with the account's token where it is known (the runnable-env export) so an API-key
+    // account is told there is nothing to install; called with NOTHING on the spawn/resume path, so
+    // the command it returns then must handle both shapes from the cage's own environment.
+    //
+    // NEVER CLOBBER A FRESHER SESSION. The CLI refreshes that file in place (the session expires in
+    // ~7 days and carries a refresh_token), so a resume that blindly rewrote it would put a stale
+    // copy — possibly with an already-spent refresh token — over the live one. The rule is
+    // create_time: install only when the credential the queenzee holds is NEWER than what the cage
+    // already has, which installs a human's re-login and leaves the CLI's own refresh alone.
+    authSetupCmd: ({ token } = {}) => {
+      if (token && !grokSessionCredential(token)) return null;   // an API key: the env IS the login
+      return 'if [ -n "${GROK_AUTH_JSON:-}" ]; then '
+        // node's own stderr can quote the offending input, so it is dropped and we say our own line
+        + 'if said=$(printenv GROK_AUTH_JSON | node -e '
+        + '"const fs=require(\'fs\'),os=require(\'os\'),path=require(\'path\');'
+        + 'let s=\'\';process.stdin.on(\'data\',(d)=>{s+=d;}).on(\'end\',()=>{'
+        + 'const inc=JSON.parse(s);'
+        + 'const dir=process.env.GROK_HOME||path.join(os.homedir(),\'.grok\');'
+        + 'const p=path.join(dir,\'auth.json\');'
+        + 'const born=(o)=>Math.max(0,...Object.values(o||{}).map((e)=>Date.parse(e&&e.create_time)||0));'
+        + 'let cur=null;try{cur=JSON.parse(fs.readFileSync(p,\'utf8\'));}catch{}'
+        + 'if(cur&&born(cur)>=born(inc)){process.stdout.write(\'kept the cage session\');return;}'
+        + 'fs.mkdirSync(dir,{recursive:true});'
+        + 'fs.writeFileSync(p+\'.zeehive\',JSON.stringify(inc),{mode:0o600});'
+        + 'fs.renameSync(p+\'.zeehive\',p);fs.chmodSync(p,0o600);'
+        + 'process.stdout.write(\'installed the seat session\');});" 2>/dev/null); then '
+        + 'echo "$said"; echo AUTH_OK; '
+        + 'else echo "could not install the Grok session into ~/.grok/auth.json — is it the JSON that '
+        + 'grok login --device-auth wrote?"; echo AUTH_FAILED; fi; '
+        + 'elif [ -n "${XAI_API_KEY:-}" ]; then echo "XAI_API_KEY is the login"; echo AUTH_OK; '
+        + 'else echo "the cage has neither GROK_AUTH_JSON nor XAI_API_KEY"; echo AUTH_FAILED; fi';
+    },
     // The ONE dialect difference measured in that stream: a FAILED turn carries its message in
     // `errors[]`, where claude carries it in `result` — and `result` is what every consumer reads
     // (the zee's last_stop_reason, the revive classifier that decides transient vs terminal, the
