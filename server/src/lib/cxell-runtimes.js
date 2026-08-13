@@ -418,7 +418,10 @@ const ADAPTERS = {
   //     declares no firstRunSeedCmd rather than being handed a speculative config.
   //   • the model is validated CLIENT-side — an id the CLI does not know ends the turn before the
   //     API is called ("unknown model id. Run 'grok models'"), which is why the picker below
-  //     offers only what `grok models` lists.
+  //     offers only what `grok models` lists. NOT YET MEASURED on a SEAT: a subscription's catalog
+  //     is the vendor's to differ from an API account's, so if a seat cage ever ends a turn on
+  //     "unknown model id", the answer is `grok models` in that cage and the model spec row in the
+  //     meta-DB — not a change here.
   // -p takes the prompt as an ARGUMENT (kimi's situation), so it rides in on stdin and `"$(cat)"`
   // splices it in-container — model text never touches the queenzee-side command line.
   'grok-cxell': {
