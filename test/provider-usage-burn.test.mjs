@@ -31,7 +31,8 @@ const eq = (a, b, m) => ok(a === b, `${m} (got ${JSON.stringify(a)}, want ${JSON
 const near = (a, b, m, tol = 0.05) =>
   ok(a != null && Math.abs(Number(a) - b) <= tol, `${m} (got ${JSON.stringify(a)}, want ~${b})`);
 
-const { extractRateLimit, recordAccountUsageLimit } = await import('../server/src/lib/gateway.js');
+const { extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit } =
+  await import('../server/src/lib/gateway.js');
 const { getFleetBurn } = await import('../server/src/lib/fleet.js');
 const { listProviderTokens, providerLimits } = await import('../server/src/lib/provider-tokens.js');
 const { q, one, pool } = await import('../server/src/db/pool.js');
@@ -74,6 +75,23 @@ console.log('\n── A3. empty / null → null ──');
 eq(extractRateLimit({}), null, 'no headers → null');
 eq(extractRateLimit(null), null, 'null headers → null');
 
+console.log('\n── A4. DeepSeek balance (the only quota signal — no headers exist) ──');
+{
+  const snap = extractDeepseekBalance({
+    is_available: true,
+    balance_infos: [{ currency: 'USD', total_balance: '56.40', granted_balance: '0.00', topped_up_balance: '56.40' }],
+  });
+  ok(!!snap, 'balance body produces a snapshot');
+  eq(snap.source, 'balance', 'source is "balance" (not headers)');
+  eq(snap.is_available, true, 'is_available rides through');
+  eq(snap.available_pct, null, 'a dollar balance is NOT a % window — no invented available_pct');
+  eq(snap.balance[0].currency, 'USD', 'currency captured');
+  eq(snap.balance[0].total_balance, '56.40', 'total_balance captured');
+  eq(extractDeepseekBalance(null), null, 'null body → null');
+  eq(extractDeepseekBalance({}), null, 'no is_available → null');
+  eq(extractDeepseekBalance({ is_available: true, balance_infos: [] }), null, 'no balance rows → null');
+}
+
 // ── B. provider_token.usage_limit + providerLimits (account grain) ───────────────────────────
 console.log('\n── B. usage_limit stored on the ACCOUNT, not the xell ──');
 let projectId = null;
@@ -102,6 +120,10 @@ try {
     `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
      VALUES ($1, 'grok', 'xai-TESTTOKEN_GROK_cccccccccccccccc', '…cccc', 'seat')
      RETURNING id`, [projectId]);
+  const deepseek = await one(
+    `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
+     VALUES ($1, 'deepseek', 'sk-TESTTOKEN_DEEPSEEK_dddddddddddddddddd', '…dddd', 'main')
+     RETURNING id`, [projectId]);
 
   // Simulate what the gateway writes after a call.
   const snapWork = extractRateLimit({
@@ -119,13 +141,20 @@ try {
     'x-ratelimit-limit-tokens': '100000',
     'x-ratelimit-remaining-tokens': '90000',
   });
+  // The DEEPSEEK snapshot is the balance probe's output — no % window, just the money facts.
+  const snapDeepseek = extractDeepseekBalance({
+    is_available: true,
+    balance_infos: [{ currency: 'USD', total_balance: '56.40', granted_balance: '0.00', topped_up_balance: '56.40' }],
+  });
   await recordAccountUsageLimit(a1.id, snapWork);
   await recordAccountUsageLimit(a2.id, snapPersonal);
   await recordAccountUsageLimit(grok.id, snapGrok);
+  await recordAccountUsageLimit(deepseek.id, snapDeepseek);
 
   const listed = await listProviderTokens(projectId);
   const claude = listed.find((p) => p.provider === 'claude');
   const grokP = listed.find((p) => p.provider === 'grok');
+  const deepseekP = listed.find((p) => p.provider === 'deepseek');
   ok(!!claude, 'claude provider present');
   eq(claude.accounts.length, 2, 'two claude accounts');
   const work = claude.accounts.find((a) => a.label === 'work');
@@ -135,6 +164,13 @@ try {
   // Provider-level = WORST active account (work is tighter).
   near(claude.available_pct, 20, 'provider available_pct is the WORST account (20%)');
   near(grokP.available_pct, 90, 'grok available_pct from TPM headers = 90%');
+  // DEEPSEEK: available_pct stays null (a dollar balance is not a %), but the account HAS a
+  // usage_limit snapshot with the balance facts — the fix for "deepseek shows no limit".
+  eq(deepseekP.available_pct, null, 'deepseek available_pct stays null (no % window exists)');
+  ok(!!deepseekP.accounts[0]?.usage_limit, 'deepseek account carries a usage_limit snapshot');
+  eq(deepseekP.accounts[0].usage_limit.source, 'balance', '…with source "balance"');
+  eq(deepseekP.accounts[0].usage_limit.balance[0].total_balance, '56.40',
+     '…and the balance facts a human wants');
 
   const limits = await providerLimits(projectId);
   ok(limits.some((p) => p.provider === 'claude' && p.available_pct === 20
@@ -170,6 +206,10 @@ console.log('\n── C. wiring — limits chip is SEPARATE from per-xell burn �
   ok(/anthropic-ratelimit-unified/.test(gw), 'gateway parses unified seat headers');
   ok(/recordAccountUsageLimit/.test(gw), 'gateway writes usage_limit onto the account');
   ok(/available_pct/.test(gw), 'gateway computes available_pct (remaining), not only used%');
+  ok(/extractDeepseekBalance/.test(gw) && /probeDeepseekBalance/.test(gw),
+     'gateway has the DeepSeek balance probe (the gap-filler for a provider with no rate-limit headers)');
+  ok(/probeDeepseekBalance\(/.test(gw) && /upstream\.provider === 'deepseek'/.test(gw),
+     '…and fires it on completed deepseek calls');
 
   const pt = read('server/src/lib/provider-tokens.js');
   ok(/export async function providerLimits/.test(pt), 'providerLimits read model exists');
@@ -195,6 +235,8 @@ console.log('\n── C. wiring — limits chip is SEPARATE from per-xell burn �
   const setup = read('web/src/ProjectSetup.jsx');
   ok(/AccountUsageLimit/.test(setup) && /account-usage-limit/.test(setup),
      'Project setup shows remaining limit on each account row');
+  ok(/balance/.test(setup) && /balanceText/.test(setup),
+     '…and renders a DeepSeek balance snapshot (a dollar balance, not a % window)');
 }
 
 console.log(fail ? `\n${fail} FAIL` : '\nall good');

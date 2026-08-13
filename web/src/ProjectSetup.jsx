@@ -2379,16 +2379,23 @@ function AccountUsageLimit({ account }) {
   if (rl.tokens?.available_pct != null && !bits.length) {
     bits.push(`TPM ${rl.tokens.available_pct}%`);
   }
+  // A BALANCE snapshot (deepseek: no % window exists, the quota IS a dollar balance). The
+  // first balance row is the account's money; is_available says whether calls still work.
+  const balanceRow = (Array.isArray(rl.balance) ? rl.balance[0] : null) || null;
+  const balanceText = balanceRow?.total_balance
+    ? `${balanceRow.currency || ''} ${balanceRow.total_balance}`.trim()
+    : null;
   const title = [
     pct != null ? `${pct}% of the binding window still available` : 'limit snapshot present',
     bits.length ? bits.join(' · ') : null,
     rl.representative ? `binding: ${rl.representative}` : null,
+    balanceText ? `balance: ${balanceText}` : null,
     account.usage_limit_at ? `as of ${new Date(account.usage_limit_at).toLocaleString()}` : null,
   ].filter(Boolean).join('\n');
   const cls = pct != null && pct < 20 ? ' is-tight' : pct != null && pct < 40 ? ' is-warn' : '';
   return (
     <span className={`token-usage-limit${cls}`} data-testid="account-usage-limit" title={title}>
-      {pct != null ? `${pct}% free` : 'limit: ok'}
+      {pct != null ? `${pct}% free` : balanceText ? `limit: ${balanceText}` : 'limit: ok'}
       {bits.length ? ` (${bits.join(', ')})` : ''}
     </span>
   );

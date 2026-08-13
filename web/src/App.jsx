@@ -150,14 +150,17 @@ function providerBurnTitle(p) {
 // Tooltip for the PROVIDER LIMITS chip — remaining quota per account (not per-xell, not spend).
 function providerLimitsTitle(limits) {
   const lines = ['How much of each provider account\'s usage limit is still AVAILABLE.',
-    'Source: the provider\'s own response headers (Claude 5h/7d seat windows, API TPM/RPM).'];
+    'Source: the provider\'s own response headers (Claude 5h/7d seat windows, API TPM/RPM) or the account balance (DeepSeek).'];
   for (const p of limits || []) {
     for (const a of p.accounts || []) {
       if (a.available_pct == null && !a.usage_limit) continue;
       const name = a.label || a.token_hint || a.id?.slice?.(0, 8) || 'account';
       const rl = a.usage_limit || {};
       const win = rl.windows || {};
-      const parts = [`${p.provider} · ${name}: ${a.available_pct != null ? `${a.available_pct}% free` : 'no snapshot yet'}`];
+      const balanceRow = (Array.isArray(rl.balance) ? rl.balance[0] : null) || null;
+      const balanceText = balanceRow?.total_balance
+        ? `${balanceRow.currency || ''} ${balanceRow.total_balance}`.trim() : null;
+      const parts = [`${p.provider} · ${name}: ${a.available_pct != null ? `${a.available_pct}% free` : balanceText ? `limit: ${balanceText}` : 'no snapshot yet'}`];
       if (win['5h']?.available_pct != null) parts.push(`5h ${win['5h'].available_pct}%`);
       if (win['7d']?.available_pct != null) parts.push(`7d ${win['7d'].available_pct}%`);
       if (a.usage_limit_at) parts.push(`as of ${new Date(a.usage_limit_at).toLocaleString()}`);
@@ -1284,21 +1287,26 @@ export default function App() {
         )}
         {/* PROVIDER LIMITS — how much of each connected provider account's quota is STILL AVAILABLE.
             Account-grained (provider_token.usage_limit), never per-xell. Source: gateway-captured
-            response headers (Claude 5h/7d seat windows + API TPM/RPM). Empty until a call has
-            crossed the gateway for that account. */}
-        {(fleet.provider_limits || []).some((p) => p.available_pct != null) && (
+            response headers (Claude 5h/7d seat windows + API TPM/RPM) or the account balance
+            (DeepSeek). Empty until a call has crossed the gateway for that account. */}
+        {(fleet.provider_limits || []).some((p) => p.available_pct != null || p.accounts?.some((a) => a.usage_limit)) && (
           <span className="providerlimits" data-testid="provider-limits"
                 title={providerLimitsTitle(fleet.provider_limits)}>
             {' · '}limits:
-            {(fleet.provider_limits || []).filter((p) => p.available_pct != null).map((p) => {
+            {(fleet.provider_limits || []).filter((p) => p.available_pct != null || p.accounts?.some((a) => a.usage_limit)).map((p) => {
               const pct = p.available_pct;
+              // A balance snapshot (deepseek) has no % window — render the account's dollar balance.
+              const balanceRow = p.accounts?.map((a) => (Array.isArray(a.usage_limit?.balance) ? a.usage_limit.balance[0] : null))
+                .find(Boolean) || null;
+              const balanceText = balanceRow?.total_balance
+                ? `${balanceRow.currency || ''} ${balanceRow.total_balance}`.trim() : null;
               const tight = pct != null && pct < 20;
               const warn = pct != null && pct < 40;
               return (
                 <span key={p.provider} className={`providerlimits-prov${tight ? ' is-tight' : warn ? ' is-warn' : ''}`}
                       data-provider={p.provider} data-testid={`provider-limit-${p.provider}`}>
                   {' '}<span className="providerlimits-name">{p.provider}</span>
-                  {' '}<b>{pct}% free</b>
+                  {' '}<b>{pct != null ? `${pct}% free` : balanceText ? `${balanceText} balance` : 'limit: ok'}</b>
                 </span>
               );
             })}

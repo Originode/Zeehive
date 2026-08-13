@@ -340,6 +340,48 @@ export function extractRateLimit(headers = {}) {
   };
 }
 
+// DEEPSEEK BALANCE — the ONE quota signal DeepSeek offers.
+//
+// DeepSeek's API returns NO rate-limit response headers at all (verified live on 2026-08-13 with a
+// real key: a 200 from api.deepseek.com/anthropic/v1/messages carries only content-type/date/etc).
+// So extractRateLimit() above returns null for every deepseek call and provider_token.usage_limit
+// was never written — the console showed "limit: —" for deepseek while claude had its 5h/7d
+// windows. What DeepSeek DOES offer is its account balance endpoint:
+//
+//   GET https://api.deepseek.com/user/balance   (Authorization: Bearer <key>)
+//   → { "is_available": true,
+//       "balance_infos": [ { "currency": "USD", "total_balance": "56.40",
+//                            "granted_balance": "0.00", "topped_up_balance": "56.40" } ] }
+//
+// A dollar balance is not a "percent of a window remaining", so this snapshot deliberately does NOT
+// invent an available_pct. It carries the balance FACTS (source 'balance', currency, total,
+// granted, topped-up, is_available) and the console renders "— $56.40 balance" for deepseek
+// instead of a "% free" chip. The one number a human actually cares about ("is there money left?")
+// is is_available, plus the total. Pure so it is unit-testable without a network.
+export function extractDeepseekBalance(body = null) {
+  if (!body || typeof body !== 'object') return null;
+  if (typeof body.is_available !== 'boolean') return null;
+  const infos = Array.isArray(body.balance_infos) ? body.balance_infos : [];
+  const rows = infos
+    .map((b) => ({
+      currency: b?.currency || null,
+      total_balance: b?.total_balance != null ? String(b.total_balance) : null,
+      granted_balance: b?.granted_balance != null ? String(b.granted_balance) : null,
+      topped_up_balance: b?.topped_up_balance != null ? String(b.topped_up_balance) : null,
+    }))
+    .filter((b) => b.total_balance != null);
+  if (!rows.length) return null;
+  return {
+    source: 'balance',
+    is_available: body.is_available,
+    available_pct: null,          // a dollar balance is not a % of a window — no invented number
+    representative: 'balance',
+    balance: rows,
+    // legacy no-op fields so consumers that expect the header shape keep working
+    status: body.is_available ? 'allowed' : null,
+  };
+}
+
 // Persist a rate/usage-limit snapshot onto the provider_token ACCOUNT that authenticated the
 // call. Best-effort, never throws — observability must not sink an AI request. The console
 // reads this column (listProviderTokens / fleet provider_limits) to answer "how much of the
@@ -356,6 +398,41 @@ export async function recordAccountUsageLimit(accountId, rateLimit) {
     // Column absent (migration 203 not applied yet) or row gone — log once-ish, never throw.
     logline('gateway', `could not store usage_limit on account ${String(accountId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
   }
+}
+
+// ── the DeepSeek balance probe ─────────────────────────────────────────────────────────────────
+// Fired best-effort from the gateway on each completed deepseek call. DeepSeek sends no
+// rate-limit headers, so the ONLY quota signal is the /user/balance endpoint; the probe fills
+// the gap (the "deepseek shows no limit" report). Bounded (hard timeout), silent on failure
+// (observability must never sink or slow an AI response), and it never touches the response
+// stream — it runs in the background after the response is handed through.
+const BALANCE_TIMEOUT_MS = 5000;
+
+export async function probeDeepseekBalance({ accountId = null, upstreamUrl = null, token = null } = {}) {
+  if (!accountId || !token) return null;
+  try {
+    // The balance endpoint lives at the API ROOT (https://api.deepseek.com/user/balance), NOT under
+    // the /anthropic path the messages endpoint rides (that path 404s — verified live). So derive
+    // the origin from the upstream URL and hit /user/balance there.
+    let origin = 'https://api.deepseek.com';
+    try { origin = new URL(String(upstreamUrl || providerUpstreamUrl('deepseek'))).origin; } catch { /* default */ }
+    const url = `${origin}/user/balance`;
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), BALANCE_TIMEOUT_MS);
+    let out = null;
+    try {
+      const res = await fetch(url, {
+        headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        signal: ctl.signal,
+      });
+      if (res.ok) {
+        const snap = extractDeepseekBalance(await res.json().catch(() => null));
+        if (snap) { await recordAccountUsageLimit(accountId, snap); out = snap; }
+      }
+    } catch { /* timeout / network — no snapshot, never an error */ }
+    finally { clearTimeout(t); }
+    return out;
+  } catch { return null; }
 }
 
 // ── the recorder ──────────────────────────────────────────────────────────────────────────────
@@ -729,6 +806,17 @@ export async function gatewayProxy(req, res) {
         // Persist onto the account — the Providers panel and the statusline limits chip read this.
         if (upstream.accountId) recordAccountUsageLimit(upstream.accountId, rateLimit);
       }
+      // DEEPSEEK: no rate-limit headers exist, so a response header snapshot is never captured
+      // (verified live — api.deepseek.com returns none). The only quota signal is the account
+      // balance endpoint; probe it in the BACKGROUND (bounded, never blocks the stream) so the
+      // deepseek account gets a usage_limit snapshot like claude does.
+      if (upstream.provider === 'deepseek' && upstream.accountId) {
+        void probeDeepseekBalance({
+          accountId: upstream.accountId,
+          upstreamUrl: upstream.upstreamUrl,
+          token: upstream.token,
+        });
+      }
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
         cost: costOf({ upstreamCost, price, usage: u }),
@@ -805,7 +893,8 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
-                 extractRateLimit, recordAccountUsageLimit,
+                 extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
+                 probeDeepseekBalance,
                  providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
                  completeRequest, gatewayEnv, zeeTurnForXell };
 
