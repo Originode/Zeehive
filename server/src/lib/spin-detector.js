@@ -59,9 +59,9 @@ export const DEFAULT_SPIN_CONFIG = {
 
 // ── the pure verdict ─────────────────────────────────────────────────────────────────────────────
 // Decide whether one turn's gateway calls are a spin. `requests` is the turn's llm_gateway_request
-// rows (oldest first; only path/total_tokens/requested_at are read). `lastProgressAt` is the latest
-// progress event for the turn, or null when it never had one. PURE and never throws — the loop hands
-// it exactly what the ledger says and trusts the table.
+// rows (oldest first; path/total_tokens/input_tokens/output_tokens/requested_at are read).
+// `lastProgressAt` is the latest progress event for the turn, or null when it never had one. PURE and
+// never throws — the loop hands it exactly what the ledger says and trusts the table.
 //
 // → { spinning, reason, windowCalls, windowTokens, maxSizeRatio, samePath }
 //   spinning=false reasons: 'not-enough-calls' | 'not-enough-tokens' | 'not-similar' | 'multiple-paths'
@@ -73,7 +73,12 @@ export function detectSpin({ requests = [], lastProgressAt = null, cfg = DEFAULT
   // feed the same shapes.
   const window = (requests || [])
     .filter((r) => r && r.total_tokens != null && Number.isFinite(Number(r.total_tokens)))
-    .map((r) => ({ ...r, total_tokens: Number(r.total_tokens) }))
+    .map((r) => ({
+      ...r,
+      total_tokens: Number(r.total_tokens),
+      input_tokens: r.input_tokens == null ? null : Number(r.input_tokens),
+      output_tokens: r.output_tokens == null ? null : Number(r.output_tokens),
+    }))
     .filter((r) => !r.requested_at || new Date(r.requested_at).getTime() >= since);
 
   const windowCalls = window.length;
@@ -91,14 +96,38 @@ export function detectSpin({ requests = [], lastProgressAt = null, cfg = DEFAULT
   // turn's context GROWS as it works, so its max/min blows past 1.6 long before the call floor. A
   // zero-token call (an errored request) makes the ratio infinite ⇒ NOT similar ⇒ not a spin — an
   // error is a change, and a change is the opposite of repetition.
+  //
+  // WHAT "SIZE" MEANS. This is the whole reason a working ZEEHIVE turn was misread as a spin.
+  // ZEEHIVE zees carry a huge constant context (the manual + skills + task prompt), and the CLI
+  // re-sends it on EVERY call. The provider prices that re-sent prefix as cache_read — so
+  // total_tokens (= input + output + cache_read + cache_write) is DOMINATED by the near-constant
+  // cached prefix. A genuinely working zee that does varied new work shows total_tokens barely
+  // moving (measured: max/min 1.05× — comfortably under the 1.6 spread) while its actual new
+  // work varies 8×+. The detector therefore measured the WRONG signal: every long-context turn
+  // looked "similar-sized" and got ended as a spin. A poll loop, by contrast, sends SMALL amounts
+  // of new text (a few hundred tokens of "is it done yet?") over and over. So the metric that
+  // separates them is the NEW WORK per call — input_tokens + output_tokens (prompt + completion,
+  // the tokens the model actually processes), NOT the cached prefix and NOT the total. cache_read
+  // is dropped precisely because it is the constant a working zee re-sends and a poll loop cannot
+  // avoid either; cache_write is dropped as a mostly-zero column that would only add noise.
+  //
+  // A call with NO usage split recorded (input_tokens/output_tokens NULL — an old ledger row or a
+  // request that never completed) falls back to total_tokens so it still participates, and a
+  // missing-NEW-work call (input+output = 0, e.g. a fully-cached prompt with no completion yet) is
+  // treated as "a change" (not-similar) rather than a repetition — an error is a change, and change
+  // is the opposite of repetition.
+  const workOf = (r) => {
+    if (r.input_tokens != null && r.output_tokens != null) return r.input_tokens + r.output_tokens;
+    return r.total_tokens;
+  };
   let lo = Infinity, hi = 0;
   for (const r of window) {
-    const t = r.total_tokens;
+    const t = workOf(r);
+    if (t <= 0) {
+      return { spinning: false, reason: 'not-similar', windowCalls, windowTokens, maxSizeRatio: Infinity, samePath: true };
+    }
     if (t < lo) lo = t;
     if (t > hi) hi = t;
-  }
-  if (lo <= 0) {
-    return { spinning: false, reason: 'not-similar', windowCalls, windowTokens, maxSizeRatio: Infinity, samePath: true };
   }
   const maxSizeRatio = hi / lo;
   if (maxSizeRatio > c.maxSizeSpread) {
