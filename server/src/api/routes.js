@@ -49,7 +49,7 @@ import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { resolveProjectId } from '../lib/project-resolve.js';
-import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderToken,
+import { listProviderTokens, providerLimits, setProviderToken, addProviderToken, deleteProviderToken,
          deleteProviderAccount, setProviderAccountPaused } from '../lib/provider-tokens.js';
 import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
          listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
@@ -633,6 +633,13 @@ router.post('/sites/:id/adopt', async (req, res) => {
 router.get('/projects/:id/tokens', async (req, res) => {
   try { res.json(await listProviderTokens(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// HOW MUCH OF EACH PROVIDER ACCOUNT'S USAGE LIMIT IS STILL AVAILABLE — project-scoped,
+// account-grained, never per-xell. Same data as fleet.provider_limits; a dedicated route so
+// Project setup can refresh without re-pulling the whole fleet snapshot.
+router.get('/projects/:id/provider-limits', async (req, res) => {
+  try { res.json({ ok: true, project_id: req.params.id, providers: await providerLimits(req.params.id) }); }
+  catch (err) { res.status(503).json({ error: `provider limits unavailable: ${err.message}` }); }
 });
 router.post('/projects/:id/tokens', async (req, res) => {
   try {

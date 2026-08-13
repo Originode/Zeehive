@@ -2358,12 +2358,49 @@ function DiscoverPanel({ project, sites, busy, onAdopted }) {
   );
 }
 
+// Remaining usage limit for ONE provider account. Source: provider_token.usage_limit (migration
+// 203), written by the LLM gateway from the provider's own response headers. Never per-xell.
+// "X% free" is available_pct — how much of the binding window is still AVAILABLE.
+function AccountUsageLimit({ account }) {
+  const pct = account?.available_pct;
+  const rl = account?.usage_limit || {};
+  const win = rl.windows || {};
+  if (pct == null && !account?.usage_limit) {
+    return (
+      <span className="token-usage-limit is-empty" data-testid="account-usage-limit-empty"
+            title="No limit snapshot yet — it appears after a zee call authenticates with this account through the gateway">
+        limit: —
+      </span>
+    );
+  }
+  const bits = [];
+  if (win['5h']?.available_pct != null) bits.push(`5h ${win['5h'].available_pct}%`);
+  if (win['7d']?.available_pct != null) bits.push(`7d ${win['7d'].available_pct}%`);
+  if (rl.tokens?.available_pct != null && !bits.length) {
+    bits.push(`TPM ${rl.tokens.available_pct}%`);
+  }
+  const title = [
+    pct != null ? `${pct}% of the binding window still available` : 'limit snapshot present',
+    bits.length ? bits.join(' · ') : null,
+    rl.representative ? `binding: ${rl.representative}` : null,
+    account.usage_limit_at ? `as of ${new Date(account.usage_limit_at).toLocaleString()}` : null,
+  ].filter(Boolean).join('\n');
+  const cls = pct != null && pct < 20 ? ' is-tight' : pct != null && pct < 40 ? ' is-warn' : '';
+  return (
+    <span className={`token-usage-limit${cls}`} data-testid="account-usage-limit" title={title}>
+      {pct != null ? `${pct}% free` : 'limit: ok'}
+      {bits.length ? ` (${bits.join(', ')})` : ''}
+    </span>
+  );
+}
+
 // ── agent providers: the per-project credential a CXELLD zee runs on ───────────
 // Provider ACCOUNTS, stored in the meta-DB. A project can hold several accounts of one provider
 // type — e.g. two Claude subscriptions — each with its own label, its own prompt button in the
 // header, and its own last-used date. The human does the OAuth: copy the command, run it in a
 // terminal, authorize in the browser, paste the token back (plus an optional label naming the
 // account). The server only ever returns a masked hint — a connected token cannot be read back.
+// Remaining usage limit is per ACCOUNT (usage_limit), not per xell.
 function TokensSection({ project, run, busy }) {
   const [tokens, setTokens] = useState(null);
   const [open, setOpen] = useState(null);     // provider key whose add-account panel is open
@@ -2402,12 +2439,19 @@ function TokensSection({ project, run, busy }) {
 
   return (
     <div className="setup-sec">
-      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back. Several accounts of one provider are fine: each gets its own prompt button)</span></h3>
+      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back. Several accounts of one provider are fine: each gets its own prompt button. Remaining usage limit is per ACCOUNT, refreshed from the provider's own response headers whenever a call crosses the gateway.)</span></h3>
       {(tokens || []).map((p) => (
         <div key={p.provider} className="siteed">
           <div className="setup-row">
             <span className="sitekey">{p.label}</span>
             {!p.connected && <span className="gate g-warn">△ not connected</span>}
+            {p.available_pct != null && (
+              <span className={`token-usage-limit${p.available_pct < 20 ? ' is-tight' : p.available_pct < 40 ? ' is-warn' : ''}`}
+                    data-testid={`provider-limit-${p.provider}`}
+                    title="Worst remaining quota across this provider's active accounts">
+                {p.available_pct}% free
+              </span>
+            )}
             <button type="button" className="ghost"
                     onClick={() => { setOpen(open === p.provider ? null : p.provider); setPaste(''); setLabel(''); }}>
               {open === p.provider ? '▾ cancel' : p.connected ? '＋ add another account' : '＋ connect'}
@@ -2428,6 +2472,9 @@ function TokensSection({ project, run, busy }) {
                   {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
                 </span>
               )}
+              {/* Remaining usage limit for THIS account (Claude 5h/7d seat, API TPM/RPM). Null
+                  until the gateway has authenticated one call with this key. */}
+              <AccountUsageLimit account={a} />
               <button type="button" className="projpop-del" disabled={busy}
                       title={a.paused ? `Resume this ${p.label} account` : `Pause this ${p.label} account — no dispatch can use it while paused`}
                       onClick={() => pauseToggle(p, a)}>{a.paused ? '▶' : '⏸'}</button>

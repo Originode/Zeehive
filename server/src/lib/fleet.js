@@ -461,9 +461,18 @@ export async function getFleet(projectId) {
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
   // figures on the client, so it also counts zees on retired xells the card list no longer shows.
-  // NB: this is the fleet's OWN consumption only — Anthropic's account-wide %/limits are not exposed
-  // to us (only their /usage shows those).
+  // This is spend. HOW MUCH OF EACH PROVIDER ACCOUNT'S LIMIT IS STILL AVAILABLE is provider_limits
+  // below — a different question, answered from provider_token.usage_limit (gateway headers).
   const fleetBurn = await getFleetBurn(pid);
+
+  // PROVIDER LIMITS — remaining quota on each connected dispatchable account (Claude 5h/7d seat
+  // windows, API TPM/RPM). Account-grained, never per-xell. Empty until the gateway has seen a
+  // call for that account. Soft-fail so a pre-203 meta-DB still serves the fleet snapshot.
+  let providerLimitsList = [];
+  try {
+    const { providerLimits } = await import('./provider-tokens.js');
+    providerLimitsList = await providerLimits(pid);
+  } catch { /* column missing or module issue — chip simply does not render */ }
 
   // production is a xell too, but it's not a pooled work-xell — exclude it from the counts
   const work = xells.filter((x) => !x.is_production);
@@ -658,6 +667,8 @@ export async function getFleet(projectId) {
     backup,
     xells,
     fleet_burn: fleetBurn,
+    // Per-provider remaining usage limit (provider_token.usage_limit) — NOT per-xell burn.
+    provider_limits: providerLimitsList,
     landing,
     holding,
     shipping,
@@ -746,21 +757,38 @@ export async function getFleetBurn(projectId) {
       GROUP BY 1
       ORDER BY tokens DESC, cost DESC`, [pid]).catch(() => []);
 
-  // Latest rate-limit snapshot per provider: the gateway stamped meta.rate_limit on every call
-  // that carried the headers. DISTINCT ON (provider) + ORDER BY completed_at DESC is the freshest
-  // one; a provider with no headers ever is simply absent (the chip shows nothing for it).
-  const current = await q(
-    `SELECT DISTINCT ON (provider)
-            provider,
-            meta->'rate_limit' AS rate_limit,
-            completed_at AS at
-       FROM llm_gateway_request
-      WHERE project_id = $1
-        AND provider IS NOT NULL
-        AND meta ? 'rate_limit'
-      ORDER BY provider, completed_at DESC NULLS LAST`, [pid]).catch(() => []);
+  // Latest AVAILABLE limit per provider ACCOUNT from provider_token.usage_limit (migration 203) —
+  // the authoritative grain for "how much of the usage limit is available per provider". Falls
+  // back to the gateway ledger's meta.rate_limit when the column is not yet applied.
+  let current = [];
+  try {
+    current = await q(
+      `SELECT provider, id AS account_id, label AS account_label, token_hint,
+              usage_limit AS rate_limit, usage_limit_at AS at
+         FROM provider_token
+        WHERE project_id = $1
+          AND usage_limit IS NOT NULL
+          AND paused_at IS NULL
+        ORDER BY provider, usage_limit_at DESC NULLS LAST`, [pid]);
+  } catch {
+    current = await q(
+      `SELECT DISTINCT ON (provider)
+              provider,
+              meta->'rate_limit' AS rate_limit,
+              completed_at AS at
+         FROM llm_gateway_request
+        WHERE project_id = $1
+          AND provider IS NOT NULL
+          AND meta ? 'rate_limit'
+        ORDER BY provider, completed_at DESC NULLS LAST`, [pid]).catch(() => []);
+  }
 
   const num = (v) => Number(v || 0);
+  const parseRl = (v) => {
+    if (!v) return null;
+    if (typeof v === 'string') { try { return JSON.parse(v); } catch { return null; } }
+    return v;
+  };
   return {
     fleet: {
       tokens: num(fleet?.tokens), cost: num(fleet?.cost),
@@ -779,14 +807,19 @@ export async function getFleetBurn(projectId) {
       cache_read: num(r.cache_read), cache_write: num(r.cache_write),
       requests: num(r.requests),
     })),
-    current: (current || []).map((r) => ({
-      provider: r.provider,
-      // pg returns jsonb as a parsed object already; tolerate a string if a driver changes.
-      rate_limit: (typeof r.rate_limit === 'string'
-        ? (() => { try { return JSON.parse(r.rate_limit); } catch { return null; } })()
-        : r.rate_limit) || null,
-      at: r.at || null,
-    })).filter((r) => r.rate_limit),
+    // current = remaining limit per account (available_pct). NOT per-xell usage.
+    current: (current || []).map((r) => {
+      const rl = parseRl(r.rate_limit);
+      return {
+        provider: r.provider,
+        account_id: r.account_id || null,
+        account_label: r.account_label || null,
+        token_hint: r.token_hint || null,
+        rate_limit: rl,
+        available_pct: rl?.available_pct ?? null,
+        at: r.at || null,
+      };
+    }).filter((r) => r.rate_limit),
   };
 }
 

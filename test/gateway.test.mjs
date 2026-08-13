@@ -68,10 +68,9 @@ const o = normalizeUsage({ prompt_tokens: 100, completion_tokens: 50 }, 'chat-co
 eq(o.input, 100, 'openai prompt'); eq(o.output, 50, 'openai completion');
 eq(o.cacheRead, 0, 'openai has no cache read'); eq(o.cacheWrite, 0, 'openai has no cache write');
 
-// ── B2. extractRateLimit — current usage % off response headers (pure) ───────────────────────
-// The free surface for "how full is this provider's window right now". Admin /usage needs a
-// separate key the fleet does not hold; these headers ride every ordinary call.
-console.log('\n── B2. extractRateLimit — Anthropic + OpenAI headers ──');
+// ── B2. extractRateLimit — AVAILABLE % of the provider account's limit (pure) ────────────────
+// Claude Code seat windows (unified) + API TPM/RPM. Primary field is available_pct (remaining).
+console.log('\n── B2. extractRateLimit — Anthropic + OpenAI + unified seat headers ──');
 const antRl = extractRateLimit({
   'anthropic-ratelimit-tokens-limit': '100000',
   'anthropic-ratelimit-tokens-remaining': '40000',
@@ -81,8 +80,8 @@ const antRl = extractRateLimit({
 });
 eq(antRl?.tokens_limit, 100000, 'anthropic tokens limit');
 eq(antRl?.tokens_remaining, 40000, 'anthropic tokens remaining');
-eq(antRl?.tokens_used_pct, 60, 'anthropic tokens used% = 1 − 40000/100000 = 60');
-eq(antRl?.requests_used_pct, 80, 'anthropic requests used% = 1 − 10/50 = 80');
+eq(antRl?.available_pct, 40, 'AVAILABLE = remaining/limit = 40% (the number a human wants)');
+eq(antRl?.tokens_used_pct, 60, 'legacy used% still present for older meta readers');
 eq(antRl?.tokens_reset, '2026-08-13T12:00:00Z', 'anthropic tokens reset timestamp');
 const oaiRl = extractRateLimit({
   'x-ratelimit-limit-tokens': '20000',
@@ -90,14 +89,24 @@ const oaiRl = extractRateLimit({
   'x-ratelimit-limit-requests': '60',
   'x-ratelimit-remaining-requests': '60',
 });
-eq(oaiRl?.tokens_used_pct, 75, 'openai tokens used% = 1 − 5000/20000 = 75');
-eq(oaiRl?.requests_used_pct, 0, 'openai requests used% = 0 when remaining=limit');
+eq(oaiRl?.available_pct, 25, 'openai available = 5000/20000 = 25%');
+eq(oaiRl?.requests?.available_pct, 100, 'openai RPM fully free when remaining=limit');
+// Claude Code unified seat windows (5h/7d) — utilization 0.0–1.0.
+const seat = extractRateLimit({
+  'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+  'anthropic-ratelimit-unified-5h-utilization': '0.07',
+  'anthropic-ratelimit-unified-5h-status': 'allowed',
+  'anthropic-ratelimit-unified-7d-utilization': '0.53',
+});
+eq(seat?.representative, '5h', 'five_hour → 5h');
+eq(seat?.available_pct, 93, 'seat available follows binding 5h window: 100−7=93');
+eq(seat?.windows?.['7d']?.available_pct, 47, '7d available = 100−53=47');
 // Case-insensitive + array-valued headers (node/express variance).
 const mixed = extractRateLimit({
   'Anthropic-Ratelimit-Tokens-Limit': ['1000'],
   'Anthropic-Ratelimit-Tokens-Remaining': ['250'],
 });
-eq(mixed?.tokens_used_pct, 75, 'header names are case-insensitive; array values take [0]');
+eq(mixed?.available_pct, 25, 'header names are case-insensitive; array values take [0]');
 eq(extractRateLimit({}), null, 'no rate-limit headers → null (not a zero-filled object)');
 eq(extractRateLimit(null), null, 'null headers → null');
 eq(extractRateLimit({ 'content-type': 'application/json' }), null, 'unrelated headers → null');

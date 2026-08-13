@@ -224,17 +224,40 @@ export function credentialVendorMismatch({ provider, token } = {}) {
 // state (paused/paused_at/paused_by/reason — migration 104): a paused account is still connected
 // but no dispatch may start a zee on it.
 export async function listProviderTokens(projectId) {
-  const rows = await q(
-    `SELECT id, provider, label, token_hint, created_at, last_used_at,
-            paused_at, paused_by, reason
-       FROM provider_token WHERE project_id = $1 ORDER BY created_at`, [projectId]);
+  // usage_limit / usage_limit_at (migration 203) — how much of THIS account's provider quota is
+  // still available. Written by the LLM gateway from upstream rate-limit headers. SELECT * of the
+  // known columns so a pre-203 database still answers (missing columns → query fails → we retry
+  // without them, so the Providers panel never goes blank over a missing migration).
+  let rows;
+  try {
+    rows = await q(
+      `SELECT id, provider, label, token_hint, created_at, last_used_at,
+              paused_at, paused_by, reason, usage_limit, usage_limit_at
+         FROM provider_token WHERE project_id = $1 ORDER BY created_at`, [projectId]);
+  } catch {
+    rows = await q(
+      `SELECT id, provider, label, token_hint, created_at, last_used_at,
+              paused_at, paused_by, reason
+         FROM provider_token WHERE project_id = $1 ORDER BY created_at`, [projectId]);
+  }
   return Object.values(PROVIDERS).map((p) => {
     const accounts = rows.filter((r) => r.provider === p.key)
-      .map(({ id, label, token_hint, created_at, last_used_at, paused_at, paused_by, reason }) => ({
+      .map(({ id, label, token_hint, created_at, last_used_at, paused_at, paused_by, reason,
+              usage_limit, usage_limit_at }) => ({
         id, label, token_hint, created_at, last_used_at,
         paused: !!paused_at, paused_at, paused_by, reason,
+        // USAGE LIMIT available for THIS account — not fleet spend, not per-xell. Null until the
+        // gateway has seen one call authenticated with this account's key.
+        usage_limit: usage_limit || null,
+        usage_limit_at: usage_limit_at || null,
+        available_pct: usage_limit?.available_pct ?? null,
       }));
     const pausedCount = accounts.filter((a) => a.paused).length;
+    // The provider-level available_pct is the WORST (lowest remaining) of its active accounts —
+    // "claude is at 12%" means at least one connected seat is that tight.
+    const activeAvails = accounts
+      .filter((a) => !a.paused && a.available_pct != null)
+      .map((a) => a.available_pct);
     return {
       provider: p.key, label: p.label, command: p.command, steps: p.steps,
       placeholder: p.placeholder || null,   // the SHAPE to paste — console copy, so it stays here
@@ -246,8 +269,32 @@ export async function listProviderTokens(projectId) {
       token_hint: accounts[0]?.token_hint || null,
       created_at: accounts[0]?.created_at || null,
       last_used_at: accounts[0]?.last_used_at || null,
+      available_pct: activeAvails.length ? Math.min(...activeAvails) : null,
     };
   });
+}
+
+// PROJECT-LEVEL PROVIDER LIMITS — how much of each connected provider account's quota is still
+// available. Read-only, account-grained (never per-xell). Used by the statusline chip and any
+// surface that asks "can I still dispatch on claude?" without opening Project setup.
+export async function providerLimits(projectId) {
+  const tokens = await listProviderTokens(projectId);
+  return tokens
+    .filter((p) => p.dispatch && p.connected)
+    .map((p) => ({
+      provider: p.provider,
+      label: p.label,
+      available_pct: p.available_pct,
+      accounts: p.accounts.map((a) => ({
+        id: a.id,
+        label: a.label,
+        token_hint: a.token_hint,
+        paused: a.paused,
+        available_pct: a.available_pct,
+        usage_limit: a.usage_limit,
+        usage_limit_at: a.usage_limit_at,
+      })),
+    }));
 }
 
 function validate(provider, token) {
