@@ -220,6 +220,8 @@ try {
   catch (e) { guardErr = e.message; }
   ok(/REFUSING to bind/.test(guardErr || ''),
      `a writable bind to the managing meta-DB is REFUSED at attach [${(guardErr || 'no error').slice(0, 60)}]`);
+  ok(/zee seed/.test(guardErr || ''),
+     'the refusal names `zee seed` as the prod-data WRITE path (not only manager/readonly)');
   ok(projection(g.wt).text === guardBefore, 'the file on disk is untouched — never the meta-DB');
   const guardRow = await one(`SELECT db_coupling FROM xell WHERE id=$1`, [g.id]);
   ok(guardRow.db_coupling === 'db-isolated',
@@ -238,6 +240,8 @@ try {
   catch (e) { g2Err = e.message; }
   ok(/REFUSING to bind/.test(g2Err || ''),
      `naming the meta-DB container explicitly is refused too [${(g2Err || 'no error').slice(0, 60)}]`);
+  ok(/zee seed/.test(g2Err || ''),
+     'container-named refusal also names the seed path');
   ok(projection(g2.wt).text === g2Before, 'and the second xell\'s file is untouched as well');
   await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
           [pid, SHARED_PROD]);
