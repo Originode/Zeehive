@@ -1025,7 +1025,11 @@ export async function openCxellSsh({ ctx, name, publicKey, agentEnv = {}, xellTo
 // cage). `required:false` means the adapter needs no setup — the ordinary case.
 export async function prepareCxellAuth({ ctx = 'default', name, adapter = CLAUDE_ADAPTER,
                                          token = null, baseUrl = null, model = null } = {}) {
-  const cmd = adapter?.authSetupCmd?.();
+  // The token is offered to the adapter because a vendor can have MORE THAN ONE credential shape:
+  // grok's `xai-…` API key needs no install (the env is the login) while a device-auth SEAT session
+  // is a file that must be written into the cage. The adapter decides; an adapter that always needs
+  // its door (codex) ignores the argument, and a shape that needs nothing costs no exec at all.
+  const cmd = adapter?.authSetupCmd?.({ token });
   if (!cmd) return { required: false, ok: true };
   if (!token) {
     return { required: true, ok: false,

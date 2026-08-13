@@ -68,8 +68,11 @@ export async function spinTick() {
   for (const t of turns) {
     try {
       // The turn's gateway calls — the one query the card promised. No calls → nothing to judge.
+      // input_tokens/output_tokens ride along so detectSpin can judge similarity on the call's
+      // NEW WORK (input+output) rather than total_tokens — the cached-prefix-dominated total is
+      // what misread working long-context turns as spins (lib/spin-detector.js).
       const requests = await q(
-        `SELECT path, total_tokens, requested_at FROM llm_gateway_request
+        `SELECT path, total_tokens, input_tokens, output_tokens, requested_at FROM llm_gateway_request
           WHERE turn_id=$1 ORDER BY requested_at ASC`, [t.turn_id]);
       if (!requests?.length) continue;
 

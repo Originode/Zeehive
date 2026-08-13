@@ -10,7 +10,7 @@ import { logline } from './logbus.js';
 // vendor through this door, so the mapping is never copied into the zee CLI (the exact drift class
 // test/cxell-cli-drift.test.mjs exists to catch). One direction only: cxell-runtimes.js imports
 // nothing from here, so there is no cycle.
-import { runtimeKeyForProvider, adapterFor } from './cxell-runtimes.js';
+import { runtimeKeyForProvider, adapterFor, grokSessionCredential } from './cxell-runtimes.js';
 
 // provider TYPE registry — how to obtain a token of each type and what a valid one looks like.
 // UI copy lives here too so the console renders new provider types without a client change.
@@ -20,6 +20,7 @@ export const PROVIDERS = {
     label: 'Claude',
     dispatch: true,   // a zee can run on this provider today
     command: 'claude setup-token',
+    placeholder: 'sk-ant-oat01-…',
     steps: 'Run the command in any terminal. Your browser opens — authorize, and the CLI prints a long-lived token (sk-ant-oat01-…). Paste it below; it is stored only in the meta-DB.',
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
     valid: (t) => /^sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}$/.test(t),
@@ -37,6 +38,7 @@ export const PROVIDERS = {
     label: 'ChatGPT Codex',
     dispatch: true,   // codex-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://platform.openai.com/api-keys',
+    placeholder: 'sk-proj-… / sk-…',
     steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Codex CLI inside their cxell.',
     valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
@@ -49,6 +51,7 @@ export const PROVIDERS = {
     label: 'Kimi Code',
     dispatch: true,   // kimi-code-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://kimi.com/code/console',
+    placeholder: 'the coding key from the Kimi Code console',
     steps: 'Create a dedicated CODING key in the Kimi Code console (not a Moonshot platform key) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Kimi Code CLI inside their cxell.',
     valid: (t) => /^[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
@@ -60,23 +63,52 @@ export const PROVIDERS = {
     label: 'DeepSeek',
     dispatch: true,   // deepseek-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://platform.deepseek.com/api_keys',
+    placeholder: 'sk-…',
     steps: 'Create an API key on the DeepSeek platform (sk-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the claude CLI against DeepSeek’s Anthropic-compatible endpoint.',
     // sk-<alnum tail>; sk-ant-… is explicitly rejected so a Claude token in the wrong slot fails loudly
     valid: (t) => /^sk-[A-Za-z0-9]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
   // xAI ships its own coding-agent CLI, so the vendor-native ruling applies with no exception: a
-  // Grok zee runs the literal Grok Build CLI (`grok -p` inside the cxell — runtime 'grok-cxell'),
-  // authenticated by the console.x.ai key alone.
+  // Grok zee runs the literal Grok Build CLI (`grok -p` inside the cxell — runtime 'grok-cxell').
+  //
+  // TWO CREDENTIALS ARE ACCEPTED, because xAI sells two things. An `xai-…` API key spends PREPAID
+  // API credits; a SuperGrok / Business SEAT is a signed-in SESSION and spends the subscription's
+  // weekly pool instead. The seat's headless door is `grok login --device-auth` (a device code, no
+  // browser on the box), and what it produces is the FILE ~/.grok/auth.json — so that file's
+  // contents are what a human pastes here, and the cage installs it (lib/cxell-runtimes.js
+  // authSetupCmd). Pasting BOTH is not a thing: an account row is one credential, and a cage given a
+  // session deliberately carries no XAI_API_KEY, since the key wins over the seat.
   grok: {
     key: 'grok',
     label: 'Grok Build',
     dispatch: true,   // grok-cxell runtime (lib/cxell-runtimes.js)
-    command: 'https://console.x.ai',
-    steps: 'Create an API key in the xAI console (xai-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Grok Build CLI inside their cxell.',
-    valid: (t) => /^xai-[A-Za-z0-9_-]{20,}$/.test(t),
+    command: 'grok login --device-auth && cat ~/.grok/auth.json',
+    placeholder: '{"https://accounts.x.ai/sign-in":{…}}  — or xai-… for an API key',
+    steps: 'For a SuperGrok / Business seat (no prepaid API credits): run the command on any machine that has the grok CLI — it prints a URL and a code to enter in any browser — then paste the ~/.grok/auth.json it prints below. For pay-as-you-go instead, create an API key at https://console.x.ai (xai-…) and paste that. Either way it is stored only in the meta-DB, and dispatched zees run the Grok Build CLI inside their cxell.',
+    // an xai-… API key, OR a device-auth session (the auth.json object — shape measured in
+    // lib/cxell-runtimes.js, which owns the predicate because the adapter branches on it too)
+    valid: (t) => /^xai-[A-Za-z0-9_-]{20,}$/.test(t) || !!grokSessionCredential(t),
+    // Stored CANONICALLY: a session pasted from a pretty-printed file becomes one compact line, so
+    // it can never split a KEY=value in the cage's /etc/environment (scrubEnvValue's concern) and
+    // two pastes of the same session are the same string.
+    normalize: (t) => (grokSessionCredential(t) ? JSON.stringify(grokSessionCredential(t)) : t),
+    // A session's first 13 characters are `{"https://acc` for every account alike, so the generic
+    // head…tail hint would name nothing. Say what it IS instead — the scope's auth_mode and the
+    // last 4 of the session key, which is what an xAI-side error message can be matched against.
+    hint: (t) => {
+      const s = grokSessionCredential(t);
+      if (!s) return null;                       // an API key: the generic hint is right for it
+      const e = Object.values(s)[0] || {};
+      return `grok ${String(e.auth_mode || 'session')} session …${String(e.key || '').slice(-4)}`;
+    },
     // SIGNATURE (see claude): `xai-` is xAI's own prefix, and it has to be declared here because the
     // loose shapes above swallow it — kimi's "20+ chars that are not sk-ant-" accepts an xAI key, so
-    // without this an xAI token pasted into the wrong slot would be unattributable.
+    // without this an xAI token pasted into the wrong slot would be unattributable. A SESSION needs
+    // no signature arm: it is a JSON object, every other vendor's `valid` is an anchored one-line
+    // charset that rejects `{`, so the SHAPE arm of attributeTokenVendor already names it grok and
+    // nothing else — and keeping the signature a bare prefix keeps scrubSecrets' registry-built
+    // regex a set of prefixes. (What that costs: a session key echoed back in a vendor error is not
+    // masked by scrubSecrets — it carries no prefix to match. Nothing in the fleet prints it.)
     signature: /^xai-/,
   },
   // GitHub is INBOUND BY DEFAULT (migration 032): this token drives clone/pull fetches in
@@ -88,6 +120,7 @@ export const PROVIDERS = {
     key: 'github',
     label: 'GitHub',
     command: 'GitHub → Settings → Developer settings → Fine-grained tokens',
+    placeholder: 'github_pat_… / ghp_…',
     steps: 'Create a fine-grained personal access token scoped to this repo. Contents: READ-ONLY keeps Zeehive fetch-only (the safe default). Grant Contents: WRITE (plus Pull requests: write for PRs) and Project setup gains a human-confirmed Push / open-PR button. Paste it below; it is stored only in the meta-DB.',
     // classic ghp_…, fine-grained github_pat_…, or an OAuth/device token gho_/ghu_/ghs_ (what
     // `gh auth token` and git-credential-manager hold — a proven-working fallback when an org's
@@ -101,7 +134,11 @@ export const PROVIDERS = {
   },
 };
 
-const hint = (t) => `${t.slice(0, 13)}…${t.slice(-4)}`;
+// The masked read model of a credential: head…tail is right for every key-shaped token, and a
+// provider may override it for a credential that is NOT key-shaped (grok's device-auth session is a
+// JSON object whose first 13 characters are identical for every account). Never the token itself.
+const hint = (t, provider = null) => PROVIDERS[provider]?.hint?.(t)
+  || `${t.slice(0, 13)}…${t.slice(-4)}`;
 
 // ── THE LAST GATE BEFORE A CREDENTIAL LEAVES FOR A VENDOR'S API ──────────────────────────────────
 //
@@ -173,7 +210,7 @@ export function credentialVendorMismatch({ provider, token } = {}) {
   const from = attributeTokenVendor(t);
   if (!from || from === provider) return null;    // unattributable, or the right vendor — allowed
   const label = (k) => PROVIDERS[k]?.label || k;
-  const masked = t.length > 20 ? hint(t) : '…';
+  const masked = t.length > 20 ? hint(t, from) : '…';
   return { from, to: provider, hint: masked, sentence:
     `that credential is a ${label(from)} token (${masked}) and this cage runs on ${label(provider)} — `
     + `a ${label(provider)} endpoint will answer "your api key is invalid" and blame the ${label(from)} `
@@ -200,6 +237,7 @@ export async function listProviderTokens(projectId) {
     const pausedCount = accounts.filter((a) => a.paused).length;
     return {
       provider: p.key, label: p.label, command: p.command, steps: p.steps,
+      placeholder: p.placeholder || null,   // the SHAPE to paste — console copy, so it stays here
       dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
       connected: accounts.length > 0,
       accounts,
@@ -218,7 +256,10 @@ function validate(provider, token) {
   const t = String(token || '').trim();
   if (!t) throw new Error('token is empty');
   if (!p.valid(t)) throw new Error(`that does not look like a ${p.label} token — see the steps for what to paste`);
-  return { p, t };
+  // CANONICALIZE before it is stored, where the provider says how (grok compacts a pasted
+  // auth.json). Every write path goes through here, so a stored credential is never the paste's
+  // incidental whitespace.
+  return { p, t: p.normalize ? String(p.normalize(t)) : t };
 }
 
 // ADD an account of this type (multiple per type allowed — that is the point since 036).
@@ -227,7 +268,7 @@ export async function addProviderToken(projectId, provider, token, label = null)
   const row = await one(
     `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
      VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-    [projectId, provider, t, hint(t), String(label || '').trim() || null]);
+    [projectId, provider, t, hint(t, provider), String(label || '').trim() || null]);
   return (await listProviderTokens(projectId)).find((r) => r.provider === provider)
     ?? { id: row.id };
 }
@@ -240,10 +281,10 @@ export async function setProviderToken(projectId, provider, token) {
   if (rows.length > 1) throw new Error(`several ${provider} accounts are connected — add/remove specific accounts instead`);
   if (rows.length === 1) {
     await q(`UPDATE provider_token SET token=$2, token_hint=$3, created_at=now(), last_used_at=NULL WHERE id=$1`,
-      [rows[0].id, t, hint(t)]);
+      [rows[0].id, t, hint(t, provider)]);
   } else {
     await q(`INSERT INTO provider_token (project_id, provider, token, token_hint) VALUES ($1,$2,$3,$4)`,
-      [projectId, provider, t, hint(t)]);
+      [projectId, provider, t, hint(t, provider)]);
   }
   return (await listProviderTokens(projectId)).find((r) => r.provider === provider);
 }
@@ -488,7 +529,7 @@ export function everyProviderEnv(accounts = []) {
     const K = p.key.toUpperCase();
     env[`ZEE_PROVIDER_${K}_TOKEN`] = token;
     env[`ZEE_PROVIDER_${K}_LABEL`] = acct.label || p.label;
-    env[`ZEE_PROVIDER_${K}_HINT`] = acct.token_hint || hint(token);
+    env[`ZEE_PROVIDER_${K}_HINT`] = acct.token_hint || hint(token, p.key);
     keys.push(p.key);
     accountsUsed.push({ provider: p.key, account_id: acct.id, account_created_at: acct.created_at || null });
   }
@@ -541,7 +582,16 @@ export function providerRunEnvFromAccount({ provider, token, label = null, hint 
     hint: hint || null,
     bin: adapter.bin || null,
     env: adapter.env({ token: t, baseUrl: p.anthropicBaseUrl || null, model }),
-    auth_setup: adapter.authSetupCmd ? { required: true, command: adapter.authSetupCmd() } : null,
+    // The account's token is passed so an adapter that installs only SOME credential shapes can
+    // say "nothing to install" for the others (grok: an API key is env-only, a seat session is a
+    // file). The spawn path calls it with no token and gets the command that handles both.
+    // `file` is the vendor's own proof that the install happened (relative to $HOME) — declared by
+    // the adapter, so the CLI can refuse to exit 0 on an un-installed cage without knowing a single
+    // vendor path itself.
+    auth_setup: (() => {
+      const cmd = adapter.authSetupCmd?.({ token: t });
+      return cmd ? { required: true, command: cmd, file: adapter.authFile || null } : null;
+    })(),
   };
 }
 

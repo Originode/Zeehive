@@ -15,14 +15,24 @@
 // (stdin → ~/.codex/auth.json) the same key IS sent and a bogus one returns the honest
 // `invalid_api_key`. So the queenzee installs the credential into the cage before the agent starts.
 //
+// `grok` is the SECOND exception, and for the opposite reason: not a CLI that ignores its env, but a
+// vendor with TWO credential shapes. An `xai-…` API key is read straight from XAI_API_KEY (nothing to
+// install); a SuperGrok / Business SEAT is obtained by `grok login --device-auth`, which writes a
+// session into ~/.grok/auth.json — a file, not a key, and the CLI's env door for it (GROK_AUTH) does
+// not accept that file's shape (measured on grok 0.2.118). So the seat session rides in as the
+// carrier var GROK_AUTH_JSON and the adapter writes the file. A seat cage gets NO XAI_API_KEY at all:
+// the key OVERRIDES the seat, so setting both would quietly spend prepaid credits while a human
+// believes the weekly subscription pool is being used.
+//
 // What this pins (lib/cxell-runtimes.js authSetupCmd + lib/cxell.js prepareCxellAuth):
 //   1. THE ADAPTER CONTRACT — only a CLI that needs it declares a setup command, and that command
 //      reads the key from the ENV the exec carries. A token interpolated into a command line would
 //      land in `ps`, in the docker argv and in every log; that must stay impossible by construction.
 //   2. THE VERDICT IS THE CONTAINER'S — AUTH_OK / AUTH_FAILED via dkVerdict, never the exit code,
 //      and NO verdict is a FAILURE here (guessing would restore the silence this fixes).
-//   3. A NO-OP IS FREE — an adapter with no setup runs NO exec at all. Provider-agnostic means the
-//      claude/kimi/deepseek path is not paying for codex's quirk.
+//   3. A NO-OP IS FREE — an adapter with no setup runs NO exec at all, and the adapter is asked with
+//      the TOKEN, so a shape that needs no install (a grok API key) costs nothing either. Provider-
+//      agnostic means the claude/kimi/deepseek path is not paying for codex's quirk.
 //   4. THE CREDENTIAL IS THE DISPATCHED ONE — the exec carries the token that was passed in, so a
 //      re-crewed cage or a rotated account key installs the CURRENT key, not the one it was born
 //      with.
@@ -36,6 +46,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { fakeTokens } from './_bin/tokens.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = mkdtempSync(join(tmpdir(), 'cxauth-'));
@@ -50,6 +61,7 @@ const readLog = () => (existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8')
 const clearLog = () => { rmSync(DOCKER_LOG, { force: true }); };
 
 const TOKEN = 'sk-proj-testtoken0123456789abcdef';
+const SESSION = fakeTokens.grokSession();          // what `grok login --device-auth` leaves behind
 
 try {
   const RT = await import('../server/src/lib/cxell-runtimes.js');
@@ -70,10 +82,34 @@ try {
   ok(/sk-\[A-Za-z0-9_-\]/.test(cmd) || /sed/.test(cmd),
      'the failure path scrubs sk-… before anything it echoes can reach a log');
 
-  for (const key of ['claude-code-cxell', 'kimi-code-cxell', 'deepseek-cxell', 'grok-cxell']) {
+  for (const key of ['claude-code-cxell', 'kimi-code-cxell', 'deepseek-cxell']) {
     const a = RT.adapterFor(key);
     ok(!a.authSetupCmd, `${key}: no setup command — its environment IS the login (measured)`);
   }
+
+  // grok: one adapter, two shapes — the KEY needs nothing, the SEAT SESSION is a file to install
+  const grok = RT.adapterFor('grok-cxell');
+  ok(grok.authSetupCmd({ token: fakeTokens.grok() }) === null,
+     'grok + an xai-… API key: no setup command — XAI_API_KEY IS the login');
+  const gcmd = grok.authSetupCmd({ token: SESSION });
+  ok(typeof gcmd === 'string' && gcmd.length > 0,
+     'grok + a device-auth SEAT session: a setup command, because the session is a FILE');
+  ok(/printenv GROK_AUTH_JSON/.test(gcmd) && !gcmd.includes(SESSION),
+     'the session is read from the ENV the exec carries — never interpolated into the command');
+  ok(/auth\.json/.test(gcmd) && /GROK_HOME/.test(gcmd),
+     "it writes the vendor's own file (~/.grok/auth.json, GROK_HOME honored)");
+  ok(/create_time/.test(gcmd) && /born\(cur\)>=born\(inc\)/.test(gcmd),
+     'it NEVER clobbers a fresher session: the CLI refreshes that file in place, so newer wins');
+  ok(/mode:0o600/.test(gcmd) && /chmodSync\(p,0o600\)/.test(gcmd),
+     '…and the credential file is 0600, whatever umask the cage was built with');
+  ok(/renameSync/.test(gcmd),
+     '…written to a temp name and renamed, so a killed exec cannot leave half a session behind');
+  ok(RT.AUTH_MARKERS.every((m) => gcmd.includes(m)),
+     'it prints both declared verdicts, so dkVerdict reads the cage’s own answer');
+  ok(!/`/.test(gcmd),
+     'no backtick survives in it — a message quoting the login command would EXECUTE it in the cage');
+  ok(/elif \[ -n "\$\{XAI_API_KEY:-\}" \]/.test(gcmd),
+     'called with NO token (the spawn path) it still handles both shapes from the cage’s own env');
 
   // ── 2. the exec that installs it ────────────────────────────────────────────────────────────
   section('prepareCxellAuth — the container states the outcome');
@@ -113,13 +149,40 @@ try {
 
   // ── 3. the providers that need nothing pay nothing ──────────────────────────────────────────
   section('an adapter with no setup runs no exec');
-  for (const key of ['claude-code-cxell', 'kimi-code-cxell', 'deepseek-cxell', 'grok-cxell']) {
+  for (const key of ['claude-code-cxell', 'kimi-code-cxell', 'deepseek-cxell']) {
     clearLog();
     const res = await prepareCxellAuth({ ctx: 'default', name: 'cxell_test',
                                          adapter: RT.adapterFor(key), token: TOKEN });
     ok(res.required === false && res.ok === true, `${key}: required:false, ok:true`);
     ok(readLog() === '', `${key}: no docker exec was attempted`);
   }
+
+  // ── 3a. grok — the SHAPE decides, per dispatch ──────────────────────────────────────────────
+  section('grok: an API key installs nothing; a seat session is written into the cage');
+  clearLog();
+  let g = await prepareCxellAuth({ ctx: 'default', name: 'cxell_test', adapter: grok,
+                                   token: fakeTokens.grok() });
+  ok(g.required === false && g.ok === true, 'an xai-… key: required:false, ok:true');
+  ok(readLog() === '', '…and no docker exec was attempted to find that out');
+
+  clearLog();
+  process.env.DOCKER_FAKE_CXELL_VERDICT = 'AUTH_OK';
+  g = await prepareCxellAuth({ ctx: 'default', name: 'cxell_test', adapter: grok, token: SESSION });
+  ok(g.required && g.ok && g.verdict === 'AUTH_OK', 'a seat session: installed, on the cage’s own verdict');
+  log = readLog();
+  ok(log.includes(`-e GROK_AUTH_JSON=${SESSION}`), 'the session rides in as the carrier env GROK_AUTH_JSON');
+  ok(!/-e XAI_API_KEY=/.test(log),
+     'a SEAT cage gets NO XAI_API_KEY — the key overrides the seat, and would spend prepaid credits');
+  const gLine = (log.match(/=== docker (.*) ===/) || [])[1] || '';
+  ok(!gLine.replace(/-e GROK_AUTH_JSON=\S+/g, '').includes(SESSION.slice(0, 40)),
+     'the session appears ONLY as the -e env value, never in the command line');
+  ok(!/ -u 0 /.test(gLine), 'installed as the cage user, so it lands in the zee’s own ~/.grok');
+
+  clearLog();
+  process.env.DOCKER_FAKE_CXELL_VERDICT = 'AUTH_FAILED';
+  g = await prepareCxellAuth({ ctx: 'default', name: 'cxell_test', adapter: grok, token: SESSION });
+  ok(g.required && !g.ok && g.verdict === 'AUTH_FAILED',
+     'a session the cage refuses is a FAILURE — better than a zee that runs unauthenticated');
 
   // ── 3b. the FIRST-RUN prompts, per vendor ───────────────────────────────────────────────────
   // The cage used to be pre-answered for claude alone (cxell-claude-seed.mjs, baked into the
