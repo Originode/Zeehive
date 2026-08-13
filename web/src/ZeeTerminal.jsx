@@ -314,7 +314,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                       data-testid="talk-toggle" onClick={() => setTalkOpen((v) => !v)}
                       title={feed.live === true
                         ? 'Talk to this zee — it is MID-TURN, so this pane is a read-only feed: your message is queued and typed into its session the moment the turn ends'
-                        : "Talk to this zee — typed straight into its live session (long text and images are handed over as files in its .zee-inbox)"}>
+                        : "Talk to this zee — typed straight into its live session (long text and any files are handed over into its .zee-inbox)"}>
                 💬 talk
               </button>
             )}
@@ -338,7 +338,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
           )}
           <div className="zeeterm-body" ref={holder} onContextMenu={onContextMenu} />
           {/* The SAME composer the hexagon's 📨 button opens (one delivery path, one set of rules
-              about long text and images) — rendered INSIDE the terminal, because the terminal is
+              about long text and any files) — rendered INSIDE the terminal, because the terminal is
               where a human is standing when they want to say something to this zee. */}
           {talkOpen && xell?.id && (
             <MessageComposer xell={xell} onClose={() => { setTalkOpen(false); termRef.current?.focus(); }}

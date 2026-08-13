@@ -18,6 +18,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel) => readFileSync(resolve(here, rel), 'utf8');
 const msg = read('../web/src/MessageComposer.jsx');
 const disp = read('../web/src/Dispatch.jsx');
+const zt = read('../web/src/ZeeTerminal.jsx');
+const app = read('../web/src/App.jsx');
 const nudge = read('../server/src/queenzee/nudge.js');
 const intake = read('../server/src/queenzee/intake.js');
 const css = read('../web/src/styles.css');
@@ -53,6 +55,13 @@ ok(nudge.includes(".replace(/^\\.+/, '')"),
 ok(/saveDispatchAttachments\(/.test(intake), 'intake.js renamed saveDispatchImages → saveDispatchAttachments');
 ok(/## Attached files/.test(intake), 'the prompt block says Attached files');
 ok(!/## Attached images/.test(intake), '…not Attached images');
+
+console.log('\n── the message/talk window COPY says files, not images ──');
+ok(!/long text and images/.test(zt), 'the 💬 talk tooltip no longer tells a human "images"');
+ok(/long text and any files/.test(zt), '…it says long text and ANY FILES are handed over');
+ok(!/Uploading \$\{nImg\} image/.test(app), 'the dispatch toast no longer says "Uploading N image(s)"');
+ok(/Uploading \$\{nAtt\} attachment/.test(app), '…it counts attachments');
+ok(!/open the long-text\/image composer/.test(app), 'the 📨 comment no longer says "image composer"');
 
 console.log('\n── the stylesheets back the new file chips ──');
 ok(/\.msg-filechip/.test(css), '.msg-filechip is styled in the stylesheet');
