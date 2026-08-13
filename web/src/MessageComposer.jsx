@@ -1,6 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { sendXellMessage } from './api.js';
 
+// PORTALLED TO <body>, ALWAYS — the same lesson Dispatch.jsx paid for. An overlay is only as tall as
+// its stacking context lets it be: rendered where its button happens to live it is ranked among that
+// pane's contents. From the hexagon that is fine (app root, no positioned ancestor, so `.msg-back`
+// covers the viewport), but the terminal's 💬 talk opens the SAME composer INSIDE `.zeeterm-main`
+// (position:relative) inside `.zeeterm` (overflow:hidden) — so the modal was confined to the
+// terminal's content box and its footer (the Send button) could be clipped off the bottom, which
+// read as "I press Send and nothing sends." Portalling makes BOTH doors render the identical
+// full-viewport box. `.msg-back` is `position:fixed; z-index:60` — above the terminal overlay (50).
+//
 // A "proper message" composer for a xell's live cxell zee — the answer to "the terminal is annoying
 // and difficult to use". Long text and/or FILE attachments go over the /xells/:id/message API: the
 // server hands files + long text to the zee as real files in its .zee-inbox and types a pointer into
@@ -90,7 +100,7 @@ export default function MessageComposer({ xell, onClose, onSent, initialText = '
 
   const onKeyDown = (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); } };
 
-  return (
+  return createPortal(
     <div className="msg-back" onClick={onClose}>
       <div className="msg-modal" onClick={(e) => e.stopPropagation()}
            onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
@@ -127,6 +137,7 @@ export default function MessageComposer({ xell, onClose, onSent, initialText = '
           <button className="msg-send" disabled={!canSend} onClick={send}>{busy ? 'Sending…' : 'Send'}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

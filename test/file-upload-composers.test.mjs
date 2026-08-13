@@ -56,6 +56,12 @@ ok(/saveDispatchAttachments\(/.test(intake), 'intake.js renamed saveDispatchImag
 ok(/## Attached files/.test(intake), 'the prompt block says Attached files');
 ok(!/## Attached images/.test(intake), '…not Attached images');
 
+console.log('\n── the composer is ONE full-viewport box from every door ──');
+ok(/createPortal\(/.test(msg) && /document\.body/.test(msg),
+   'MessageComposer is portalled to <body> — the hexagon 📨 and the terminal 💬 talk render the SAME box');
+ok(/.msg-back \{ position: fixed/.test(css) && /z-index: 60/.test(css),
+   '…and its backdrop is fixed to the viewport at z 60 (above the terminal overlay 50, below toasts 80)');
+
 console.log('\n── the message/talk window COPY says files, not images ──');
 ok(!/long text and images/.test(zt), 'the 💬 talk tooltip no longer tells a human "images"');
 ok(/long text and any files/.test(zt), '…it says long text and ANY FILES are handed over');

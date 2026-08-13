@@ -2295,8 +2295,11 @@ a.cbox:hover { border-color: var(--accent); }
 .tstat.t-live { color: #35c46b; } .tstat.t-connecting { color: #e0a53b; }
 .tstat.t-closed, .tstat.t-error { color: #e5554e; }
 
-/* ── message composer (long text + images → a xell's live cxell zee) ─────────── */
-.msg-back { position: absolute; inset: 0; z-index: 22; display: flex; align-items: center;
+/* ── message composer (long text + files → a xell's live cxell zee) ────────────
+   Portalled to <body>, so it is FIXED to the viewport regardless of where it opened
+   (hexagon OR the terminal's 💬 talk). z-index 60 sits above the terminal overlay
+   (50) and below toasts (80) / dialogs (90) — see the header comment in MessageComposer. */
+.msg-back { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center;
   justify-content: center; background: rgba(6,8,12,.6); backdrop-filter: blur(3px); }
 .msg-modal { width: min(560px, 92%); background: var(--panel); border: 1px solid var(--line);
   border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.6); display: flex;
