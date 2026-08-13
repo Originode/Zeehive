@@ -1173,7 +1173,7 @@ export async function cloneIntoCxell({ ctx, name, worktree }) {
     const attachDir = join(worktree, '.zeehive', 'prompt-attachments');
     if (existsSync(attachDir)) {
       // Best-effort, unlike .zeehive.env: a screenshot that fails to copy must not sink the whole
-      // cxell spawn (the zee can still work without it) — same stance as saveDispatchImages.
+      // cxell spawn (the zee can still work without it) — same stance as saveDispatchAttachments.
       try {
         await dk(ctx, ['cp', attachDir, `${name}:/tmp/prompt-attachments`]);
         await dk(ctx, ['exec', '-u', '0', name, 'bash', '-lc',
