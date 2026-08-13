@@ -2431,7 +2431,7 @@ export async function selfMeetSay(xell, { code = null, message = null } = {}) {
   return {
     ok: true, posted: r.posted, code: r.code, meet_id: r.meet_id, message: r.message,
     deliveries: r.deliveries,
-    message_text: `Posted to "${r.message.from} in ${r.code}". ${r.deliveries.length} live member(s) notified.`,
+    message_text: `Posted to ${r.code}. ${r.deliveries.length} live member(s) notified; the rest catch up with \`zee meet --transcript\`.`,
   };
 }
 
