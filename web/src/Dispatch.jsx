@@ -4,6 +4,44 @@ import { createPortal } from 'react-dom';
 import { getDispatchOptions, getHarnesses, getRouterStatus } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
 import ZeeAvatar from './ZeeAvatar.jsx';
+import { providerWide, modelWide, formatLimitChip } from './usageLimits.js';
+
+// MODEL-WIDE only — empty when no model-specific pool is known (do not fall back to provider-wide
+// on the model button; that number lives on the provider button).
+function modelLimitLabel(provider, modelKey, modelRow, account) {
+  if (account?.usage_limit) {
+    const lim = modelWide(account.usage_limit, { provider, model: modelKey });
+    if (lim.available_pct != null) return formatLimitChip(lim);
+  }
+  // Server already attaches model-wide only (null when unknown).
+  if (modelRow?.available_pct != null && modelRow.limit_source === 'model') {
+    return formatLimitChip({
+      available_pct: modelRow.available_pct,
+      window: modelRow.limit_window,
+      source: 'model',
+    });
+  }
+  if (modelRow?.available_pct != null && modelRow.limit_source == null && modelRow.limit_window) {
+    // older shape: treat non-null as model when window is a model tier
+    return formatLimitChip({
+      available_pct: modelRow.available_pct,
+      window: modelRow.limit_window,
+      source: 'model',
+    });
+  }
+  return '';
+}
+
+// PROVIDER-WIDE chip for a provider button.
+function providerLimitLabel(providerRow, account) {
+  if (account?.usage_limit) {
+    return formatLimitChip(providerWide(account.usage_limit));
+  }
+  if (providerRow?.available_pct != null) {
+    return formatLimitChip({ available_pct: providerRow.available_pct, source: 'provider' });
+  }
+  return '';
+}
 
 // Same ceiling as the 📨 MessageComposer: pasted files ride the dispatch JSON body as base64 data
 // URLs, and base64 inflates ~33% — so keep the total file payload well under the server's 30mb
@@ -800,18 +838,27 @@ export default function Dispatch({ projectId, projectName,
                               data-testid="custom-provider-router"
                               title="Leave the provider to the router (its policy weights and schedule decide)."
                               onClick={() => setCProv(null)}>router decides</button>
-                      {cProviderRows.map((p) => (
+                      {cProviderRows.map((p) => {
+                        const pAcct = (p.accounts || []).find((a) => !a.paused && a.usage_limit)
+                          || (p.accounts || []).find((a) => !a.paused) || null;
+                        const pLim = providerLimitLabel(p, pAcct);
+                        return (
                         <button key={p.provider} className={`disp-seg ${cProv === p.provider ? 'on' : ''} ${p.blocked_reason ? 'seg-hollow' : ''}`}
                                 data-testid={`custom-provider-${p.provider}`}
                                 disabled={!!p.blocked_reason}
                                 title={p.blocked_reason
                                   ? `${p.label}: ${p.blocked_reason}`
-                                  : `Pin this dispatch to ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`}
+                                  : `Pin this dispatch to ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`
+                                    + (pLim ? `\nprovider-wide: ${pLim}` : '')}
                                 onClick={() => setCProv(p.provider)}>
-                          <ZeeAvatar provider={p.provider} size={18} />
+                          <ZeeAvatar provider={p.provider} size={18}
+                                     availablePct={p.available_pct
+                                       ?? providerWide(pAcct?.usage_limit).available_pct} />
                           {p.label}
+                          {pLim ? <span className="disp-limit" data-testid={`custom-provider-limit-${p.provider}`}> · {pLim}</span> : null}
                         </button>
-                      ))}
+                        );
+                      })}
                       {!cProviderRows.length && (
                         <span className="disp-hint" data-testid="custom-no-providers">
                           {optsErr ? `could not read this project's providers: ${optsErr}` : 'loading…'}
@@ -857,17 +904,23 @@ export default function Dispatch({ projectId, projectName,
                                 data-testid="custom-model-router"
                                 title="Leave the model to the router (the persona's policy resolves it)."
                                 onClick={() => setCModel(null)}>router decides</button>
-                        {cModels.map((m) => (
+                        {cModels.map((m) => {
+                          const cAcc = cAcctId ? cAccounts.find((a) => a.id === cAcctId) : cAccounts[0];
+                          const lim = modelLimitLabel(cProv, m.key, m, cAcc);
+                          return (
                           <button key={m.key} className={`disp-seg ${cModel === m.key ? 'on' : ''}`}
                                   data-testid={`custom-model-${m.key}`}
                                   title={[m.note || m.label,
+                                          lim ? `model limit: ${lim}` : null,
                                           m.context_window ? `context ${Number(m.context_window).toLocaleString()} tokens` : null,
                                           m.parameters ? `${m.parameters}B parameters` : null,
                                           m.priority > 1 ? `deployment priority ${m.priority}` : null].filter(Boolean).join(' · ')}
                                   onClick={() => setCModel(m.key)}>
                             {m.label}{m.key === cActive?.default_model ? ' ·default' : ''}
+                            {lim ? <span className="disp-limit" data-testid={`model-limit-${m.key}`}> · {lim}</span> : null}
                           </button>
-                        ))}
+                          );
+                        })}
                         {!cModels.length && (
                           <span className="disp-hint" data-testid="custom-no-models">
                             this persona's model policy allows no model on {cActive?.label || 'this provider'}
@@ -958,21 +1011,30 @@ export default function Dispatch({ projectId, projectName,
             <div className="disp-field">
               <label className="disp-label">AI provider</label>
               <div className="disp-models" role="group" aria-label="AI provider">
-                {providerRows.map((p) => (
+                {providerRows.map((p) => {
+                  const pAcct = (p.accounts || []).find((a) => !a.paused && a.usage_limit)
+                    || (p.accounts || []).find((a) => !a.paused) || null;
+                  const pLim = providerLimitLabel(p, pAcct);
+                  return (
                   <button key={p.provider} className={`disp-seg ${prov === p.provider ? 'on' : ''} ${p.blocked_reason ? 'seg-hollow' : ''}`}
                           data-testid={`dispatch-provider-${p.provider}`}
                           disabled={!!p.blocked_reason}
                           title={p.blocked_reason
                             ? `${p.label}: ${p.blocked_reason}`
-                            : `Run this zee on ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`}
+                            : `Run this zee on ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`
+                              + (pLim ? `\nprovider-wide limit: ${pLim}` : '')}
                           onClick={() => setProv(p.provider)}>
                     {/* the vendor's own coin — the badge the dispatched zee will WEAR in the
                         honeycomb (web/src/providerArt.js). Which AI is thinking is the identity,
                         so it is a picture here as well as on the hexagon. */}
-                    <ZeeAvatar provider={p.provider} size={18} />
+                    <ZeeAvatar provider={p.provider} size={18}
+                               availablePct={p.available_pct
+                                 ?? providerWide(pAcct?.usage_limit).available_pct} />
                     {p.label}
+                    {pLim ? <span className="disp-limit" data-testid={`provider-limit-${p.provider}`}> · {pLim}</span> : null}
                   </button>
-                ))}
+                  );
+                })}
                 {!providerRows.length && (
                   <span className="disp-hint" data-testid="dispatch-no-providers">
                     {optsErr ? `could not read this project's providers: ${optsErr}` : 'loading…'}
@@ -992,15 +1054,24 @@ export default function Dispatch({ projectId, projectName,
               <div className="disp-field">
                 <label className="disp-label">Account</label>
                 <div className="disp-models" role="group" aria-label="AI account">
-                  {accounts.map((a) => (
+                  {accounts.map((a) => {
+                    const pw = providerWide(a.usage_limit);
+                    const aPct = pw.available_pct ?? a.available_pct ?? null;
+                    const aLim = aPct != null
+                      ? formatLimitChip({ available_pct: aPct, source: 'provider' })
+                      : '';
+                    return (
                     <button key={a.id} className={`disp-seg ${acct?.id === a.id ? 'on' : ''}`}
                             data-testid={`dispatch-account-${a.id}`}
-                            title={`Run this zee on ${a.name} (${active?.label}) — its own CLI inside the cxell`}
+                            title={`Run this zee on ${a.name} (${active?.label}) — its own CLI inside the cxell`
+                              + (aLim ? `\nprovider-wide: ${aLim}` : '')}
                             onClick={() => setAcctId(a.id)}>
-                      <ZeeAvatar provider={active?.provider} size={18} />
+                      <ZeeAvatar provider={active?.provider} size={18} availablePct={aPct} />
                       {a.name}
+                      {aLim ? <span className="disp-limit"> · {aLim}</span> : null}
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1032,17 +1103,23 @@ export default function Dispatch({ projectId, projectName,
             <div className="disp-field">
               <label className="disp-label">Model</label>
               <div className="disp-models" role="group" aria-label="Model">
-                {models.map((m) => (
+                {models.map((m) => {
+                  const lim = modelLimitLabel(active?.provider || prov, m.key, m, acct);
+                  return (
                   <button key={m.key} className={`disp-seg ${model === m.key ? 'on' : ''}`}
                           data-testid={`dispatch-model-${m.key}`}
                           title={[m.note || m.label,
+                                  lim || null,
+                                  lim ? 'remaining usage limit for this model on the selected account' : null,
                                   m.context_window ? `context ${Number(m.context_window).toLocaleString()} tokens` : null,
                                   m.parameters ? `${m.parameters}B parameters` : null,
                                   m.priority > 1 ? `deployment priority ${m.priority}` : null].filter(Boolean).join(' · ')}
                           onClick={() => setModel(m.key)}>
                     {m.label}{(active ? m.key === active.default_model : m.default) ? ' ·default' : ''}
+                    {lim ? <span className="disp-limit" data-testid={`model-limit-${m.key}`}> · {lim}</span> : null}
                   </button>
-                ))}
+                  );
+                })}
                 {!models.length && (
                   <span className="disp-hint" data-testid="dispatch-no-models">
                     this persona's model policy allows no model on {active?.label || 'this provider'}

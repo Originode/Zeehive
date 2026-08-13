@@ -383,17 +383,19 @@ export function extractDeepseekBalance(body = null) {
 }
 
 // Persist a rate/usage-limit snapshot onto the provider_token ACCOUNT that authenticated the
-// call. Best-effort, never throws — observability must not sink an AI request. The console
-// reads this column (listProviderTokens / fleet provider_limits) to answer "how much of the
-// limit is still available per provider", account-grained, not per-xell.
-export async function recordAccountUsageLimit(accountId, rateLimit) {
+// call. MERGES with the previous snapshot so provider-wide updates AND by_model entries accumulate
+// (an opus call must not wipe the sonnet / gpt-5.6 row). Best-effort, never throws.
+export async function recordAccountUsageLimit(accountId, rateLimit, { model = null, provider = null } = {}) {
   if (!accountId || !rateLimit) return;
   try {
+    const { mergeUsageLimit } = await import('./usage-limits.js');
+    const prev = await one(`SELECT usage_limit FROM provider_token WHERE id = $1`, [accountId]);
+    const merged = mergeUsageLimit(prev?.usage_limit, rateLimit, { model, provider });
     await q(
       `UPDATE provider_token
           SET usage_limit = $2::jsonb, usage_limit_at = now()
         WHERE id = $1`,
-      [accountId, JSON.stringify(rateLimit)]);
+      [accountId, JSON.stringify(merged)]);
   } catch (e) {
     // Column absent (migration 203 not applied yet) or row gone — log once-ish, never throw.
     logline('gateway', `could not store usage_limit on account ${String(accountId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
@@ -803,8 +805,13 @@ export async function gatewayProxy(req, res) {
           rate_limit: rateLimit,
           provider_token_id: upstream.accountId || null,
         };
-        // Persist onto the account — the Providers panel and the statusline limits chip read this.
-        if (upstream.accountId) recordAccountUsageLimit(upstream.accountId, rateLimit);
+        // Persist onto the account (provider-wide + by_model merge) for prompt pickers + badge HP.
+        if (upstream.accountId) {
+          recordAccountUsageLimit(upstream.accountId, rateLimit, {
+            model: m || model || null,
+            provider: upstream.provider,
+          });
+        }
       }
       // DEEPSEEK: no rate-limit headers exist, so a response header snapshot is never captured
       // (verified live — api.deepseek.com returns none). The only quota signal is the account

@@ -1920,7 +1920,10 @@ function paintAccessories(ctx, cx, cy, r, gear, { behind, detail }) {
 }
 
 export function drawZeeAvatar(ctx, cx, cy, r, { provider = null, providerImg = null, gear = null,
-                                                harnessImg = null, ring = null } = {}) {
+                                                harnessImg = null, ring = null,
+                                                // remaining usage limit 0–100; draws an HP bar
+                                                // across the middle of the provider coin
+                                                availablePct = null } = {}) {
   const detail = r >= 13;                       // below this a feather notch is three grey pixels
   // 1. borders + equipment-behind — everything that belongs UNDER the coin
   if (gear && r >= 5) paintAccessories(ctx, cx, cy, r, gear, { behind: true, detail });
@@ -1938,6 +1941,33 @@ export function drawZeeAvatar(ctx, cx, cy, r, { provider = null, providerImg = n
     drawAvatarDisc(ctx, cx, cy, r, ring || gear?.color || COL.ready,
       { img: harnessImg, glyph: gear ? null : undefined, letter: gear ? gear.label[0].toUpperCase() : 'H',
         ringWidth: Math.max(1.2, r * 0.07) });
+  }
+  // 2b. HP bar — horizontal slice through the middle of the coin. Green = remaining usage limit,
+  // red = used. Clipped to the disc so it reads as part of the badge, not a sticker on top.
+  // Only drawn when we know a % (gateway snapshot for the account that is running this xell).
+  if (availablePct != null && Number.isFinite(Number(availablePct)) && r >= 6) {
+    const free = Math.max(0, Math.min(100, Number(availablePct))) / 100;
+    const used = 1 - free;
+    const barH = Math.max(1.5, r * 0.18);
+    const y = cy - barH / 2;
+    const x0 = cx - r;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.clip();
+    if (used > 0.001) {
+      ctx.fillStyle = 'rgba(196, 68, 68, 0.92)';
+      ctx.fillRect(x0, y, r * 2 * used, barH);
+    }
+    if (free > 0.001) {
+      ctx.fillStyle = 'rgba(61, 154, 95, 0.92)';
+      ctx.fillRect(x0 + r * 2 * used, y, r * 2 * free, barH);
+    }
+    // hairline outline so the bar reads on light and dark coins alike
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(x0, y, r * 2, barH);
+    ctx.restore();
   }
   if (!gear || r < 5) return;                   // too small to dress — the coin alone is the badge
 
@@ -1965,7 +1995,9 @@ export function zeeBadge(x, harness, { providerImg = null, harnessImg = null } =
   const provider = providerArtOf(x);
   const gear = harnessGear(harness);
   if (!provider && !gear) return null;
-  return { provider, gear, providerImg, harnessImg };
+  // usage_available_pct rides the fleet row (model-aware remaining on the account running here).
+  const availablePct = x?.usage_available_pct != null ? Number(x.usage_available_pct) : null;
+  return { provider, gear, providerImg, harnessImg, availablePct };
 }
 
 // ── the MANAGER hexagon: a persona, not a work-cell ───────────────────────────

@@ -78,7 +78,12 @@ function CustomStamps({ items, behind }) {
 }
 
 export default function ZeeAvatar({ xell = null, provider = null, harness = null, size = 26,
-                                    title = null, className = '', ...rest }) {
+                                    title = null, className = '',
+                                    // Remaining usage limit % (0–100). When set, a horizontal HP bar
+                                    // is drawn through the middle of the provider coin: green free,
+                                    // red used. From the xell row (usage_available_pct) or an explicit
+                                    // availablePct (dispatch account picker).
+                                    availablePct = null, ...rest }) {
   const art = providerArtOf(provider || xell);
   const src = harness || (xell && (xell.harness_key || xell.harness_label) ? xell : null);
   const gear = harnessGear(src);
@@ -89,12 +94,20 @@ export default function ZeeAvatar({ xell = null, provider = null, harness = null
     a.art?.glyphOn ? { ...a, mark: gear.mark } : a
   ));
   const accKeys = items.map((a) => a.key).join(',');
+  // HP bar: prefer explicit prop, else the xell fleet row's usage_available_pct (model-aware).
+  const free = availablePct != null ? Number(availablePct)
+    : (xell?.usage_available_pct != null ? Number(xell.usage_available_pct) : null);
+  const showHp = free != null && Number.isFinite(free);
+  const freeClamped = showHp ? Math.max(0, Math.min(100, free)) : 0;
+  const usedClamped = showHp ? Math.max(0, 100 - freeClamped) : 0;
   return (
     <span className={`zav${className ? ` ${className}` : ''}`} data-testid="zee-avatar"
           data-provider={art?.key || ''} data-harness={gear?.key || ''} data-gear={gear?.gear || ''}
           data-accessories={accKeys}
+          data-usage-available={showHp ? freeClamped : undefined}
           style={{ '--zav-size': `${size}px` }}
-          title={title || avatarTitle(art, gear)} {...rest}>
+          title={title || avatarTitle(art, gear)
+            + (showHp ? `\n${freeClamped}% of usage limit remaining` : '')} {...rest}>
       {gear && <CustomStamps items={items} behind />}
       {gear && <PathLayer items={items} behind color={color} />}
       {/* the coin's inset is DERIVED from GEAR_EXTENT, not typed into the stylesheet: the costume
@@ -107,6 +120,12 @@ export default function ZeeAvatar({ xell = null, provider = null, harness = null
           /* no provider resolved → the harness is the face, as its INITIAL: its glyph belongs to the
              costume, and one mark twice reads as two marks (drawZeeAvatar does the same) */
           : <span className="zav-mono">{gear.label[0].toUpperCase()}</span>}
+        {showHp && (
+          <span className="zav-hp" data-testid="zee-avatar-hp" aria-hidden="true">
+            <span className="zav-hp-used" style={{ width: `${usedClamped}%` }} />
+            <span className="zav-hp-free" />
+          </span>
+        )}
       </span>
       {gear && <PathLayer items={items} behind={false} color={color} />}
       {gear && <CustomStamps items={items} behind={false} />}

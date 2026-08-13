@@ -21,6 +21,7 @@
 // this module exists to make impossible, so nothing below restates a list that lives elsewhere.
 import { one } from '../db/pool.js';
 import { PROVIDERS, listProviderTokens, decideDispatchProvider } from './provider-tokens.js';
+import { providerWide, modelWide } from './usage-limits.js';
 import { effectiveModelPolicy, allowedModelsForProvider, modelSpecs, resolveDispatchModel } from './model-policy.js';
 import { resolveHarness, defaultHarnessId } from './harness.js';
 import { runtimeKeyForProvider, decideRuntimePairing } from './cxell-runtimes.js';
@@ -143,16 +144,39 @@ export async function dispatchOptions({ projectId, harness: harnessArg, zeeType 
     const caged = !rt || rt.driver === 'cxell-cli';
     const usableAccounts = p.accounts.filter((a) => !a.paused);
     const models = allowed ? await modelsFor(policy, p.provider) : [];
+    // USAGE LIMITS: provider-wide on the provider button; model-wide on each model button when
+    // we have a model-specific signal (Claude 7d_opus/7d_sonnet, or by_model from last call).
+    // Pick the first active account that has a snapshot (freshest is already first in list order
+    // from listProviderTokens when multiple — accounts are by created_at; usable are unpaused).
+    const limitSource = usableAccounts.find((a) => a.usage_limit) || p.accounts.find((a) => a.usage_limit) || null;
+    const snap = limitSource?.usage_limit || null;
+    const provLim = providerWide(snap);
+    const modelsWithLimit = models.map((m) => {
+      const ml = modelWide(snap, { provider: p.provider, model: m.key });
+      return {
+        ...m,
+        // MODEL-WIDE only — null when no model-specific pool is known (UI hides the chip).
+        available_pct: ml.available_pct,
+        limit_window: ml.window,
+        limit_source: ml.source,   // 'model' | null
+      };
+    });
     providers.push({
       provider: p.provider, label: p.label,
       connected: p.connected, all_paused: p.all_paused,
-      accounts: p.accounts.map((a) => ({
-        id: a.id, label: a.label, token_hint: a.token_hint, paused: a.paused,
-        // What the console's button called an account: its own label, else the provider type (with
-        // the token tail when the project holds several of the type — otherwise two buttons read
-        // identically and neither says which subscription it spends).
-        name: a.label || (p.accounts.length > 1 ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label),
-      })),
+      accounts: p.accounts.map((a) => {
+        const al = providerWide(a.usage_limit);
+        return {
+          id: a.id, label: a.label, token_hint: a.token_hint, paused: a.paused,
+          // What the console's button called an account: its own label, else the provider type (with
+          // the token tail when the project holds several of the type — otherwise two buttons read
+          // identically and neither says which subscription it spends).
+          name: a.label || (p.accounts.length > 1 ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label),
+          available_pct: al.available_pct,           // provider-wide for this account
+          usage_limit: a.usage_limit || null,
+          usage_limit_at: a.usage_limit_at || null,
+        };
+      }),
       allowed,
       // Why a human cannot pick this provider — ONE sentence, the same shape the spawn would have
       // thrown after the prompt was written. null = pickable.
@@ -162,7 +186,9 @@ export async function dispatchOptions({ projectId, harness: harnessArg, zeeType 
         : !usableAccounts.length ? `every ${p.label} account on this project is PAUSED`
         : (allowed && !models.length) ? "this harness's model policy allows no model on this provider"
         : null,
-      models,
+      models: modelsWithLimit,
+      // PROVIDER-WIDE remaining — shown on the provider button in the prompt window.
+      available_pct: provLim.available_pct,
       default_model: allowed ? await defaultModelFor(harnessRow, p.provider) : null,
       runtime: rt ? { key: rt.key, label: rt.label, caged } : { key: null, label: null, caged: true },
       modes: modesForRuntime({ caged }),

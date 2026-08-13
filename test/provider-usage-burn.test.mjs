@@ -193,12 +193,8 @@ try {
 }
 
 // ── C. wiring ────────────────────────────────────────────────────────────────────────────────
-console.log('\n── C. wiring — limits chip is SEPARATE from per-xell burn ──');
+console.log('\n── C. wiring — limits on accounts / model picker / badge HP, NOT statusline ──');
 {
-  ok(/203_provider_token_usage_limit\.sql/.test(read('db/migrations/203_provider_token_usage_limit.sql')
-    ? '203_provider_token_usage_limit.sql' : '')
-    || read('db/migrations/203_provider_token_usage_limit.sql').includes('usage_limit'),
-     'migration 203 adds usage_limit on provider_token');
   const mig = read('db/migrations/203_provider_token_usage_limit.sql');
   ok(/usage_limit/.test(mig) && /usage_limit_at/.test(mig), 'migration 203 columns present');
 
@@ -216,27 +212,22 @@ console.log('\n── C. wiring — limits chip is SEPARATE from per-xell burn �
   ok(/available_pct/.test(pt), 'listProviderTokens surfaces available_pct');
 
   const fleet = read('server/src/lib/fleet.js');
-  ok(/provider_limits/.test(fleet), 'fleet snapshot carries provider_limits');
-
-  const routes = read('server/src/api/routes.js');
-  ok(/provider-limits/.test(routes), 'GET /projects/:id/provider-limits route exists');
+  ok(/usage_available_pct|attachUsageLimits/.test(fleet),
+     'fleet attaches model-aware usage_available_pct for the badge HP bar');
 
   const app = read('web/src/App.jsx');
-  ok(/provider-limits/.test(app) && /% free/.test(app),
-     'statusline has a dedicated limits chip showing "% free"');
-  ok(!/provider-usage-/.test(app) || /provider-limit-/.test(app),
-     'limits use provider-limit-* testids (not mixed into xell burn)');
-  // The limits chip must NOT be inside the fleet-burn span.
-  const limitsIdx = app.indexOf('data-testid="provider-limits"');
-  const burnIdx = app.indexOf('data-testid="fleet-burn"');
-  ok(limitsIdx > 0 && burnIdx > 0 && limitsIdx !== burnIdx,
-     'limits chip is a separate element from fleet burn');
+  ok(!/data-testid="provider-limits"/.test(app),
+     'statusline does NOT render the provider-limits chip (limits live in the prompt window)');
 
   const setup = read('web/src/ProjectSetup.jsx');
   ok(/AccountUsageLimit/.test(setup) && /account-usage-limit/.test(setup),
      'Project setup shows remaining limit on each account row');
   ok(/balance/.test(setup) && /balanceText/.test(setup),
      '…and renders a DeepSeek balance snapshot (a dollar balance, not a % window)');
+
+  const disp = read('web/src/Dispatch.jsx');
+  ok(/model-limit-|formatLimitChip|availableForModel/.test(disp),
+     'prompt window model picker shows remaining limit chips');
 }
 
 console.log(fail ? `\n${fail} FAIL` : '\nall good');
