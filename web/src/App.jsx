@@ -123,7 +123,8 @@ const fmtUsd = (n) => {
   return '$' + (v >= 100 ? v.toFixed(0) : v.toFixed(2));
 };
 
-// Tooltip for the whole fleet-burn chip: total + each provider + any live rate-limit window.
+// Tooltip for the whole fleet-burn chip: total + spend per provider. Limits (remaining %) live
+// on a SEPARATE chip — this one is spend only, so a human never confuses the two questions.
 function fleetBurnTitle(burn) {
   if (!burn?.fleet) return '';
   const lines = [
@@ -134,42 +135,19 @@ function fleetBurnTitle(burn) {
     lines.push(`${p.provider}: ${Number(p.tokens).toLocaleString()} tok · ${fmtUsd(p.cost)}`
       + ` over ${p.requests} gateway call(s)`);
   }
-  for (const c of burn.current || []) {
-    const rl = c.rate_limit || {};
-    if (rl.tokens_used_pct != null) {
-      lines.push(`${c.provider} rate window: ${rl.tokens_used_pct}% used`
-        + (rl.tokens_remaining != null && rl.tokens_limit != null
-          ? ` (${Number(rl.tokens_remaining).toLocaleString()} / ${Number(rl.tokens_limit).toLocaleString()} tok remaining)`
-          : ''));
-    }
-  }
-  lines.push('Fleet-own consumption + gateway rate-limit headers — not Admin account %/limits.');
+  lines.push('Fleet-own spend only. Remaining provider quotas live on the "limits" chip.');
   return lines.join('\n');
 }
 
-// Tooltip for one provider's segment of the chip.
-function providerBurnTitle(p, cur) {
-  const lines = [
-    `${p.provider}: ${Number(p.tokens).toLocaleString()} tokens · ${fmtUsd(p.cost)}`
-      + ` · ${p.requests} gateway call(s)`,
-    `input ${fmtTok(p.input)} · output ${fmtTok(p.output)}`
-      + ` · cache R ${fmtTok(p.cache_read)} · W ${fmtTok(p.cache_write)}`,
-  ];
-  const rl = cur?.rate_limit;
-  if (rl) {
-    if (rl.tokens_used_pct != null) {
-      lines.push(`rate window: ${rl.tokens_used_pct}% used`
-        + (rl.tokens_remaining != null ? ` · ${Number(rl.tokens_remaining).toLocaleString()} remaining` : '')
-        + (rl.tokens_limit != null ? ` of ${Number(rl.tokens_limit).toLocaleString()}` : ''));
-    }
-    if (rl.requests_used_pct != null) {
-      lines.push(`request window: ${rl.requests_used_pct}% used`
-        + (rl.requests_remaining != null ? ` · ${rl.requests_remaining} remaining` : ''));
-    }
-    if (cur.at) lines.push(`as of ${new Date(cur.at).toLocaleString()}`);
-  }
-  return lines.join('\n');
+// Tooltip for one provider's SPEND segment of the burn chip.
+function providerBurnTitle(p) {
+  return `${p.provider}: ${Number(p.tokens).toLocaleString()} tokens · ${fmtUsd(p.cost)}`
+    + ` · ${p.requests} gateway call(s)\n`
+    + `input ${fmtTok(p.input)} · output ${fmtTok(p.output)}`
+    + ` · cache R ${fmtTok(p.cache_read)} · W ${fmtTok(p.cache_write)}`;
 }
+
+
 
 
 // Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
@@ -1266,11 +1244,8 @@ export default function App() {
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
-        {/* FLEET-CUMULATIVE BURN — every run across the project, tokens + $. Fleet-own consumption
-            from zee rows; the per-provider breakdown and "current" rate-limit window ride beside
-            it from the LLM gateway ledger (lib/fleet.js getFleetBurn). Account-wide Admin /usage
-            APIs still need separate admin keys — the % here is the provider's own rate-limit
-            headers the gateway captured on each call. */}
+        {/* FLEET-CUMULATIVE BURN — spend only (tokens + $). Remaining provider quotas are the
+            SEPARATE "limits" chip below — deliberately not mixed, so the two questions stay clear. */}
         {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0
             || (fleet.fleet_burn.by_provider || []).length > 0) && (
           <span className="fleetburn" data-testid="fleet-burn"
@@ -1278,21 +1253,13 @@ export default function App() {
             {' · '}fleet burn: <b>{fmtTok(fleet.fleet_burn.fleet.tokens)} tok · {fmtUsd(fleet.fleet_burn.fleet.cost)}</b>
             {(fleet.fleet_burn.by_provider || []).length > 0 && (
               <span className="fleetburn-by-provider" data-testid="fleet-burn-by-provider">
-                {(fleet.fleet_burn.by_provider || []).map((p) => {
-                  // CURRENT usage % for this provider, if the gateway has a rate-limit snapshot.
-                  const cur = (fleet.fleet_burn.current || []).find((c) => c.provider === p.provider);
-                  const pct = cur?.rate_limit?.tokens_used_pct;
-                  return (
-                    <span key={p.provider} className="fleetburn-prov" data-provider={p.provider}
-                          title={providerBurnTitle(p, cur)}>
-                      {' · '}<span className="fleetburn-prov-name">{p.provider}</span>
-                      {' '}<b>{fmtTok(p.tokens)}/{fmtUsd(p.cost)}</b>
-                      {pct != null && <span className="fleetburn-prov-pct" data-testid={`provider-usage-${p.provider}`}>
-                        {' '}{pct}%
-                      </span>}
-                    </span>
-                  );
-                })}
+                {(fleet.fleet_burn.by_provider || []).map((p) => (
+                  <span key={p.provider} className="fleetburn-prov" data-provider={p.provider}
+                        title={providerBurnTitle(p)}>
+                    {' · '}<span className="fleetburn-prov-name">{p.provider}</span>
+                    {' '}<b>{fmtTok(p.tokens)}/{fmtUsd(p.cost)}</b>
+                  </span>
+                ))}
               </span>
             )}
           </span>

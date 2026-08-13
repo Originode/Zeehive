@@ -197,13 +197,26 @@ export function costOf({ upstreamCost = null, price = null, usage = null } = {})
   return (input + output + cacheRead + cacheWrite) / 1e6 || 0;
 }
 
-// RATE-LIMIT HEADERS — the free "current usage %" surface every provider response already carries.
-// Anthropic: anthropic-ratelimit-{tokens,requests}-{limit,remaining,reset}. OpenAI-compatible:
-// x-ratelimit-{limit,remaining}-{tokens,requests} (+ reset). Account-wide Admin /usage APIs need
-// separate admin keys (sk-ant-admin01-…) the fleet does not hold — the comments on fleet burn
-// are right about that. These headers ride every ordinary call and are the only authoritative
-// "how full is this provider's window right now" the gateway can read. Pure so the extraction is
-// unit-testable without a proxy. Returns null when no limit header is present.
+// RATE / USAGE-LIMIT HEADERS — how much of THIS provider ACCOUNT's limit is still available.
+//
+// Two header families ride ordinary API responses (no Admin key needed):
+//
+//   1. Claude Code / OAuth SEAT windows (the answer a human on Pro/Max actually wants):
+//        anthropic-ratelimit-unified-5h-utilization   0.0–1.0 used fraction of the 5-hour window
+//        anthropic-ratelimit-unified-7d-utilization   same for the weekly cap
+//        anthropic-ratelimit-unified-*-status         allowed | exceeded | rate_limited
+//        anthropic-ratelimit-unified-*-reset          unix epoch when that window resets
+//        anthropic-ratelimit-unified-status           overall
+//        anthropic-ratelimit-unified-representative-claim  five_hour | seven_day | …
+//      Measured on live Claude Code traffic (claude-meter / Anthropic client source): the client
+//      already reads these for its /usage bar; the gateway was throwing them away.
+//
+//   2. API RPM/TPM (pay-as-you-go + every vendor that publishes them):
+//        anthropic-ratelimit-{tokens,requests}-{limit,remaining,reset}
+//        x-ratelimit-{limit,remaining}-{tokens,requests}  (OpenAI-compatible)
+//
+// The number a human wants is AVAILABLE, not used: available_pct = 100 − used%. Pure so the
+// extraction is unit-testable without a proxy. Returns null when no limit header is present.
 export function extractRateLimit(headers = {}) {
   if (!headers || typeof headers !== 'object') return null;
   const h = {};
@@ -221,7 +234,55 @@ export function extractRateLimit(headers = {}) {
     const v = h[k];
     return v == null || v === '' ? null : String(v);
   };
+  // available% from remaining/limit (API TPM/RPM). Null when either side is missing.
+  const availFromRemLim = (rem, lim) => {
+    if (rem == null || lim == null || !(lim > 0)) return null;
+    return Math.round((rem / lim) * 1000) / 10;
+  };
+  // available% from a 0.0–1.0 utilization fraction (unified seat windows).
+  const availFromUtil = (u) => {
+    if (u == null || !Number.isFinite(u)) return null;
+    return Math.round((1 - Math.min(1, Math.max(0, u))) * 1000) / 10;
+  };
+  // unix epoch seconds (or ms) → ISO; leave non-numeric strings alone.
+  const resetAt = (raw) => {
+    if (raw == null || raw === '') return null;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 1e9) {
+      // seconds if < 1e12, else already ms
+      const ms = n < 1e12 ? n * 1000 : n;
+      try { return new Date(ms).toISOString(); } catch { return String(raw); }
+    }
+    return String(raw);
+  };
 
+  // ── Claude Code / OAuth unified windows ──────────────────────────────────────────────────
+  const windows = {};
+  for (const win of ['5h', '7d', '7d_sonnet', '7d_opus']) {
+    const util = num(`anthropic-ratelimit-unified-${win}-utilization`);
+    const status = str(`anthropic-ratelimit-unified-${win}-status`);
+    const reset = resetAt(str(`anthropic-ratelimit-unified-${win}-reset`));
+    if (util == null && !status) continue;
+    windows[win] = {
+      status: status || null,
+      utilization: util,
+      available_pct: availFromUtil(util),
+      reset_at: reset,
+    };
+  }
+  const unifiedStatus = str('anthropic-ratelimit-unified-status');
+  // representative_claim: five_hour | seven_day | seven_day_sonnet | … — normalize to window key
+  const claimRaw = str('anthropic-ratelimit-unified-representative-claim');
+  const claimToWin = {
+    five_hour: '5h', fivehour: '5h', '5h': '5h',
+    seven_day: '7d', sevenday: '7d', '7d': '7d',
+    seven_day_sonnet: '7d_sonnet', seven_day_opus: '7d_opus',
+  };
+  const representative = claimRaw
+    ? (claimToWin[claimRaw.toLowerCase().replace(/-/g, '_')] || claimRaw)
+    : null;
+
+  // ── API TPM / RPM ────────────────────────────────────────────────────────────────────────
   const tokens_remaining = num('anthropic-ratelimit-tokens-remaining')
     ?? num('x-ratelimit-remaining-tokens');
   const tokens_limit = num('anthropic-ratelimit-tokens-limit')
@@ -235,24 +296,66 @@ export function extractRateLimit(headers = {}) {
   const requests_reset = str('anthropic-ratelimit-requests-reset')
     || str('x-ratelimit-reset-requests');
 
-  if (tokens_remaining == null && tokens_limit == null
-      && requests_remaining == null && requests_limit == null) {
-    return null;
+  const hasUnified = Object.keys(windows).length > 0 || !!unifiedStatus;
+  const hasApi = tokens_remaining != null || tokens_limit != null
+    || requests_remaining != null || requests_limit != null;
+  if (!hasUnified && !hasApi) return null;
+
+  // PRIMARY available_pct: the binding unified window first (what a seat user hits), else TPM, else RPM.
+  let available_pct = null;
+  if (representative && windows[representative]?.available_pct != null) {
+    available_pct = windows[representative].available_pct;
+  } else if (windows['5h']?.available_pct != null) {
+    available_pct = windows['5h'].available_pct;
+  } else if (windows['7d']?.available_pct != null) {
+    available_pct = windows['7d'].available_pct;
+  } else {
+    available_pct = availFromRemLim(tokens_remaining, tokens_limit)
+      ?? availFromRemLim(requests_remaining, requests_limit);
   }
 
-  // used% = 1 − remaining/limit. One decimal so a chip can say "62.3%" without noise.
-  // Null when either side is missing (a header set can publish remaining without limit).
-  const pct = (rem, lim) => {
-    if (rem == null || lim == null || !(lim > 0)) return null;
-    return Math.round((1 - rem / lim) * 1000) / 10;
-  };
+  // Keep the legacy used% fields so older readers of meta.rate_limit still work; the primary
+  // field for the console is available_pct.
+  const usedFromAvail = (a) => (a == null ? null : Math.round((100 - a) * 10) / 10);
 
   return {
+    source: 'headers',
+    status: unifiedStatus || null,
+    representative,
+    available_pct,
+    windows: hasUnified ? windows : undefined,
+    tokens: hasApi ? {
+      remaining: tokens_remaining, limit: tokens_limit, reset: tokens_reset,
+      available_pct: availFromRemLim(tokens_remaining, tokens_limit),
+    } : undefined,
+    requests: hasApi ? {
+      remaining: requests_remaining, limit: requests_limit, reset: requests_reset,
+      available_pct: availFromRemLim(requests_remaining, requests_limit),
+    } : undefined,
+    // legacy (used% for meta.rate_limit consumers written before available_pct)
     tokens_remaining, tokens_limit, tokens_reset,
-    tokens_used_pct: pct(tokens_remaining, tokens_limit),
+    tokens_used_pct: usedFromAvail(availFromRemLim(tokens_remaining, tokens_limit)),
     requests_remaining, requests_limit, requests_reset,
-    requests_used_pct: pct(requests_remaining, requests_limit),
+    requests_used_pct: usedFromAvail(availFromRemLim(requests_remaining, requests_limit)),
   };
+}
+
+// Persist a rate/usage-limit snapshot onto the provider_token ACCOUNT that authenticated the
+// call. Best-effort, never throws — observability must not sink an AI request. The console
+// reads this column (listProviderTokens / fleet provider_limits) to answer "how much of the
+// limit is still available per provider", account-grained, not per-xell.
+export async function recordAccountUsageLimit(accountId, rateLimit) {
+  if (!accountId || !rateLimit) return;
+  try {
+    await q(
+      `UPDATE provider_token
+          SET usage_limit = $2::jsonb, usage_limit_at = now()
+        WHERE id = $1`,
+      [accountId, JSON.stringify(rateLimit)]);
+  } catch (e) {
+    // Column absent (migration 203 not applied yet) or row gone — log once-ish, never throw.
+    logline('gateway', `could not store usage_limit on account ${String(accountId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
+  }
 }
 
 // ── the recorder ──────────────────────────────────────────────────────────────────────────────
@@ -360,9 +463,13 @@ export function gatewayHello(_req, res) {
   return res.status(200).json({ ok: true, service: 'zeehive-llm-gateway' });
 }
 
-// Resolve the upstream for a request: which provider URL + credential. `path` is the gateway
-// path (/v1/messages or /v1/chat/completions). Returns { provider, upstreamUrl, token, kind }
-// or null when the caller is not a known xell / the project has no account for the provider.
+// Resolve the upstream for a request: which provider URL + credential. Returns
+// { provider, upstreamUrl, token, kind, accountId, accountLabel } or null when the caller is
+// not a known xell / the project has no account for the provider.
+//
+// Account selection: prefer the account this xell was GRANTED at spawn (xell_provider_grant) so
+// the usage-limit snapshot lands on the same row the cage is actually holding — the freshest
+// project account can differ after a rotation. Fall back to tokenForSpawn's freshest ACTIVE.
 async function resolveUpstream(xell, kind, providerKey) {
   // The provider comes from the PATH (/x/<token>/<provider>/...) — the gateway's own URL, so it is
   // authoritative. claude + deepseek speak the Anthropic dialect (/v1/messages); openai + kimi the
@@ -371,14 +478,24 @@ async function resolveUpstream(xell, kind, providerKey) {
   // with no dispatch runtime is refused.
   const p = PROVIDERS[providerKey];
   if (!p || !p.dispatch) return null;
-  const acct = await tokenForSpawn(xell.project_id, p.key).catch(() => null);
+  let tokenId = null;
+  try {
+    const grant = await one(
+      `SELECT provider_token_id FROM xell_provider_grant
+        WHERE xell_id = $1 AND provider = $2`, [xell.id, p.key]);
+    tokenId = grant?.provider_token_id || null;
+  } catch { /* grant table missing in ancient DBs — fall through */ }
+  const acct = await tokenForSpawn(xell.project_id, p.key, { tokenId }).catch(() => null);
   if (!acct) {
     logline('gateway', `xell ${xell.slug}: no ${p.label} account — refusing to forward`);
     return null;
   }
   // The upstream URL per provider (the same base the adapter would have used directly).
   const upstreamUrl = providerUpstreamUrl(p.key);
-  return { provider: p.key, upstreamUrl, token: acct.token, kind };
+  return {
+    provider: p.key, upstreamUrl, token: acct.token, kind,
+    accountId: acct.id || null, accountLabel: acct.label || null,
+  };
 }
 
 // The provider's real API base, by provider key — the value the cxell adapters inject today.
@@ -599,11 +716,19 @@ export async function gatewayProxy(req, res) {
         logUnpriced(upstream.provider, m);
         metaPatch = { unpriced: { provider: upstream.provider, model: m } };
       }
-      // CURRENT USAGE of the provider account: the upstream's own rate-limit headers, if any.
-      // Stored on the row so the fleet burn read model can surface the freshest snapshot per
-      // provider without an Admin API key (see extractRateLimit).
+      // HOW MUCH OF THIS ACCOUNT'S LIMIT IS STILL AVAILABLE — the upstream's own headers.
+      // Stored on the ledger row (meta.rate_limit) AND on the provider_token account
+      // (usage_limit — migration 203) so the console can answer per PROVIDER, not per xell.
       const rateLimit = extractRateLimit(proxyRes.headers);
-      if (rateLimit) metaPatch = { ...(metaPatch || {}), rate_limit: rateLimit };
+      if (rateLimit) {
+        metaPatch = {
+          ...(metaPatch || {}),
+          rate_limit: rateLimit,
+          provider_token_id: upstream.accountId || null,
+        };
+        // Persist onto the account — the Providers panel and the statusline limits chip read this.
+        if (upstream.accountId) recordAccountUsageLimit(upstream.accountId, rateLimit);
+      }
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
         cost: costOf({ upstreamCost, price, usage: u }),
@@ -680,7 +805,7 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
-                 extractRateLimit,
+                 extractRateLimit, recordAccountUsageLimit,
                  providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
                  completeRequest, gatewayEnv, zeeTurnForXell };
 

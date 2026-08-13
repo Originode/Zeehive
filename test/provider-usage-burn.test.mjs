@@ -1,20 +1,20 @@
-// PROVIDER USAGE — trace (gateway rate-limit headers) + display (fleet burn by_provider).
+// PROVIDER USAGE LIMITS — how much of each provider ACCOUNT's quota is still AVAILABLE.
 //
-// The job: "figure out how to trace and display current usage per provider".
+// The job: "determine how much of the usage limit is available per provider" — NOT per-xell
+// spend. Fleet burn answers "what did we spend"; this answers "how full is the seat / API
+// window on each connected account".
 //
-// TRACE: the gateway already records every AI call with a provider key (llm_gateway_request,
-// migration 154). This change additionally captures the upstream's rate-limit response headers
-// into meta.rate_limit (gateway.extractRateLimit) — the free "current usage %" surface, since
-// Admin /usage APIs need separate admin keys the fleet does not hold.
+// TRACE: gateway.extractRateLimit reads Claude's anthropic-ratelimit-unified-* headers (5h/7d
+// seat windows) and API TPM/RPM headers; completeRequest persists onto provider_token.usage_limit
+// (migration 203) for the account that authenticated the call.
 //
-// DISPLAY: getFleetBurn (GET /api/fleet/burn, and the fleet snapshot's fleet_burn) returns
-// by_provider (tokens+$ per provider from the gateway ledger) and current (freshest rate-limit
-// snapshot per provider). The console statusline renders both.
+// DISPLAY: listProviderTokens / providerLimits / fleet.provider_limits carry available_pct per
+// account; statusline "limits:" chip and Project setup account rows render "% free".
 //
 // What this file covers:
-//   A. extractRateLimit pure (also covered in gateway.test.mjs — kept here as the job's contract).
-//   B. getFleetBurn.by_provider + .current against a throwaway project (DATABASE_URL).
-//   C. Wiring: the read model shape, the console statusline chips, the delivery-telemetry card.
+//   A. extractRateLimit pure — unified windows + available_pct (the number a human wants).
+//   B. provider_token.usage_limit round-trip + providerLimits / getFleetBurn.current.
+//   C. Wiring — statusline limits chip, Project setup account row, migration 203.
 //
 // House rule 1: every fixture is deleted in a finally, whatever happens.
 import { readFileSync } from 'node:fs';
@@ -28,124 +28,164 @@ const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 const eq = (a, b, m) => ok(a === b, `${m} (got ${JSON.stringify(a)}, want ${JSON.stringify(b)})`);
+const near = (a, b, m, tol = 0.05) =>
+  ok(a != null && Math.abs(Number(a) - b) <= tol, `${m} (got ${JSON.stringify(a)}, want ~${b})`);
 
-const { extractRateLimit } = await import('../server/src/lib/gateway.js');
+const { extractRateLimit, recordAccountUsageLimit } = await import('../server/src/lib/gateway.js');
 const { getFleetBurn } = await import('../server/src/lib/fleet.js');
+const { listProviderTokens, providerLimits } = await import('../server/src/lib/provider-tokens.js');
 const { q, one, pool } = await import('../server/src/db/pool.js');
 
-// ── A. extractRateLimit (the TRACE half) ─────────────────────────────────────────────────────
-console.log('\n── A. extractRateLimit — current usage % off response headers ──');
+// ── A. extractRateLimit (AVAILABLE, not used) ────────────────────────────────────────────────
+console.log('\n── A1. Claude Code unified 5h/7d seat windows ──');
 {
   const rl = extractRateLimit({
-    'anthropic-ratelimit-tokens-limit': '1000',
-    'anthropic-ratelimit-tokens-remaining': '250',
+    'anthropic-ratelimit-unified-status': 'allowed',
+    'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-utilization': '0.07',
+    'anthropic-ratelimit-unified-5h-reset': '1774933200',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '0.53',
   });
-  eq(rl?.tokens_used_pct, 75, 'used% = 1 − remaining/limit');
-  eq(extractRateLimit({}), null, 'no headers → null (the chip then shows nothing for that provider)');
+  ok(!!rl, 'unified headers produce a snapshot');
+  eq(rl.representative, '5h', 'representative five_hour → 5h');
+  near(rl.windows['5h'].available_pct, 93, '5h available = 100 − 7');
+  near(rl.windows['7d'].available_pct, 47, '7d available = 100 − 53');
+  near(rl.available_pct, 93, 'PRIMARY available_pct follows the binding (5h) window');
+  eq(rl.status, 'allowed', 'overall status');
+  ok(!!rl.windows['5h'].reset_at, '5h reset is ISO-ified from unix epoch');
 }
 
-// ── B. getFleetBurn.by_provider + .current against a real project ────────────────────────────
-console.log('\n── B. getFleetBurn — by_provider + current rate-limit snapshot ──');
+console.log('\n── A2. API TPM/RPM headers (OpenAI-shaped) ──');
+{
+  const rl = extractRateLimit({
+    'x-ratelimit-limit-tokens': '20000',
+    'x-ratelimit-remaining-tokens': '5000',
+    'x-ratelimit-limit-requests': '60',
+    'x-ratelimit-remaining-requests': '60',
+  });
+  near(rl.available_pct, 25, 'TPM available = remaining/limit = 5000/20000 = 25%');
+  near(rl.tokens.available_pct, 25, 'tokens.available_pct');
+  near(rl.requests.available_pct, 100, 'RPM fully free when remaining=limit');
+}
+
+console.log('\n── A3. empty / null → null ──');
+eq(extractRateLimit({}), null, 'no headers → null');
+eq(extractRateLimit(null), null, 'null headers → null');
+
+// ── B. provider_token.usage_limit + providerLimits (account grain) ───────────────────────────
+console.log('\n── B. usage_limit stored on the ACCOUNT, not the xell ──');
 let projectId = null;
-let xellId = null;
 try {
+  // Ensure migration 203 columns exist (sandbox may already have them from --migrate).
+  await q(`ALTER TABLE provider_token
+             ADD COLUMN IF NOT EXISTS usage_limit jsonb,
+             ADD COLUMN IF NOT EXISTS usage_limit_at timestamptz`).catch(() => {});
+
   const proj = await one(
     `INSERT INTO project (name, repo_root)
-     VALUES ($1, '/tmp/provider-usage-burn-test') RETURNING id`,
-    [`provider-usage-burn-${randomUUID().slice(0, 8)}`]);
+     VALUES ($1, '/tmp/provider-usage-limit-test') RETURNING id`,
+    [`provider-limit-${randomUUID().slice(0, 8)}`]);
   projectId = proj.id;
 
-  // A xource is required for a xell (FK). Minimal row.
-  const xource = await one(
-    `INSERT INTO xource (project_id, ref) VALUES ($1, 'main') RETURNING id`, [projectId]);
-  const xell = await one(
-    `INSERT INTO xell (project_id, xource_id, slug, branch, status)
-     VALUES ($1, $2, $3, $4, 'working') RETURNING id`,
-    [projectId, xource.id, `pu-${randomUUID().slice(0, 8)}`,
-     `spinoff/pu-${randomUUID().slice(0, 8)}`]);
-  xellId = xell.id;
+  // Two claude accounts — different remaining quotas. Provider-level available is the WORST.
+  const a1 = await one(
+    `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
+     VALUES ($1, 'claude', 'sk-ant-oat01-TESTTOKEN_ONE_aaaaaaaaaaaaaaaa', '…aaaa', 'work')
+     RETURNING id`, [projectId]);
+  const a2 = await one(
+    `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
+     VALUES ($1, 'claude', 'sk-ant-oat01-TESTTOKEN_TWO_bbbbbbbbbbbbbbbb', '…bbbb', 'personal')
+     RETURNING id`, [projectId]);
+  const grok = await one(
+    `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
+     VALUES ($1, 'grok', 'xai-TESTTOKEN_GROK_cccccccccccccccc', '…cccc', 'seat')
+     RETURNING id`, [projectId]);
 
-  // Two providers, known token counts. Claude has a rate-limit snapshot; grok does not.
-  // total_tokens is the ledger's own sum column; set it explicitly so the GROUP BY is exact.
-  await q(
-    `INSERT INTO llm_gateway_request
-       (xell_id, project_id, kind, provider, model, method, path,
-        input_tokens, output_tokens, total_tokens, cost_usd, status, completed_at, meta)
-     VALUES
-       ($1, $2, 'messages', 'claude', 'opus', 'POST', '/v1/messages',
-        1000, 200, 1200, 0.50, 200, now(),
-        $3::jsonb),
-       ($1, $2, 'messages', 'claude', 'opus', 'POST', '/v1/messages',
-        500, 100, 600, 0.25, 200, now() - interval '1 minute',
-        '{}'::jsonb),
-       ($1, $2, 'messages', 'grok', 'grok-4.5', 'POST', '/responses',
-        300, 50, 350, 0.10, 200, now(),
-        '{}'::jsonb)`,
-    [xellId, projectId, JSON.stringify({
-      rate_limit: {
-        tokens_remaining: 40000, tokens_limit: 100000, tokens_used_pct: 60,
-        requests_remaining: 10, requests_limit: 50, requests_used_pct: 80,
-      },
-    })]);
+  // Simulate what the gateway writes after a call.
+  const snapWork = extractRateLimit({
+    'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+    'anthropic-ratelimit-unified-5h-utilization': '0.80',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '0.30',
+  });
+  const snapPersonal = extractRateLimit({
+    'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+    'anthropic-ratelimit-unified-5h-utilization': '0.10',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  });
+  const snapGrok = extractRateLimit({
+    'x-ratelimit-limit-tokens': '100000',
+    'x-ratelimit-remaining-tokens': '90000',
+  });
+  await recordAccountUsageLimit(a1.id, snapWork);
+  await recordAccountUsageLimit(a2.id, snapPersonal);
+  await recordAccountUsageLimit(grok.id, snapGrok);
 
+  const listed = await listProviderTokens(projectId);
+  const claude = listed.find((p) => p.provider === 'claude');
+  const grokP = listed.find((p) => p.provider === 'grok');
+  ok(!!claude, 'claude provider present');
+  eq(claude.accounts.length, 2, 'two claude accounts');
+  const work = claude.accounts.find((a) => a.label === 'work');
+  const personal = claude.accounts.find((a) => a.label === 'personal');
+  near(work.available_pct, 20, 'work account: 20% free (util 0.80)');
+  near(personal.available_pct, 90, 'personal account: 90% free (util 0.10)');
+  // Provider-level = WORST active account (work is tighter).
+  near(claude.available_pct, 20, 'provider available_pct is the WORST account (20%)');
+  near(grokP.available_pct, 90, 'grok available_pct from TPM headers = 90%');
+
+  const limits = await providerLimits(projectId);
+  ok(limits.some((p) => p.provider === 'claude' && p.available_pct === 20
+    || (p.provider === 'claude' && Math.abs(p.available_pct - 20) < 0.1)),
+     'providerLimits lists claude with worst remaining');
+  ok(limits.every((p) => p.accounts.every((a) => 'available_pct' in a)),
+     'every account carries available_pct (may be null)');
+
+  // getFleetBurn.current reads from provider_token.usage_limit now.
   const burn = await getFleetBurn(projectId);
-  ok(!!burn, 'getFleetBurn returns a read model');
-  ok(Array.isArray(burn.by_provider), 'by_provider is an array');
-  ok(Array.isArray(burn.current), 'current is an array');
-
-  const claude = burn.by_provider.find((p) => p.provider === 'claude');
-  const grok = burn.by_provider.find((p) => p.provider === 'grok');
-  eq(claude?.tokens, 1800, 'claude tokens = 1200 + 600');
-  eq(claude?.cost, 0.75, 'claude cost = 0.50 + 0.25');
-  eq(claude?.requests, 2, 'claude requests = 2');
-  eq(grok?.tokens, 350, 'grok tokens = 350');
-  eq(grok?.cost, 0.10, 'grok cost = 0.10');
-  eq(grok?.requests, 1, 'grok requests = 1');
-
-  // by_provider is ordered tokens DESC — claude (1800) before grok (350).
-  eq(burn.by_provider[0]?.provider, 'claude', 'by_provider ordered tokens DESC (claude first)');
-
-  const curClaude = burn.current.find((c) => c.provider === 'claude');
-  ok(!!curClaude, 'current carries a rate-limit snapshot for claude');
-  eq(curClaude?.rate_limit?.tokens_used_pct, 60, 'current claude tokens_used_pct = 60');
-  eq(curClaude?.rate_limit?.tokens_remaining, 40000, 'current claude tokens_remaining');
-  ok(!burn.current.find((c) => c.provider === 'grok'),
-     'grok has no rate-limit headers → absent from current (not a zero-filled row)');
+  ok(Array.isArray(burn.current), 'getFleetBurn.current is an array');
+  ok(burn.current.some((c) => c.provider === 'claude' && c.available_pct != null),
+     'current carries claude available_pct from the account row');
+  ok(burn.current.every((c) => c.account_id || c.provider),
+     'current is account-grained (has account_id when from provider_token)');
 } finally {
   if (projectId) {
-    // Cascades: xource, xell, llm_gateway_request (project_id ON DELETE CASCADE).
     await q(`DELETE FROM project WHERE id=$1`, [projectId]).catch(() => {});
   }
 }
 
 // ── C. wiring ────────────────────────────────────────────────────────────────────────────────
-console.log('\n── C. wiring — statusline + delivery telemetry surface the fields ──');
+console.log('\n── C. wiring — limits on accounts / model picker / badge HP, NOT statusline ──');
 {
-  const fleetSrc = read('server/src/lib/fleet.js');
-  ok(/by_provider/.test(fleetSrc), 'getFleetBurn builds by_provider');
-  ok(/rate_limit/.test(fleetSrc) && /current/.test(fleetSrc),
-     'getFleetBurn builds current from meta.rate_limit');
+  const mig = read('db/migrations/203_provider_token_usage_limit.sql');
+  ok(/usage_limit/.test(mig) && /usage_limit_at/.test(mig), 'migration 203 columns present');
 
-  const gwSrc = read('server/src/lib/gateway.js');
-  ok(/export function extractRateLimit/.test(gwSrc), 'gateway exports extractRateLimit');
-  ok(/rate_limit:\s*rateLimit|rate_limit:\s*rl|rate_limit: rateLimit/.test(gwSrc)
-     || /rate_limit:\s*rateLimit/.test(gwSrc.replace(/\s+/g, ' '))
-     || /meta\.rate_limit|rate_limit: rateLimit|rate_limit: rl/.test(gwSrc),
-     'gateway stores rate_limit on completeRequest meta');
-  // A more direct check: the finish path merges rate_limit into metaPatch.
-  ok(/extractRateLimit\(proxyRes\.headers\)/.test(gwSrc),
-     'gateway reads rate-limit headers off the upstream response');
+  const gw = read('server/src/lib/gateway.js');
+  ok(/anthropic-ratelimit-unified/.test(gw), 'gateway parses unified seat headers');
+  ok(/recordAccountUsageLimit/.test(gw), 'gateway writes usage_limit onto the account');
+  ok(/available_pct/.test(gw), 'gateway computes available_pct (remaining), not only used%');
 
-  const appSrc = read('web/src/App.jsx');
-  ok(/fleet-burn-by-provider/.test(appSrc), 'statusline has the by-provider chip');
-  ok(/provider-usage-/.test(appSrc), 'statusline has a data-testid per provider usage %');
-  ok(/fleetBurnTitle|providerBurnTitle/.test(appSrc), 'tooltips name the per-provider figures');
+  const pt = read('server/src/lib/provider-tokens.js');
+  ok(/export async function providerLimits/.test(pt), 'providerLimits read model exists');
+  ok(/available_pct/.test(pt), 'listProviderTokens surfaces available_pct');
 
-  const dtSrc = read('server/src/lib/delivery-telemetry.js');
-  ok(/usage_by_provider/.test(dtSrc), 'delivery telemetry returns usage_by_provider');
-  const dtUi = read('web/src/DeliveryTelemetry.jsx');
-  ok(/usage-by-provider/.test(dtUi) && /Usage per provider/.test(dtUi),
-     'delivery telemetry panel renders the per-provider card');
+  const fleet = read('server/src/lib/fleet.js');
+  ok(/usage_available_pct|attachUsageLimits/.test(fleet),
+     'fleet attaches model-aware usage_available_pct for the badge HP bar');
+
+  const app = read('web/src/App.jsx');
+  ok(!/data-testid="provider-limits"/.test(app),
+     'statusline does NOT render the provider-limits chip (limits live in the prompt window)');
+
+  const setup = read('web/src/ProjectSetup.jsx');
+  ok(/AccountUsageLimit/.test(setup) && /account-usage-limit/.test(setup),
+     'Project setup shows remaining limit on each account row');
+
+  const disp = read('web/src/Dispatch.jsx');
+  ok(/model-limit-|formatLimitChip|availableForModel/.test(disp),
+     'prompt window model picker shows remaining limit chips');
 }
 
 console.log(fail ? `\n${fail} FAIL` : '\nall good');
