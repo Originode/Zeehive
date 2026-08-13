@@ -61,6 +61,8 @@ import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, 
 import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateHarness,
          deleteHarnessUnlessWorn, liveHarnessWearers, wearerList } from '../lib/harness.js';
 import { uploadConversationArchive, conversationsForManager, harnessArchivalSettings } from '../lib/conversations.js';
+// The A2A outbound send (`zee a2a <card-url> --message "…"`, phase 4) — queenzee-mediated, recorded.
+import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -2343,6 +2345,16 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
     message: deliveryReceipt(r.delivery?.delivery, worker.slug,
                              r.delivery?.reason || r.delivery?.error || null),
   };
+}
+
+// POST /api/xell/self/a2a — a zee sends an A2A SendMessage to an EXTERNAL agent card URL
+// (`zee a2a <card-url> --message "…"`, plan §6 P4, DR-2/DR-7). The zee never dials the external
+// server: the queenzee makes the HTTP call on its behalf and RECORDS it at the transport layer
+// (lib/a2a-outbound.js → a2a_outbound_request, migration 201). The sender resolves from the xell
+// token, never from a payload — this is a verb, not a wire hole.
+export async function selfA2ASend(xell, { card_url = null, message = null } = {}) {
+  const out = await sendExternalA2AMessage({ xell, cardUrl: card_url, message });
+  return out.ok ? { ok: true, ...out } : { ok: false, error: out.error };
 }
 
 // POST /api/xell/self/report — a WORKER's note to its manager (`zee report`), and the vehicle for
