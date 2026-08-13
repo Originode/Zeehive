@@ -686,11 +686,21 @@ export async function getFleet(projectId) {
 // project-cumulative total AND a per-xell breakdown grouped by xell, both summed across every zee
 // the xell has hosted. Retired xells still count toward the cumulative total (their zees really did
 // burn tokens) but are not listed per-xell, matching the card list which hides retired xells.
+//
+// Also:
+//   by_provider — tokens + $ from the LLM GATEWAY ledger (llm_gateway_request, migration 154),
+//     which is the only place a call is attributed to a PROVIDER key (claude/openai/kimi/…).
+//     The zee-row totals above have no provider column; they are fleet-own lifetime burn. The
+//     gateway grain is the one a human asking "how much is each provider costing us" needs.
+//   current — the freshest rate-limit snapshot the gateway captured off each provider's response
+//     headers (meta.rate_limit — see gateway.extractRateLimit). That is the free "current usage %"
+//     surface: remaining/limit of the provider's own rate window. Account-wide Admin /usage APIs
+//     still need separate admin keys the fleet does not hold — this is what we CAN show.
+//
 //   { fleet: { tokens, cost, input, output, cache_read, cache_write, zees },
-//     xells: [{ xell_id, slug, is_production, tokens, cost, zees }, …] }
-// IMPORTANT: these are the FLEET's OWN consumption only. Account-wide %/limits (how much of the
-// plan is used) are NOT available here — only Anthropic's /usage surfaces those; this tracks solely
-// what our own runs spent.
+//     xells: [{ xell_id, slug, is_production, tokens, cost, zees }, …],
+//     by_provider: [{ provider, tokens, cost, input, output, cache_read, cache_write, requests }, …],
+//     current: [{ provider, rate_limit, at }, …] }
 export async function getFleetBurn(projectId) {
   const pid = projectId
     || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
@@ -719,6 +729,37 @@ export async function getFleetBurn(projectId) {
       GROUP BY x.id, x.slug, x.is_production
       ORDER BY tokens DESC, cost DESC`, [pid]);
 
+  // Per-provider usage from the gateway ledger. COALESCE(provider,'(unrecorded)') so a row that
+  // somehow lost its provider still contributes to a named bucket rather than vanishing from the
+  // sum. total_tokens is the ledger's own column (input+output+cache) — use it, do not re-add.
+  const byProvider = await q(
+    `SELECT COALESCE(provider, '(unrecorded)') AS provider,
+            COALESCE(SUM(input_tokens), 0)::bigint       AS input,
+            COALESCE(SUM(output_tokens), 0)::bigint      AS output,
+            COALESCE(SUM(cache_read_tokens), 0)::bigint  AS cache_read,
+            COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write,
+            COALESCE(SUM(total_tokens), 0)::bigint       AS tokens,
+            COALESCE(SUM(cost_usd), 0)                   AS cost,
+            COUNT(*)::int                                AS requests
+       FROM llm_gateway_request
+      WHERE project_id = $1
+      GROUP BY 1
+      ORDER BY tokens DESC, cost DESC`, [pid]).catch(() => []);
+
+  // Latest rate-limit snapshot per provider: the gateway stamped meta.rate_limit on every call
+  // that carried the headers. DISTINCT ON (provider) + ORDER BY completed_at DESC is the freshest
+  // one; a provider with no headers ever is simply absent (the chip shows nothing for it).
+  const current = await q(
+    `SELECT DISTINCT ON (provider)
+            provider,
+            meta->'rate_limit' AS rate_limit,
+            completed_at AS at
+       FROM llm_gateway_request
+      WHERE project_id = $1
+        AND provider IS NOT NULL
+        AND meta ? 'rate_limit'
+      ORDER BY provider, completed_at DESC NULLS LAST`, [pid]).catch(() => []);
+
   const num = (v) => Number(v || 0);
   return {
     fleet: {
@@ -731,6 +772,21 @@ export async function getFleetBurn(projectId) {
       xell_id: r.xell_id, slug: r.slug, is_production: r.is_production,
       tokens: num(r.tokens), cost: num(r.cost), zees: num(r.zees),
     })),
+    by_provider: (byProvider || []).map((r) => ({
+      provider: r.provider,
+      tokens: num(r.tokens), cost: num(r.cost),
+      input: num(r.input), output: num(r.output),
+      cache_read: num(r.cache_read), cache_write: num(r.cache_write),
+      requests: num(r.requests),
+    })),
+    current: (current || []).map((r) => ({
+      provider: r.provider,
+      // pg returns jsonb as a parsed object already; tolerate a string if a driver changes.
+      rate_limit: (typeof r.rate_limit === 'string'
+        ? (() => { try { return JSON.parse(r.rate_limit); } catch { return null; } })()
+        : r.rate_limit) || null,
+      at: r.at || null,
+    })).filter((r) => r.rate_limit),
   };
 }
 

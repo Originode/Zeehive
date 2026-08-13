@@ -41,6 +41,7 @@ const OPENAI_TOK   = fakeTokens.openaiProject();
 const KIMI_TOK     = fakeTokens.kimi();
 const GITHUB_TOK   = fakeTokens.github();
 const GROK_TOK     = fakeTokens.grok();
+const GROK_SESSION = fakeTokens.grokSession();   // what `grok login --device-auth` writes
 
 // account rows in the shape allProviderTokenRows hands everyProviderEnv (freshest first)
 const A = (provider, token, { label = null, hint = null, paused = false } = {}) =>
@@ -151,6 +152,8 @@ section('the RUNNABLE env — `zee creds --provider <key> --export` is server-co
   ok(codex.bin === 'codex' && codex.auth_setup?.required === true
      && /codex login --with-api-key/.test(codex.auth_setup.command),
      'openai: the codex CLI needs an in-cage install, and the exact one-liner comes from the adapter (never the CLI)');
+  ok(codex.auth_setup.file === '.codex/auth.json',
+     '…and the FILE that proves it happened comes from the adapter too — the CLI hard-codes no vendor path');
 
   const kimi = providerRunEnvFromAccount({ provider: 'kimi', token: KIMI_TOK });
   ok(kimi.env.KIMI_MODEL_API_KEY === KIMI_TOK && kimi.env.KIMI_MODEL_PROVIDER_TYPE === 'kimi'
@@ -169,7 +172,22 @@ section('the RUNNABLE env — `zee creds --provider <key> --export` is server-co
 
   const grok = providerRunEnvFromAccount({ provider: 'grok', token: GROK_TOK });
   ok(grok.env.XAI_API_KEY === GROK_TOK && grok.bin === 'grok' && !grok.auth_setup,
-     'grok: the runnable env is XAI_API_KEY alone — what the Grok Build CLI reads (measured on 0.2.118)');
+     'grok: an xai-… API key IS the runnable env (XAI_API_KEY, nothing to install — measured on 0.2.118)');
+  // grok's second shape: a SuperGrok / Business seat, obtained by `grok login --device-auth`, which
+  // is a session FILE rather than a key. It rides in as the carrier var and the adapter installs it.
+  const seat = providerRunEnvFromAccount({ provider: 'grok', token: GROK_SESSION });
+  ok(seat.env.GROK_AUTH_JSON === GROK_SESSION && !('XAI_API_KEY' in seat.env),
+     'grok: a device-auth SEAT session exports GROK_AUTH_JSON and NO XAI_API_KEY — the key would '
+     + 'override the seat and spend prepaid credits behind a human\'s back');
+  ok(seat.auth_setup?.required === true && /auth\.json/.test(seat.auth_setup.command),
+     '…and it carries the install: the session belongs in ~/.grok/auth.json, where the CLI reads it');
+  ok(!seat.auth_setup.command.includes(GROK_SESSION),
+     '…with the session read from the env, never interpolated into the command a human would run');
+  ok(seat.auth_setup.file === '.grok/auth.json',
+     '…and the same declared proof file, so `--export` fails non-zero until the seat is really installed');
+  const cliSrc = readFileSync(join(ROOT, 'scripts', 'zee'), 'utf8');
+  ok(/auth\.file/.test(cliSrc) && !/'\.codex'/.test(cliSrc),
+     'the CLI checks the SERVER-declared auth file — no vendor path of its own to drift');
   ok(!Object.keys(grok.env).some((k) => k in claude.env || k in codex.env || k in kimi.env),
      '…and it shares no env key with another vendor, so a cage can carry both without a collision');
 }

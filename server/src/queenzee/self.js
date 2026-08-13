@@ -35,7 +35,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 // the guard at the head of selfLand.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
-import { attachXellDb } from '../lib/xell-db.js';
+import { attachXellDb, projectProdIsManagingMeta, managingMetaWritableRefusal } from '../lib/xell-db.js';
 import { probeRoleUpstream } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
@@ -835,6 +835,12 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
 // Records a REQUEST only. It does NOT bind: binding grants prod DATA, a human's call (HANDOFF). The
 // human confirms in the console (decideProdBind), and ONLY then does the queenzee attachProdStack
 // AND re-seal the cxell firewall to allow the prod db. Until confirmed the cxell cannot reach prod.
+//
+// Two structural refusals fire BEFORE a row is written, so a human is never shown a BIND button
+// that cannot succeed:
+//   • manager → already holds SELECT-only; escalation is not a zee-ask (see below).
+//   • project's prod IS the managing meta-DB (ZEEHIVE self-hosting) → a writable bind would hand
+//     a nested queenzee the live fleet database. The write path for that case is `zee seed`.
 export async function selfProdRequest(xell, { reason = null } = {}) {
   // A MANAGER already holds production — READ-ONLY, through its own SELECT-only postgres role. A
   // full bind would be a WRITE escalation, and escalating your own access is not a thing an agent
@@ -847,6 +853,18 @@ export async function selfProdRequest(xell, { reason = null } = {}) {
       + 'freely. If rows must CHANGE in production, that is `zee seed` — a landed file a human reads '
       + 'and the queenzee runs — or a human\'s own decision. If you believe this job genuinely needs '
       + 'write access, raise it with `zee tend --reason "…"` and let a human decide.' };
+  }
+  // Self-hosting: the project's production database IS this queenzee's meta-DB. Attach would refuse
+  // (§6.2); refuse the ASK too so nothing pending lands on a human, and name the seed path.
+  const meta = await projectProdIsManagingMeta(xell.project_id);
+  if (meta.isMeta) {
+    const error = managingMetaWritableRefusal(xell.slug, meta.dsn);
+    logline('xell-prod', `${xell.slug} prod-bind REFUSED (managing meta-DB): use zee seed for prod data writes`);
+    return { ok: false, status: 'refused', error,
+      path: 'zee seed',
+      note: 'This project\'s production database is the orchestrator\'s own meta-DB. A writable bind '
+        + 'is structurally unsafe. Modify prod data via `zee seed` (landed SQL, human-approved, '
+        + 'queenzee-run); read prod via a MANAGER (db-prod-readonly).' };
   }
   const existing = await one(
     `SELECT * FROM prod_bind_request WHERE xell_id=$1 AND status='pending'`, [xell.id]);
@@ -1033,8 +1051,24 @@ export async function listProdBindRequests(projectId, { open = true } = {}) {
 // The human decides. On CONFIRM: bind the prod stack (attachProdStack — the same call /xell-prod
 // makes) AND re-seal the cxell firewall so the cxell can now reach the prod db host:port. Rejection is
 // a plain status flip; nothing is bound and the cxell stays sealed.
+//
+// Preflight BEFORE flipping status: if this project's prod IS the managing meta-DB, attach would
+// throw after the row was already 'confirmed', leaving a half-decided ask with no bind. Refuse the
+// confirm with the seed path named; the request stays pending so the human can Reject it cleanly
+// (selfProdRequest no longer creates these for new asks — this is the backstop for leftovers).
 export async function decideProdBind(id, decision, by = 'human@console') {
   if (!['confirmed', 'rejected'].includes(decision)) throw new Error(`bad decision: ${decision}`);
+  const pending = await one(
+    `SELECT pbr.*, x.slug AS xell_slug FROM prod_bind_request pbr
+       LEFT JOIN xell x ON x.id = pbr.xell_id
+      WHERE pbr.id=$1 AND pbr.status='pending'`, [id]);
+  if (!pending) throw new Error('no such pending prod-bind request (already decided?)');
+  if (decision === 'confirmed') {
+    const meta = await projectProdIsManagingMeta(pending.project_id);
+    if (meta.isMeta) {
+      throw new Error(managingMetaWritableRefusal(pending.xell_slug || pending.xell_id, meta.dsn));
+    }
+  }
   const row = await one(
     `UPDATE prod_bind_request SET status=$2, decided_at=now(), decided_by=$3
        WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by]);

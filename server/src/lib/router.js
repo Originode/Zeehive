@@ -26,6 +26,8 @@ import { resolveHarness } from './harness.js';
 import { effectiveModelPolicy } from './model-policy.js';
 import { effectiveRouterPolicy, providerInSchedule } from './router-policy.js';
 import { resolveProjectId } from './project-resolve.js';
+import { randomUUID } from 'node:crypto';
+import { buildEnvelope } from './a2a.js';
 
 export const ROUTER_HARNESS_KEY = 'router';
 
@@ -414,25 +416,35 @@ export async function routeRawPrompt({ project, prompt, images = [], harness_hin
   // rolls its message back. Either way exactly one message row survives for one key — the duplicate
   // is never left in zee_message. A non-key path (no client_request_id) skips the ledger entirely
   // and is a plain single insert, byte-for-byte what it always was.
+  // The A2A ENVELOPE (plan §4, DR-3): the router intake is C3 in the plan's §1 scope — it must be
+  // on the A2A plane like every directive. The row is written by a raw INSERT (it carries images
+  // and a dedup ledger, so it cannot use managers.postMessage unchanged), so the envelope is built
+  // and stamped here — the same buildEnvelope pure function, minting a taskId (a routing request
+  // OPENS a task) and a contextId for the human→router thread. The messageId is the row id, so it
+  // is minted BEFORE the insert (same as postMessage, DR-3).
+  const routerMessageId = randomUUID();
+  const routerEnvelope = buildEnvelope({ messageId: routerMessageId, kind: 'directive', contextId: null });
+  const auditText = auditBody(head, text, tail);
+  const metaFor = (extra) => JSON.stringify({ by, routing_request: true, ...extra,
+    a2a: routerEnvelope });
   const row = await (async () => {
     if (!key) {
       return one(
-        `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
-         VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
-        [projectId, by, router.xell_id, router.slug, auditBody(head, text, tail),
-         JSON.stringify({ by, routing_request: true,
-                          ...(deployment ? { custom_deployment: deployment } : {}) })]);
+        `INSERT INTO zee_message (id, project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+         VALUES ($1, $2, NULL, $3, $4, $5, 'directive', $6, $7::jsonb) RETURNING *`,
+        [routerMessageId, projectId, by, router.xell_id, router.slug, auditText,
+         metaFor(deployment ? { custom_deployment: deployment } : {})]);
     }
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const run = async (text, params) => (await client.query(text, params)).rows;
       const [msg] = await run(
-        `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
-         VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
-        [projectId, by, router.xell_id, router.slug, auditBody(head, text, tail),
-         JSON.stringify({ by, routing_request: true, client_request_id: key,
-                          ...(deployment ? { custom_deployment: deployment } : {}) })]);
+        `INSERT INTO zee_message (id, project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+         VALUES ($1, $2, NULL, $3, $4, $5, 'directive', $6, $7::jsonb) RETURNING *`,
+        [routerMessageId, projectId, by, router.xell_id, router.slug, auditText,
+         metaFor({ client_request_id: key,
+                   ...(deployment ? { custom_deployment: deployment } : {}) })]);
       await run(
         `INSERT INTO router_route_dedup (project_id, to_xell_id, client_request_id, message_id)
          VALUES ($1,$2,$3,$4)`,

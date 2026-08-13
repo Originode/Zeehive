@@ -321,6 +321,21 @@ export async function deliveryTelemetry({ projectId, days = DEFAULT_WINDOW_DAYS 
   const abandoned = workersNever.filter((r) => r.zees > 0);
   const sumCost = (rows) => round2(rows.reduce((a, r) => a + Number(r.cost || 0), 0));
 
+  // ── USAGE PER PROVIDER — gateway ledger (llm_gateway_request), the only grain that attributes
+  // a call to a provider key. Window-bounded like everything else here. Empty when the gateway
+  // has not recorded any call in the window (a fleet that never went through the door, or a
+  // project whose provider traffic predates migration 154).
+  const byProvider = await q(
+    `SELECT COALESCE(provider, '(unrecorded)') AS provider,
+            COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
+            COALESCE(SUM(cost_usd), 0)::float8     AS cost,
+            COUNT(*)::int                          AS requests
+       FROM llm_gateway_request
+      WHERE project_id = $1
+        AND requested_at > now() - interval '1 day' * $2
+      GROUP BY 1
+      ORDER BY cost DESC, tokens DESC`, args).catch(() => []);
+
   return {
     ok: true,
     generated_at: new Date().toISOString(),
@@ -343,6 +358,16 @@ export async function deliveryTelemetry({ projectId, days = DEFAULT_WINDOW_DAYS 
       by_model: costPerLanded(landedXells, 'model'),
       by_harness: costPerLanded(landedXells, 'harness'),
     },
+
+    // Gateway-traced usage per provider over the window (tokens + $ + call count). Sample size is
+    // the request count, not the xell count — a provider with one expensive call must not read like
+    // one with a hundred cheap ones.
+    usage_by_provider: (byProvider || []).map((r) => ({
+      provider: r.provider,
+      tokens: Number(r.tokens || 0),
+      cost: round2(r.cost),
+      requests: Number(r.requests || 0),
+    })),
 
     error_rate: { zees_n: zees.length, by_model: errorRateByModel(zees) },
 

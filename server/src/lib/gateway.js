@@ -197,6 +197,64 @@ export function costOf({ upstreamCost = null, price = null, usage = null } = {})
   return (input + output + cacheRead + cacheWrite) / 1e6 || 0;
 }
 
+// RATE-LIMIT HEADERS — the free "current usage %" surface every provider response already carries.
+// Anthropic: anthropic-ratelimit-{tokens,requests}-{limit,remaining,reset}. OpenAI-compatible:
+// x-ratelimit-{limit,remaining}-{tokens,requests} (+ reset). Account-wide Admin /usage APIs need
+// separate admin keys (sk-ant-admin01-…) the fleet does not hold — the comments on fleet burn
+// are right about that. These headers ride every ordinary call and are the only authoritative
+// "how full is this provider's window right now" the gateway can read. Pure so the extraction is
+// unit-testable without a proxy. Returns null when no limit header is present.
+export function extractRateLimit(headers = {}) {
+  if (!headers || typeof headers !== 'object') return null;
+  const h = {};
+  for (const [k, v] of Object.entries(headers)) {
+    // node http lowercases; express/undici may not. Array values take the first entry.
+    h[String(k).toLowerCase()] = Array.isArray(v) ? v[0] : v;
+  }
+  const num = (k) => {
+    const v = h[k];
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const str = (k) => {
+    const v = h[k];
+    return v == null || v === '' ? null : String(v);
+  };
+
+  const tokens_remaining = num('anthropic-ratelimit-tokens-remaining')
+    ?? num('x-ratelimit-remaining-tokens');
+  const tokens_limit = num('anthropic-ratelimit-tokens-limit')
+    ?? num('x-ratelimit-limit-tokens');
+  const requests_remaining = num('anthropic-ratelimit-requests-remaining')
+    ?? num('x-ratelimit-remaining-requests');
+  const requests_limit = num('anthropic-ratelimit-requests-limit')
+    ?? num('x-ratelimit-limit-requests');
+  const tokens_reset = str('anthropic-ratelimit-tokens-reset')
+    || str('x-ratelimit-reset-tokens');
+  const requests_reset = str('anthropic-ratelimit-requests-reset')
+    || str('x-ratelimit-reset-requests');
+
+  if (tokens_remaining == null && tokens_limit == null
+      && requests_remaining == null && requests_limit == null) {
+    return null;
+  }
+
+  // used% = 1 − remaining/limit. One decimal so a chip can say "62.3%" without noise.
+  // Null when either side is missing (a header set can publish remaining without limit).
+  const pct = (rem, lim) => {
+    if (rem == null || lim == null || !(lim > 0)) return null;
+    return Math.round((1 - rem / lim) * 1000) / 10;
+  };
+
+  return {
+    tokens_remaining, tokens_limit, tokens_reset,
+    tokens_used_pct: pct(tokens_remaining, tokens_limit),
+    requests_remaining, requests_limit, requests_reset,
+    requests_used_pct: pct(requests_remaining, requests_limit),
+  };
+}
+
 // ── the recorder ──────────────────────────────────────────────────────────────────────────────
 
 // Best-effort: find the LIVE zee for a xell and its OPEN turn, so a gateway request can be
@@ -541,6 +599,11 @@ export async function gatewayProxy(req, res) {
         logUnpriced(upstream.provider, m);
         metaPatch = { unpriced: { provider: upstream.provider, model: m } };
       }
+      // CURRENT USAGE of the provider account: the upstream's own rate-limit headers, if any.
+      // Stored on the row so the fleet burn read model can surface the freshest snapshot per
+      // provider without an Admin API key (see extractRateLimit).
+      const rateLimit = extractRateLimit(proxyRes.headers);
+      if (rateLimit) metaPatch = { ...(metaPatch || {}), rate_limit: rateLimit };
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
         cost: costOf({ upstreamCost, price, usage: u }),
@@ -617,6 +680,7 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
+                 extractRateLimit,
                  providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
                  completeRequest, gatewayEnv, zeeTurnForXell };
 
@@ -660,6 +724,13 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 // account. The grok CLI (Grok Build) reads GROK_XAI_API_BASE_URL for its endpoint — EMPIRICALLY
 // verified on grok 0.2.118 (XAI_API_BASE_URL is ignored; GROK_XAI_API_BASE_URL redirects to a mock;
 // the CLI then speaks /responses, not /v1/messages).
+//
+// KNOWN GAP, stated rather than hidden: that redirect was measured on the API-KEY path
+// (api.x.ai/v1/responses). A cage authenticated with a SuperGrok / Business SEAT session — the
+// device-auth credential, see lib/cxell-runtimes.js grokSessionCredential — talks to the vendor's
+// own cli-chat-proxy.grok.com instead, so its turns are NOT observed to pass through this gateway
+// and may not be metered here. The seat is billed by the weekly pool rather than per call, so
+// nothing is spent unseen; what is missing is the RECORD. Measure it before claiming either way.
 export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
   if (config.gatewayPort === config.port) return {};
   const base = gatewayBaseUrl();

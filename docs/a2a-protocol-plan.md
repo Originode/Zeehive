@@ -30,7 +30,12 @@ smaller than it sounds. Everything below was read from the code, with the author
 
 **Scope of this design: C1, C2, C3 (the `zee_message` plane) gain A2A envelopes and an A2A read
 side; C8 is the new door A2A opens; C7 is a named seam (execution outputs ⇄ A2A Artifacts), not
-built. C4–C6 are explicitly out** — see DR-1 for why, and what was rejected.
+built. C4–C6 are explicitly out** — see DR-1 for why, and what was rejected. **DR-8 (2026-08-13)
+extends the conversation set** to the three non-`zee_message` stores that ARE conversations —
+`xell_conversation` archives (112), `zee_conversation` working memory (192), `zee_turn` ledger
+(153) — each projecting to deterministic A2A Tasks (uuid v5 at read time, nothing stored).
+`session_event` stays out (the control-plane hook log, not a conversation). See
+[the decision record](a2a-protocol-decision-record.md) DR-8.
 
 Two structural facts drive everything else:
 

@@ -35,7 +35,7 @@ import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
          requestsForXell, gatewayHello, usageFromStream, modelFromStream, providerUpstreamUrl,
-         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf } from '../server/src/lib/gateway.js';
+         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf, extractRateLimit } from '../server/src/lib/gateway.js';
 
 // providerUpstreamUrl reads these from the PROCESS env (the queenzee's own operator overrides).
 // This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
@@ -67,6 +67,40 @@ eq(a.cacheRead, 20, 'anthropic cache read'); eq(a.cacheWrite, 5, 'anthropic cach
 const o = normalizeUsage({ prompt_tokens: 100, completion_tokens: 50 }, 'chat-completions');
 eq(o.input, 100, 'openai prompt'); eq(o.output, 50, 'openai completion');
 eq(o.cacheRead, 0, 'openai has no cache read'); eq(o.cacheWrite, 0, 'openai has no cache write');
+
+// ── B2. extractRateLimit — current usage % off response headers (pure) ───────────────────────
+// The free surface for "how full is this provider's window right now". Admin /usage needs a
+// separate key the fleet does not hold; these headers ride every ordinary call.
+console.log('\n── B2. extractRateLimit — Anthropic + OpenAI headers ──');
+const antRl = extractRateLimit({
+  'anthropic-ratelimit-tokens-limit': '100000',
+  'anthropic-ratelimit-tokens-remaining': '40000',
+  'anthropic-ratelimit-tokens-reset': '2026-08-13T12:00:00Z',
+  'anthropic-ratelimit-requests-limit': '50',
+  'anthropic-ratelimit-requests-remaining': '10',
+});
+eq(antRl?.tokens_limit, 100000, 'anthropic tokens limit');
+eq(antRl?.tokens_remaining, 40000, 'anthropic tokens remaining');
+eq(antRl?.tokens_used_pct, 60, 'anthropic tokens used% = 1 − 40000/100000 = 60');
+eq(antRl?.requests_used_pct, 80, 'anthropic requests used% = 1 − 10/50 = 80');
+eq(antRl?.tokens_reset, '2026-08-13T12:00:00Z', 'anthropic tokens reset timestamp');
+const oaiRl = extractRateLimit({
+  'x-ratelimit-limit-tokens': '20000',
+  'x-ratelimit-remaining-tokens': '5000',
+  'x-ratelimit-limit-requests': '60',
+  'x-ratelimit-remaining-requests': '60',
+});
+eq(oaiRl?.tokens_used_pct, 75, 'openai tokens used% = 1 − 5000/20000 = 75');
+eq(oaiRl?.requests_used_pct, 0, 'openai requests used% = 0 when remaining=limit');
+// Case-insensitive + array-valued headers (node/express variance).
+const mixed = extractRateLimit({
+  'Anthropic-Ratelimit-Tokens-Limit': ['1000'],
+  'Anthropic-Ratelimit-Tokens-Remaining': ['250'],
+});
+eq(mixed?.tokens_used_pct, 75, 'header names are case-insensitive; array values take [0]');
+eq(extractRateLimit({}), null, 'no rate-limit headers → null (not a zero-filled object)');
+eq(extractRateLimit(null), null, 'null headers → null');
+eq(extractRateLimit({ 'content-type': 'application/json' }), null, 'unrelated headers → null');
 
 // ── D. gatewayEnv — the base URLs cxells get ─────────────────────────────────────────────────
 console.log('\n── D. gatewayEnv — the base URLs cxells get ──');

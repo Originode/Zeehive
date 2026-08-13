@@ -2446,7 +2446,10 @@ function TokensSection({ project, run, busy }) {
               <span className="pc">2 · {p.steps}</span>
               <label>3 · Paste the token{p.connected ? ' (a new account — existing ones stay)' : ''}
                 <span className="setup-row">
-                  <input type="password" autoComplete="off" value={paste} placeholder="sk-ant-oat01-…"
+                  {/* the SHAPE to paste comes from the provider registry (server-side copy), so a
+                      vendor with a different-looking credential — a Grok seat session is a JSON
+                      object, not an sk-… string — never shows claude's example */}
+                  <input type="password" autoComplete="off" value={paste} placeholder={p.placeholder || 'paste it here'}
                          onChange={(e) => setPaste(e.target.value)}
                          onKeyDown={(e) => { if (e.key === 'Enter' && paste.trim()) { e.preventDefault(); save(p); } }} />
                   <input value={label} placeholder="label (optional) — e.g. work / personal"

@@ -79,7 +79,10 @@ export function computePorts(slug, project = {}) {
 // Pure projection of meta-DB truth: regenerable at any time, meaningless to hand-edit.
 // Two postgres URLs meaning the same database? Compared on host:port+dbname, not string equality
 // — localhost spellings differ but the port+db pair is what actually collides.
-function sameDatabase(a, b) {
+// Exported so attachXellDb (lib/xell-db.js) can REFUSE a db-shared-prod bind whose target IS the
+// managing instance's own meta-DB at ATTACH time — the §6.2 guard only fires at EMIT time, which
+// leaves the xell coupled to prod with no DATABASE_URL and a permanently-failing reconcile.
+export function sameDatabase(a, b) {
   const parse = (s) => { try { return new URL(String(s).replace(/^postgres(ql)?:/, 'http:')); } catch { return null; } };
   const ua = parse(a), ub = parse(b);
   if (!ua || !ub) return String(a) === String(b);

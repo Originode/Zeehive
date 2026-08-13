@@ -68,6 +68,7 @@ const OPENAI_TOK   = fakeTokens.openaiProject();
 const KIMI_TOK     = fakeTokens.kimi();
 const GITHUB_TOK   = fakeTokens.github();
 const GROK_TOK     = fakeTokens.grok();
+const GROK_SESSION = fakeTokens.grokSession();   // the ~/.grok/auth.json a device-auth login writes
 
 try {
   const RT = await import('../server/src/lib/cxell-runtimes.js');
@@ -95,6 +96,10 @@ try {
   ok(attributeTokenVendor(KIMI_TOK) === 'kimi', 'attribution: a unique SHAPE match is enough on its own');
   ok(identifyTokenVendors(GROK_TOK).includes('kimi') && attributeTokenVendor(GROK_TOK) === 'grok',
      'attribution: an xAI key is SHAPE-ambiguous (kimi accepts it too) and is settled by the xai- SIGNATURE');
+  ok(identifyTokenVendors(GROK_SESSION).join(',') === 'grok'
+     && attributeTokenVendor(GROK_SESSION) === 'grok',
+     'attribution: a device-auth SEAT session is grok by SHAPE alone — every other vendor’s shape is '
+     + 'an anchored charset that a JSON object cannot satisfy, so the seat is unambiguous');
   ok(attributeTokenVendor(DEEPSEEK_TOK) === null && attributeTokenVendor(OPENAI_TOK) === null,
      'attribution: DeepSeek and OpenAI keys are NOT attributable — no signature, overlapping shapes');
   ok(attributeTokenVendor('sk-something-brand-new-from-a-vendor-2027') === null
@@ -135,6 +140,10 @@ try {
      + 'and a claude cage an xAI one');
   ok(credentialVendorMismatch({ provider: 'grok', token: GROK_TOK }) === null,
      '…while an xAI key on an xAI cage passes');
+  ok(credentialVendorMismatch({ provider: 'grok', token: GROK_SESSION }) === null
+     && !!credentialVendorMismatch({ provider: 'claude', token: GROK_SESSION }),
+     '…and so does a SEAT session — one vendor, two credential shapes, and neither is another '
+     + 'vendor’s (a session pasted into a claude account is still refused)');
 
   // ── 3. the door: the headless RUN ───────────────────────────────────────────────────────────
   section('runZee — the mismatch dies before docker is spawned');

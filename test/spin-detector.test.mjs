@@ -41,14 +41,40 @@ import { detectSpin, DEFAULT_SPIN_CONFIG, spinConfigFor, lastProgressAtForTurn, 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
 
-// A synthetic gateway-request row in the shape detectSpin reads.
-const req = (total, path = '/v1/messages', at = new Date(), extra = {}) =>
-  ({ path, total_tokens: total, requested_at: at, ...extra });
+// A synthetic gateway-request row in the shape detectSpin reads. When `work` is given, the row
+// carries the input/output split (work = input+output, the metric the detector judges similarity
+// on) plus `cache` as the re-sent cached context that dominates total_tokens — matching the real
+// ledger. Without `work`, the row is a legacy shape with only total_tokens (the fallback path).
+const req = (total, path = '/v1/messages', at = new Date(), extra = {}, work = null, cache = 0) => {
+  const row = { path, total_tokens: total, requested_at: at, ...extra };
+  if (work != null) {
+    row.input_tokens = Math.floor(work / 2);
+    row.output_tokens = Math.ceil(work / 2);
+    row.cache_read_tokens = cache;
+  }
+  return row;
+};
 
 // A "spinning" fixture: 30 calls of ~72k tokens each, same path, no progress — the measured shape.
+// Total-tokens-only (legacy shape) → the fallback still trips on the total.
 const SPIN_ROWS = Array.from({ length: 30 }, (_, i) => req(72000 + (i % 3) * 500));
 // An equally long but DIVERSE fixture: 30 calls, same total-ish spend, sizes spanning 5k→500k.
 const DIVERSE_ROWS = Array.from({ length: 30 }, (_, i) => req(5000 + (i * 17000)));
+
+// THE FALSE-POSITIVE SHAPE THE FIX TARGETS: a WORKING long-context zee. Every call carries the
+// same ~70k cached context (manual+skills+task), so total_tokens barely moves (max/min ≈ 1.05)
+// while the actual NEW work (input+output) varies 8×+. Before the fix, the detector measured the
+// near-constant total and called this a spin. It must NOT spin.
+const WORKING_LONG_CONTEXT = Array.from({ length: 25 }, (_, i) => {
+  const work = 500 + ((i * 7919) % 3800);          // genuinely varied new work: 500..4300
+  return req(work + 70000, '/v1/messages', new Date(Date.now() - (25 - i) * 45000), {}, work, 70000);
+});
+// A REAL poll loop: small near-constant new work (~400 tokens of "is it done?") over the same
+// cache. This is what the detector exists to catch.
+const REAL_POLL_LOOP = Array.from({ length: 25 }, (_, i) => {
+  const work = 420 + (i % 3) * 20;                 // ~420 tokens, near-constant
+  return req(work + 50000, '/v1/messages', new Date(Date.now() - (25 - i) * 30000), {}, work, 50000);
+});
 
 console.log('\n── A. the detector: repetition WITHOUT progress trips; diverse work does not ──');
 const cfg = DEFAULT_SPIN_CONFIG;
@@ -61,6 +87,17 @@ ok(spin.spinning === true && spin.reason === 'repetition-without-progress',
 const diverse = detectSpin({ requests: DIVERSE_ROWS, lastProgressAt: null, cfg });
 ok(diverse.spinning === false && diverse.reason === 'not-similar',
    `30 calls of genuinely diverse size → NOT a spin (max/min ${diverse.maxSizeRatio.toFixed(1)}) — a real turn's context grows`);
+
+// THE FALSE-POSITIVE REGRESSION (the bug this fix exists for): a WORKING long-context zee whose
+// total_tokens are dominated by a constant cached context must NOT be read as a spin. Its NEW
+// work (input+output) varies 8×+, which is the correct "not-similar" signal.
+const workingLong = detectSpin({ requests: WORKING_LONG_CONTEXT, lastProgressAt: null, cfg });
+ok(workingLong.spinning === false && workingLong.reason === 'not-similar',
+   `WORKING long-context zee (constant cache, varied new work) → NOT a spin (max/min ${workingLong.maxSizeRatio.toFixed(1)}) — the cache is a constant, the work is not`);
+// ...while a REAL poll loop with the same cached context but small near-constant new work MUST trip.
+const realPoll = detectSpin({ requests: REAL_POLL_LOOP, lastProgressAt: null, cfg });
+ok(realPoll.spinning === true,
+   `REAL poll loop over the same cache → SPIN (${realPoll.windowCalls} calls, max/min ${realPoll.maxSizeRatio.toFixed(2)}) — small repeated new work`);
 
 // Edge cases.
 const underFloor = detectSpin({ requests: SPIN_ROWS.slice(0, 19), cfg });
@@ -144,10 +181,16 @@ try {
   const mkTurn = async (zeeId, xellId, kind = 'spawn') => one(
     `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, status) VALUES ($1,$2,$3,$4,'started') RETURNING *`,
     [zeeId, xellId, PID, kind]);
-  const mkGatewayRow = async (turnId, total) => one(
-    `INSERT INTO llm_gateway_request (xell_id, zee_id, turn_id, project_id, kind, method, path, total_tokens)
-     VALUES ($1,$2,$3,$4,'messages','POST','/v1/messages',$5) RETURNING *`,
-    [undefined, undefined, turnId, PID, total]);
+  // A realistic gateway row: `work` is the call's NEW work (input+output — the metric the detector
+  // judges similarity on), `cache` the re-sent cached context that DOMINATES total_tokens. A poll
+  // loop keeps work small and near-constant; a working long-context zee varies work widely while its
+  // total_tokens barely moves (the cache is the constant). Splitting the columns is what lets the
+  // detector tell them apart — the old total_tokens-only similarity is the false-positive bug.
+  const mkGatewayRow = async (turnId, work, cache = 70000) => one(
+    `INSERT INTO llm_gateway_request
+       (xell_id, zee_id, turn_id, project_id, kind, method, path, input_tokens, output_tokens, cache_read_tokens, total_tokens)
+     VALUES ($1,$2,$3,$4,'messages','POST','/v1/messages',$5,$6,$7,$8) RETURNING *`,
+    [undefined, undefined, turnId, PID, Math.floor(work / 2), Math.ceil(work / 2), cache, work + cache]);
   const turnRow = (id) => one(`SELECT * FROM zee_turn WHERE id=$1`, [id]);
   const zeeRow = (id) => one(`SELECT * FROM zee WHERE id=$1`, [id]);
 

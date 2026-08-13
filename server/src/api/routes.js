@@ -427,7 +427,8 @@ router.get('/fleet/xells-stream', async (req, res) => {
 
 // Fleet burn: per-xell token + $ consumption and a project-cumulative total, summed across every
 // zee. Same 503-not-throw contract as /fleet (a read model must never take the queenzee down).
-// NB: FLEET-OWN consumption only — Anthropic's account-wide %/limits are NOT surfaced here.
+// Fleet-own zee burn + gateway by_provider + current rate-limit headers (lib/fleet.js getFleetBurn).
+// Account-wide Admin /usage still needs separate admin keys the fleet does not hold.
 router.get('/fleet/burn', async (req, res) => {
   try {
     const burn = await getFleetBurn(req.query.project || null);
