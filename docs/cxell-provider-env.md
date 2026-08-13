@@ -65,7 +65,7 @@ claude -p "…"                                    # the claude CLI aimed at Dee
 eval "$(zee creds --provider claude --export)"   # ANTHROPIC_AUTH_TOKEN (+ CLAUDE_CODE_OAUTH_TOKEN)
 claude -p "…"
 
-eval "$(zee creds --provider grok --export)"     # XAI_API_KEY
+eval "$(zee creds --provider grok --export)"     # XAI_API_KEY — or GROK_AUTH_JSON, see below
 grok -p "…"                                      # xAI's own CLI (Grok Build)
 ```
 
@@ -93,6 +93,25 @@ current key after a rotation.
 eval "$(zee creds --provider openai --export)"
 printenv OPENAI_API_KEY | codex login --with-api-key    # writes ~/.codex/auth.json — then `codex exec` sends the key
 ```
+
+**grok is the other exception, because xAI has TWO credential shapes.** A pay-as-you-go `xai-…` API
+key is read straight from `XAI_API_KEY` and needs no install. A **SuperGrok / Business seat** (the
+weekly pool, no prepaid credits) is obtained with `grok login --device-auth` — it prints a URL and a
+code to type into any browser, which works over SSH, and stores the session in `~/.grok/auth.json`.
+That file's CONTENTS are what you paste as the grok account credential in the console; a cage granted
+such an account exports `GROK_AUTH_JSON` (a carrier var the CLI does not read) plus the install note:
+
+```
+eval "$(zee creds --provider grok --export)"
+printenv GROK_AUTH_JSON | …                             # the exact one-liner is on stderr; it writes ~/.grok/auth.json
+```
+
+Two things follow, and both are deliberate. A seat cage gets **no `XAI_API_KEY` at all** — the key
+OVERRIDES the seat login, so carrying both would quietly spend prepaid credits while a human believes
+the subscription pool is being used. And the install **never clobbers a fresher session**: the CLI
+refreshes that file in place (a session expires in about a week), so the queenzee writes only when the
+credential it holds has a NEWER `create_time` than what the cage already has. When a session finally
+expires, the fix is a human's: run `grok login --device-auth` again and re-paste the file.
 
 An unknown/absent provider fails with a sentence naming what the cage does hold (read `ZEE_PROVIDERS`),
 and a token that is unmistakably another vendor's is refused with the same named sentence the spawn

@@ -660,6 +660,13 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 // account. The grok CLI (Grok Build) reads GROK_XAI_API_BASE_URL for its endpoint — EMPIRICALLY
 // verified on grok 0.2.118 (XAI_API_BASE_URL is ignored; GROK_XAI_API_BASE_URL redirects to a mock;
 // the CLI then speaks /responses, not /v1/messages).
+//
+// KNOWN GAP, stated rather than hidden: that redirect was measured on the API-KEY path
+// (api.x.ai/v1/responses). A cage authenticated with a SuperGrok / Business SEAT session — the
+// device-auth credential, see lib/cxell-runtimes.js grokSessionCredential — talks to the vendor's
+// own cli-chat-proxy.grok.com instead, so its turns are NOT observed to pass through this gateway
+// and may not be metered here. The seat is billed by the weekly pool rather than per call, so
+// nothing is spent unseen; what is missing is the RECORD. Measure it before claiming either way.
 export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
   if (config.gatewayPort === config.port) return {};
   const base = gatewayBaseUrl();
