@@ -197,6 +197,22 @@ if (!url) {
     const got = await getTask(manager, d.message.meta.a2a.taskId);
     eq(got.task.status, 'submitted', 'B6: the zee_message GetTask path is untouched (additive)');
 
+    // B7. EXTERNAL (zhk_ a2a) views of the conversation Tasks are id-scrubbed (DR-6): no xell
+    // uuids, no key material. The metadata.xell is a SLUG, never an internal id.
+    const { createProjectApiKey, authenticateApiKey } = await import('../server/src/lib/project-api-keys.js');
+    const { externalCaller } = await import('../server/src/lib/a2a-read.js');
+    const keyRow = await createProjectApiKey(projectId, { label: 'conv a2a', scopes: ['a2a'] });
+    const auth = await authenticateApiKey(keyRow.key, { scope: 'a2a' });
+    const ext = externalCaller(auth);
+    const extMem = await loadConversationTask(ext, memTask.id);
+    ok(!!extMem && extMem.metadata.xell === worker.slug, 'B7: an external caller sees the memory Task, and metadata.xell is the SLUG');
+    const extAll = await listTasks(ext);
+    const extText = JSON.stringify(extAll);
+    ok(!extText.includes(worker.id), 'B7: the external conversation views leak no xell uuid');
+    ok(!extText.includes(keyRow.key), 'B7: …and no key material');
+    ok(extAll.tasks.some((t) => t.id === archTaskId) && extAll.tasks.some((t) => t.id === turnTask.id),
+       'B7: an external caller sees its project\'s archive + turn Tasks');
+
     console.log(`    (project=zt-${tag}, archive=${up.conversation_id?.slice(0, 8)}…, mem=${memTask.id?.slice(0, 8)}…, turn=${turnTask.id?.slice(0, 8)}…)`);
   } finally {
     if (projectId) await q(`DELETE FROM project WHERE id=$1`, [projectId]).catch(() => {});
