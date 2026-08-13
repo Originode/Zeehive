@@ -20,6 +20,7 @@ export const PROVIDERS = {
     label: 'Claude',
     dispatch: true,   // a zee can run on this provider today
     command: 'claude setup-token',
+    placeholder: 'sk-ant-oat01-…',
     steps: 'Run the command in any terminal. Your browser opens — authorize, and the CLI prints a long-lived token (sk-ant-oat01-…). Paste it below; it is stored only in the meta-DB.',
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
     valid: (t) => /^sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}$/.test(t),
@@ -37,6 +38,7 @@ export const PROVIDERS = {
     label: 'ChatGPT Codex',
     dispatch: true,   // codex-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://platform.openai.com/api-keys',
+    placeholder: 'sk-proj-… / sk-…',
     steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Codex CLI inside their cxell.',
     valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
@@ -49,6 +51,7 @@ export const PROVIDERS = {
     label: 'Kimi Code',
     dispatch: true,   // kimi-code-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://kimi.com/code/console',
+    placeholder: 'the coding key from the Kimi Code console',
     steps: 'Create a dedicated CODING key in the Kimi Code console (not a Moonshot platform key) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Kimi Code CLI inside their cxell.',
     valid: (t) => /^[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
@@ -60,6 +63,7 @@ export const PROVIDERS = {
     label: 'DeepSeek',
     dispatch: true,   // deepseek-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://platform.deepseek.com/api_keys',
+    placeholder: 'sk-…',
     steps: 'Create an API key on the DeepSeek platform (sk-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the claude CLI against DeepSeek’s Anthropic-compatible endpoint.',
     // sk-<alnum tail>; sk-ant-… is explicitly rejected so a Claude token in the wrong slot fails loudly
     valid: (t) => /^sk-[A-Za-z0-9]{20,}$/.test(t) && !/^sk-ant-/.test(t),
@@ -79,6 +83,7 @@ export const PROVIDERS = {
     label: 'Grok Build',
     dispatch: true,   // grok-cxell runtime (lib/cxell-runtimes.js)
     command: 'grok login --device-auth && cat ~/.grok/auth.json',
+    placeholder: '{"https://accounts.x.ai/sign-in":{…}}  — or xai-… for an API key',
     steps: 'For a SuperGrok / Business seat (no prepaid API credits): run the command on any machine that has the grok CLI — it prints a URL and a code to enter in any browser — then paste the ~/.grok/auth.json it prints below. For pay-as-you-go instead, create an API key at https://console.x.ai (xai-…) and paste that. Either way it is stored only in the meta-DB, and dispatched zees run the Grok Build CLI inside their cxell.',
     // an xai-… API key, OR a device-auth session (the auth.json object — shape measured in
     // lib/cxell-runtimes.js, which owns the predicate because the adapter branches on it too)
@@ -115,6 +120,7 @@ export const PROVIDERS = {
     key: 'github',
     label: 'GitHub',
     command: 'GitHub → Settings → Developer settings → Fine-grained tokens',
+    placeholder: 'github_pat_… / ghp_…',
     steps: 'Create a fine-grained personal access token scoped to this repo. Contents: READ-ONLY keeps Zeehive fetch-only (the safe default). Grant Contents: WRITE (plus Pull requests: write for PRs) and Project setup gains a human-confirmed Push / open-PR button. Paste it below; it is stored only in the meta-DB.',
     // classic ghp_…, fine-grained github_pat_…, or an OAuth/device token gho_/ghu_/ghs_ (what
     // `gh auth token` and git-credential-manager hold — a proven-working fallback when an org's
@@ -231,6 +237,7 @@ export async function listProviderTokens(projectId) {
     const pausedCount = accounts.filter((a) => a.paused).length;
     return {
       provider: p.key, label: p.label, command: p.command, steps: p.steps,
+      placeholder: p.placeholder || null,   // the SHAPE to paste — console copy, so it stays here
       dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
       connected: accounts.length > 0,
       accounts,
@@ -578,7 +585,13 @@ export function providerRunEnvFromAccount({ provider, token, label = null, hint 
     // The account's token is passed so an adapter that installs only SOME credential shapes can
     // say "nothing to install" for the others (grok: an API key is env-only, a seat session is a
     // file). The spawn path calls it with no token and gets the command that handles both.
-    auth_setup: (() => { const cmd = adapter.authSetupCmd?.({ token: t }); return cmd ? { required: true, command: cmd } : null; })(),
+    // `file` is the vendor's own proof that the install happened (relative to $HOME) — declared by
+    // the adapter, so the CLI can refuse to exit 0 on an un-installed cage without knowing a single
+    // vendor path itself.
+    auth_setup: (() => {
+      const cmd = adapter.authSetupCmd?.({ token: t });
+      return cmd ? { required: true, command: cmd, file: adapter.authFile || null } : null;
+    })(),
   };
 }
 

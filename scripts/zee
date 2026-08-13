@@ -734,18 +734,18 @@ switch (cmd) {
           console.error('  environment alone — install it once in this cage before running it (idempotent, prints AUTH_OK):');
           console.error(`    ${auth.command}`);
           // FAIL NON-ZERO until the in-cage auth install has been done: a hasty zee must not read
-          // exit 0 and walk into a silent 401. The structural check is whether the vendor's auth
-          // file exists (codex writes ~/.codex/auth.json on `codex login --with-api-key`); the key
-          // itself is never read here.
-          const authFile = auth.required && (r.json.bin || r.json.provider) === 'codex'
-            ? join(os.homedir(), '.codex', 'auth.json') : null;
+          // exit 0 and walk into a silent 401. The structural check is whether the VENDOR'S OWN auth
+          // file exists, and WHICH file that is comes from the server (the runtime adapter's
+          // `authFile` — codex writes ~/.codex/auth.json, a grok seat session lands in
+          // ~/.grok/auth.json). No vendor path is hard-coded here; the key itself is never read.
+          const authFile = auth.file ? join(os.homedir(), ...String(auth.file).split('/')) : null;
           let authFileOk = true;
           if (authFile && !envVar('SKIP_AUTH_CHECK')) {
             try { authFileOk = existsSync(authFile); } catch { authFileOk = false; }
           }
           if (!authFileOk) {
-            console.error('\n  ✗ the in-cage auth install has NOT been done — `codex exec` will 401.');
-            console.error('    Run the command above once, then re-run `zee creds --provider openai --export`.');
+            console.error(`\n  ✗ the in-cage auth install has NOT been done — ${r.json.bin || r.json.provider} will not authenticate.`);
+            console.error(`    Run the command above once, then re-run \`zee creds --provider ${want} --export\`.`);
             process.exit(1);
           }
         }

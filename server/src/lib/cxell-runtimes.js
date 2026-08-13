@@ -269,6 +269,10 @@ const ADAPTERS = {
     // of this file. This is the vendor's own door: the key is piped in from the env the exec already
     // carries (never on the command line), and codex writes ~/.codex/auth.json. Idempotent — it just
     // rewrites that file, which is what makes a rotated key take effect on the next resume.
+    // The file that PROVES the install happened, relative to $HOME — declared here so nothing
+    // outside the adapters has to know a vendor's path (`zee creds --export` fails non-zero until
+    // it exists, rather than letting a zee eval the env and walk into a silent 401).
+    authFile: '.codex/auth.json',
     authSetupCmd: () =>
       'if out=$(printenv OPENAI_API_KEY | codex login --with-api-key 2>&1); then echo AUTH_OK; '
       // never let a key reach a log, even on the vendor's own error path
@@ -456,6 +460,7 @@ const ADAPTERS = {
     // copy — possibly with an already-spent refresh token — over the live one. The rule is
     // create_time: install only when the credential the queenzee holds is NEWER than what the cage
     // already has, which installs a human's re-login and leaves the CLI's own refresh alone.
+    authFile: '.grok/auth.json',   // what a device-auth login writes (GROK_HOME moves it)
     authSetupCmd: ({ token } = {}) => {
       if (token && !grokSessionCredential(token)) return null;   // an API key: the env IS the login
       return 'if [ -n "${GROK_AUTH_JSON:-}" ]; then '

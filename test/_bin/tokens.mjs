@@ -40,4 +40,13 @@ export const fakeTokens = {
   // satisfies our `gh[opus]_` shape (20+) and can never trip the vendor scanner's fixed-length 36.
   githubClassic: () => `ghp_${seed(24)}`,
   grok: () => `xai-${seed(28)}`,                 // xai-<alnum>; ours wants ≥20
+  // grok's OTHER shape: the ~/.grok/auth.json a `grok login --device-auth` writes for a SuperGrok /
+  // Business seat. Keyed by auth SCOPE, and every entry carries key + auth_mode + create_time +
+  // user_id (the CLI's serde names each missing field in turn). Built at runtime like the rest, and
+  // the key is a plain alnum run — a seat session has no vendor prefix for a scanner to match.
+  grokSession: ({ createTime = '2026-08-01T00:00:00Z' } = {}) => JSON.stringify({
+    'https://accounts.x.ai/sign-in': {
+      key: seed(40), auth_mode: 'web_login', create_time: createTime, user_id: `u-${seed(8)}`,
+    },
+  }),
 };
