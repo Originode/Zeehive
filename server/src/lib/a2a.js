@@ -301,8 +301,10 @@ export function archiveRowToTask(archive = {}) {
 // zee_conversation (192) → A2A Task. `rows` are the xell's memory rows in seq order (role,
 // content, name). One Task per xell — deterministic id from the xell id (the durable work unit,
 // DR-4/DR-8). status = 'working' — the memory is the state its next turn reads, not a finished
-// task. role system/tool map to user; assistant → agent.
-export function memoryRowsToTask({ xellId = null, rows = [] } = {}) {
+// task. role system/tool map to user; assistant → agent. `xellSlug` (when the caller has it) is
+// what metadata.xell carries — a slug is a public name, a uuid is internal (DR-6: external views
+// are id-scrubbed).
+export function memoryRowsToTask({ xellId = null, rows = [], xellSlug = null } = {}) {
   if (!xellId) return null;
   const id = conversationTaskId('zee_conversation', xellId);
   const history = rows.map((r) => conversationEventToMessage({
@@ -313,7 +315,7 @@ export function memoryRowsToTask({ xellId = null, rows = [] } = {}) {
     id,
     status: 'working',
     metadata: {
-      store: 'zee_conversation', kind: 'working-memory', xell: xellId,
+      store: 'zee_conversation', kind: 'working-memory', xell: xellSlug || xellId,
       note: 'the live xell\'s stateful working memory — one Task per xell, rows in seq order; '
         + 'status stays working (it is the state the next turn reads, not a finished task)',
     },
@@ -334,7 +336,7 @@ export function turnRowToTask(turn = {}) {
     id,
     status: ended ? 'completed' : 'working',
     metadata: {
-      store: 'zee_turn', kind: 'turn', xell: turn.xell_id || null,
+      store: 'zee_turn', kind: 'turn', xell: turn.xell_slug || turn.xell_id || null,
       kind_name: turn.kind || null, model: turn.model || null,
       started_at: turn.started_at ? String(turn.started_at) : null,
       ended_at: turn.ended_at ? String(turn.ended_at) : null,

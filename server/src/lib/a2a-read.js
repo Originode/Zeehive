@@ -174,16 +174,20 @@ export async function loadConversationTask(caller, taskId, { visible = null } = 
     if (conversationTaskId('xell_conversation', a.id) === taskId) return archiveRowToTask(a);
   }
   // zee_conversation — natural key is the XELL id, so the deterministic task id is v5("zee_conversation", xell_id).
-  const mems = await q(`SELECT DISTINCT xell_id FROM zee_conversation WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+  const mems = await q(
+    `SELECT DISTINCT zc.xell_id, x.slug AS xell_slug
+       FROM zee_conversation zc LEFT JOIN xell x ON x.id = zc.xell_id
+      WHERE zc.xell_id = ANY($1::uuid[])`, [xellIds]);
   for (const m of mems) {
     if (conversationTaskId('zee_conversation', m.xell_id) === taskId) {
       const rows = await q(
         `SELECT role, content, name, created_at FROM zee_conversation WHERE xell_id=$1 ORDER BY seq ASC`, [m.xell_id]);
-      return memoryRowsToTask({ xellId: m.xell_id, rows });
+      return memoryRowsToTask({ xellId: m.xell_id, rows, xellSlug: m.xell_slug });
     }
   }
   const turns = await q(
-    `SELECT * FROM zee_turn WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+    `SELECT t.*, x.slug AS xell_slug FROM zee_turn t LEFT JOIN xell x ON x.id = t.xell_id
+      WHERE t.xell_id = ANY($1::uuid[])`, [xellIds]);
   for (const t of turns) {
     if (conversationTaskId('zee_turn', t.id) === taskId) return turnRowToTask(t);
   }
@@ -203,16 +207,19 @@ export async function loadConversationTasks(caller, { visible = null, limit = 50
   for (const a of archs) { const t = archiveRowToTask(a); if (t) out.push(t); }
   // Working memories — one per visible xell (only when it has rows).
   const mems = await q(
-    `SELECT DISTINCT xell_id FROM zee_conversation WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+    `SELECT DISTINCT zc.xell_id, x.slug AS xell_slug
+       FROM zee_conversation zc LEFT JOIN xell x ON x.id = zc.xell_id
+      WHERE zc.xell_id = ANY($1::uuid[])`, [xellIds]);
   for (const m of mems) {
     const rows = await q(
       `SELECT role, content, name, created_at FROM zee_conversation WHERE xell_id=$1 ORDER BY seq ASC`, [m.xell_id]);
-    const t = memoryRowsToTask({ xellId: m.xell_id, rows });
+    const t = memoryRowsToTask({ xellId: m.xell_id, rows, xellSlug: m.xell_slug });
     if (t) out.push(t);
   }
   // Turns of the caller's visible xells.
   const turns = await q(
-    `SELECT * FROM zee_turn WHERE xell_id = ANY($1::uuid[]) ORDER BY started_at DESC LIMIT $2`,
+    `SELECT t.*, x.slug AS xell_slug FROM zee_turn t LEFT JOIN xell x ON x.id = t.xell_id
+      WHERE t.xell_id = ANY($1::uuid[]) ORDER BY t.started_at DESC LIMIT $2`,
     [xellIds, Math.min(Math.max(Number(limit) || 50, 1), 500)]);
   for (const t of turns) { const tt = turnRowToTask(t); if (tt) out.push(tt); }
   return out.slice(0, Math.min(Number(limit) || 50, 500));
