@@ -22,7 +22,8 @@ import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { computePorts } from './provision.js';
+import { computePorts, sameDatabase } from './provision.js';
+import { dbIdentity } from './projects.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
@@ -588,6 +589,26 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
     mode = 'db-shared-dev';
     target = await sharedDb(project.id, 'dev');
     if (!target) throw new Error('no dev db container registered for this project');
+  }
+
+  // §6.2 AT ATTACH TIME, not just at EMIT time. When ZEEHIVE orchestrates ITSELF, the project's
+  // prod db row IS the managing instance's own meta-DB (conn_ref postgres://…@meta-db:5432/zeehive).
+  // The env projection (§6.2 guard in provision.writeXellEnv) refuses to emit that DSN for a
+  // WRITABLE bind — but by then the xell is already coupled to prod with no DATABASE_URL, the
+  // reconcile fails every boot, and the zee is stuck in an env-alert with nothing it can do.
+  // A worker must never hold the orchestrator's own meta-DB writable; only the manager's
+  // db-prod-readonly binding (a minted SELECT-only role) legitimately points at it. So REFUSE the
+  // attach here, with the same reason the §6.2 guard gives — a clear error beats a broken xell.
+  if (mode === 'db-shared-prod') {
+    const dbid = await dbIdentity(xell.project_id);
+    const targetDsn = target?.conn_ref || derivedTcpDsn(target, dbid);
+    if (targetDsn && sameDatabase(targetDsn, config.databaseUrl)) {
+      throw new Error(`REFUSING to bind ${xell.slug} to production: this project's production database `
+        + `IS the managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}). `
+        + 'A writable xell on the orchestrator\'s own database would let a nested queenzee reap live '
+        + 'xells. Use db-isolated (own db from the latest prod dump), db-clone, or db-shared-dev — '
+        + 'or dispatch the xell as a MANAGER (db-prod-readonly) if reading production read-only is the job.');
+    }
   }
 
   // Re-point: drop the xell's existing db links, then attach the chosen one.
