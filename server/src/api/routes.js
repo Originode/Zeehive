@@ -1538,10 +1538,38 @@ router.post('/xells/:id/nudge', async (req, res) => {
 // files under its .zee-inbox and a pointer is typed into the live session; short text is typed inline.
 // Body: { text, images: [{ name, type, data }], by }. `images` is a legacy name — it carries any file
 // attachment. Returns { sent, attachments?, reason?/error? }.
+//
+// The 📨 window and 💬 talk deliver into the zee's session but used to write NO durable record — the
+// console's conversation view (GET /xells/:id/messages) reads zee_message, so a sent operator
+// message vanished from the audit: the human saw "Sent" and then nothing anywhere as received. So
+// record it here the same way a router's routing request is recorded (lib/router.js): one zee_message
+// row, its id handed to sendMessageToXell so the existing delivery-correction machinery works, then
+// stamp delivered from the actual verdict. The same guard as router.js/managers.js — a correction
+// written by messageUndelivered (the resume died) is never clobbered by this later stamp.
 router.post('/xells/:id/message', async (req, res) => {
-  try { res.json(await sendMessageToXell(req.params.id, {
-    text: req.body?.text || '', attachments: req.body?.images || [], by: req.body?.by || 'human@console' })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try {
+    const xellId = req.params.id;
+    const by = req.body?.by || 'human@console';
+    const text = String(req.body?.text || '').trim();
+    const attachments = Array.isArray(req.body?.images) ? req.body.images : [];
+    if (!text && !attachments.length) {
+      return res.json({ sent: false, delivery: 'none', reason: 'empty message (no text or attachments)' });
+    }
+    const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
+    if (!xell) return res.status(404).json({ error: 'no such xell' });
+    const [row] = await q(
+      `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+       VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
+      [xell.project_id, by, xellId, xell.slug,
+       text || `(${attachments.length} file attachment${attachments.length === 1 ? '' : 's'})`,
+       JSON.stringify({ by, operator: true, attachments: attachments.length })]);
+    const delivery = await sendMessageToXell(xellId, { text, attachments, by, messageId: row.id });
+    await q(
+      `UPDATE zee_message SET delivered=$2, delivery=$3::jsonb
+        WHERE id=$1 AND NOT COALESCE((delivery->>'undelivered')::boolean, false)`,
+      [row.id, !!delivery.sent, JSON.stringify(delivery)]);
+    res.json(delivery);
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // Accepting happens on the XOURCE's card — the side being asked to take the code.

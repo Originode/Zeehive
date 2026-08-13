@@ -20,6 +20,7 @@ const msg = read('../web/src/MessageComposer.jsx');
 const disp = read('../web/src/Dispatch.jsx');
 const zt = read('../web/src/ZeeTerminal.jsx');
 const app = read('../web/src/App.jsx');
+const routes = read('../server/src/api/routes.js');
 const nudge = read('../server/src/queenzee/nudge.js');
 const intake = read('../server/src/queenzee/intake.js');
 const css = read('../web/src/styles.css');
@@ -55,6 +56,16 @@ ok(nudge.includes(".replace(/^\\.+/, '')"),
 ok(/saveDispatchAttachments\(/.test(intake), 'intake.js renamed saveDispatchImages → saveDispatchAttachments');
 ok(/## Attached files/.test(intake), 'the prompt block says Attached files');
 ok(!/## Attached images/.test(intake), '…not Attached images');
+
+console.log('\n── a sent operator message becomes a DURABLE record (shows in the console conversation) ──');
+const msgRoute = routes.slice(routes.indexOf("router.post('/xells/:id/message'"),
+                              routes.indexOf("// Accepting happens on the XOURCE's card"));
+ok(/INSERT INTO zee_message/.test(msgRoute),
+   'the 📨/talk route records the operator message in zee_message — the console conversation view reads it');
+ok(/messageId: row\.id/.test(msgRoute) && /sendMessageToXell\(/.test(msgRoute),
+   '…and hands the row id to sendMessageToXell so delivery is tracked and corrected');
+ok(/UPDATE zee_message SET delivered=\$2/.test(msgRoute),
+   '…then stamps delivered from the actual delivery verdict');
 
 console.log('\n── the composer is ONE full-viewport box from every door ──');
 ok(/createPortal\(/.test(msg) && /document\.body/.test(msg),
