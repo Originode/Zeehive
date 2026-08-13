@@ -264,8 +264,12 @@ export function conversationEventToMessage({ store, role = null, content = null,
     }
   }
   if (!text) return null;
+  // messageId is a DETERMINISTIC v5 of (store, role, text) so the same row always projects to
+  // the same Message id (DR-3: the projection must be stable — a client that cited a Message id
+  // must get the same id back on every read). The text is truncated to keep the sha1 input sane.
+  const messageId = uuidv5Name(`${store}:msg:${kind || role}:${String(text).slice(0, 200)}`, CONVERSATION_NS);
   const m = {
-    messageId: `${store}-${kind || role}-${Math.random().toString(36).slice(2, 10)}`,
+    messageId,
     role: role === 'assistant' || role === 'agent' ? 'agent' : 'user',
     parts: [{ text: String(text).slice(0, 4000) }],
   };
