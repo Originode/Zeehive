@@ -4,6 +4,23 @@ import { createPortal } from 'react-dom';
 import { getDispatchOptions, getHarnesses, getRouterStatus } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
 import ZeeAvatar from './ZeeAvatar.jsx';
+import { availableForModel, formatLimitChip } from './usageLimits.js';
+
+// Limit chip for a model button: prefer the SELECTED account's snapshot (model-aware), else the
+// server-attached per-model available_pct from dispatch options (provider-wide account fallback).
+function modelLimitLabel(provider, modelKey, modelRow, account) {
+  if (account?.usage_limit) {
+    return formatLimitChip(availableForModel(account.usage_limit, { provider, model: modelKey }));
+  }
+  if (modelRow?.available_pct != null) {
+    return formatLimitChip({
+      available_pct: modelRow.available_pct,
+      window: modelRow.limit_window,
+      source: modelRow.limit_source,
+    });
+  }
+  return '';
+}
 
 // Same ceiling as the 📨 MessageComposer: pasted files ride the dispatch JSON body as base64 data
 // URLs, and base64 inflates ~33% — so keep the total file payload well under the server's 30mb
@@ -857,17 +874,23 @@ export default function Dispatch({ projectId, projectName,
                                 data-testid="custom-model-router"
                                 title="Leave the model to the router (the persona's policy resolves it)."
                                 onClick={() => setCModel(null)}>router decides</button>
-                        {cModels.map((m) => (
+                        {cModels.map((m) => {
+                          const lim = modelLimitLabel(cProv, m.key, m,
+                            cAcctId ? cAccounts.find((a) => a.id === cAcctId) : cAccounts[0]);
+                          return (
                           <button key={m.key} className={`disp-seg ${cModel === m.key ? 'on' : ''}`}
                                   data-testid={`custom-model-${m.key}`}
                                   title={[m.note || m.label,
+                                          lim || null,
                                           m.context_window ? `context ${Number(m.context_window).toLocaleString()} tokens` : null,
                                           m.parameters ? `${m.parameters}B parameters` : null,
                                           m.priority > 1 ? `deployment priority ${m.priority}` : null].filter(Boolean).join(' · ')}
                                   onClick={() => setCModel(m.key)}>
                             {m.label}{m.key === cActive?.default_model ? ' ·default' : ''}
+                            {lim ? <span className="disp-limit" data-testid={`model-limit-${m.key}`}> · {lim}</span> : null}
                           </button>
-                        ))}
+                          );
+                        })}
                         {!cModels.length && (
                           <span className="disp-hint" data-testid="custom-no-models">
                             this persona's model policy allows no model on {cActive?.label || 'this provider'}
@@ -992,15 +1015,24 @@ export default function Dispatch({ projectId, projectName,
               <div className="disp-field">
                 <label className="disp-label">Account</label>
                 <div className="disp-models" role="group" aria-label="AI account">
-                  {accounts.map((a) => (
+                  {accounts.map((a) => {
+                    const aLim = a.available_pct != null
+                      ? formatLimitChip({ available_pct: a.available_pct, source: 'provider' })
+                      : formatLimitChip(availableForModel(a.usage_limit, { provider: active?.provider }));
+                    return (
                     <button key={a.id} className={`disp-seg ${acct?.id === a.id ? 'on' : ''}`}
                             data-testid={`dispatch-account-${a.id}`}
-                            title={`Run this zee on ${a.name} (${active?.label}) — its own CLI inside the cxell`}
+                            title={`Run this zee on ${a.name} (${active?.label}) — its own CLI inside the cxell`
+                              + (aLim ? `\n${aLim} remaining on this account` : '')}
                             onClick={() => setAcctId(a.id)}>
-                      <ZeeAvatar provider={active?.provider} size={18} />
+                      <ZeeAvatar provider={active?.provider} size={18}
+                                 availablePct={a.available_pct
+                                   ?? availableForModel(a.usage_limit, { provider: active?.provider }).available_pct} />
                       {a.name}
+                      {aLim ? <span className="disp-limit"> · {aLim}</span> : null}
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1032,17 +1064,23 @@ export default function Dispatch({ projectId, projectName,
             <div className="disp-field">
               <label className="disp-label">Model</label>
               <div className="disp-models" role="group" aria-label="Model">
-                {models.map((m) => (
+                {models.map((m) => {
+                  const lim = modelLimitLabel(active?.provider || prov, m.key, m, acct);
+                  return (
                   <button key={m.key} className={`disp-seg ${model === m.key ? 'on' : ''}`}
                           data-testid={`dispatch-model-${m.key}`}
                           title={[m.note || m.label,
+                                  lim || null,
+                                  lim ? 'remaining usage limit for this model on the selected account' : null,
                                   m.context_window ? `context ${Number(m.context_window).toLocaleString()} tokens` : null,
                                   m.parameters ? `${m.parameters}B parameters` : null,
                                   m.priority > 1 ? `deployment priority ${m.priority}` : null].filter(Boolean).join(' · ')}
                           onClick={() => setModel(m.key)}>
                     {m.label}{(active ? m.key === active.default_model : m.default) ? ' ·default' : ''}
+                    {lim ? <span className="disp-limit" data-testid={`model-limit-${m.key}`}> · {lim}</span> : null}
                   </button>
-                ))}
+                  );
+                })}
                 {!models.length && (
                   <span className="disp-hint" data-testid="dispatch-no-models">
                     this persona's model policy allows no model on {active?.label || 'this provider'}

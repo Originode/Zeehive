@@ -1540,6 +1540,8 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-seg b { color: var(--text); font-weight: 700; }
 /* a segment that carries a provider coin lays it out beside its words */
 .disp-seg:has(.zav) { display: inline-flex; align-items: center; gap: 6px; }
+/* Remaining usage limit next to a model/account segment in the prompt window. */
+.disp-limit { color: var(--ok, #3d9a5f); font-size: 11px; font-family: 'Cascadia Code', monospace; opacity: 0.95; }
 .disp-seg:hover { border-color: var(--accent); }
 .disp-seg.on { border-color: var(--accent); color: var(--text); background: rgba(91,140,255,.14); }
 .disp-hint { color: var(--muted); font-size: 11px; max-width: 320px; }
@@ -3134,6 +3136,16 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   display: grid; place-items: center; border: 1.5px solid var(--line); z-index: 1; }
 .zav-coin img { width: 76%; height: 76%; object-fit: contain; display: block; user-select: none; }
 .zav-mono { font-size: calc(var(--zav-size, 26px) * 0.22); line-height: 1; color: var(--text); }
+/* HP bar across the middle of the provider coin: green = remaining limit, red = used.
+   Clipped by the coin's border-radius so it reads as a slice through the badge. */
+.zav-hp {
+  position: absolute; left: 0; right: 0; top: 50%; height: 18%;
+  transform: translateY(-50%); display: flex; flex-direction: row;
+  pointer-events: none; z-index: 2;
+  box-shadow: 0 0 0 0.5px rgba(0,0,0,.35);
+}
+.zav-hp-used { background: rgba(196, 68, 68, 0.92); height: 100%; flex: none; }
+.zav-hp-free { background: rgba(61, 154, 95, 0.92); height: 100%; flex: 1 1 auto; }
 /* the costume: unit-space SVG over the whole box — behind the coin (wings) and in front of it
    (the tool on the belt, the glasses on the face). pointer-events off: it is paint, not a target. */
 .zav-gear { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible;

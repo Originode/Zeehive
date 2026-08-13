@@ -147,25 +147,7 @@ function providerBurnTitle(p) {
     + ` · cache R ${fmtTok(p.cache_read)} · W ${fmtTok(p.cache_write)}`;
 }
 
-// Tooltip for the PROVIDER LIMITS chip — remaining quota per account (not per-xell, not spend).
-function providerLimitsTitle(limits) {
-  const lines = ['How much of each provider account\'s usage limit is still AVAILABLE.',
-    'Source: the provider\'s own response headers (Claude 5h/7d seat windows, API TPM/RPM).'];
-  for (const p of limits || []) {
-    for (const a of p.accounts || []) {
-      if (a.available_pct == null && !a.usage_limit) continue;
-      const name = a.label || a.token_hint || a.id?.slice?.(0, 8) || 'account';
-      const rl = a.usage_limit || {};
-      const win = rl.windows || {};
-      const parts = [`${p.provider} · ${name}: ${a.available_pct != null ? `${a.available_pct}% free` : 'no snapshot yet'}`];
-      if (win['5h']?.available_pct != null) parts.push(`5h ${win['5h'].available_pct}%`);
-      if (win['7d']?.available_pct != null) parts.push(`7d ${win['7d'].available_pct}%`);
-      if (a.usage_limit_at) parts.push(`as of ${new Date(a.usage_limit_at).toLocaleString()}`);
-      lines.push(parts.join(' · '));
-    }
-  }
-  return lines.join('\n');
-}
+
 
 
 // Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
@@ -1280,28 +1262,6 @@ export default function App() {
                 ))}
               </span>
             )}
-          </span>
-        )}
-        {/* PROVIDER LIMITS — how much of each connected provider account's quota is STILL AVAILABLE.
-            Account-grained (provider_token.usage_limit), never per-xell. Source: gateway-captured
-            response headers (Claude 5h/7d seat windows + API TPM/RPM). Empty until a call has
-            crossed the gateway for that account. */}
-        {(fleet.provider_limits || []).some((p) => p.available_pct != null) && (
-          <span className="providerlimits" data-testid="provider-limits"
-                title={providerLimitsTitle(fleet.provider_limits)}>
-            {' · '}limits:
-            {(fleet.provider_limits || []).filter((p) => p.available_pct != null).map((p) => {
-              const pct = p.available_pct;
-              const tight = pct != null && pct < 20;
-              const warn = pct != null && pct < 40;
-              return (
-                <span key={p.provider} className={`providerlimits-prov${tight ? ' is-tight' : warn ? ' is-warn' : ''}`}
-                      data-provider={p.provider} data-testid={`provider-limit-${p.provider}`}>
-                  {' '}<span className="providerlimits-name">{p.provider}</span>
-                  {' '}<b>{pct}% free</b>
-                </span>
-              );
-            })}
           </span>
         )}
         {/* The prewarmed-pool knob, right here in the status line so it never hides in project
