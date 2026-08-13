@@ -236,12 +236,15 @@ export async function getTask(caller, taskId, { visible = null } = {}) {
 
 // ListTasks — returns { tasks }, filtered to the caller's visibility (plan §3.2). The extension
 // (DR-8) adds the caller's conversation Tasks (archives, working memories, turns) after the
-// zee_message Tasks — the whole conversation set in one read.
+// zee_message Tasks — the whole conversation set in one read. zee_message Tasks always come
+// first (the plan's §3.2 order); the conversation Tasks follow. The limit caps the combined list.
 export async function listTasks(caller, { visible = null, limit = 50 } = {}) {
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 500);
   const vis = visible || await taskVisibleXellIds(caller);
   const tasks = await loadTasks(vis);
-  const conv = await loadConversationTasks(caller, { visible: vis, limit });
-  return { tasks: [...tasks, ...conv].slice(0, Math.min(Math.max(Number(limit) || 50, 1), 500)) };
+  if (tasks.length >= lim) return { tasks: tasks.slice(0, lim) };
+  const conv = await loadConversationTasks(caller, { visible: vis, limit: lim - tasks.length });
+  return { tasks: [...tasks, ...conv].slice(0, lim) };
 }
 
 // SubscribeToTask — the read half: return the current Task snapshot (the stream itself is the

@@ -253,3 +253,101 @@ someone will be tempted to skip to it. This record is the answer to that someone
 **What would change our mind about the ordering.** A concrete external integration deadline —
 in which case the compression happens by overlapping P2/P3, never by skipping P1's envelope
 (ids minted wrong are the mistake that cannot be unminted; see DR-4).
+
+---
+
+## DR-8 — What "all zee conversations" means, and how the other stores join the projection
+
+**Date:** 2026-08-13
+**Status:** SUPERSEDES nothing; extends DR-1's scope boundary. The directive follow-on is the
+human's *"i want all zee conversations in a2a"*; DR-1 scoped A2A to the `zee_message` plane.
+
+**Decision.** "All zee conversations" = every store that is a CONVERSATION (an agent's language
+with someone — a manager, a human, a model, itself) gets an A2A Task. Concretely, four stores
+exist beside `zee_message`; three join the projection and one deliberately stays out:
+
+| store | what it is | A2A status |
+|---|---|---|
+| `xell_conversation` (migration 112) | a finished xell's ARCHIVED session transcript | **IN** — one Task per archive row; the parsed transcript events become the Task's history; status `completed` (the archive is a receipt) |
+| `zee_conversation` (migration 192) | a live xell's STATEFUL WORKING MEMORY (the langchain driver) | **IN** — one Task per xell; its rows in seq order become the history; status `working` (the memory is the state its next turn reads, not a finished task) |
+| `zee_turn` (migration 153) | the per-turn OBSERVABILITY LEDGER | **IN** — one Task per turn; the summary (last assistant text) is the single message; status `completed` when the turn ended, `working` while open |
+| `session_event` | the append-only CONTROL-PLANE event log (tend/hints/refusals/play-by-play feed) | **OUT** — it is not a conversation; it is the hook/event log. The zee_turn Task already surfaces its turn's evidence via metadata. |
+
+**Why the boundary (the options considered).**
+
+- **A · The three-in, one-out reading above** *(chosen)*. For: it answers the human's ask with the
+  stores that are actually conversations — an archive of what a zee said, a memory of what it
+  knows, a record of a turn it ran. `session_event` is the odd one: a row `{hook_event_name:
+  'tend-request', raw: …}` is not speech, and wrapping the whole append-only log (1,815 rows
+  and growing, feed events included) in A2A Tasks would misdescribe control-plane noise as agent
+  conversation — the same category error DR-1 already names for C4. The zee_turn Task's metadata
+  is the seam: it can name its turn_id, and a future record can widen `session_event` in.
+- **B · Literal maximalism — every store row as a Task, `session_event` included.** For: "all"
+  taken literally. Rejected for the category-error reason above, and because a feed event is a
+  telemetry byproduct, not a counterparty exchange — a conforming A2A client has nothing to say
+  to it. `session_eventToTask` is the named stub so the exclusion is a decision, not an absence.
+- **C · Extend only `xell_conversation` (the archives), leave the memory/ledger out.** For:
+  smallest build; archives are the obvious "conversation". Rejected because the human's words are
+  "all", and the working memory is exactly the conversation a live zee is having with itself
+  across turns — the A2A Task is the one place a peer can see it without a database grant.
+
+**Identity — deterministic v5, minted at READ time, never stored (DR-3/DR-4).** Each conversation
+Task's id is `uuid v5(namespace, "store:naturalKey")`: `xell_conversation:<archive row id>`,
+`zee_conversation:<xell id>` (the durable work unit — a swap keeps the same memory Task, exactly
+the DR-4 seat-identity rule), `zee_turn:<turn row id>`. The v5 is computed on read; nothing is
+written to any store; the same row always projects to the same id. This is the additive,
+no-backfill-compatible reading of DR-3: pre-A2A history is served as Tasks without inventing a
+mutable id vocabulary on the wire. A reverse lookup (GetTask by v5 id) scans the caller's visible
+stores and recomputes — acceptable at fleet volume (the 520-row zee_message seq-scan precedent,
+plan §6).
+
+**Compatibility.** Every existing zee_message path is untouched; `listTasks` puts the zee_message
+Tasks first and appends the conversation Tasks. Old rows stay exactly as they were. The router
+intake (C3) now stamps the envelope too — see the audit findings below.
+
+**Consequences.** Easy: a peer can address a whole xell's conversation set — its archives, its
+working memory, its turns — by deterministic id. Hard: a reverse lookup is a scan (no index on a
+derived id — a second store would fix it, and DR-3's no-second-store rule is why we do not);
+the task-state mapping for these stores is a small fixed table (completed/working), not the
+derived §3.3 engine. Impossible: a peer cannot distinguish two memories of the same xell (one per
+xell by design — the memory IS the xell's), and `session_event` rows are not individually
+addressable.
+
+**Reversibility.** Fully — the read side can stop serving conversation Tasks with a one-line
+change; the deterministic ids cost nothing to stop minting (they are derived, never stored).
+
+**What would change our mind.** `session_event` growing a genuine conversational shape (an agent
+message that is not also a zee_message row); or an integrator needing per-feed-event Tasks.
+
+---
+
+## AUDIT FINDINGS (2026-08-13) — the A2A implementation vs the plan and this record
+
+The four A2A test suites (`test/a2a-envelope.test.mjs`, `a2a-read.test.mjs`, `a2a-write.test.mjs`,
+`a2a-external.test.mjs`) all pass against a fresh db-sandbox. The real routes were exercised on an
+own server: fleet card (anonymous), directory + per-agent card (internal token and external
+`zhk_` key), JSON-RPC `GetTask` / `ListTasks` / `SendMessage` / `CancelTask` with `A2A-Version:
+1.0`, and the exact spec error codes (-32001 TaskNotFound, -32003 PushNotificationNotSupported,
+-32009 VersionNotSupported). `meta.a2a` is confirmed stamped on `zee_message` rows with
+messageId/taskId/contextId.
+
+**Deviation #1 — the router intake (C3) did not stamp the A2A envelope.**
+`server/src/lib/router.js` `routeRawPrompt` writes its `🧭 ROUTING REQUEST` row with a raw
+`INSERT INTO zee_message` (it carries images + a dedup ledger, so it cannot use
+`managers.postMessage` unchanged), and the insert's `meta` did not include `a2a`. A routing
+request therefore never appeared in `ListTasks`/`GetTask` and had no taskId — violating the plan's
+§1 scope ("C1, C2, C3 gain A2A envelopes") and DR-1. **Fixed:** the insert now stamps the same
+`buildEnvelope` (`kind:'directive'`, minting taskId + contextId) with the messageId minted before
+the insert, exactly like `postMessage`.
+
+**Deviation #2 — DR-1's scope did not cover the other conversation stores.**
+The plan §1 scope is the `zee_message` plane; the human wants all conversations. This is the
+extension decided in DR-8 and implemented (this branch). Not a defect in the original code — a
+scope widening with a written decision.
+
+**Non-deviations checked and found conformant:** the P3 expression indexes exist (migration 198);
+`A2A-Version` is gated before dispatch (-32009); external views are id-scrubbed (verified after the
+DR-8 extension — a transient leak of xell uuids in the new conversation Task metadata was caught
+and fixed); `CancelTask` is sender-only and never interrupts a running turn; the `typed`-into-a-
+no-turn-hook-cage KNOWN GAP stays `working` with the honest metadata note, never faked to
+`completed`; the C7 seam (execution outputs ⇄ Artifacts) is still a named stub shipping nothing.
