@@ -16,7 +16,8 @@
 // already have. CancelTask is sender-only on top of that (plan §3.2): only the xell that OPENED the
 // task may cancel it, and only while it is still undelivered/queued.
 import { q, one } from '../db/pool.js';
-import { rowToTask, rowToMessage, buildAgentCard, A2A_ERROR, partsToBody, cancelVerdict } from './a2a.js';
+import { rowToTask, rowToMessage, buildAgentCard, A2A_ERROR, partsToBody, cancelVerdict,
+         archiveRowToTask, memoryRowsToTask, turnRowToTask, conversationTaskId } from './a2a.js';
 import { broadcast } from './events.js';
 import { effectiveHarness } from './harness.js';
 import { isManager, postMessage } from './managers.js';
@@ -137,19 +138,103 @@ export async function loadTasks(visible) {
   return tasks;
 }
 
+// ── EXTENSION (DR-8): the other conversation stores as A2A Tasks ─────────────
+// "All zee conversations" is decided (DR-8) as: xell_conversation archives (112), zee_conversation
+// working memory (192), and zee_turn ledger rows (153) each project onto A2A Tasks with
+// DETERMINISTIC ids (uuid v5 of a store-namespaced natural key, minted at READ time — nothing is
+// written, no backfill, the same row always projects to the same id). session_event stays OUT: it
+// is the control-plane hook/play-by-play log, not a conversation (DR-8; the zee_turn Task's
+// metadata already names its turn). Scope is the same crew rule as the zee_message plane: the
+// caller may read conversations OF itself and its crew (taskVisibleXellIds).
+
+// A store row id → { kind, id } when the row's store row is a conversation the caller may read.
+// The deterministic task id is computed and returned as a POJO (the caller's loadTask consumes a
+// zee_message-shaped row; these are separate lookups).
+const CONVERSATION_LOADERS = [
+  { store: 'xell_conversation', sql: `SELECT * FROM xell_conversation WHERE id=$1`, build: archiveRowToTask },
+  { store: 'zee_turn', sql: `SELECT * FROM zee_turn WHERE id=$1`, build: turnRowToTask },
+];
+
+// One conversation Task by its DETERMINISTIC id (uuid v5 of `store:naturalKey`). The id is derived,
+// not stored — so lookups must reverse it. We cannot reverse a v5 id, so the route resolves a
+// conversation id by scanning the caller's visible xells' stores (volumes are small: archives and
+// turns per xell, and the zee_message seq-scan precedent already accepts this at fleet volume).
+export async function loadConversationTask(caller, taskId, { visible = null } = {}) {
+  const vis = visible || await taskVisibleXellIds(caller);
+  if (!vis.size) return null;
+  const xellIds = Array.from(vis);
+  // The lookup is by the DETERMINISTIC id, which is NOT the store row id — it is a v5 of it. To
+  // reverse it we scan the caller's visible rows and compute the v5 for each, matching the caller's
+  // taskId (the same approach loadConversationTasks uses to list them). This is the cost of "no
+  // second store" (DR-3): the ids are derived, never stored, so a reverse lookup is a scan. At
+  // fleet volume (archives + turns per xell, the 520-row zee_message precedent) this is fine.
+  const archs = await q(
+    `SELECT * FROM xell_conversation WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+  for (const a of archs) {
+    if (conversationTaskId('xell_conversation', a.id) === taskId) return archiveRowToTask(a);
+  }
+  // zee_conversation — natural key is the XELL id, so the deterministic task id is v5("zee_conversation", xell_id).
+  const mems = await q(`SELECT DISTINCT xell_id FROM zee_conversation WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+  for (const m of mems) {
+    if (conversationTaskId('zee_conversation', m.xell_id) === taskId) {
+      const rows = await q(
+        `SELECT role, content, name, created_at FROM zee_conversation WHERE xell_id=$1 ORDER BY seq ASC`, [m.xell_id]);
+      return memoryRowsToTask({ xellId: m.xell_id, rows });
+    }
+  }
+  const turns = await q(
+    `SELECT * FROM zee_turn WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+  for (const t of turns) {
+    if (conversationTaskId('zee_turn', t.id) === taskId) return turnRowToTask(t);
+  }
+  return null;
+}
+
+// Every conversation Task the caller may read (archives, working memories, turns), newest first.
+export async function loadConversationTasks(caller, { visible = null, limit = 50 } = {}) {
+  const vis = visible || await taskVisibleXellIds(caller);
+  if (!vis.size) return [];
+  const xellIds = Array.from(vis);
+  const out = [];
+  // Archives of the caller's visible xells.
+  const archs = await q(
+    `SELECT * FROM xell_conversation WHERE xell_id = ANY($1::uuid[]) ORDER BY created_at DESC LIMIT $2`,
+    [xellIds, Math.min(Math.max(Number(limit) || 50, 1), 500)]);
+  for (const a of archs) { const t = archiveRowToTask(a); if (t) out.push(t); }
+  // Working memories — one per visible xell (only when it has rows).
+  const mems = await q(
+    `SELECT DISTINCT xell_id FROM zee_conversation WHERE xell_id = ANY($1::uuid[])`, [xellIds]);
+  for (const m of mems) {
+    const rows = await q(
+      `SELECT role, content, name, created_at FROM zee_conversation WHERE xell_id=$1 ORDER BY seq ASC`, [m.xell_id]);
+    const t = memoryRowsToTask({ xellId: m.xell_id, rows });
+    if (t) out.push(t);
+  }
+  // Turns of the caller's visible xells.
+  const turns = await q(
+    `SELECT * FROM zee_turn WHERE xell_id = ANY($1::uuid[]) ORDER BY started_at DESC LIMIT $2`,
+    [xellIds, Math.min(Math.max(Number(limit) || 50, 1), 500)]);
+  for (const t of turns) { const tt = turnRowToTask(t); if (tt) out.push(tt); }
+  return out.slice(0, Math.min(Number(limit) || 50, 500));
+}
+
 // GetTask — returns { task } or throws A2AError(TaskNotFoundError, -32001).
 export async function getTask(caller, taskId, { visible = null } = {}) {
   if (!taskId || typeof taskId !== 'string') throw new A2AError(JSONRPC_INVALID_PARAMS, 'params.taskId is required');
   const vis = visible || await taskVisibleXellIds(caller);
-  const task = await loadTask(taskId, vis);
+  const task = await loadTask(taskId, vis) || await loadConversationTask(caller, taskId, { visible: vis });
   if (!task) throw new A2AError(A2A_ERROR.TaskNotFound, `no task "${taskId}"`);
   return { task };
 }
 
-// ListTasks — returns { tasks }, filtered to the caller's visibility (plan §3.2).
-export async function listTasks(caller, { visible = null } = {}) {
+// ListTasks — returns { tasks }, filtered to the caller's visibility (plan §3.2). The extension
+// (DR-8) adds the caller's conversation Tasks (archives, working memories, turns) after the
+// zee_message Tasks — the whole conversation set in one read.
+export async function listTasks(caller, { visible = null, limit = 50 } = {}) {
   const vis = visible || await taskVisibleXellIds(caller);
-  return { tasks: await loadTasks(vis) };
+  const tasks = await loadTasks(vis);
+  const conv = await loadConversationTasks(caller, { visible: vis, limit });
+  return { tasks: [...tasks, ...conv].slice(0, Math.min(Math.max(Number(limit) || 50, 1), 500)) };
 }
 
 // SubscribeToTask — the read half: return the current Task snapshot (the stream itself is the

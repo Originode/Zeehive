@@ -21,7 +21,7 @@
 // function taking plain facts, returning a plain verdict, table-tested standalone. A2A objects are
 // a VIEW over the row, never a second store (DR-3): the zee_message columns (delivered, delivery,
 // read_at, kind) win whenever they disagree with anything derived here.
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 
 // ── ENVELOPE CONSTRUCTION — the stamp postMessage writes ────────────────────
 // Takes the facts a caller has already gathered (the reused contextId, the referenced taskId) and
@@ -181,6 +181,192 @@ export function cancelVerdict({ delivery = null, hasReply = false } = {}) {
 // home; nothing behind it ships in P1.
 export function executionOutputsToArtifacts(_execution = null) {
   return [];
+}
+
+// ── EXTENSION (DR-8): ALL zee conversations as A2A — the four other stores ──
+// The original scope (DR-1) is the zee_message plane. The human wants ALL zee conversations in
+// A2A. "All" is decided in DR-8 as: every store that is a CONVERSATION (two-or-more turns of an
+// agent with someone — itself, a human, a model) gets a DETERMINISTIC Task id so A2A peers can
+// address it. Deterministic (uuid v5 of a store-namespaced natural key, minted at READ time) is the
+// one additive, no-backfill-compatible reading of DR-3/DR-4: nothing is written, nothing is
+// re-keyed, the same store row always projects to the same A2A id, and pre-A2A history is served
+// as Tasks without inventing a new id vocabulary on the wire.
+//
+// The four non-zee_message stores and how each becomes an A2A Task (decided in DR-8):
+//
+//   xell_conversation (migration 112)  — a finished xell's ARCHIVED session transcript. A Task
+//     per archive row; the transcript events become the history (role user/assistant from the
+//     JSONL event type, tool events flattened to text parts); deterministic id from the archive's
+//     own row id. status = 'completed' (the archive is a receipt about a finished conversation).
+//   zee_conversation (migration 192)   — a LIVE xell's STATEFUL WORKING MEMORY (the langchain
+//     driver). A Task per xell; its rows are the history in seq order; deterministic id from the
+//     xell id. status = 'working' (the memory is the state its next turn reads — it is not a
+//     finished task).
+//   zee_turn (migration 153)           — the per-turn OBSERVABILITY LEDGER. A Task per turn; the
+//     summary is the single message; deterministic id from the turn row id. status = 'completed'
+//     when the turn ended, 'working' while it is open.
+//   session_event                      — the append-only hook/play-by-play log. NOT a conversation:
+//     it is the CONTROL-PLANE event log (tend/hints/refusals/feed events). It stays out per DR-8 —
+//     a "conversation" it does not make; the zee_turn Task already surfaces its play-by-play via
+//     metadata (the turn's events are its evidence, not its speech).
+//
+// Role mapping for a history message: A2A roles are user/agent. The conversation stores use
+// system/user/assistant/tool. The mapping is deliberately lossy-and-honest: assistant → agent;
+// user → user; tool → user (a tool result is the agent's instrument, not a separate speaker); a
+// system line (a brief, a policy snapshot) → user (it was INPUT, not the agent speaking). Nothing
+// of the original taxonomy is lost — the store's own role rides in metadata.kind.
+
+// Deterministic A2A task id for a store row. `mint` stays injectable so the function is
+// test-deterministic (the same contract as buildEnvelope); the default is uuid v5 under the
+// fixed namespace. The namespace is a stable constant — a different value would re-id every row
+// on a future code change and orphan every external Task that cited one.
+export function conversationTaskId(store, naturalKey, mint = null) {
+  if (mint) return mint();
+  return uuidv5Name(`${store}:${naturalKey}`, CONVERSATION_NS);
+}
+
+const CONVERSATION_NS = 'b8a2b2a4-0a2a-4a2a-a2a2-a2a2a2a2a2a2';
+
+// A deterministic uuid v5 (name-based, RFC 4122 §4.3) over sha1. `createHash` is imported from
+// node:crypto at the top of this module; this is pure and synchronous.
+function uuidv5Name(name, ns) {
+  const nsHex = String(ns || '').replace(/-/g, '');
+  const nsBytes = Uint8Array.from(nsHex.match(/.{2}/g).map((h) => parseInt(h, 16)));
+  const h = createHash('sha1').update(new Uint8Array([...nsBytes, ...Buffer.from(String(name))])).digest();
+  h[6] = (h[6] & 0x0f) | 0x50;   // version 5
+  h[8] = (h[8] & 0x3f) | 0x80;   // variant 10xx
+  const hex = [...h.slice(0, 16)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+// A transcript line (xell_conversation.events is an array of parsed JSONL events; zee_conversation
+// rows are role/content pairs; session_event.raw is a JSON blob) → an A2A Message. Returns null
+// for a line that is not speech (system noise). The store's own role/taxonomy rides in metadata.
+export function conversationEventToMessage({ store, role = null, content = null, event = null, at = null } = {}) {
+  let text = content;
+  let kind = role;
+  if (event && typeof event === 'object') {
+    // xell_conversation.events are Claude-code JSONL events: { type, message?, ... }.
+    if (event.type === 'user') {
+      role = 'user'; kind = 'user';
+      text = event.message?.content || (typeof event.message === 'string' ? event.message : null);
+      if (Array.isArray(text)) text = text.map((b) => (b?.type === 'text' ? b.text : `[${b?.type}]`)).join('\n');
+    } else if (event.type === 'assistant') {
+      role = 'agent'; kind = 'assistant';
+      text = event.message?.content?.[0]?.text
+        || (typeof event.message?.content === 'string' ? event.message.content : null)
+        || (event.message?.content && event.message.content.length ? JSON.stringify(event.message.content) : null);
+    } else if (event.type === 'custom-title' || event.type === 'system' || event.type === 'summary') {
+      return null; // not speech — the archive's title/headers stay out of the Task history
+    } else {
+      role = 'agent'; kind = event.type;   // tool_result, result, stream_event, … — the agent's
+      text = event.result || event.content || (event.message?.content && JSON.stringify(event.message.content)) || JSON.stringify(event);
+    }
+  }
+  if (!text) return null;
+  const m = {
+    messageId: `${store}-${kind || role}-${Math.random().toString(36).slice(2, 10)}`,
+    role: role === 'assistant' || role === 'agent' ? 'agent' : 'user',
+    parts: [{ text: String(text).slice(0, 4000) }],
+  };
+  if (kind) m.metadata = { kind };
+  if (at) m.metadata = { ...(m.metadata || {}), at: String(at) };
+  return m;
+}
+
+// xell_conversation (112) → A2A Task. `archive` is a row with id/xell_slug/title/events/content/
+// line_count/byte_count/created_at. The events (already-parsed JSONL) become the history; the raw
+// `content` is NOT itself copied into a message (it is the source of truth; the events are its
+// parse). Deterministic id from the archive row id (the row is already a uuid).
+export function archiveRowToTask(archive = {}) {
+  const id = archive.id ? conversationTaskId('xell_conversation', archive.id) : null;
+  if (!id) return null;
+  const events = Array.isArray(archive.events) ? archive.events : [];
+  const history = events.map((ev) => conversationEventToMessage({ store: 'xell_conversation', event: ev }))
+    .filter(Boolean).slice(0, 200);
+  const task = {
+    id,
+    status: 'completed',
+    metadata: {
+      store: 'xell_conversation', kind: 'archive',
+      title: archive.title || null, xell: archive.xell_slug || null,
+      line_count: archive.line_count || events.length, byte_count: archive.byte_count || 0,
+      uploaded_at: archive.created_at ? String(archive.created_at) : null,
+    },
+  };
+  if (history.length) task.history = history;
+  return task;
+}
+
+// zee_conversation (192) → A2A Task. `rows` are the xell's memory rows in seq order (role,
+// content, name). One Task per xell — deterministic id from the xell id (the durable work unit,
+// DR-4/DR-8). status = 'working' — the memory is the state its next turn reads, not a finished
+// task. role system/tool map to user; assistant → agent.
+export function memoryRowsToTask({ xellId = null, rows = [] } = {}) {
+  if (!xellId) return null;
+  const id = conversationTaskId('zee_conversation', xellId);
+  const history = rows.map((r) => conversationEventToMessage({
+    store: 'zee_conversation', role: r.role, content: r.content,
+    at: r.created_at ? String(r.created_at) : null,
+  })).filter(Boolean).slice(0, 200);
+  const task = {
+    id,
+    status: 'working',
+    metadata: {
+      store: 'zee_conversation', kind: 'working-memory', xell: xellId,
+      note: 'the live xell\'s stateful working memory — one Task per xell, rows in seq order; '
+        + 'status stays working (it is the state the next turn reads, not a finished task)',
+    },
+  };
+  if (history.length) task.history = history;
+  return task;
+}
+
+// zee_turn (153) → A2A Task. `turn` is a zee_turn row. deterministic id from the turn row id.
+// status = 'completed' when the turn ended (ended_at set), 'working' while it is open. The
+// summary (the last assistant text) is the single message; the turn's play-by-play events are
+// NOT copied into the Task (they are control-plane evidence, not conversation — DR-8).
+export function turnRowToTask(turn = {}) {
+  if (!turn?.id) return null;
+  const id = conversationTaskId('zee_turn', turn.id);
+  const ended = !!turn.ended_at;
+  const task = {
+    id,
+    status: ended ? 'completed' : 'working',
+    metadata: {
+      store: 'zee_turn', kind: 'turn', xell: turn.xell_id || null,
+      kind_name: turn.kind || null, model: turn.model || null,
+      started_at: turn.started_at ? String(turn.started_at) : null,
+      ended_at: turn.ended_at ? String(turn.ended_at) : null,
+      stop_reason: turn.stop_reason || null,
+      input_tokens: turn.input_tokens || 0, output_tokens: turn.output_tokens || 0,
+      cost_usd: Number(turn.cost_usd || 0),
+    },
+  };
+  const summary = turn.summary || lastAssistantTextFromTurn(turn);
+  if (summary) {
+    task.history = [{ messageId: `zee_turn-${String(turn.id).slice(0, 8)}`, role: 'agent',
+                      parts: [{ text: String(summary).slice(0, 4000) }], metadata: { kind: 'summary' } }];
+  }
+  return task;
+}
+
+// The last assistant TEXT a turn produced — mirrors turn-ledger.js's lastAssistantText so this
+// module stays pure (no import of the ledger). The zee_turn.summary column is authoritative; this
+// is the fallback when it is null (an old turn before the summary column was backfilled).
+function lastAssistantTextFromTurn(turn) {
+  const s = turn?.summary;
+  if (s) return String(s);
+  const meta = turn?.meta || {};
+  if (meta.last_assistant_text) return String(meta.last_assistant_text);
+  return null;
+}
+
+// session_event stays OUT of the conversation projection (DR-8). This stub is the named seam:
+// it returns null so a future record that changes the decision has a home, and tests can assert
+// the exclusion.
+export function sessionEventToTask(_event = null) {
+  return null;
 }
 
 // ── A2A v1.0 ERROR CODES — the exact spec numbers (plan §3.2, DR-5) ─────────
