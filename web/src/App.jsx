@@ -508,12 +508,12 @@ export default function App() {
   }, [appendToastLine]);
 
   // Fire-and-forget dispatch. The composer hands us the whole payload and closes IMMEDIATELY; the
-  // slow bits (uploading a pasted image, renaming the worktree, spawning + awaiting the zee) run
-  // here and report through a toast. A failure keeps the payload in a Retry closure, so "no ready
-  // xell available" et al. never lose the composed prompt even though the modal is already gone.
+  // slow bits (uploading pasted attachments, renaming the worktree, spawning + awaiting the zee)
+  // run here and report through a toast. A failure keeps the payload in a Retry closure, so "no
+  // ready xell available" et al. never lose the composed prompt even though the modal is already gone.
   const runDispatch = useCallback(async (payload) => {
     const id = `disp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const nImg = payload.images?.length || 0;
+    const nAtt = payload.images?.length || 0;   // `images` is the wire field's legacy name — any file
     // THE ROUTER PAYLOADS (139) ride the same fire-and-forget toast machinery: the composer closed
     // already, so progress/failure/Retry live here whichever door the payload goes through.
     //   via_router      → hand the RAW prompt to the live router (POST /api/router/route)
@@ -528,8 +528,8 @@ export default function App() {
       body: routerVerb === 'route'
         ? 'Handing the raw prompt to the router zee — it recomposes and dispatches.'
         : routerVerb ? 'Claiming a xell and spawning the router (prod read-only, no land/ship)…'
-        : nImg
-        ? `Uploading ${nImg} image${nImg === 1 ? '' : 's'}, claiming a xell and spawning…`
+        : nAtt
+        ? `Uploading ${nAtt} attachment${nAtt === 1 ? '' : 's'}, claiming a xell and spawning…`
         : 'Claiming a ready xell and spawning…' });
     // YIELD before the network call. dispatchTask() runs synchronously up to its first await —
     // JSON.stringify()-ing a multi-MB base64 screenshot blocks the main thread for that whole
@@ -877,7 +877,7 @@ export default function App() {
     if (x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
-    if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
+    if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/file composer
     if (kind === 'directives') { setDirectivesXell(x); return; } // read the manager⇄worker conversation
     if (kind === 'env') {
       // Opens the ENVIRONMENT panel (ticket #20): which environment this xell resolved to and why,
