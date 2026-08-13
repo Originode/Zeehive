@@ -21,7 +21,7 @@
 // this module exists to make impossible, so nothing below restates a list that lives elsewhere.
 import { one } from '../db/pool.js';
 import { PROVIDERS, listProviderTokens, decideDispatchProvider } from './provider-tokens.js';
-import { providerWide, modelWide, availableForXell } from './usage-limits.js';
+import { providerWide, modelWide } from './usage-limits.js';
 import { effectiveModelPolicy, allowedModelsForProvider, modelSpecs, resolveDispatchModel } from './model-policy.js';
 import { resolveHarness, defaultHarnessId } from './harness.js';
 import { runtimeKeyForProvider, decideRuntimePairing } from './cxell-runtimes.js';
