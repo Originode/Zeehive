@@ -21,7 +21,7 @@
 // this module exists to make impossible, so nothing below restates a list that lives elsewhere.
 import { one } from '../db/pool.js';
 import { PROVIDERS, listProviderTokens, decideDispatchProvider } from './provider-tokens.js';
-import { availableForModel } from './usage-limits.js';
+import { providerWide, modelWide, availableForXell } from './usage-limits.js';
 import { effectiveModelPolicy, allowedModelsForProvider, modelSpecs, resolveDispatchModel } from './model-policy.js';
 import { resolveHarness, defaultHarnessId } from './harness.js';
 import { runtimeKeyForProvider, decideRuntimePairing } from './cxell-runtimes.js';
@@ -144,33 +144,35 @@ export async function dispatchOptions({ projectId, harness: harnessArg, zeeType 
     const caged = !rt || rt.driver === 'cxell-cli';
     const usableAccounts = p.accounts.filter((a) => !a.paused);
     const models = allowed ? await modelsFor(policy, p.provider) : [];
-    // USAGE LIMIT for the provider: worst remaining among active accounts (provider-wide).
-    // Per-MODEL limits are attached to each model row below (opus vs fable vs sonnet windows).
+    // USAGE LIMITS: provider-wide on the provider button; model-wide on each model button when
+    // we have a model-specific signal (Claude 7d_opus/7d_sonnet, or by_model from last call).
+    // Pick the first active account that has a snapshot (freshest is already first in list order
+    // from listProviderTokens when multiple — accounts are by created_at; usable are unpaused).
     const limitSource = usableAccounts.find((a) => a.usage_limit) || p.accounts.find((a) => a.usage_limit) || null;
-    const providerLimit = availableForModel(limitSource?.usage_limit, { provider: p.provider, model: null });
+    const snap = limitSource?.usage_limit || null;
+    const provLim = providerWide(snap);
     const modelsWithLimit = models.map((m) => {
-      const lim = availableForModel(limitSource?.usage_limit, { provider: p.provider, model: m.key });
+      const ml = modelWide(snap, { provider: p.provider, model: m.key });
       return {
         ...m,
-        // How much of this model's limit is still AVAILABLE on the project's best-known account.
-        // Null until the gateway has seen a call for that account (no snapshot yet).
-        available_pct: lim.available_pct,
-        limit_window: lim.window,
-        limit_source: lim.source,   // 'model' | 'provider' | null
+        // MODEL-WIDE only — null when no model-specific pool is known (UI hides the chip).
+        available_pct: ml.available_pct,
+        limit_window: ml.window,
+        limit_source: ml.source,   // 'model' | null
       };
     });
     providers.push({
       provider: p.provider, label: p.label,
       connected: p.connected, all_paused: p.all_paused,
       accounts: p.accounts.map((a) => {
-        const al = availableForModel(a.usage_limit, { provider: p.provider, model: null });
+        const al = providerWide(a.usage_limit);
         return {
           id: a.id, label: a.label, token_hint: a.token_hint, paused: a.paused,
           // What the console's button called an account: its own label, else the provider type (with
           // the token tail when the project holds several of the type — otherwise two buttons read
           // identically and neither says which subscription it spends).
           name: a.label || (p.accounts.length > 1 ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label),
-          available_pct: al.available_pct,
+          available_pct: al.available_pct,           // provider-wide for this account
           usage_limit: a.usage_limit || null,
           usage_limit_at: a.usage_limit_at || null,
         };
@@ -185,8 +187,8 @@ export async function dispatchOptions({ projectId, harness: harnessArg, zeeType 
         : (allowed && !models.length) ? "this harness's model policy allows no model on this provider"
         : null,
       models: modelsWithLimit,
-      // Provider-wide remaining (fallback when a model has no tier window of its own).
-      available_pct: providerLimit.available_pct,
+      // PROVIDER-WIDE remaining — shown on the provider button in the prompt window.
+      available_pct: provLim.available_pct,
       default_model: allowed ? await defaultModelFor(harnessRow, p.provider) : null,
       runtime: rt ? { key: rt.key, label: rt.label, caged } : { key: null, label: null, caged: true },
       modes: modesForRuntime({ caged }),

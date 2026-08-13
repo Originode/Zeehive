@@ -430,7 +430,7 @@ async function attachUsageLimits(xells) {
   } catch {
     return; // migration 203 not applied, or grant table missing — no HP bar
   }
-  const { providerFromRuntime, availableForModel } = await import('./usage-limits.js');
+  const { providerFromRuntime, availableForXell } = await import('./usage-limits.js');
   const byXell = new Map();
   for (const g of grants) {
     const list = byXell.get(g.xell_id) || [];
@@ -444,12 +444,14 @@ async function attachUsageLimits(xells) {
     const pick = (want && list.find((g) => g.provider === want)) || list[0];
     x._usage_limit = pick.usage_limit;
     x._usage_provider = pick.provider;
-    const lim = availableForModel(pick.usage_limit, {
+    // model-wide if known, else provider-wide — badge HP bar
+    const lim = availableForXell(pick.usage_limit, {
       provider: pick.provider,
       model: x.zee_model || null,
     });
     x.usage_available_pct = lim.available_pct;
     x.usage_limit_window = lim.window;
+    x.usage_limit_source = lim.source;   // 'model' | 'provider' | null
   }
 }
 
