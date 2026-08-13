@@ -227,6 +227,21 @@ try {
   await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
           [pid, SHARED_PROD]);
 
+  // …and the CONTAINER-named path (attachXellDb by container id) refuses the same way.
+  const g2 = await mkXell('guard2');
+  const g2Before = projection(g2.wt).text;
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, config.databaseUrl]);
+  const prodRow = await one(`SELECT id FROM container WHERE project_id=$1 AND role='db' AND tier='prod'`, [pid]);
+  let g2Err = null;
+  try { await attachXellDb(g2.id, { container: prodRow.id }); }
+  catch (e) { g2Err = e.message; }
+  ok(/REFUSING to bind/.test(g2Err || ''),
+     `naming the meta-DB container explicitly is refused too [${(g2Err || 'no error').slice(0, 60)}]`);
+  ok(projection(g2.wt).text === g2Before, 'and the second xell\'s file is untouched as well');
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, SHARED_PROD]);
+
   // ── 5. an EMPTY environment must not read like a broken merge ───────────────────────────────
   // The third half of the ticket: when a project's environments hold no vars (Zeehive's own dev
   // AND prod do, today) a perfectly correct merge writes nothing — and "my binding says prod and
