@@ -63,6 +63,9 @@ import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateH
 import { uploadConversationArchive, conversationsForManager, harnessArchivalSettings } from '../lib/conversations.js';
 // The A2A outbound send (`zee a2a <card-url> --message "…"`, phase 4) — queenzee-mediated, recorded.
 import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
+// The A2A MEET group-chat rooms (`zee meet`, docs/zee-meet-plan.md) — the DB half lives here so
+// the self verbs below are thin. Any live zee of a project may create/attend a room by code.
+import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '../lib/a2a-meet.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -2389,6 +2392,62 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
 export async function selfA2ASend(xell, { card_url = null, message = null } = {}) {
   const out = await sendExternalA2AMessage({ xell, cardUrl: card_url, message });
   return out.ok ? { ok: true, ...out } : { ok: false, error: out.error };
+}
+
+// ── A2A MEET — group chat rooms (`zee meet`, docs/zee-meet-plan.md) ────────────
+// The human directive: "i want agents to be able to talk to each other via some sort of peer to
+// peer a2a chat session like a group chat via a zee meet verb… zees can join and talk." These four
+// verbs are the self half of that surface (the CLI + routes are thin wrappers). Any live zee of a
+// project may create a room (create), attend a room by the code a founder printed (attend), post to
+// a room it is a member of (say), and list/read its rooms (list/transcript). The design decisions
+// are recorded in docs/zee-meet-decision-record.md — the short version: a room is a first-class
+// store (DR-1), attendance is self-serve and recorded (DR-2), and a post is one transcript row plus
+// a best-effort delivery fan-out (DR-3).
+export async function selfMeetCreate(xell, { title = null } = {}) {
+  const r = await createMeet({ xell, title });
+  if (!r.ok) return { ok: false, error: r.error };
+  return {
+    ok: true, meet_id: r.room.id, code: r.code, title: r.room.title,
+    members: [{ slug: xell.slug, role: 'founder' }],
+    message: `Created meet "${r.room.title}". Hand this code to the zees you want in: \`zee meet attend ${r.code}\``,
+  };
+}
+
+export async function selfMeetAttend(xell, { code = null } = {}) {
+  const r = await attendMeet({ xell, code });
+  if (!r.ok) return { ok: false, error: r.error };
+  return {
+    ok: true, meet_id: r.meet_id, code: r.code, title: r.title, members: r.members,
+    joined: r.joined,
+    message: r.joined
+      ? `You joined "${r.title}" (${r.code}). Read what you missed: \`zee meet --transcript ${r.code}\`, then \`zee meet say ${r.code} --message "…"\`.`
+      : `You are already a member of "${r.title}" (${r.code}).`,
+  };
+}
+
+export async function selfMeetSay(xell, { code = null, message = null } = {}) {
+  const r = await sayToMeet({ xell, code, message });
+  if (!r.ok) return { ok: false, error: r.error };
+  return {
+    ok: true, posted: r.posted, code: r.code, meet_id: r.meet_id, message: r.message,
+    deliveries: r.deliveries,
+    message_text: `Posted to "${r.message.from} in ${r.code}". ${r.deliveries.length} live member(s) notified.`,
+  };
+}
+
+// GET /api/xell/self/meet — the caller's rooms, or one room's transcript when ?code= is given.
+export async function selfMeet(xell, { code = null } = {}) {
+  if (code) {
+    const t = await transcriptFor(xell, code);
+    if (!t.ok) return { ok: false, error: t.error };
+    return { ok: true, meet: { code: t.code, title: t.title, members: t.members },
+             messages: t.messages, count: t.messages.length,
+             message: `${t.messages.length} message(s) in "${t.title}" — now marked read.` };
+  }
+  const meets = await listMeetsFor(xell);
+  return { ok: true, count: meets.length, meets,
+           message: meets.length ? `${meets.length} meet(s) — \`zee meet --transcript <code>\` to read one.`
+                                 : 'You are in no meets yet. Create one: `zee meet create --title "…"`.' };
 }
 
 // POST /api/xell/self/report — a WORKER's note to its manager (`zee report`), and the vehicle for
