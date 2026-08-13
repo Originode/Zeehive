@@ -940,8 +940,12 @@ switch (cmd) {
     // membership set is the visibility boundary. The transcript is the record; live members are
     // notified (DR-3).
     const sub = positional();
-    const code = flag('code') || flag('to') || (sub !== 'create' && !rest.includes('--list') && !rest.includes('--status')
-      && !rest.includes('--transcript') ? (rest.find((a) => !a.startsWith('--')) || null) : null);
+    // The code is the positional AFTER the subcommand — NOT the first non-flag, which is the
+    // subcommand itself (`meet say <code>` would otherwise take "say" as the code). --code /
+    // --to / --transcript are the explicit forms and win. For the read forms (--list/--status,
+    // or a bare `meet`), there is no code.
+    const code = flag('code') || flag('to') || flag('transcript')
+      || (sub ? (rest.filter((a) => !a.startsWith('--') && a !== sub)[0] || null) : null);
     if (sub === 'create') {
       const title = flag('title');
       if (!title) { console.error('meet create needs --title "…" — what the room is about'); process.exit(1); }
