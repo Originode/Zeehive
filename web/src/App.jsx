@@ -109,7 +109,8 @@ const fmtAgo = (ts) => {
 
 // FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
 // dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
-// consumption; account-wide %/limits are NOT available (only Anthropic's /usage shows those).
+// consumption. Per-provider breakdown and "current" rate-limit % come from the gateway ledger
+// (getFleetBurn.by_provider / .current) — not Admin /usage, which needs keys the fleet does not hold.
 const fmtTok = (n) => {
   const v = Number(n || 0);
   if (v >= 1e9) return (v / 1e9).toFixed(v >= 1e10 ? 0 : 1).replace(/\.0$/, '') + 'B';
@@ -121,6 +122,54 @@ const fmtUsd = (n) => {
   const v = Number(n || 0);
   return '$' + (v >= 100 ? v.toFixed(0) : v.toFixed(2));
 };
+
+// Tooltip for the whole fleet-burn chip: total + each provider + any live rate-limit window.
+function fleetBurnTitle(burn) {
+  if (!burn?.fleet) return '';
+  const lines = [
+    `Every run across this project consumed ${Number(burn.fleet.tokens).toLocaleString()} tokens `
+      + `for ${fmtUsd(burn.fleet.cost)}, over ${burn.fleet.zees} zee run(s).`,
+  ];
+  for (const p of burn.by_provider || []) {
+    lines.push(`${p.provider}: ${Number(p.tokens).toLocaleString()} tok · ${fmtUsd(p.cost)}`
+      + ` over ${p.requests} gateway call(s)`);
+  }
+  for (const c of burn.current || []) {
+    const rl = c.rate_limit || {};
+    if (rl.tokens_used_pct != null) {
+      lines.push(`${c.provider} rate window: ${rl.tokens_used_pct}% used`
+        + (rl.tokens_remaining != null && rl.tokens_limit != null
+          ? ` (${Number(rl.tokens_remaining).toLocaleString()} / ${Number(rl.tokens_limit).toLocaleString()} tok remaining)`
+          : ''));
+    }
+  }
+  lines.push('Fleet-own consumption + gateway rate-limit headers — not Admin account %/limits.');
+  return lines.join('\n');
+}
+
+// Tooltip for one provider's segment of the chip.
+function providerBurnTitle(p, cur) {
+  const lines = [
+    `${p.provider}: ${Number(p.tokens).toLocaleString()} tokens · ${fmtUsd(p.cost)}`
+      + ` · ${p.requests} gateway call(s)`,
+    `input ${fmtTok(p.input)} · output ${fmtTok(p.output)}`
+      + ` · cache R ${fmtTok(p.cache_read)} · W ${fmtTok(p.cache_write)}`,
+  ];
+  const rl = cur?.rate_limit;
+  if (rl) {
+    if (rl.tokens_used_pct != null) {
+      lines.push(`rate window: ${rl.tokens_used_pct}% used`
+        + (rl.tokens_remaining != null ? ` · ${Number(rl.tokens_remaining).toLocaleString()} remaining` : '')
+        + (rl.tokens_limit != null ? ` of ${Number(rl.tokens_limit).toLocaleString()}` : ''));
+    }
+    if (rl.requests_used_pct != null) {
+      lines.push(`request window: ${rl.requests_used_pct}% used`
+        + (rl.requests_remaining != null ? ` · ${rl.requests_remaining} remaining` : ''));
+    }
+    if (cur.at) lines.push(`as of ${new Date(cur.at).toLocaleString()}`);
+  }
+  return lines.join('\n');
+}
 
 
 // Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
@@ -1218,13 +1267,34 @@ export default function App() {
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
         {/* FLEET-CUMULATIVE BURN — every run across the project, tokens + $. Fleet-own consumption
-            only; account-wide %/limits are NOT available (Anthropic's /usage alone shows those). */}
-        {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0) && (
+            from zee rows; the per-provider breakdown and "current" rate-limit window ride beside
+            it from the LLM gateway ledger (lib/fleet.js getFleetBurn). Account-wide Admin /usage
+            APIs still need separate admin keys — the % here is the provider's own rate-limit
+            headers the gateway captured on each call. */}
+        {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0
+            || (fleet.fleet_burn.by_provider || []).length > 0) && (
           <span className="fleetburn" data-testid="fleet-burn"
-                title={`Every run across this project consumed ${Number(fleet.fleet_burn.fleet.tokens).toLocaleString()} tokens `
-                  + `for ${fmtUsd(fleet.fleet_burn.fleet.cost)}, over ${fleet.fleet_burn.fleet.zees} zee run(s).\n`
-                  + 'Fleet-own consumption only — not your Anthropic account %/limits.'}>
+                title={fleetBurnTitle(fleet.fleet_burn)}>
             {' · '}fleet burn: <b>{fmtTok(fleet.fleet_burn.fleet.tokens)} tok · {fmtUsd(fleet.fleet_burn.fleet.cost)}</b>
+            {(fleet.fleet_burn.by_provider || []).length > 0 && (
+              <span className="fleetburn-by-provider" data-testid="fleet-burn-by-provider">
+                {(fleet.fleet_burn.by_provider || []).map((p) => {
+                  // CURRENT usage % for this provider, if the gateway has a rate-limit snapshot.
+                  const cur = (fleet.fleet_burn.current || []).find((c) => c.provider === p.provider);
+                  const pct = cur?.rate_limit?.tokens_used_pct;
+                  return (
+                    <span key={p.provider} className="fleetburn-prov" data-provider={p.provider}
+                          title={providerBurnTitle(p, cur)}>
+                      {' · '}<span className="fleetburn-prov-name">{p.provider}</span>
+                      {' '}<b>{fmtTok(p.tokens)}/{fmtUsd(p.cost)}</b>
+                      {pct != null && <span className="fleetburn-prov-pct" data-testid={`provider-usage-${p.provider}`}>
+                        {' '}{pct}%
+                      </span>}
+                    </span>
+                  );
+                })}
+              </span>
+            )}
           </span>
         )}
         {/* The prewarmed-pool knob, right here in the status line so it never hides in project

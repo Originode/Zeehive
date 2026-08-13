@@ -591,6 +591,13 @@ a.cbox:hover { border-color: var(--accent); }
 .burn { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted); }
 .statusline .fleetburn { color: var(--muted); font-size: 14px; }
 .statusline .fleetburn b { color: var(--fg, inherit); font-family: 'Cascadia Code', monospace; font-size: 12px; }
+/* Per-provider burn + current rate-window % (gateway ledger). Name is muted; the figure is the
+   fact. The % is the provider's own rate-limit header (tokens used of its window), not Admin /usage. */
+.statusline .fleetburn-prov-name { color: var(--muted); font-size: 12px; }
+.statusline .fleetburn-prov-pct {
+  font-family: 'Cascadia Code', monospace; font-size: 11px;
+  color: var(--amber, #d4a017); margin-left: 1px;
+}
 
 /* production card */
 .card.prod { border-top-color: var(--down); background: linear-gradient(180deg, rgba(229,85,78,.06), transparent); }
