@@ -46,6 +46,10 @@ ok(/attachmentFileName\(/.test(nudge), 'nudge.js names inbox files from the orig
 ok(!/image-\$\{i \+ 1\}/.test(nudge), 'the generic image-N naming is gone');
 ok(/attachments = \[\]/.test(nudge), 'sendMessageToXell takes `attachments`, not `images`');
 ok(/attached file\(s\)/.test(nudge), 'the typed pointer says attached files');
+ok(nudge.includes(".replace(/[^A-Za-z0-9._-]/g, '_')"),
+   'a hostile filename (path separators, shell chars) is sanitized before it lands in .zee-inbox');
+ok(nudge.includes(".replace(/^\\.+/, '')"),
+   '…and leading dots are stripped (no hidden/traversal names)');
 ok(/saveDispatchAttachments\(/.test(intake), 'intake.js renamed saveDispatchImages → saveDispatchAttachments');
 ok(/## Attached files/.test(intake), 'the prompt block says Attached files');
 ok(!/## Attached images/.test(intake), '…not Attached images');
