@@ -133,6 +133,31 @@ wait_live() {
   trap - INT
 }
 
+# ── THE GROK GUARDS: a human must never land on grok's device-code login prompt ───────────────
+# grok is the ONE runtime where "no credential" and "stale session" both END ON A LOGIN PROMPT
+# instead of an exit — `grok` offers the interactive device-code login and waits, so the `|| fresh`
+# fallback (codex/kimi's pattern) never fires. The cage IS the permission system and the credential
+# is the DISPATCH's job, so the attend path must not offer a login either: a cage with no grok key
+# drops to a shell with the reason, and a stale session id is never passed to `grok -r` (a local
+# check beats Ctrl-C as the escape from the remote-restore prompt).
+# has_grok_key — does THIS cage hold a grok credential the CLI will actually read? grok
+# authenticates from exactly two places: the XAI_API_KEY env var (an xai-… key), or the installed
+# seat FILE ~/.grok/auth.json. The adapter's GROK_AUTH_JSON carrier env is deliberately NOT one of
+# them — the grok CLI does not read it, so a cage carrying the carrier without the file would still
+# draw the login screen. NON-EMPTY file check: an empty auth.json is what a half-finished
+# `grok login` leaves, and it would still draw the login screen.
+has_grok_key() {
+  [[ -n "${XAI_API_KEY:-}" || -s "${GROK_HOME:-$HOME/.grok}/auth.json" ]]
+}
+# has_local_grok_sid — was $SID produced in THIS cage? grok stores sessions under
+# ~/.grok/sessions/<encoded-cwd>/<session-id>/ (GROK_HOME honored, like the adapter), so a session id
+# that is not a directory there was never this cage's — passing it to `grok -r` makes the TUI try a
+# REMOTE restore and sit on the device-code login prompt (the old comment's Ctrl-C escape).
+has_local_grok_sid() {
+  [[ -n "$SID" && -d "${GROK_HOME:-$HOME/.grok}/sessions" ]] \
+    && find "${GROK_HOME:-$HOME/.grok}/sessions" -maxdepth 2 -type d -name "$SID" 2>/dev/null | grep -q .
+}
+
 # Each branch: wait out the headless turn (feed or plain wait), THEN start the queue drainer, THEN
 # hand the pane to the interactive session. The order is the whole contract — a drainer started any
 # earlier would type into the read-only feed, which is the failure it exists to end.
@@ -159,11 +184,17 @@ case "$RUNTIME" in
     wait_live
     start_talk_drain
     # grok resumes by session id (`-r <id>`), out of ~/.grok/sessions in this cage — which is where
-    # the headless turn wrote it. ⚠ an id that is NOT there locally makes grok try to restore it
-    # from remote and sit on a device-code login prompt, so the plain `grok` fallback is reached by
-    # Ctrl-C rather than by an exit: never pass an id this cage did not produce.
+    # the headless turn wrote it. Two failure modes land on the device-code login prompt, and both
+    # are refused here (the cage IS the permission system — the credential is the dispatch's job):
+    #   1. no grok key in this cage → `grok` (fresh or resume) would sit on the login; fall through
+    #      to the shell with the reason instead of offering the interactive login;
+    #   2. a session id that is NOT local → `grok -r` tries a remote restore and sits on the same
+    #      prompt (Ctrl-C was the only escape). A local id is passed; a stale one falls back to a
+    #      fresh session automatically.
     # --always-approve because the cxell is the permission system, same stance as the others.
-    if [[ -n "$SID" ]]; then
+    if ! has_grok_key; then
+      printf '\033[1;33m── no grok key in this cage — the grok CLI would sit on a device-code login, so here is a plain shell instead. Connect a grok account in Project setup and re-dispatch to get a grok session. ──\033[0m\r\n'
+    elif [[ -n "$SID" ]] && has_local_grok_sid; then
       grok -r "$SID" --always-approve || grok --always-approve
     else
       grok --always-approve

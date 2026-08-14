@@ -130,6 +130,90 @@ ok(/stop_talk_drain\nexec bash -l/.test(attach),
 ok(/READ-ONLY feed/.test(attach),
    'and the feed banner SAYS the pane cannot hear you, and where the door is (this is how it was reported)');
 
+// ── 4a. the grok guards: a human must never land on grok's device-code login prompt ───────────
+// grok is the ONE runtime whose "no credential" and "stale session" failure modes END ON A LOGIN
+// PROMPT instead of an exit — `grok` offers the interactive device-code login and waits, so the
+// `|| fresh` fallback (codex/kimi's pattern) never fires. The cage IS the permission system and
+// the credential is the DISPATCH's job, so the attend path must not offer a login either.
+console.log('\n── zee-attach.sh grok branch: no key → shell, stale SID → fresh (never the login prompt) ──');
+const grokBranch = branches.find((x) => x.includes('grok -r "$SID"')) || '';
+ok(/has_grok_key/.test(attach) && /has_grok_key/.test(grokBranch),
+   'the grok branch gates on a has_grok_key() guard before grok is ever invoked');
+ok(/XAI_API_KEY:-/.test(attach) && /auth\.json/.test(attach),
+   '…which sees EXACTLY what the grok CLI reads: the XAI_API_KEY env var or the installed ~/.grok/auth.json');
+ok(/GROK_AUTH_JSON:-/.test(attach) === false,
+   '…and deliberately NOT the GROK_AUTH_JSON carrier — the grok CLI does not read that env, so a cage '
+   + 'carrying it without the installed file would still draw the login screen');
+ok(/-s .*auth\.json/.test(attach),
+   '…and a NON-EMPTY auth.json check — an empty one is a half-finished `grok login`, still a login screen');
+ok(/no grok key in this cage/.test(grokBranch),
+   '…and a cage with no key is told why and falls through to the shell (no interactive login)');
+ok(/has_local_grok_sid/.test(attach) && /has_local_grok_sid/.test(grokBranch),
+   '`grok -r <sid>` is gated on a has_local_grok_sid() guard');
+ok(/sessions\/<encoded-cwd>\/<session-id>/.test(attach),
+   '…which knows grok stores sessions under ~/.grok/sessions/<encoded-cwd>/<session-id>/');
+ok(/grok -r "\$SID" --always-approve \|\| grok --always-approve/.test(grokBranch),
+   'a LOCAL id is still resumed, with the fresh-session fallback intact');
+ok(!grokBranch.slice(0, grokBranch.indexOf('has_local_grok_sid')).includes('grok -r "$SID"'),
+   '…and the resume is reached ONLY through the local check — nothing before it ever passes the id');
+
+// ── 4b. the grok guards RUN: a fake grok records what the real branch would invoke ────────────
+// Lifts the two guards + the grok branch body out of the shipped script (the same seam the
+// drain_talk test uses) and drives them with a fake `grok` that logs its argv, so the assertion
+// is "the script that ships would invoke grok like this", not a guess at the branch's intent.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'zee-grok-'));
+  const bin = join(dir, 'bin');
+  const log = join(dir, 'grok.log');
+  const fakeGrok = join(bin, 'grok');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(fakeGrok, `#!/bin/bash\necho "GROK $*" >> "${log}"\n`);
+  execFileSync('chmod', ['+x', fakeGrok]);
+  const g0 = attach.indexOf('has_grok_key() {');
+  const g1 = attach.indexOf('has_local_grok_sid() {');
+  const g2 = attach.indexOf('}\n', attach.indexOf('{', g1));
+  const guards = attach.slice(g0, g2 + 2);
+  const branch = (attach.match(/^    if ! has_grok_key; then[\s\S]*?\n    fi$/m) || [''])[0];
+  ok(guards.includes('has_local_grok_sid() {') && branch.includes('grok --always-approve'),
+     'the guards and the grok branch were lifted out of the shipped script');
+  const run = (envLines, sid, homeDir) => {
+    writeFileSync(log, '');
+    mkdirSync(homeDir, { recursive: true });
+    const script = ['set -u', 'PATH="' + bin + ':$PATH"', guards,
+      `SID='${sid}'`, `HOME='${homeDir}'`, ...envLines, branch, 'echo EXIT=$?'].join('\n');
+    return execFileSync('bash', ['-c', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  };
+  const noKeyHome = join(dir, 'home-nokey');
+  const out = run([], SID, noKeyHome);
+  ok(!readFileSync(log, 'utf8').includes('GROK '), 'no grok key → grok is NOT invoked');
+  ok(out.includes('no grok key in this cage'), '…and the banner says why, out loud');
+  ok(out.includes('EXIT=0'), '…and the branch exits cleanly (the common tail drops to a login shell)');
+  const keyHome = join(dir, 'home-key');
+  mkdirSync(join(keyHome, '.grok', 'sessions', '%2Fwork%2Frepo', SID), { recursive: true });
+  const resumed = run(['export XAI_API_KEY=xai-test'], SID, keyHome);
+  ok(readFileSync(log, 'utf8').includes(`GROK -r ${SID} --always-approve`),
+     'key + LOCAL session id → `grok -r <sid> --always-approve` (the resume still works)');
+  ok(!resumed.includes('no grok key'), '…and no no-key banner when the cage has a key');
+  const staleHome = join(dir, 'home-stale');
+  const fresh = run(['export XAI_API_KEY=xai-test'], SID, staleHome);
+  ok(readFileSync(log, 'utf8').trim() === 'GROK --always-approve',
+     'key + STALE session id → `grok --always-approve` (fresh session — the stale id is never passed)');
+  const seatHome = join(dir, 'home-seat');
+  mkdirSync(join(seatHome, '.grok', 'sessions', '%2Fwork%2Frepo', SID), { recursive: true });
+  writeFileSync(join(seatHome, '.grok', 'auth.json'), '{"session": "installed-by-the-adapter"}');
+  run(['export GROK_AUTH_JSON=\'{"https://accounts.x.ai/sign-in":{"key":"k"}}\''], SID, seatHome);
+  ok(readFileSync(log, 'utf8').includes(`GROK -r ${SID} --always-approve`),
+     'seat cage (auth.json installed) + local id → `grok -r <sid>` (the seat path resumes too)');
+  const brokenSeatHome = join(dir, 'home-broken-seat');
+  mkdirSync(join(brokenSeatHome, '.grok', 'sessions', '%2Fwork%2Frepo', SID), { recursive: true });
+  writeFileSync(log, '');
+  run(['export GROK_AUTH_JSON=\'{"https://accounts.x.ai/sign-in":{"key":"k"}}\''], SID, brokenSeatHome);
+  ok(!readFileSync(log, 'utf8').includes('GROK '),
+     'carrier env WITHOUT the installed file → grok NOT invoked (the file IS the login — a broken '
+     + 'install must not end on the device-code prompt)');
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── 5. the refresh: the drainer must reach cxells that already exist ──────────────────────────
 console.log('\n── the attach script is refreshed like the CLI and the renderer ──');
 ok(typeof installZeeAttachIntoCxell === 'function' && ZEE_ATTACH_DEST === '/usr/local/bin/zee-attach.sh',
