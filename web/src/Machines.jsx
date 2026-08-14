@@ -6,11 +6,12 @@
 // The column header is the machine's control surface: dev spawn priority, pool size / max cap,
 // can-build, and — when the machine has no shared dev db for this project — the one-click
 // provision that makes it able to host xells at all. "+ machine" adds a host as the hive grows.
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
          setMachinePool, setMachinePriority, getSites, createSite,
-         registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices, checkMachineConnection } from './api.js';
+         registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices, checkMachineConnection,
+         getBuildReadiness } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
@@ -37,6 +38,22 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
   // knobs themselves: remote prio/pool render DIMMED with the reason in their tooltip, and
   // stay editable so an operator can still zero them.
   const poolingDeadFor = (m) => !!spinoffIsProcess && !m.is_queenzee_host;
+
+  // MACHINE × PROJECT BUILD-READINESS (ticket #173): per-machine "can a build actually work
+  // HERE?" probe, fetched once on mount and on a badge re-check. Read-only; the verdict is
+  // ok | unknown | missing with the failing check named, rendered in each column header.
+  const [readiness, setReadiness] = useState(null);          // array of per-machine verdicts
+  const [readinessBusy, setReadinessBusy] = useState(false);
+  const loadReadiness = useCallback(async () => {
+    if (!projectId) { setReadiness(null); return; }
+    setReadinessBusy(true);
+    try { setReadiness(await getBuildReadiness(projectId)); }
+    catch { setReadiness(null); }   // the badge shows an un-checked state; the matrix stays usable
+    finally { setReadinessBusy(false); }
+  }, [projectId]);
+  useEffect(() => { loadReadiness(); }, [loadReadiness]);
+  const readinessByMachine = Object.fromEntries(
+    (readiness || []).map((r) => [r.machine_id, r]));
 
   // Where a container lives, for column placement: its own run context — or, for a PROCESS role
   // (docker_ctx NULL, probed by URL: the self-shipped queenzee), its deploy site's context. A
@@ -89,6 +106,9 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
         return col.kind === 'machine'
         ? <MachineHead key={col.m.id} m={col.m} projectId={projectId}
                        poolingDead={poolingDeadFor(col.m)}
+                       readiness={readinessByMachine[col.m.id]}
+                       readinessBusy={readinessBusy}
+                       onRecheck={loadReadiness}
                        // Spec: a xell never crosses docker contexts for its database, so every dev
                        // machine wants this project's own dev db. Missing-here-but-exists-elsewhere
                        // is a WARNING (spawns here are being refused); missing-everywhere is the
@@ -119,7 +139,8 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
 
 // A machine's header: identity + the policy knobs, edited in place. Numbers commit on blur/Enter;
 // every change PATCHes and refreshes, so what you read is always the server's truth.
-function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhere, empty, onChanged }) {
+function MachineHead({ m, projectId, poolingDead = false, readiness = null, readinessBusy = false,
+                       onRecheck = null, hasDevDb, devDbElsewhere, empty, onChanged }) {
   const [busy, setBusy] = useState(false);
   // Connection check state — the Deploy tab's per-machine "can the queenzee reach this host with
   // the settings on its row?" probe. null = not checked yet; { checking:true } = in flight; a
@@ -185,11 +206,9 @@ function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhe
   };
   // `dead` dims the knob without disabling it (the value stays editable so an operator can
   // still zero old numbers) and swaps the tooltip for the reason it has no effect here.
-  const num = (field, v, title, onCommit, dead = false) => (
+  const num = (field, v, title, onCommit, dead = false, deadTitle = null) => (
     <label className={`mx-knob${dead ? ' dead' : ''}`} {...(dead ? { 'data-pooling-dead': m.key } : {})}
-           title={dead
-             ? `No effect for this project: the spinoff server is runner:process, so its xells all run on the queenzee host — set the pool on the queenzee-host machine's column instead. To place xells on ${m.key}, give the server a compose runner in zeehive.yml.`
-             : title}>
+           title={dead ? (deadTitle || title) : title}>
       <span className="k">{field === 'dev_priority' ? 'prio' : field === 'pool_size' ? 'pool' : 'cap'}</span>
       <input type="number" min="0" defaultValue={v} disabled={busy} data-testid={`mx-${field}-${m.key}`}
              onBlur={(e) => Number(e.target.value) !== v
@@ -198,6 +217,18 @@ function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhe
     </label>
   );
 
+  // BUILD-READINESS DEMOTION (ticket #173, same pattern as pooling-dead):
+  // when the probe says this machine cannot build the project — or cannot tell — the
+  // prio/pool knobs that would place xells here are DIMMED with the reason in the tooltip,
+  // not silently green. The knobs stay editable so an operator can still zero them.
+  const buildDead = !!readiness && readiness.status !== 'ok'
+    && (Number(m.dev_priority) > 0 || Number(m.pool_size) > 0);
+  const buildDeadReason = buildDead
+    ? `⚠ ${m.key} cannot build this project (readiness ${readiness.status}): ${readiness.error || 'no reason recorded'}\n`
+      + 'Xells placed here will fail to build. See the build-ready badge (⚙) for the failing check.'
+    : null;
+  const poolingDeadReason = 'No effect for this project: the spinoff server is runner:process, so its xells all run on the queenzee host — set the pool on the queenzee-host machine\'s column instead. To place xells on ' + m.key + ', give the server a compose runner in zeehive.yml.';
+
   return (
     <div className={`mx-head${m.enabled ? '' : ' off'}`} data-testid={`machine-${m.key}`}>
       <div className="mx-name" title={`${m.label || m.key}\ncontext: ${m.docker_ctx}${m.host_ip ? `\nhost: ${m.host_ip}` : ''}${m.notes ? `\n${m.notes}` : ''}`}>
@@ -205,11 +236,12 @@ function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhe
         <button className="mx-prod" data-testid={`mx-prod-${m.key}`} disabled={busy} onClick={addProd}
                 title={`Place a PRODUCTION on ${m.key} — creates the prod site + its production xell here`}>＋prod</button>
         <MachineConn m={m} conn={conn} onCheck={check} />
+        <BuildReady m={m} readiness={readiness} busy={readinessBusy} onRecheck={onRecheck} />
         {empty && <button className="mx-del" title="Remove this machine row" onClick={remove}>✕</button>}
       </div>
       <div className="mx-knobs">
-        {num('dev_priority', m.dev_priority, 'Dev spawn priority for THIS project — the highest-priority machine with room gets this project\'s new dev xells first. 0 = not a dev host for this project. Per project — one project can prefer this box while another prefers the laptop.', setPrio, poolingDead)}
-        {num('pool_size', m.pool_size, 'How many READY (pre-warmed) xells THIS project keeps on this machine. Per project — a high-load project pools bigger here than a quiet one.', setPool, poolingDead)}
+        {num('dev_priority', m.dev_priority, 'Dev spawn priority for THIS project — the highest-priority machine with room gets this project\'s new dev xells first. 0 = not a dev host for this project. Per project — one project can prefer this box while another prefers the laptop.', setPrio, poolingDead || buildDead, buildDead ? buildDeadReason : poolingDeadReason)}
+        {num('pool_size', m.pool_size, 'How many READY (pre-warmed) xells THIS project keeps on this machine. Per project — a high-load project pools bigger here than a quiet one.', setPool, poolingDead || buildDead, buildDead ? buildDeadReason : poolingDeadReason)}
         {num('max_xells', m.max_xells, 'Machine-wide cap: total live dev xells here across ALL projects (ready + claimed + working).')}
         <label className={`mx-build${m.can_build ? ' on' : ''}`}
                title={m.can_build ? 'Suitable for compiling images — its xells build here, and it can compile for machines that can\'t.'
@@ -266,6 +298,41 @@ function MachineConn({ m, conn, onCheck }) {
     <button className={cls} data-testid={`mx-conn-${m.key}`} disabled={checking}
             onClick={onCheck} title={title}>
       {checking ? '⏳…' : ok ? '✓ ok' : fail ? '✗ down' : '🔌 check'}
+    </button>
+  );
+}
+
+// The per-(machine, project) BUILD-READINESS badge (ticket #173): "can a build actually work on
+// this machine FOR THIS PROJECT?" — the pool knob is set blind today, so this is the fact that
+// answers it, right where the knob is. Read-only probe (server-side, bounded docker calls):
+//   ✓ build  → ok — every check passed
+//   △ ?      → unknown — a check could not be run (context unreachable, docker absent), reason on hover
+//   ✗ build  → missing — a named prerequisite is absent; the failing check is in the tooltip
+// Clicking re-runs the probe. Same shape as MachineConn: the button IS the verdict.
+function BuildReady({ m, readiness, busy = false, onRecheck = null }) {
+  const titleFor = () => {
+    const checks = (readiness?.checks || []).map((c) => `• ${c.check}: ${c.detail}`).join('\n');
+    const failed = (readiness?.checks || []).filter((c) => !c.ok)
+      .map((c) => `• ${c.check}${c.unknown ? ' (unknown)' : ''}: ${c.detail}`).join('\n');
+    if (readiness?.status === 'ok') {
+      return `✓ ${m.key} can build this project\n${checks}\nClick to re-check (read-only).`;
+    }
+    if (readiness?.status === 'unknown') {
+      return `△ Can't tell whether ${m.key} can build this project — a check could not be run:\n${failed || readiness.error || 'unknown reason'}\nClick to re-check (read-only).`;
+    }
+    if (readiness?.status === 'missing') {
+      return `✗ ${m.key} CANNOT build this project — missing:\n${failed || readiness.error || 'no reason recorded'}\nClick to re-check (read-only).`;
+    }
+    return busy ? 'Checking whether this machine can build this project…'
+      : onRecheck ? `Check whether ${m.key} can build this project (read-only probe)\n` +
+        'Probes the docker context, the spinoff compose, the declared requires, the shared dev db and the registry handoff.'
+      : 'build readiness not checked yet';
+  };
+  const cls = `mx-br${readiness ? (readiness.status === 'ok' ? ' ok' : readiness.status === 'unknown' ? ' unk' : ' miss') : ''}`;
+  return (
+    <button className={cls} data-testid={`mx-build-ready-${m.key}`} disabled={busy}
+            onClick={onRecheck || undefined} title={titleFor()}>
+      {busy ? '⏳…' : readiness?.status === 'ok' ? '✓ build' : readiness?.status === 'unknown' ? '△ ?' : readiness?.status === 'missing' ? '✗ build' : '⚙'}
     </button>
   );
 }

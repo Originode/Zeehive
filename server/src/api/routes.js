@@ -29,6 +29,7 @@ import { checkContainers, decommissionContainer } from '../queenzee/containers.j
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
+import { buildReadinessForProject } from '../lib/build-readiness.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
@@ -878,6 +879,14 @@ router.post('/projects/probe', (req, res) => res.json(probeRepo(req.body?.repo_r
 router.get('/projects/:id/readiness', async (req, res) => {
   try { res.json(await projectReadiness(req.params.id)); }
   catch (err) { res.status(404).json({ error: err.message }); }
+});
+// Machine × project BUILD-READINESS (ticket #173): for every machine of this project, can a
+// build actually work there? Read-only probe — same docker facts verifyRequires uses, plus the
+// meta-DB facts a placement needs. Verdict per machine: ok | unknown | missing, with the
+// failing check NAMED. Rendered in the container matrix where the pool knobs are set.
+router.get('/projects/:id/build-readiness', async (req, res) => {
+  try { res.json(await buildReadinessForProject(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 // The dev spawn template: what a new xell gets by default (couplings, runtime, pool size).
 router.get('/projects/:id/pool-config', async (req, res) => res.json(await getPoolConfig(req.params.id)));

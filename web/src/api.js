@@ -513,6 +513,9 @@ export const squashOffer = (r, branch = 'main') =>
   + `${branch}, on top of the remote base. The review diff is identical, the intermediate commits are not pushed, and `
   + `nothing local is rewritten.`;
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
+// Machine × project build-readiness (ticket #173): per-machine verdict {ok|unknown|missing}
+// with the failing check named, rendered in the container matrix where the pool knobs are set.
+export const getBuildReadiness = (projectId) => fetch(`/api/projects/${projectId}/build-readiness`).then((r) => r.json());
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
 export const getSharedContainers = (projectId) => fetch(`/api/projects/${projectId}/containers`).then((r) => r.json());

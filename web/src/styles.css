@@ -824,6 +824,17 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-conn.ok:hover:not(:disabled) { color: var(--up); border-color: var(--up); }
 .mx-conn.fail { color: var(--down); border-color: rgba(229,85,78,.5); }
 .mx-conn.fail:hover:not(:disabled) { color: var(--down); border-color: var(--down); }
+/* the per-(machine, project) BUILD-READINESS badge (ticket #173) — same shape as mx-conn: the
+   button IS the verdict. ok=green, unknown=amber, missing=red, un-checked=idle. */
+.mx-br { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
+  cursor: pointer; font-size: 9px; padding: 0 4px; white-space: nowrap; }
+.mx-br:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-br.ok { color: var(--up); border-color: rgba(53,196,107,.5); }
+.mx-br.ok:hover:not(:disabled) { color: var(--up); border-color: var(--up); }
+.mx-br.unk { color: #e0a53b; border-color: rgba(224,165,59,.5); }
+.mx-br.unk:hover:not(:disabled) { color: #e0a53b; border-color: #e0a53b; }
+.mx-br.miss { color: var(--down); border-color: rgba(229,85,78,.5); }
+.mx-br.miss:hover:not(:disabled) { color: var(--down); border-color: var(--down); }
 .mx-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 10px; padding: 0 2px; }
 .mx-del:hover { color: #d9553b; }
 .mx-prod { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
