@@ -1950,6 +1950,17 @@ function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing
             </span>
           </div>
         )}
+        {/* OVER-BUDGET SPEND-ALERT (migration 206) — this xell's cumulative spend on a provider
+            exceeded the project's per-provider alert amount set in Project setup → Agent providers.
+            Shown right under the burn it explains. */}
+        {!isProd && x.burn_alert?.open && (
+          <div className="row"><span className="rk">alert</span>
+            <span className="envalert" data-testid="xell-burn-alert"
+                  title={`This xell has spent ${fmtUsd(x.burn_alert.cost)} on ${x.burn_alert.provider} — over the ${fmtUsd(x.burn_alert.limit)} alert you set for that provider.\n\nSet / clear it in Project setup → Agent providers.`}>
+              ⚠ over budget: {fmtUsd(x.burn_alert.cost)} on {x.burn_alert.provider} (limit {fmtUsd(x.burn_alert.limit)})
+            </span>
+          </div>
+        )}
         {/* Can this xell ship to prod, and if not, why? Two different "no"s that the gate itself
             treats differently — collapsing them into one "blocked" would be a lie in both
             directions. See shipState(). */}

@@ -10,7 +10,7 @@ import {
   getComposeOnboardingPlan, applyComposeOnboarding,
   getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
-  pauseProviderAccount, resumeProviderAccount, getReposHome, listFsDirs,
+  pauseProviderAccount, resumeProviderAccount, setProviderAlertAmount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
@@ -2414,9 +2414,22 @@ function TokensSection({ project, run, busy }) {
   const [paste, setPaste] = useState('');
   const [label, setLabel] = useState('');
   const [copied, setCopied] = useState(false);
+  // Per-provider spend-alert input draft (migration 206): keyed by provider, undefined until the
+  // human edits. Kept separate from the loaded row so typing does not fight a refresh — on save the
+  // draft is cleared and the row re-reads the saved value.
+  const [alertDraft, setAlertDraft] = useState({});
   const load = useCallback(() => getProviderTokens(project.id).then(setTokens).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  // Save ONE provider's spend-alert amount (USD). Empty / invalid clears it. The draft is cleared
+  // after save so the input re-binds to the server value (null → placeholder).
+  const saveAlert = (p) => {
+    const raw = alertDraft[p.provider];
+    const v = String(raw ?? '').trim();
+    wrapped(() => setProviderAlertAmount(project.id, p.provider, v === '' ? null : v))
+      .then(() => setAlertDraft((d) => ({ ...d, [p.provider]: undefined })))
+      .catch(() => {});
+  };
 
   const copy = async (cmd) => {
     try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); }
@@ -2459,6 +2472,23 @@ function TokensSection({ project, run, busy }) {
                 {p.available_pct}% free
               </span>
             )}
+            {/* PER-PROVIDER SPEND-ALERT (migration 206): a USD amount — when a xell's gateway-ledger
+                spend on this provider exceeds it, that xell's hexagon shows an over-budget indicator.
+                Empty clears the alert. Saves on blur / Enter. */}
+            <span className="pc" title="When a xell's spend on this provider exceeds this amount (USD), its hexagon shows an over-budget alert.">
+              alert $
+            </span>
+            <input
+              className="mono"
+              style={{ width: 72 }}
+              type="number" min="0" step="0.01"
+              placeholder="no alert"
+              value={alertDraft[p.provider] ?? p.alert_amount ?? ''}
+              onChange={(e) => setAlertDraft((d) => ({ ...d, [p.provider]: e.target.value }))}
+              onBlur={() => saveAlert(p)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } }}
+              data-testid={`provider-alert-${p.provider}`}
+            />
             <button type="button" className="ghost"
                     onClick={() => { setOpen(open === p.provider ? null : p.provider); setPaste(''); setLabel(''); }}>
               {open === p.provider ? '▾ cancel' : p.connected ? '＋ add another account' : '＋ connect'}

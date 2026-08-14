@@ -399,6 +399,11 @@ export const pauseProviderAccount = (projectId, accountId, reason) =>
     { reason: reason || undefined });
 export const resumeProviderAccount = (projectId, accountId) =>
   siteCall(`/api/projects/${projectId}/tokens/account/${accountId}/resume`, 'POST');
+// Per-provider spend-alert threshold (migration 206) — a USD amount per provider; a xell whose
+// gateway-ledger spend on that provider exceeds it gets an over-budget hexagon indicator.
+export const setProviderAlertAmount = (projectId, provider, amount) =>
+  siteCall(`/api/projects/${projectId}/provider-alerts/${provider}`, 'PUT',
+    { amount: amount === '' || amount == null ? null : amount });
 // ── project API keys — the credential a DEPLOYED project presents to /api/ext/v1 (migration 190).
 // The plaintext key comes back ONCE, on create; every later read carries key_hint alone, so the
 // console must show it at mint time or never (lib/project-api-keys.js). ─────────
