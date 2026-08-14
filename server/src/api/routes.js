@@ -50,7 +50,7 @@ import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { resolveProjectId } from '../lib/project-resolve.js';
 import { listProviderTokens, providerLimits, setProviderToken, addProviderToken, deleteProviderToken,
-         deleteProviderAccount, setProviderAccountPaused } from '../lib/provider-tokens.js';
+         deleteProviderAccount, setProviderAccountPaused, setProviderAlertAmount } from '../lib/provider-tokens.js';
 import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
          listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
          resolvedEnvView, setXellEnvironment, extractXellEnv } from '../lib/environments.js';
@@ -656,6 +656,16 @@ router.delete('/projects/:id/tokens/account/:accountId', async (req, res) => {
   try { res.json(await deleteProviderAccount(req.params.id, req.params.accountId)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// SET one provider's spend-alert threshold (migration 206) — a customizable USD amount per
+// provider, applied per xell by the fleet read model: when a xell's gateway-ledger spend on
+// that provider exceeds the amount, its hexagon shows an over-budget indicator. Body: { amount }
+// (number, or null/'' to clear).
+router.put('/projects/:id/provider-alerts/:provider', async (req, res) => {
+  try {
+    res.json(await setProviderAlertAmount(req.params.id, req.params.provider, req.body?.amount));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // PAUSE / RESUME a provider account (migration 104): disabling it for every dispatch surface
 // without disconnecting the token. Pausing is reversible (resume), and a paused account can
 // still be deleted. Same shape as the fleet/project/xell pause routes.
