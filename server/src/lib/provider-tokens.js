@@ -240,6 +240,10 @@ export async function listProviderTokens(projectId) {
               paused_at, paused_by, reason
          FROM provider_token WHERE project_id = $1 ORDER BY created_at`, [projectId]);
   }
+  // Per-provider spend-alert thresholds (migration 206): { claude: 50 } = "flag a xell whose
+  // gateway-ledger spend on claude exceeds $50". Read beside the accounts so the Providers panel
+  // can offer the alert input on the same row it shows the % free.
+  const alertAmounts = await getProviderAlertAmounts(projectId);
   return Object.values(PROVIDERS).map((p) => {
     const accounts = rows.filter((r) => r.provider === p.key)
       .map(({ id, label, token_hint, created_at, last_used_at, paused_at, paused_by, reason,
@@ -264,6 +268,9 @@ export async function listProviderTokens(projectId) {
       dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
       connected: accounts.length > 0,
       accounts,
+      // spend-alert threshold (USD) for ONE xell on THIS provider — migration 206, set in the
+      // Providers panel. Null when no alert configured.
+      alert_amount: alertAmounts[p.key] ?? null,
       // every account of this type is paused → the provider as a whole is disabled
       all_paused: accounts.length > 0 && pausedCount === accounts.length,
       token_hint: accounts[0]?.token_hint || null,
@@ -272,6 +279,35 @@ export async function listProviderTokens(projectId) {
       available_pct: activeAvails.length ? Math.min(...activeAvails) : null,
     };
   });
+}
+
+// PROJECT-LEVEL PROVIDER SPEND-ALERT THRESHOLDS (migration 206) — { provider: USD }. A human
+// sets these in Project setup → Agent providers; the fleet read model compares each xell's
+// gateway-ledger spend on a provider against the threshold and flags the hexagon when it is
+// exceeded. Absent key = no alert. Read as a plain object (never undefined).
+export async function getProviderAlertAmounts(projectId) {
+  const row = await one(
+    `SELECT provider_alert_amounts FROM project WHERE id = $1`, [projectId]).catch(() => null);
+  const map = row?.provider_alert_amounts;
+  if (map && typeof map === 'object' && !Array.isArray(map)) return map;
+  return {};
+}
+
+// Set (or clear) ONE provider's spend-alert threshold. `amount` is a USD number; null/0/''/NaN
+// clears the alert. Unknown provider keys are refused (the catalogue lives in PROVIDERS above, so
+// a typo becomes a 400 instead of a silently-ignored threshold).
+export async function setProviderAlertAmount(projectId, provider, amount) {
+  if (!PROVIDERS[provider]) throw new Error(`unknown provider "${provider}"`);
+  const next = await getProviderAlertAmounts(projectId);
+  const v = amount === '' || amount == null ? null : Number(amount);
+  if (v != null && (!Number.isFinite(v) || v < 0)) {
+    throw new Error('alert amount must be a non-negative USD number (or empty to clear)');
+  }
+  if (v == null || v <= 0) delete next[provider];
+  else next[provider] = Math.round(v * 100) / 100;   // cents precision — it is money
+  await q(`UPDATE project SET provider_alert_amounts = $2 WHERE id = $1`,
+    [projectId, JSON.stringify(next)]);
+  return { ok: true, provider, alert_amount: next[provider] ?? null };
 }
 
 // PROJECT-LEVEL PROVIDER LIMITS — how much of each connected provider account's quota is still

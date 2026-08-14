@@ -401,7 +401,7 @@ export async function streamXells(projectId, onXell) {
   if (!project) return null;
   const { heads, deployed } = await fleetGitContext(project);
   const rows = await fetchXellRows(project.id);
-  await attachUsageLimits(rows);
+  await attachUsageLimits(rows, project.id);
   const { paused } = await pauseState();
   const projPause = await projectPauseState(project.id);
   const projectPaused = projPause.paused;
@@ -415,7 +415,14 @@ export async function streamXells(projectId, onXell) {
 // Load provider_token.usage_limit for each xell via xell_provider_grant (the account the cage was
 // actually granted). Prefer the grant matching the runtime's provider; else the freshest grant.
 // Soft-fails on pre-203 DBs (no usage_limit column) so the fleet snapshot still paints.
-async function attachUsageLimits(xells) {
+//
+// ALSO computes the per-provider SPEND-ALERT (migration 206): the project's
+// provider_alert_amounts { claude: 50 } is compared against each xell's cumulative gateway-ledger
+// spend on that provider (llm_gateway_request.cost_usd — the only grain attributed per provider).
+// When a threshold is exceeded, x.burn_alert = { open: true, provider, cost, limit } names the
+// worst offender (the provider most over its threshold), else null. The hexagon reads that flag to
+// paint the over-budget indicator.
+async function attachUsageLimits(xells, projectId) {
   if (!xells?.length) return;
   const ids = xells.map((x) => x.id);
   let grants = [];
@@ -428,7 +435,7 @@ async function attachUsageLimits(xells) {
           AND pt.usage_limit IS NOT NULL
         ORDER BY g.granted_at DESC`, [ids]);
   } catch {
-    return; // migration 203 not applied, or grant table missing — no HP bar
+    grants = []; // migration 203 not applied, or grant table missing — no HP bar
   }
   const { providerFromRuntime, availableForXell } = await import('./usage-limits.js');
   const byXell = new Map();
@@ -437,22 +444,84 @@ async function attachUsageLimits(xells) {
     list.push(g);
     byXell.set(g.xell_id, list);
   }
+
+  // SPEND-ALERT thresholds (migration 206). Absent on pre-206 DBs → the project read fails → no
+  // alert. readSpendByProvider soft-fails the same way (missing llm_gateway_request table).
+  let alertAmounts = {};
+  try {
+    const proj = await one(`SELECT provider_alert_amounts FROM project WHERE id = $1`, [projectId]);
+    if (proj?.provider_alert_amounts && typeof proj.provider_alert_amounts === 'object') {
+      alertAmounts = proj.provider_alert_amounts;
+    }
+  } catch { /* pre-206 db — no spend alerts */ }
+  const thresholded = Object.entries(alertAmounts)
+    .filter(([, v]) => v != null && Number.isFinite(Number(v)) && Number(v) > 0)
+    .map(([p, v]) => [p, Number(v)]);
+  const spendByXell = thresholded.length ? await readSpendByProvider(projectId, ids) : new Map();
+
   for (const x of xells) {
     const list = byXell.get(x.id) || [];
-    if (!list.length) { x.usage_available_pct = null; continue; }
-    const want = providerFromRuntime({ runtime_key: x.runtime_key, runtime_vendor: x.runtime_vendor });
-    const pick = (want && list.find((g) => g.provider === want)) || list[0];
-    x._usage_limit = pick.usage_limit;
-    x._usage_provider = pick.provider;
-    // model-wide if known, else provider-wide — badge HP bar
-    const lim = availableForXell(pick.usage_limit, {
-      provider: pick.provider,
-      model: x.zee_model || null,
-    });
-    x.usage_available_pct = lim.available_pct;
-    x.usage_limit_window = lim.window;
-    x.usage_limit_source = lim.source;   // 'model' | 'provider' | null
+    if (list.length) {
+      const want = providerFromRuntime({ runtime_key: x.runtime_key, runtime_vendor: x.runtime_vendor });
+      const pick = (want && list.find((g) => g.provider === want)) || list[0];
+      x._usage_limit = pick.usage_limit;
+      x._usage_provider = pick.provider;
+      // model-wide if known, else provider-wide — badge HP bar
+      const lim = availableForXell(pick.usage_limit, {
+        provider: pick.provider,
+        model: x.zee_model || null,
+      });
+      x.usage_available_pct = lim.available_pct;
+      x.usage_limit_window = lim.window;
+      x.usage_limit_source = lim.source;   // 'model' | 'provider' | null
+    } else {
+      x.usage_available_pct = null;
+      x.usage_limit_window = null;
+      x.usage_limit_source = null;
+    }
+    // SPEND-ALERT: worst offender (highest cost over its threshold) across the providers with a
+    // configured amount. Null when nothing is over budget.
+    x.burn_alert = null;
+    const spend = spendByXell.get(x.id);
+    if (spend && spend.size) {
+      let worst = null;   // { provider, cost, limit, over }
+      for (const [provider, limit] of thresholded) {
+        const cost = spend.get(provider);
+        if (cost == null || cost <= limit) continue;
+        const over = cost - limit;
+        if (!worst || over > worst.over) worst = { provider, cost, limit, over };
+      }
+      if (worst) {
+        x.burn_alert = {
+          open: true,
+          provider: worst.provider,
+          cost: Math.round(worst.cost * 100) / 100,
+          limit: worst.limit,
+        };
+      }
+    }
   }
+}
+
+// Per-xell × per-provider cumulative spend from the LLM gateway ledger — the ONLY grain attributed
+// to a provider key. Returns Map<xell_id, Map<provider, cost>>. Empty map when the ledger table is
+// missing (pre-154 db) or nothing is thresholded (caller gates on that).
+async function readSpendByProvider(projectId, xellIds) {
+  const out = new Map();
+  let rows = [];
+  try {
+    rows = await q(
+      `SELECT xell_id, provider, COALESCE(SUM(cost_usd), 0)::float8 AS cost
+         FROM llm_gateway_request
+        WHERE project_id = $1 AND xell_id = ANY($2::uuid[]) AND provider IS NOT NULL
+        GROUP BY xell_id, provider`, [projectId, xellIds]);
+  } catch { return out; }
+  for (const r of rows) {
+    let byProv = out.get(r.xell_id);
+    if (!byProv) { byProv = new Map(); out.set(r.xell_id, byProv); }
+    byProv.set(r.provider, Number(r.cost || 0));
+  }
+  return out;
 }
 
 export async function getFleet(projectId) {
@@ -498,7 +567,7 @@ export async function getFleet(projectId) {
   // xells with their resolved container stack + live zee + runtime label. Same rows + decoration
   // the streaming path emits — just collected into an array here rather than flushed one by one.
   const xells = await fetchXellRows(pid);
-  await attachUsageLimits(xells);
+  await attachUsageLimits(xells, pid);
   // The fleet PAUSE, read ONCE for the whole snapshot: it is a single fleet-wide flag, so asking per
   // xell would be one round-trip per hexagon for one boolean.
   const pause = await pauseState();

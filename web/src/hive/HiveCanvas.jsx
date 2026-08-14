@@ -197,6 +197,47 @@ function drawBusyDot(ctx, x, y, r) {
   ctx.fill();
   ctx.restore();
 }
+// THE OVER-BUDGET SPEND-ALERT (migration 206): a pulsing red ring around the whole hexagon plus a
+// red "!" badge pinned to the upper-right vertex — drawn for a xell whose cumulative spend on a
+// provider exceeded the project's per-provider alert amount. Painted OUTSIDE the card clip (like
+// the relation mark) so it reads as a badge on the cell, never buried under the card's own lines.
+// `ba` is the fleet row's burn_alert: { open, provider, cost, limit }.
+function drawBurnAlert(ctx, cx, cy, size, ba) {
+  if (!ba?.open) return;
+  const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 260);
+  // 1. the pulsing ring — one pass just outside the hex edge, stroked with a glow so even a tiny
+  // hex reads "alert" from across the room.
+  ctx.save();
+  hexPath(ctx, cx, cy, size + 2.5);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = withAlpha(COL.error, 0.35 + 0.55 * pulse);
+  ctx.shadowColor = COL.error;
+  ctx.shadowBlur = 6 * pulse;
+  ctx.stroke();
+  ctx.restore();
+
+  // 2. the badge at the upper-right vertex (hexCorners i=0: 330° math, cos=√3/2, sin=-½) — the
+  // mirror of the provider coin at upper-left, so the two corners of a hexagon carry its two facts:
+  // WHO is thinking (upper-left) and whether it is over budget (upper-right).
+  if (size < 24) return;                       // too small to read a badge — the ring says it
+  const angle = (-30 * Math.PI) / 180;
+  const dist = size * 0.80;
+  const bx = cx + dist * Math.cos(angle);
+  const by = cy + dist * Math.sin(angle);
+  const br = Math.max(4, size * 0.14);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2);
+  ctx.fillStyle = withAlpha(COL.error, 0.92);
+  ctx.shadowColor = COL.error; ctx.shadowBlur = br * 0.8 * pulse;
+  ctx.fill();
+  ctx.lineWidth = 1.2; ctx.strokeStyle = '#0d1017'; ctx.stroke();
+  ctx.font = `800 ${br * 1.3}px 'Segoe UI', sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('!', bx, by + 0.5);
+  ctx.restore();
+}
+
 // Red pause icon (two vertical bars) drawn where the yellow "working" dot would be — used when a xell
 // is paused (fleet-wide, project-scoped or per-xell). The ⏸ character is clear enough at hex scales.
 function drawPausedIcon(ctx, x, y, r) {
@@ -1779,6 +1820,9 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
   }
   ctx.restore();   // unclip
   mark();
+  // The over-budget spend-alert ring + badge rides OUTSIDE the clip, last, so it never competes
+  // with the card's own lines (migration 206 — per-provider alert amount set in Project setup).
+  drawBurnAlert(ctx, cx, cy, size, x.burn_alert);
   ctx.restore();
 }
 
