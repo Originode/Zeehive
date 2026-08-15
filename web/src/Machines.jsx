@@ -309,7 +309,9 @@ function MachineConn({ m, conn, onCheck }) {
 //   △ ?      → unknown — a check could not be run (context unreachable, docker absent), reason on hover
 //   ✗ build  → missing — a named prerequisite is absent; the failing check is in the tooltip
 // Clicking re-runs the probe. Same shape as MachineConn: the button IS the verdict.
-function BuildReady({ m, readiness, busy = false, onRecheck = null }) {
+// Exported so a test can render the badge with a fixture (the matrix fetches readiness in a
+// useEffect that SSR cannot run) — same pattern as MachineMatrix itself being exported.
+export function BuildReady({ m, readiness, busy = false, onRecheck = null }) {
   const titleFor = () => {
     const checks = (readiness?.checks || []).map((c) => `• ${c.check}: ${c.detail}`).join('\n');
     const failed = (readiness?.checks || []).filter((c) => !c.ok)
