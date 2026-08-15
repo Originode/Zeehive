@@ -32,7 +32,7 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { planBuildBootstrap, performBuildBootstrap, guardDevOnly } = await import('../server/src/lib/build-bootstrap.js');
-const { probeBuildReadiness } = await import('../server/src/lib/build-readiness.js');
+const { probeBuildReadiness, dockerAdapter } = await import('../server/src/lib/build-readiness.js');
 
 // ── the stubbed docker adapter ──────────────────────────────────────────────
 // Same dispatch shape as build-readiness.test.mjs, PLUS a `create` verb for `docker network create`
@@ -170,6 +170,18 @@ try {
   ok(volStep?.status === 'cannot', `missing volume reported 'cannot' [${volStep?.status}]`);
   ok(/DATA/.test(volStep?.detail || ''), `the cannot reason says volumes are DATA [${volStep?.detail}]`);
 
+  // ── performing an all-cannot plan is RECORDED too (the declined action must be as
+  //    readable afterwards as one that acted — the manager's review rule) ──────
+  console.log('\n── a CANNOT action is RECORDED with its step (not just the happy path) ──');
+  const pCannot = await insProject(`bs-cannot-${tag}`, { tiers: { spinoff: { requires: { volumes: ['bs_cannot_data'] } } } });
+  const mCannot = await insMachine(`bs-cannot-${tag}`, `zt-bs-cannot-${tag}`, true);
+  await insDevDb(pCannot, `zt-bs-cannot-${tag}`, `bs_${tag}_cannot_db`);
+  const perfCannot = await performBuildBootstrap(pCannot, mCannot, { dryRun: false, docker: makeDocker({ networks: new Set() }), provisionDb: makeProvision(), actor: 'tester@xell' });
+  ok(perfCannot.status === 'cannot', `a plan of only cannot steps → overall 'cannot' [${perfCannot.status}]`);
+  const cannotRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCannot.action_id]);
+  ok(cannotRow?.status === 'cannot' && cannotRow?.steps?.length === 1 && cannotRow.steps[0].status === 'cannot',
+     `the CANNOT action is RECORDED with its step [status=${cannotRow?.status}, steps=${cannotRow?.steps?.length}]`);
+
   // ── registry-for-handoff → cannot, naming what to set ──────────────────────
   console.log('\n── can_build=false + no registry → cannot, naming what to set ──');
   const p3 = await insProject(`bs-reg-${tag}`, {});
@@ -264,6 +276,32 @@ try {
   ok(perf10.status === 'refused', `unreachable context → refused [${perf10.status}]`);
   ok(/not reachable|reachable/.test(perf10.reason || ''), `the refusal names the unreachable context [${perf10.reason?.slice(0, 80)}…]`);
   ok(!docker10.calls.some((c) => c.includes('network create')), `nothing was created against an unreachable daemon`);
+
+  // ── the REAL dockerAdapter's timeout path, through the action ───────────────
+  // Manager's rule: every docker call goes through the probe's bounded ASYNC adapter — no
+  // spawnSync on the queenzee's event loop. Prove it with a REAL subprocess: a wrapper that hangs
+  // for 5s is SIGKILLed by the adapter at 250ms, the action refuses the whole thing (a daemon it
+  // cannot reach), and the whole perform returns bounded — while a heartbeat keeps ticking, which a
+  // spawnSync-style blocking call would freeze for the full 5s.
+  console.log('\n── the REAL dockerAdapter times out bounded against a hanging child (no spawnSync) ──');
+  // A static hang, whatever the real docker subcommand the probe sends: the adapter must SIGKILL
+  // it at the bound, never let a docker call run past its ceiling on the queenzee's loop.
+  const hangWrap = path.join(repoDir, 'hangwrap.cjs');
+  fs.writeFileSync(hangWrap, "#!/usr/bin/env node\nsetTimeout(() => {}, 5000);\n");
+  fs.chmodSync(hangWrap, 0o755);
+  const realDocker = (ctx, args) => dockerAdapter(ctx, args, { timeout: 250, bin: hangWrap });
+  const pReal = await insProject(`bs-real-${tag}`, { tiers: { spinoff: { requires: { networks: ['bs_real_net'] } } } });
+  const mReal = await insMachine(`bs-real-${tag}`, `zt-bs-real-${tag}`, true);
+  let heartbeats = 0;
+  const hb = setInterval(() => heartbeats++, 30);
+  const t0 = Date.now();
+  const perfReal = await performBuildBootstrap(pReal, mReal, { dryRun: false, docker: realDocker, provisionDb: makeProvision() });
+  clearInterval(hb);
+  const elapsed = Date.now() - t0;
+  ok(perfReal.status === 'refused', `a hanging daemon → whole action refused [${perfReal.status}]`);
+  ok(/did not answer within 250ms/.test(perfReal.reason || ''), `the refusal names the bounded timeout [${perfReal.reason?.slice(0, 100)}…]`);
+  ok(elapsed < 1500 && heartbeats >= 3,
+     `bounded: ${elapsed}ms with ${heartbeats} heartbeats while in flight — a spawnSync adapter would freeze the loop for the whole 5s hang`);
 
   // ── db-isolated project: the probe skips shared-dev-db, so the plan has no sdb step ──
   console.log('\n── a db-isolated project has NO shared-dev-db step (the probe already skips it) ──');
