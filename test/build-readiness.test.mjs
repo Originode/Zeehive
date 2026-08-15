@@ -21,12 +21,19 @@
 //   • can_build=false WITH a registry (project.registry)
 //     → the handoff is possible and the pair reads ok
 //   • the registry precedence matches resolveBuildTarget (project.registry, else SPINOFF_REGISTRY)
+//   • a db-isolated project (default_db_coupling=db-isolated) with NO shared dev db
+//     → shared-dev-db SKIPPED (the correct state, not a red X) — while db-shared-dev still FAILS
+//   • the REAL dockerAdapter: bounded, and the child is killed on timeout (nothing leaks past
+//     the ceiling; fast commands still return {status, stdout})
+//   • CONCURRENCY: buildReadinessForProject probes many machines genuinely in parallel — the
+//     timed stub's docker calls OVERLAP (max in-flight > 1, impossible with a spawnSync adapter)
+//     and N machines finish in ~one probe interval, not N× serial
 //   • the probe is READ-ONLY: no rows are written beyond the fixtures the test itself inserts
 process.env.PROVISION_MODE = 'simulate';
 // config.registry is read at module load — leave the global unset so the no-registry cases
 // below see "no registry configured" exactly as today's deployment does.
 process.env.SPINOFF_REGISTRY = '';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -39,7 +46,7 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
-const { probeBuildReadiness, registryForProject } = await import('../server/src/lib/build-readiness.js');
+const { probeBuildReadiness, buildReadinessForProject, registryForProject, dockerAdapter } = await import('../server/src/lib/build-readiness.js');
 
 // ── the stubbed docker adapter ──────────────────────────────────────────────
 // Dispatch on the first docker arg, like the real adapter's call sites. `reachable:false`
@@ -74,6 +81,26 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
     }
     return { status: 0, stdout: '', stderr: '' };
   };
+
+// The concurrency stub: every docker call resolves after `interval` ms (a timer, like the real
+// spawn-backed adapter would yield to). Counts calls and tracks the max number of calls IN FLIGHT
+// at once — the proof that buildReadinessForProject really probes machines in parallel instead of
+// serializing every docker call on the event loop (a spawnSync adapter would cap this at 1).
+const makeTimedDocker = ({ interval }) => {
+  let calls = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const stub = async (_ctx, _args) => {
+    calls++;
+    inFlight++;
+    if (inFlight > maxInFlight) maxInFlight = inFlight;
+    await new Promise((r) => setTimeout(r, interval));
+    inFlight--;
+    return { status: 0, stdout: 'ok\n', stderr: '' };
+  };
+  stub.stats = () => ({ calls, maxInFlight });
+  return stub;
+};
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
@@ -202,6 +229,66 @@ try {
   ok(sub.status === 0 && subRes?.g === 'localhost:5000/global',
      `global SPINOFF_REGISTRY is the fallback [${subRes?.g}]`);
   ok(subRes?.own === 'proj:5000/x', 'project own still wins over the global');
+
+  // ── the REAL dockerAdapter: bounded, and the child is killed on timeout ────
+  console.log('\n── dockerAdapter: bounded, kills the child on timeout, never leaks past the ceiling ──');
+  // The adapter speaks docker's CLI shape (`--context <ctx>` first), so the injected bin is a
+  // tiny node wrapper that swallows --context then runs the `-e` code IN-PROCESS — meaning the
+  // process the adapter SIGKILLs IS the hang; nothing grandchild is left behind to leak.
+  const wrap = join(repo, 'hangwrap.cjs');
+  writeFileSync(wrap,
+    "#!/usr/bin/env node\n" +
+    "const a = process.argv.slice(2); if (a[0] === '--context') a.splice(0, 2);\n" +
+    "const i = a.indexOf('-e'); eval(a.slice(i + 1).join(' '));\n");
+  chmodSync(wrap, 0o755);
+  const hung = await dockerAdapter('zt-hang', ['-e', 'setTimeout(()=>{},5000)'], { timeout: 120, bin: wrap });
+  ok(hung.unknown === true && /did not answer within 120ms/.test(hung.reason || ''),
+     `timeout → unknown with the reason [${hung.reason}]`);
+  const okFast = await dockerAdapter('zt-fast', ['-e', 'process.stdout.write("hi")'], { timeout: 2000, bin: wrap });
+  ok(okFast.status === 0 && okFast.stdout === 'hi', `fast command → {status, stdout} [${JSON.stringify(okFast)}]`);
+
+  // ── db-isolated project: no shared dev db is the CORRECT state, not a missing check ─────
+  console.log('\n── a db-isolated project (per-xell dev db) → shared-dev-db SKIPPED, not a red X ──');
+  const pIso = await insProject(`br-iso-${tag}`, {}, null);
+  await q(`INSERT INTO pool_config (project_id, default_db_coupling) VALUES ($1,'db-isolated')`, [pIso]);
+  await insMachine(`br-iso-${tag}`, `zt-iso-${tag}`, true);
+  // NOTE: deliberately NO shared dev db inserted for the iso machine — for a per-xell db project
+  // that absence is exactly what the probe must accept (each xell's db comes up with its stack).
+  // Goes through buildReadinessForProject because that is where the coupling is attached.
+  const iso = (await buildReadinessForProject(pIso, { docker: makeDocker({ reachable: true }) }))[0];
+  const isoSdb = iso.checks.find((c) => c.check === 'shared-dev-db');
+  ok(isoSdb?.ok === true && isoSdb?.skipped === true, `shared-dev-db SKIPPED (no shared dev db is correct) [${isoSdb?.detail}]`);
+  ok(iso.status === 'ok', `and the pair reads ok [${iso.status}]`);
+  // …and the default coupling (db-shared-dev) still FAILS without one — the shared-dev-db check is not neutered.
+  const pShare = await insProject(`br-share-${tag}`, {}, null);
+  await q(`INSERT INTO pool_config (project_id, default_db_coupling) VALUES ($1,'db-shared-dev')`, [pShare]);
+  await insMachine(`br-share-${tag}`, `zt-share-${tag}`, true);
+  const share = (await buildReadinessForProject(pShare, { docker: makeDocker({ reachable: true }) }))[0];
+  const shareSdb = share.checks.find((c) => c.check === 'shared-dev-db');
+  ok(shareSdb?.ok === false && shareSdb?.skipped === false, `db-shared-dev still FAILS without a shared dev db [${shareSdb?.detail}]`);
+
+  // ── concurrency: N machines probe in ~one interval, not N (spawnSync would freeze the loop) ─
+  console.log('\n── concurrency: buildReadinessForProject probes N machines in parallel, not N×serial ──');
+  const N = 4;
+  const pConc = await insProject(`br-conc-${tag}`, {}, null);
+  for (let i = 0; i < N; i++) {
+    await insMachine(`br-conc-${i}-${tag}`, `zt-conc-${i}-${tag}`, true);
+    await insSharedDevDb(pConc, `zt-conc-${i}-${tag}`, `conc-${i}`);
+  }
+  const timed = makeTimedDocker({ interval: 80 });
+  const t0 = Date.now();
+  const concRows = await buildReadinessForProject(pConc, { docker: timed });
+  const elapsed = Date.now() - t0;
+  const stats = timed.stats();
+  // buildReadinessForProject probes EVERY machine row (the matrix's full fleet), so scope the
+  // count to the concurrency machines; the OTHER rows (real fleet + earlier fixtures) only add
+  // to the in-flight count, which is the point — everything probes at once.
+  const concOnly = concRows.filter((r) => r.machine_key.startsWith('br-conc-'));
+  const serialMs = N * 2 * 80;            // 4 machines × (info + compose config) × 80ms
+  ok(concOnly.length === N, `all ${N} concurrency machines probed [${concOnly.length}]`);
+  ok(stats.calls >= (concRows.length) * 2, `every machine's docker calls ran [${stats.calls} >= ${concRows.length * 2}]`);
+  ok(stats.maxInFlight >= 2, `docker calls genuinely OVERLAP (max ${stats.maxInFlight} in flight — a spawnSync adapter would be 1)`);
+  ok(elapsed < serialMs / 2, `N machines finish in ~one probe interval, not N× [${elapsed}ms < ${serialMs / 2}ms serial-half]`);
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
