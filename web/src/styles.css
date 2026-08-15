@@ -835,6 +835,12 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-br.unk:hover:not(:disabled) { color: #e0a53b; border-color: #e0a53b; }
 .mx-br.miss { color: var(--down); border-color: rgba(229,85,78,.5); }
 .mx-br.miss:hover:not(:disabled) { color: var(--down); border-color: var(--down); }
+/* the one-click BUILD BOOTSTRAP (ticket #173 follow-on) — shown only when the readiness badge says
+   something is missing; amber like the "missing" verdict it fixes. */
+.mx-bs { background: none; border: 1px solid rgba(229,85,78,.5); border-radius: 4px; color: var(--down);
+  cursor: pointer; font-size: 9px; padding: 0 4px; white-space: nowrap; }
+.mx-bs:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-bs:disabled { opacity: .7; cursor: default; }
 .mx-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 10px; padding: 0 2px; }
 .mx-del:hover { color: #d9553b; }
 .mx-prod { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);

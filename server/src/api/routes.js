@@ -30,6 +30,7 @@ import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXel
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
 import { buildReadinessForProject } from '../lib/build-readiness.js';
+import { performBuildBootstrap } from '../lib/build-bootstrap.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
@@ -887,6 +888,20 @@ router.get('/projects/:id/readiness', async (req, res) => {
 router.get('/projects/:id/build-readiness', async (req, res) => {
   try { res.json(await buildReadinessForProject(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Machine × project BUILD BOOTSTRAP (ticket #173 follow-on): the one-click action that turns the
+// probe's "missing" answer into created DEV prerequisites. PLAN FIRST — dry_run (the default)
+// returns the ordered plan and performs nothing, so the console can show it before a human
+// commits; dry_run:false performs each step idempotently, re-runs the probe, and records the
+// action (build_bootstrap_action). QUEENZEE-performed; the dev-only guard in
+// lib/build-bootstrap.js refuses a prod tier/container/stack.
+router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res) => {
+  try {
+    const dryRun = req.body?.dry_run !== false;
+    res.json(await performBuildBootstrap(req.params.id, req.params.machineId, {
+      dryRun, actor: req.body?.by || 'human@console',
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // The dev spawn template: what a new xell gets by default (couplings, runtime, pool size).
 router.get('/projects/:id/pool-config', async (req, res) => res.json(await getPoolConfig(req.params.id)));

@@ -516,6 +516,14 @@ export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/rea
 // Machine × project build-readiness (ticket #173): per-machine verdict {ok|unknown|missing}
 // with the failing check named, rendered in the container matrix where the pool knobs are set.
 export const getBuildReadiness = (projectId) => fetch(`/api/projects/${projectId}/build-readiness`).then((r) => r.json());
+// Machine × project build-bootstrap (ticket #173 follow-on): the one-click action that CREATES
+// the dev prerequisites the probe names as missing. dryRun (default) returns the plan and performs
+// nothing — the console shows it before a human commits; dryRun:false performs each step
+// idempotently and re-runs the probe. QUEENZEE-performed; a prod tier/container/stack is refused.
+export const planBuildBootstrap = (projectId, machineId) =>
+  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: true });
+export const performBuildBootstrap = (projectId, machineId, actor) =>
+  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: false, by: actor });
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
 export const getSharedContainers = (projectId) => fetch(`/api/projects/${projectId}/containers`).then((r) => r.json());

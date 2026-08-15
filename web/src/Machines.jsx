@@ -11,7 +11,7 @@ import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
          setMachinePool, setMachinePriority, getSites, createSite,
          registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices, checkMachineConnection,
-         getBuildReadiness } from './api.js';
+         getBuildReadiness, planBuildBootstrap, performBuildBootstrap } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
@@ -237,6 +237,8 @@ function MachineHead({ m, projectId, poolingDead = false, readiness = null, read
                 title={`Place a PRODUCTION on ${m.key} — creates the prod site + its production xell here`}>＋prod</button>
         <MachineConn m={m} conn={conn} onCheck={check} />
         <BuildReady m={m} readiness={readiness} busy={readinessBusy} onRecheck={onRecheck} />
+        <BootstrapButton m={m} projectId={projectId} readiness={readiness}
+                         onDone={onRecheck} onChanged={onChanged} />
         {empty && <button className="mx-del" title="Remove this machine row" onClick={remove}>✕</button>}
       </div>
       <div className="mx-knobs">
@@ -335,6 +337,60 @@ export function BuildReady({ m, readiness, busy = false, onRecheck = null }) {
     <button className={cls} data-testid={`mx-build-ready-${m.key}`} disabled={busy}
             onClick={onRecheck || undefined} title={titleFor()}>
       {busy ? '⏳…' : readiness?.status === 'ok' ? '✓ build' : readiness?.status === 'unknown' ? '△ ?' : readiness?.status === 'missing' ? '✗ build' : '⚙'}
+    </button>
+  );
+}
+
+// The one-click BUILD BOOTSTRAP (ticket #173 follow-on): "make this machine buildable" — the
+// queenzee-performed action that CREATES the dev prerequisites the build-readiness probe names as
+// missing. PLAN FIRST: clicking fetches the plan (dry run), shows exactly what will happen, and
+// only after a human commits does it perform — then it re-runs the probe so the badge flips to the
+// now-true verdict. Enabled only when the probe says something is missing; a refused plan (prod
+// host, unreachable context) is shown, never half-run.
+function BootstrapButton({ m, projectId, readiness, onDone, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const missing = readiness?.status === 'missing';
+  if (!missing) return null;
+
+  const stepLine = (s) => {
+    const st = s.status === 'planned' ? 'will create' : s.status;
+    const tail = s.stderr ? `\n  stderr: ${s.stderr}` : (s.detail ? ` — ${s.detail}` : '');
+    return `• ${st}  ${s.target}${s.action ? `\n    ${s.action}` : ''}${tail}`;
+  };
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const plan = await planBuildBootstrap(projectId, m.id);
+      if (plan?.status === 'refused' || plan?.refused) {
+        showAlert(`Cannot bootstrap ${m.key}: ${plan?.reason || plan?.refused}`, { variant: 'error' });
+        return;
+      }
+      const steps = plan?.plan || plan?.steps || [];
+      if (!steps.length) { showAlert(`${m.key} has nothing the bootstrap can create — the probe says it can build here.`, { variant: 'info' }); return; }
+      const planText = steps.map(stepLine).join('\n');
+      const performable = steps.filter((s) => s.status === 'planned');
+      if (!performable.length) {
+        showAlert(`Nothing to perform on ${m.key} — what the probe found missing is not something a bootstrap can create:\n\n${planText}`, { variant: 'info' });
+        return;
+      }
+      if (!(await showConfirm(`Bootstrap ${m.key} for this project?\n\n${performable.length} action(s) — creates DEV prerequisites only, never touches prod or a running container:\n\n${planText}\n\nContinue?`, { okLabel: 'Bootstrap' }))) return;
+      const result = await performBuildBootstrap(projectId, m.id);
+      const lines = (result?.results || []).map(stepLine);
+      const head = result?.status === 'refused' ? `Refused: ${result.reason}`
+        : result?.status === 'failed' ? `Bootstrap finished with ${lines.filter((l) => l.startsWith('• failed')).length} failure(s):`
+        : `Bootstrap ${result?.status || 'performed'} on ${m.key}:`;
+      showAlert(`${head}\n\n${lines.join('\n') || '— nothing to do —'}`, { variant: result?.status === 'failed' ? 'error' : 'info' });
+      onDone?.();       // re-run the probe — the badge must reflect what is now true
+      onChanged?.();
+    } catch (e) { fail('Bootstrap')(e); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <button className="mx-bs" data-testid={`mx-bootstrap-${m.key}`} disabled={busy} onClick={run}
+            title={`One-click: create the DEV prerequisites the build-ready probe says ${m.key} is missing (networks the manifest declares, its shared dev db). Shows the plan first; idempotent; refuses a prod host or an unreachable context.`}>
+      {busy ? '⏳…' : '🔧 bootstrap'}
     </button>
   );
 }
