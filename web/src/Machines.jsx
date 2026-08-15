@@ -345,14 +345,18 @@ export function BuildReady({ m, readiness, busy = false, onRecheck = null }) {
 // queenzee-performed action that CREATES the dev prerequisites the build-readiness probe names as
 // missing. PLAN FIRST: clicking fetches the plan (dry run), shows exactly what will happen, and
 // only after a human commits does it perform — then it re-runs the probe so the badge flips to the
-// now-true verdict. Enabled only when the probe says something is missing; a refused plan (prod
-// host, unreachable context) is shown, never half-run.
+// now-true verdict. Enabled only when the probe says something is missing; a refused plan (a name
+// the prod tier also declares, an unreachable context) is shown, never half-run. A host that also
+// runs this project's PROD stack is DISCLOSED in the plan (the human confirms), not refused — on
+// the single-host topology dev and prod share the docker host, so refusing would switch the
+// bootstrap off on the most common installation.
 function BootstrapButton({ m, projectId, readiness, onDone, onChanged }) {
   const [busy, setBusy] = useState(false);
   const missing = readiness?.status === 'missing';
   if (!missing) return null;
 
   const stepLine = (s) => {
+    if (s.kind === 'disclosure') return `⚠ ${s.detail}`;
     const st = s.status === 'planned' ? 'will create' : s.status;
     const tail = s.stderr ? `\n  stderr: ${s.stderr}` : (s.detail ? ` — ${s.detail}` : '');
     return `• ${st}  ${s.target}${s.action ? `\n    ${s.action}` : ''}${tail}`;
@@ -389,7 +393,7 @@ function BootstrapButton({ m, projectId, readiness, onDone, onChanged }) {
 
   return (
     <button className="mx-bs" data-testid={`mx-bootstrap-${m.key}`} disabled={busy} onClick={run}
-            title={`One-click: create the DEV prerequisites the build-ready probe says ${m.key} is missing (networks the manifest declares, its shared dev db). Shows the plan first; idempotent; refuses a prod host or an unreachable context.`}>
+            title={`One-click: create the DEV prerequisites the build-ready probe says ${m.key} is missing (networks the manifest declares, its shared dev db). Shows the plan first, incl. a disclosure if this host also runs PROD; idempotent; refuses an unreachable context or a name the prod tier declares.`}>
       {busy ? '⏳…' : '🔧 bootstrap'}
     </button>
   );

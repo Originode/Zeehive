@@ -16,9 +16,14 @@
 //   • performing creates the missing network, re-runs the probe, and the fresh verdict flips
 //   • IDEMPOTENCE: a second perform says already-present and creates nothing
 //   • a docker failure surfaces its REAL stderr (not the last line)
-//   • the PROD GUARD refuses, in code, when the machine hosts this project's prod stack —
-//     recorded as a 'refused' action
+//   • the precise PROD GUARD refuses, in code, a network/volume the PROD tier ALSO declares —
+//     recorded as a 'refused' action (reads the manifest, not a name convention)
+//   • a machine whose context ALSO hosts this project's prod stack → DISCLOSED (plan carries a
+//     disclosure step the human confirms), NOT refused — single-host topology stays usable
+//   • a network that appears BETWEEN the inspect and the create → already-present, not failed
 //   • an unreachable context refuses the WHOLE action (never half-runs)
+//   • a CANNOT-only action is RECORDED with its step (the declined action is as readable as one that acted)
+//   • the REAL dockerAdapter times out bounded against a hanging child (no spawnSync on the loop)
 //   • every action is RECORDED (build_bootstrap_action: who asked, dry_run, steps, result)
 process.env.PROVISION_MODE = 'simulate';   // before any import: no machine may be touched
 process.env.SPINOFF_REGISTRY = '';
@@ -253,19 +258,54 @@ try {
   ok(/pool overlaps/.test(failRes?.stderr || ''), `the REAL stderr is on the step, not the last line [${failRes?.stderr}]`);
   ok(perf8.status === 'failed', `overall status is failed [${perf8.status}]`);
 
-  // ── the prod guard refuses ─────────────────────────────────────────────────
-  console.log('\n── the PROD GUARD refuses a machine hosting this project\'s prod stack ──');
-  const p9 = await insProject(`bs-prod-${tag}`, {});
-  const m9 = await insMachine(`bs-prod-${tag}`, `zt-bs-prod-${tag}`, true);
-  await insProdSite(p9, `zt-bs-prod-${tag}`);
-  let guardThrew = null;
-  try { await guardDevOnly(await row('machine', m9), await row('project', p9)); } catch (e) { guardThrew = e; }
-  ok(!!guardThrew && /refusing to bootstrap DEV prerequisites/.test(guardThrew?.message || ''),
-     `guardDevOnly refuses [${guardThrew?.message?.slice(0, 80)}…]`);
-  const perf9 = await performBuildBootstrap(p9, m9, { dryRun: false, docker: makeDocker(), provisionDb: makeProvision() });
-  ok(perf9.status === 'refused', `the perform is REFUSED end-to-end [${perf9.status}]`);
-  const refusedRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perf9.action_id]);
-  ok(refusedRow?.status === 'refused' && /PROD/.test(refusedRow?.reason || ''), `the refusal is RECORDED [${refusedRow?.status}]`);
+  // ── the precise prod guard: a network/volume the PROD tier also declares → refuse ──
+  console.log('\n── a network the PROD tier also declares → the guard REFUSES (reads the manifest) ──');
+  const pOver = await insProject(`bs-over-${tag}`, {
+    tiers: {
+      prod: { requires: { networks: ['bs_overlap_net'] } },
+      spinoff: { requires: { networks: ['bs_overlap_net'] } },
+    },
+  });
+  const mOver = await insMachine(`bs-over-${tag}`, `zt-bs-over-${tag}`, true);
+  let overlapThrew = null;
+  try { guardDevOnly(await row('machine', mOver), await row('project', pOver)); } catch (e) { overlapThrew = e; }
+  ok(!!overlapThrew && /also declared by the PROD tier/.test(overlapThrew?.message || ''),
+     `guardDevOnly refuses a name the prod tier also declares [${overlapThrew?.message?.slice(0, 90)}…]`);
+  const perfOver = await performBuildBootstrap(pOver, mOver, { dryRun: false, docker: makeDocker(), provisionDb: makeProvision() });
+  ok(perfOver.status === 'refused', `the overlap perform is REFUSED end-to-end [${perfOver.status}]`);
+  const overRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfOver.action_id]);
+  ok(overRow?.status === 'refused' && /PROD tier/.test(overRow?.reason || ''), `the overlap refusal is RECORDED [${overRow?.status}]`);
+
+  // ── host-level prod is a DISCLOSURE, not a refusal (single-host topology) ───
+  console.log('\n── a machine that also hosts this project\'s PROD stack → DISCLOSED, not refused ──');
+  const pDisc = await insProject(`bs-disc-${tag}`, { tiers: { spinoff: { requires: { networks: ['bs_disc_net'] } } } });
+  const mDisc = await insMachine(`bs-disc-${tag}`, `zt-bs-disc-${tag}`, true);
+  await insProdSite(pDisc, `zt-bs-disc-${tag}`);
+  const dockerDisc = makeDocker({ networks: new Set() });
+  const planDisc = await planBuildBootstrap(await row('machine', mDisc), await row('project', pDisc), { docker: dockerDisc });
+  ok(planDisc.steps.some((s) => s.kind === 'disclosure'),
+     `the plan carries a DISCLOSURE step [${planDisc.steps.map((s) => s.kind).join(', ')}]`);
+  ok(/also runs this project's PROD/.test(planDisc.disclosure || ''),
+     `the disclosure names the prod host [${planDisc.disclosure?.slice(0, 100)}…]`);
+  const perfDisc = await performBuildBootstrap(pDisc, mDisc, { dryRun: false, docker: dockerDisc, provisionDb: makeProvision() });
+  ok(perfDisc.status !== 'refused', `the perform PROCEEDS with the disclosure [${perfDisc.status}]`);
+  ok(perfDisc.results.some((s) => s.kind === 'disclosure'), 'the disclosure is in the performed results');
+  ok(perfDisc.results.some((s) => s.kind === 'network' && s.status === 'created'),
+     `a DEV network IS creatable on a host carrying prod rows [${perfDisc.results.map((s) => s.kind + '=' + s.status).join(',')}]`);
+  const discRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfDisc.action_id]);
+  ok(discRow?.steps?.some((s) => s.kind === 'disclosure'), 'the disclosure is RECORDED in the audit steps');
+
+  // ── a network that appears BETWEEN the inspect and the create → already-present ──
+  console.log('\n── a network that appears between inspect and create → already-present, not failed ──');
+  const pRace = await insProject(`bs-race-${tag}`, { tiers: { spinoff: { requires: { networks: ['bs_race_net'] } } } });
+  const mRace = await insMachine(`bs-race-${tag}`, `zt-bs-race-${tag}`, true);
+  await insDevDb(pRace, `zt-bs-race-${tag}`, `bs_${tag}_race_db`);
+  const dockerRace = makeDocker({ networks: new Set(), failNetworkCreate: 'Error response from daemon: network with name bs_race_net already exists' });
+  const perfRace = await performBuildBootstrap(pRace, mRace, { dryRun: false, docker: dockerRace, provisionDb: makeProvision() });
+  const raceRes = perfRace.results.find((s) => s.kind === 'network');
+  ok(raceRes?.status === 'already-present',
+     `docker's 'already exists' on create is already-present, not failed [${raceRes?.status}]`);
+  ok(perfRace.status === 'already-present', `overall status is already-present [${perfRace.status}]`);
 
   // ── unreachable context refuses the whole action ───────────────────────────
   console.log('\n── an unreachable context REFUSES the whole action ──');

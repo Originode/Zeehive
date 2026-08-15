@@ -18,37 +18,29 @@
 //   • Every docker call goes through the probe's bounded ASYNC dockerAdapter (never spawnSync —
 //     a sync adapter would serialize every call on the single Node event loop and freeze the
 //     queenzee). A test injects a stub here the same way build-readiness.test.mjs does.
-//   • DEV-ONLY GUARD: refuses, in code, to act on a prod tier / prod container / prod stack.
+//   • DEV-ONLY GUARD: refuses, in code, to CREATE a network/volume the PROD tier also declares.
+//     A machine whose context ALSO hosts this project's prod stack is DISCLOSED (the plan names it
+//     for the human to confirm), not refused — in the single-host topology dev and prod share the
+//     host, so refusing there would switch the bootstrap off on the most common installation.
 //   • Every action is RECORDED: who asked, what ran, what came back (build_bootstrap_action).
-import { q, one } from '../db/pool.js';
+import { one } from '../db/pool.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
 import { sharedDevDb, provisionDevDb } from './machines.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 
 // ── the DEV-only guard ────────────────────────────────────────────────────────
-// The bootstrap creates DEV prerequisites, so it must never run where the project's PROD stack
-// lives on the same context — a one-click dev action creating networks on a prod host is exactly
-// the "dev bootstrap quietly touches prod" accident this guard exists to refuse. Explicit in
-// code, not by convention, so a test can prove the refusal.
-export async function guardDevOnly(machine, project) {
-  const ctx = machine.docker_ctx;
-  const prodSite = await one(
-    `SELECT 1 FROM deploy_site WHERE project_id=$1 AND docker_ctx=$2 AND tier='prod' LIMIT 1`,
-    [project.id, ctx]);
-  const prodContainer = await one(
-    `SELECT 1 FROM container WHERE project_id=$1 AND docker_ctx=$2 AND tier='prod' LIMIT 1`,
-    [project.id, ctx]);
-  if (prodSite || prodContainer) {
-    throw new Error(
-      `refusing to bootstrap DEV prerequisites on '${machine.key}' (${ctx}): it hosts this `
-      + `project's PROD ${prodSite ? 'deploy site' : 'container'} — the bootstrap touches dev `
-      + `prerequisites only. Provision the missing dev prerequisites by hand (the matrix's `
-      + `per-prerequisite buttons), not the one-click dev bootstrap.`);
-  }
-  // Defense in depth: a network/volume the PROD tier also declares must never be created by a
-  // dev action, even when the same name appears in the spinoff tier — a name collision would make
-  // this dev action silently satisfy (or half-satisfy) a prod dependency.
+// The bootstrap creates DEV prerequisites, so it must NEVER create a network/volume the project's
+// PROD tier also declares — a name collision would silently satisfy (or half-satisfy) a prod
+// dependency. This is the PRECISE prod protection: it reads what the manifest ACTUALLY declares
+// (never a name convention), and refuses in code so a test can prove it.
+// The OTHER fact — the machine's docker context ALSO hosting this project's PROD stack — is a
+// DISCLOSURE, not a refusal. In the single-host topology (this product's default) the same docker
+// host carries dev AND prod, so refusing there would switch the bootstrap off on the most common
+// installation. hostProdDisclosure() surfaces it for the human to confirm instead: the bootstrap
+// still creates only what the spinoff tier declares (none of which the prod tier declares, by the
+// guard above) and touches no existing container, volume or network.
+export function guardDevOnly(machine, project) {
   const prodReq = project.manifest?.tiers?.prod?.requires;
   const spinReq = project.manifest?.tiers?.spinoff?.requires;
   if (prodReq && spinReq) {
@@ -63,6 +55,26 @@ export async function guardDevOnly(machine, project) {
         + `prod infrastructure.`);
     }
   }
+}
+
+// When the machine's docker context ALSO hosts this project's PROD stack (single-host topology),
+// the bootstrap can still run — it creates only what the spinoff tier declares, none of which the
+// prod tier declares (guardDevOnly enforces that), and touches no existing container/volume/network —
+// but the human must confirm they understand the host carries prod. Returns that disclosure (a
+// sentence the plan shows before a human commits), or null when the host does not run prod here.
+export async function hostProdDisclosure(machine, project, createNames = []) {
+  const ctx = machine.docker_ctx;
+  const prodSite = await one(
+    `SELECT 1 FROM deploy_site WHERE project_id=$1 AND docker_ctx=$2 AND tier='prod' LIMIT 1`,
+    [project.id, ctx]);
+  const prodContainer = await one(
+    `SELECT 1 FROM container WHERE project_id=$1 AND docker_ctx=$2 AND tier='prod' LIMIT 1`,
+    [project.id, ctx]);
+  if (!prodSite && !prodContainer) return null;
+  const names = createNames.length ? createNames.join(', ') : 'nothing';
+  return `this host ('${ctx}') also runs this project's PROD ${prodSite ? 'deploy site' : 'container'}; `
+    + `the bootstrap will create only ${names}, none of which the prod tier declares, and it touches `
+    + `no existing container, volume or network.`;
 }
 
 // ── the planner ───────────────────────────────────────────────────────────────
@@ -81,8 +93,11 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
     const pc = await one(`SELECT default_db_coupling FROM pool_config WHERE project_id=$1`, [project.id]);
     if (pc?.default_db_coupling) project.db_coupling = pc.default_db_coupling;
   }
+  // The precise DEV-only guard — throws when the spinoff tier declares a network/volume the PROD
+  // tier also declares. Host-level prod is a DISCLOSURE (below), not a refusal.
+  guardDevOnly(machine, project);
   const probe = await probeBuildReadiness(machine, project, { docker });
-  if (probe.status === 'ok') return { probe, steps: [], refused: null };
+  if (probe.status === 'ok') return { probe, steps: [], refused: null, disclosure: null };
 
   const check = (name) => probe.checks.find((c) => c.check === name);
   const ctxCheck = check('context-reachable');
@@ -91,7 +106,7 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
   // cannot even tell us what is missing).
   if (ctxCheck && !ctxCheck.ok && ctxCheck.unknown) {
     return {
-      probe, steps: [],
+      probe, steps: [], disclosure: null,
       refused: `cannot act on '${machine.key}' (${machine.docker_ctx}): the docker context is not `
         + `reachable — ${ctxCheck.detail}. Fix the machine's context/daemon and re-check; the `
         + `bootstrap never runs against a daemon it cannot reach.`,
@@ -167,7 +182,23 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
     cannot(comp, 'spinoff compose', null, comp.detail);
   }
 
-  return { probe, steps, refused: null };
+  // Host-level prod is a DISCLOSURE the human confirms, not a refusal: in the single-host topology
+  // dev and prod share the docker host, so refusing there would switch the bootstrap off by default.
+  // Only attach it when there is something the bootstrap will actually create.
+  const createNames = steps.filter((s) => s.status === 'planned').map((s) => s.target);
+  let disclosure = null;
+  if (createNames.length) {
+    disclosure = await hostProdDisclosure(machine, project, createNames);
+    if (disclosure) {
+      steps.unshift({
+        kind: 'disclosure', target: 'prod stack on this host',
+        why: 'this machine\'s docker context also runs this project\'s PROD stack',
+        action: null, status: 'disclosure', detail: disclosure, stderr: null,
+      });
+    }
+  }
+
+  return { probe, steps, refused: null, disclosure };
 }
 
 // ── the performer ─────────────────────────────────────────────────────────────
@@ -188,6 +219,13 @@ async function performStep(step, machine, project, { docker, provisionDb }) {
                stderr: null };
     }
     if (r.status !== 0) {
+      // Idempotence under a race: the network appeared between our inspect and create, so docker
+      // refuses with "already exists" — that is already-present, not a failure.
+      if (/already exists/i.test((r.stderr || '') + (r.stdout || ''))) {
+        return { status: 'already-present',
+                 detail: `network '${step.target}' already exists on '${machine.docker_ctx}' (appeared between check and create)`,
+                 stderr: null };
+      }
       return { status: 'failed',
                detail: `docker network create '${step.target}' failed on '${machine.docker_ctx}'`,
                stderr: (r.stderr || r.stdout || '').trim() };
@@ -257,16 +295,17 @@ export async function performBuildBootstrap(projectId, machineId,
   const machine = await one(`SELECT * FROM machine WHERE id=$1`, [machineId]);
   if (!machine) throw new Error('machine not found');
 
-  // THE DEV-ONLY GUARD — refuse before any plan is built or performed.
+  // THE DEV-ONLY GUARD — the name-overlap refusal fires before any plan is built or performed.
+  // (Host-level prod is a disclosure in the plan, not a refusal: see hostProdDisclosure.)
   try {
-    await guardDevOnly(machine, project);
+    guardDevOnly(machine, project);
   } catch (e) {
     const row = await record(projectId, machineId, actor, dryRun, 'refused', e.message, []);
     logline('machine', `bootstrap REFUSED on ${machine.key} for ${project.name} by ${actor}: ${e.message}`);
     return { status: 'refused', reason: e.message, steps: [], probe: null, action_id: row.id };
   }
 
-  const { probe, steps, refused } = await planBuildBootstrap(machine, project, { docker });
+  const { probe, steps, refused, disclosure } = await planBuildBootstrap(machine, project, { docker });
   if (refused) {
     const row = await record(projectId, machineId, actor, dryRun, 'refused', refused, []);
     logline('machine', `bootstrap REFUSED on ${machine.key} for ${project.name} by ${actor}: ${refused}`);
@@ -275,12 +314,14 @@ export async function performBuildBootstrap(projectId, machineId,
 
   if (dryRun) {
     const row = await record(projectId, machineId, actor, true, 'planned', null, steps);
-    return { status: 'planned', plan: steps, probe, action_id: row.id };
+    return { status: 'planned', plan: steps, probe, action_id: row.id, disclosure };
   }
 
   const results = [];
   for (const step of steps) {
-    if (step.status === 'cannot') { results.push(step); continue; }
+    // A disclosure is information for the human, not a step to perform — keep it in the results
+    // so the audit records it, but never hand it to the performer.
+    if (step.kind === 'disclosure' || step.status === 'cannot') { results.push(step); continue; }
     results.push({ ...step, ...(await performStep(step, machine, project, { docker, provisionDb })) });
   }
 
@@ -291,16 +332,5 @@ export async function performBuildBootstrap(projectId, machineId,
   logline('machine', `bootstrap ${status} on ${machine.key} for ${project.name} by ${actor}: `
     + results.map((s) => `${s.kind}:${s.target}=${s.status}`).join(', '));
   broadcast('machine', { id: machineId });
-  return { status, results, probe: freshProbe, action_id: row.id };
-}
-
-// The recent bootstrap actions for a (project, machine) — the console's "what did the last
-// bootstrap do?" read, newest first.
-export async function listBootstrapActions(projectId, machineId, { limit = 10 } = {}) {
-  return q(
-    `SELECT id, actor, dry_run, status, reason, steps, created_at
-       FROM build_bootstrap_action
-      WHERE project_id=$1 AND machine_id=$2
-      ORDER BY created_at DESC LIMIT $3`,
-    [projectId, machineId, limit]);
+  return { status, results, probe: freshProbe, action_id: row.id, disclosure };
 }
