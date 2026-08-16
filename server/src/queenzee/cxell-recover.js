@@ -49,7 +49,8 @@ import { q, one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { recordEvent, setTend } from '../lib/status.js';
-import { cxellName, cxellState, startCxell, stopCxell, restartCxellSshd, sealCxell } from '../lib/cxell.js';
+import { cxellName, cxellState, startCxell, stopCxell, restartCxellSshd, sealCxell,
+         refreshZeeLiveInLiveCxells } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { markZeeTurn } from '../lib/turn-record.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
@@ -185,6 +186,14 @@ async function recoverOne(row, { reason, mode }) {
     await setTend(row.xell_id, true, { reason: why, zeeId: row.zee_id, source: 'queenzee' });
     return { slug, verdict: 'unsealed', stopped, error: e.message };
   }
+
+  // 3b. THE ATTEND PATH, for the cage that was DOWN when this queenzee's boot sweep ran. index.js
+  // refreshes the feed renderer + attach script in every RUNNING cxell at boot — which is also the
+  // moment after a ship — and a stopped cage is invisible to it, so a xell that slept through a
+  // deploy would keep the old pair until some later boot happened to catch it running. Best-effort
+  // by contract (it never throws) and mode-gated inside; a file install is not egress, so its place
+  // after the seal is bookkeeping rather than safety.
+  await refreshZeeLiveInLiveCxells(async () => [{ ctx: 'default', name: cxellName(slug) }], { mode });
 
   logline('cxell-recover', `${slug}: cxell was ${probe.state} after ${reason} — RESTARTED, `
     + `ssh ${door ? 're-opened' : 'FAILED'}, re-sealed (${blockTcp.length} prod db(s) blocked)`);

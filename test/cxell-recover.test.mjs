@@ -272,6 +272,9 @@ try {
   ok(iSeal > iSsh, 'and then re-applied the firewall — iptables rules live in the container network namespace and died with it too');
   ok(/CXELL_BLOCK_TCP=[^\n]*10\.77\.0\.9:54329/.test(dl1),
      'sealed with the fleet\'s prod DBs in the block list — the same query the spawn seal uses (lib/cxell-seal.js)');
+  ok(dl1.indexOf('zee-live.mjs') > iSeal && /zee-attach\.sh/.test(dl1),
+     'and the attend path (feed renderer + attach script) is refreshed into it: index.js\'s boot sweep '
+     + 'reaches RUNNING cages only, so a cage that slept through a ship would otherwise keep the old pair');
 
   console.log('\n── C. and the zee inside it is reconnected ──');
   const r1 = await zeeRow(z1.id);
