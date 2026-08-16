@@ -1103,12 +1103,10 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 // project's — that one is now reachable, which is the whole point of the bind. Mirrors spawnCxell's
 // block-list logic (default-allow egress, drop only prod DBs).
 //
-// ⚠ Same host:port-only caveat as spawnCxell's copy, and the SAME two conditions keep it harmless:
-// an ALIAS-ONLY prod db is absent from this list because (a) it publishes no host port, so there is
-// nothing for an iptables rule to drop, AND (b) the only cage on its docker network is the
-// prod-read-only manager's, joined deliberately by connectCxellToProdNetwork(). Break either — add a
-// host_port to an alias-registered row, or join anything else to that network — and both copies of
-// this query have to change together. Read the long note in intake.js spawnCxell before touching it.
+// ⚠ The host:port-only caveat that governs WHICH pairs come back — and the two conditions that keep
+// an ALIAS-ONLY prod db harmless despite being absent from the list — are stated ONCE, in
+// lib/cxell-seal.js, which is now the single query behind all three seals (spawn, this re-seal, and
+// the re-seal of a cage restarted after a host reboot). Read it before touching any of them.
 async function resealCxellForStack(xellId) {
   const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
   // prodBound: true — the bind has just been granted, so this xell's OWN prod db is now allowed (the
