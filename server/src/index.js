@@ -28,6 +28,7 @@ import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
 import { startRevive } from './queenzee/revive.js';
+import { startCxellRecovery } from './queenzee/cxell-recover.js';
 import { startSpinDetector } from './queenzee/spin.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
@@ -207,6 +208,14 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // ones that are provably stale (lib/provision.reconcileXellEnvs).
   reconcileXellEnvs({ reason: 'boot' })
     .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
+  // AND THE RECONCILE FOR THE MACHINE ITSELF. The app tier restarts with the host; the CXELLS DO
+  // NOT (intake runs them with no restart policy, deliberately — a cage dockerd brought back would
+  // have no firewall and no ssh door, because both are runtime state inside its namespace). So the
+  // queenzee restarts them here, in the only safe order — start, re-open sshd, RE-SEAL — and then
+  // releases the turn lock the reboot left on every zee that was mid-turn, filing it as the
+  // transient death it was so the existing revive ladder reconnects the session
+  // (queenzee/cxell-recover.js). Also a slow loop, for the cage that stops later.
+  startCxellRecovery();
   startPool();
   startMonitor();
   startContainerMonitor();

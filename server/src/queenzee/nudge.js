@@ -451,9 +451,15 @@ const REVIVE_PROMPT = (signal, message, attempt, max, minutes) => [
 // ledgers — is appended, so a revived run is told what its predecessors said and did instead of
 // re-deciding the same question blind. Best-effort: a digest that cannot be built (a ledger read
 // fails, no zee row) must not sink the revive.
+//
+// `why` is what the turn is RECORDED as (the log line and last_stop_reason, via claimZeeTurn): the
+// default names a provider error because that is what almost every revive is, but a host-restart
+// revive passes its own — a zee row that says "provider error cut the turn" after a machine reboot
+// is the same lie as the prompt, written where a human greps.
 export async function nudgeXellForTurnDeath(xellId, { signal = null, message = '', attempt = 1,
                                                       max = 3, minutes = null, by = 'queenzee',
-                                                      mode = PROVISION_MODE, prompt = null } = {}) {
+                                                      mode = PROVISION_MODE, prompt = null,
+                                                      why = 'provider error cut the turn' } = {}) {
   let briefing = prompt || REVIVE_PROMPT(signal, message, attempt, max, minutes);
   try {
     const zee = await one(
@@ -471,7 +477,7 @@ export async function nudgeXellForTurnDeath(xellId, { signal = null, message = '
       + `(${String(e.message).slice(0, 120)}) — reviving without it`);
   }
   return nudgeCxell(xellId, {
-    by, mode, prompt: briefing, why: 'provider error cut the turn',
+    by, mode, prompt: briefing, why,
     log: (slug, sid) => `${slug}: REVIVING after a ${signal || 'provider'} death — resuming cxell session `
       + `${sid} (attempt ${attempt}/${max})`,
   });

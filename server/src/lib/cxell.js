@@ -269,6 +269,65 @@ export async function cxellRunning({ ctx = 'default', slug }) {
   }
 }
 
+// ── AFTER THE MACHINE COMES BACK: read a cage's state, start it, re-open its door ────────────────
+//
+// A cxell is created with `docker run -d` and NO restart policy (cxellRunArgs), and its CMD is
+// `sleep infinity` — everything that makes it a cage (sshd, the egress seal) is a root EXEC done
+// once at spawn. So a host reboot leaves every live xell's cage EXITED, with its work, its branch,
+// its /etc/environment and its agent session all intact on the container's own filesystem and
+// nothing at all running. Until queenzee/cxell-recover.js, nothing in the fleet started them again.
+//
+// THE RESTART POLICY IS DELIBERATELY NOT THE FIX. `--restart unless-stopped` would bring the cage
+// back the moment dockerd starts — WITHOUT its firewall seal, because iptables rules live in the
+// container's network namespace and die with it. A cage that is up and unsealed can reach the
+// fleet's live production databases, and it looks perfectly healthy while it does. Starting the
+// cage and re-sealing it are therefore ONE act, performed by the queenzee (cxell-recover.js), and
+// these three primitives are its steps.
+
+// The container's docker state, as its own word: running | exited | created | paused | restarting |
+// dead — or 'missing' when the daemon ANSWERED and has no such container, or 'unknown' when we could
+// not ask at all. That last distinction is the containers.js doctrine and it is load-bearing here: a
+// daemon that is still starting must never be read as "the fleet's cages are gone", because the
+// recovery's answer to 'missing' (report a cage that cannot be restarted) is very different from its
+// answer to 'unknown' (say nothing, try again next tick).
+export async function cxellState({ ctx = 'default', slug }) {
+  try {
+    const r = await dk(ctx, ['inspect', '-f', '{{.State.Status}}', cxellName(slug)], { timeoutMs: 15000 });
+    const state = String(r.out || '').trim().toLowerCase();
+    return { state: state || 'unknown', missing: false, error: state ? null : 'docker inspect printed no state' };
+  } catch (e) {
+    const said = String(e?.dk ? dkSaid(e.dk, 200) : e.message || '');
+    if (/no such (object|container)/i.test(said)) return { state: 'missing', missing: true, error: null };
+    return { state: 'unknown', missing: false, error: said.slice(0, 300) };
+  }
+}
+
+// Start a cage that exists and is stopped. Idempotent by docker's own contract (starting a running
+// container is a no-op), and it keeps everything the container already has — its filesystem, its
+// published SSH port, its labels, its network. It does NOT recreate anything: a recreate would
+// destroy work that has not been collected yet, which is exactly what must never happen here.
+export async function startCxell({ ctx = 'default', slug, timeoutMs = 60000 }) {
+  const name = cxellName(slug);
+  const r = await dk(ctx, ['start', name], { timeoutMs });
+  return { started: true, name, out: String(r.out || '').trim() };
+}
+
+// Re-run cxell-sshd.sh to bring the attend door back up after a restart: sshd is a process, so it
+// died with the container even though its host keys, its config and the zee's authorized_keys did
+// not. The script is idempotent and re-reads what is already on disk.
+//
+// ⚠ NO ENV IS PASSED, and that is not an oversight. cxell-sshd.sh OVERWRITES /etc/environment
+// whenever CXELL_ENV is set, and openCxellSsh always sets it (it appends ZEEHIVE_API
+// unconditionally) — so calling openCxellSsh with no credentials to re-open a door would replace a
+// live cage's provider token and identity token with a one-line file, and the zee would come back
+// unable to authenticate to anything. The restart path has nothing new to write: every line is
+// already in the container's own /etc/environment.
+export async function restartCxellSshd({ ctx = 'default', slug, timeoutMs = 60000 }) {
+  const name = cxellName(slug);
+  const r = await dk(ctx, ['exec', '-u', '0', name, 'bash', '/usr/local/bin/cxell-sshd.sh'], { timeoutMs });
+  return String(r.out || '').trim();
+}
+
 // ── DELIVER the xource INTO a live cxell — the mirror image of exportCxellDiff ────────────────────
 // The failure class this removes: while a cxell is LIVE, the host worktree must be READ-ONLY for
 // catch-up. The old catch-up merged the xource tip INTO the host worktree behind the zee's back

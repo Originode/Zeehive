@@ -16,6 +16,7 @@ import { logline } from '../lib/logbus.js';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
+import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
 // about the branch it just walked into (see branchHandover).
@@ -1110,12 +1111,10 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 // this query have to change together. Read the long note in intake.js spawnCxell before touching it.
 async function resealCxellForStack(xellId) {
   const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
-  const prodDbs = await q(
-    `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
-      WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
-  const blockTcp = prodDbs
-    .filter((r) => r.project_id !== xell.project_id) // this xell's prod DB is now allowed
-    .map((r) => `${r.host}:${r.host_port}`);
+  // prodBound: true — the bind has just been granted, so this xell's OWN prod db is now allowed (the
+  // xell row this reads was written before the grant, so its coupling cannot say so yet). The query
+  // itself, and the alias-only caveat above, live in lib/cxell-seal.js with the spawn seal's copy.
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, prodBound: true });
   const sealed = await sealCxell({ ctx: 'default', name: cxellName(xell.slug), blockTcp });
   return { blockTcp, tail: sealed[sealed.length - 1] || null };
 }

@@ -37,7 +37,8 @@ import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { recordEvent, setTend } from '../lib/status.js';
 import { xellPaused } from '../lib/fleet-pause.js';
-import { classifyTurnDeath, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MIN } from '../lib/turn-death.js';
+import { classifyTurnDeath, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MIN,
+         HOST_RESTART_DEATH } from '../lib/turn-death.js';
 import { providerForRuntimeKey } from '../lib/cxell-runtimes.js';
 import { raiseAuthDeathRequest, injectedRevivePrompt, scrubSecrets } from '../lib/credential-inject.js';
 import { nudgeXellForTurnDeath } from './nudge.js';
@@ -62,8 +63,15 @@ const TICK_MS = Number(process.env.REVIVE_TICK_MS) || 60000;
 //
 // Best-effort and NEVER throws: it hangs off a completion handler, and a zee's turn ending must not
 // depend on this bookkeeping succeeding.
+//
+// `death` OVERRIDES the classifier for a caller that already KNOWS how the turn died, and there is
+// exactly one class of those: a death the queenzee OBSERVED rather than read (the host restarted and
+// took every cage with it — lib/turn-death.js HOST_RESTART_DEATH). Such a turn left NO message
+// behind, so classifyTurnDeath would call it UNKNOWN and do nothing, and the zee would sit in a
+// restarted cage forever. Everything downstream is unchanged: the same decideRevive policy, the same
+// ladder, the same human at the end of it.
 export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', resumable = true,
-                                      source = 'turn' } = {}) {
+                                      source = 'turn', death: deathOverride = null } = {}) {
   try {
     if (!zeeId) return { classified: false };
     const zee = await one(
@@ -75,7 +83,9 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     if (!zee) return { classified: false };
     const name = slug || zee.slug || String(zee.xell_id).slice(0, 8);
 
-    const death = classifyTurnDeath(reason);
+    const death = deathOverride
+      ? { kind: deathOverride.kind, signal: deathOverride.signal, message: String(reason || '') }
+      : classifyTurnDeath(reason);
     const verdict = decideRevive({
       kind: death.kind,
       attempts: zee.revive_attempts || 0,
@@ -167,6 +177,46 @@ async function accountFor(projectId, runtimeKey) {
   } catch { return `this project's ${provider} account`; }
 }
 
+// THE PROMPT A HOST RESTART DESERVES — and why the standard one would be a lie.
+//
+// REVIVE_PROMPT (nudge.js) opens "your last turn was CUT SHORT BY A PROVIDER ERROR" and quotes what
+// the provider said. After a machine restart NO provider said anything: the zeehive host (or its
+// docker daemon) went down, every cage stopped where it stood, and the queenzee started this one
+// again on the way back up. Telling an agent the API refused it sends it hunting for a rate limit
+// that never happened — the exact failure mode the revive prompt exists to prevent, one layer up.
+//
+// The two facts it must carry that no other revive does: the cage was OFF for a while (so anything
+// it left running in the background — a `--wait` build poll, a dev server, a background job — is
+// gone, not merely quiet), and its FILES survived (a restart is not a rebuild: the worktree, the
+// commits and the container's disk are exactly as they were). Exported for the test.
+export function hostRestartRevivePrompt({ minutes = null, attempt = 1, max = MAX_REVIVE_ATTEMPTS } = {}) {
+  return [
+    'RESUMED — your last turn did NOT end, and it was NOT rejected: THE ZEEHIVE MACHINE RESTARTED'
+      + (minutes != null ? ` about ${minutes} minute(s) ago` : '') + ' and took your container down with it.',
+    'The queenzee started your cage again, re-opened its ssh door, re-applied its firewall and resumed',
+    `this session (attempt ${attempt} of ${max}, no human involved). Nothing of yours failed: no gate moved,`,
+    'no build broke, nothing was reverted or rejected — your transcript stops mid-thought because the',
+    'host went down, not because anybody said no to you.',
+    '',
+    'YOUR FILES SURVIVED. A restart is not a rebuild: your worktree, your commits and everything else on',
+    'your container\'s disk are exactly where you left them.',
+    'YOUR PROCESSES DID NOT. Anything you had running in the background is gone — a `zee build --wait`',
+    'that was polling, a dev server, a long job. If you were waiting on one, it did not finish while you',
+    'were down; check its state and start it again rather than waiting for an answer that cannot arrive.',
+    '',
+    'Re-orient BEFORE you act — time has passed and you must not trust your memory of the fleet\'s state:',
+    '  1. `zee status` — where you stand: your task, and whether a landing, a ship or a done proposal of',
+    '     yours is pending a human. A decision may have arrived while you were down.',
+    '  2. `zee work` if you are on a work item — re-read it rather than recalling it.',
+    '  3. `git log --oneline -5` and `git status` in your worktree — what you had actually committed',
+    '     before the machine went down, which is usually more (or less) than you remember.',
+    '',
+    'Then CONTINUE the job from there. Do not redo work that is already committed, do not re-raise a',
+    'request `zee status` shows is already open, and do not `zee tend` about the restart — it is handled,',
+    'and the machine coming back is why you are running again.',
+  ].join('\n');
+}
+
 // Zees that have been "held, paused" already reported — so a fleet paused for an hour does not write
 // sixty identical lines for the same zee. Per-process, like landgate's reportedDryLandings.
 const reportedPaused = new Set();
@@ -214,6 +264,9 @@ export async function reviveTick() {
     await recordEvent({ source: 'queenzee', hook_event_name: 'zee-revive', zee_id: row.id,
                         xell_id: row.xell_id, raw: { attempt, max: MAX_REVIVE_ATTEMPTS, signal: row.revive_signal } });
     const injected = row.revive_signal === 'credential-injected';
+    // A HOST RESTART is not a provider error, so it does not get the provider error's story: the
+    // standard prompt would quote an API refusal that never happened (hostRestartRevivePrompt).
+    const hostRestart = row.revive_signal === HOST_RESTART_DEATH.signal;
     logline('revive', `${row.slug}: REVIVING — attempt ${attempt} of ${injected ? 1 : MAX_REVIVE_ATTEMPTS} after a `
       + `${row.revive_signal || 'provider'} death`);
 
@@ -222,7 +275,10 @@ export async function reviveTick() {
       message: injected ? 'a human approved the injection of a fresh provider key into this cage' : (row.last_stop_reason || ''),
       attempt: injected ? 1 : attempt, max: injected ? 1 : MAX_REVIVE_ATTEMPTS,
       minutes, mode: PROVISION_MODE,
-      prompt: injected ? injectedRevivePrompt() : null });
+      prompt: injected ? injectedRevivePrompt()
+            : hostRestart ? hostRestartRevivePrompt({ minutes, attempt, max: MAX_REVIVE_ATTEMPTS })
+            : null,
+      why: hostRestart ? 'the zeehive machine restarted under this turn' : undefined });
 
     if (r?.nudged) { revived++; continue; }
     // A revive that could not even START is not an attempt the zee had: give the schedule back so

@@ -63,6 +63,18 @@ const RULES = [
     test: /\b5(00|02|03|20|21|22|24|25|30)\b|internal server error|bad gateway|service unavailable|server error|upstream/i },
 ];
 
+// A death nobody has to READ, because the queenzee WATCHED it happen: the machine (or its docker
+// daemon) went down under a live turn and every cxell came back EXITED. There is no provider
+// sentence to classify — the turn left no message at all, and an empty message is UNKNOWN, which is
+// deliberately inert (see the note at the top), so a host restart classified the normal way would
+// resume nobody. The caller that KNOWS what happened (queenzee/cxell-recover.js, which just
+// restarted the cage itself) passes this classification in instead of a string to guess from.
+//
+// TRANSIENT is the honest kind: the session, the cage's filesystem, the branch and the database all
+// survived the reboot — only the process did — which is the same "resume it in a few minutes" shape
+// a 529 has, on the same three-attempt ladder with the same human at the end of it.
+export const HOST_RESTART_DEATH = Object.freeze({ kind: 'transient', signal: 'host-restart' });
+
 // Classify the sentence a dead turn left behind (zee.last_stop_reason, a CLI's final result text, a
 // docker exec's stderr). Never throws; an empty message is UNKNOWN, not an error.
 // → { kind: 'transient' | 'terminal' | 'unknown', signal, message }

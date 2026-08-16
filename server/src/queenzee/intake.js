@@ -43,6 +43,7 @@ import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.
 import { projectDocFiles } from '../lib/project-docs.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
+import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
@@ -1503,25 +1504,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // which Docker's bridge NAT would otherwise expose on the LAN. A xell bound to prod
   // (db-shared-prod) keeps its OWN prod DB reachable — that binding is a human's call.
   //
-  // ⚠ THIS LIST IS host:port PAIRS ONLY, so a prod db registered ALIAS-ONLY (no host/host_port,
-  // reachable only by its docker network name — see lib/prod-readonly.js decideReaderAddress) is
-  // NOT in it. That is currently harmless, but only because TWO conditions hold together:
-  //   (a) an alias-only row publishes no host port, so there is no bridge-NAT path for a rule to
-  //       block in the first place — the thing this list exists to close does not exist for it; AND
-  //   (b) the ONLY container joined to that db's docker network is the prod-read-only MANAGER's
-  //       cage, joined deliberately by connectCxellToProdNetwork() and only for db-prod-readonly.
-  // If EITHER stops holding — a host_port is added to an alias-registered row, or anything else is
-  // joined to that network — the row belongs in blockTcp for every project except its own
-  // prod-bound one, and this query must stop filtering on host/host_port to find it.
-  const prodDbs = await q(
-    `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
-      WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
+  // WHICH host:port pairs, and the alias-only caveat that governs the query, live in ONE place now
+  // (lib/cxell-seal.js) — this seal, the re-seal after a prod bind (queenzee/self.js) and the
+  // re-seal of a cage restarted after a host reboot (queenzee/cxell-recover.js) must never drift.
   // A manager holds prod READ-ONLY ('db-prod-readonly') — it must reach the prod db host:port too,
-  // or the SELECT-only role it was given is unusable and the whole binding is theatre.
-  const prodBound = ['db-shared-prod', 'db-prod-readonly'].includes(xell.db_coupling);
-  const blockTcp = prodDbs
-    .filter((r) => !(prodBound && r.project_id === xell.project_id))
-    .map((r) => `${r.host}:${r.host_port}`);
+  // or the SELECT-only role it was given is unusable and the whole binding is theatre; both that
+  // coupling and the human grant are in PROD_REACHING_COUPLINGS.
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, dbCoupling: xell.db_coupling });
 
   // RECORD THE MODEL THE CAGE WILL ACTUALLY RUN. A claude alias means nothing to a non-claude CLI,
   // so the adapter drops it and runs the vendor's own — which left production holding deepseek-cxell
