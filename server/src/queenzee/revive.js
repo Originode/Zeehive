@@ -94,6 +94,9 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
       // A resume needs a session id as much as it needs a cage (claude/codex resume BY id), so a
       // turn that died before init is not resumable however alive the container is.
       resumable: resumable && !!zee.claude_session_id,
+      // Wording only (see decideRevive): a host restart is transient, but it is not a PROVIDER error,
+      // and the schedule line below is the sentence a human reads to find out what happened.
+      signal: death.signal,
     });
 
     // The classification lands on the row whatever the verdict — a zee that died on something
@@ -128,7 +131,11 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
           + `revived — retrying cannot mend a credential. The provider said, verbatim: "`
           + `${scrubbedReason.replace(/\s+/g, ' ').slice(0, 600)}". Fix or re-connect the account in `
           + 'Project setup (or re-dispatch this work on another account); the zee is idle in its cage until then.'
-        : `This zee's turn has now died on the provider ${(zee.revive_attempts || 0) + 1} time(s) `
+        // "on the provider" is the usual case and stays said plainly; a host restart is the one
+        // transient death that is OURS, and telling a human the provider dropped their zee three
+        // times when the machine rebooted three times sends them to the wrong logs entirely.
+        : `This zee's turn has now died ${death.signal === HOST_RESTART_DEATH.signal
+            ? 'with the zeehive machine' : 'on the provider'} ${(zee.revive_attempts || 0) + 1} time(s) `
           + `(last: ${death.signal}) and the queenzee has spent all ${MAX_REVIVE_ATTEMPTS} automatic revives. `
           + `It said, verbatim: "${scrubbedReason.replace(/\s+/g, ' ').slice(0, 400)}". Nothing is wrong `
           + 'with its work — its commits are on its branch — but it needs a human to decide whether to send it '

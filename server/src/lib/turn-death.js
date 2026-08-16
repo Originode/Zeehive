@@ -100,9 +100,17 @@ export function classifyTurnDeath(text) {
 //      provider any more, and the fourth retry is the one that would hide it.
 //
 // `attempts` is how many revives this zee has ALREADY been given (zee.revive_attempts).
+// `signal` is only used to SAY THE RIGHT THING: every transient death used to be a provider error,
+// and since HOST_RESTART_DEATH rides the same ladder (queenzee/cxell-recover.js) that sentence would
+// be a lie in the one place a human reads to find out what happened. The POLICY does not branch on
+// it — a machine that rebooted and a 529 are both "wait and resume", which is why they share a
+// ladder — only the wording does.
 // → { action: 'revive' | 'tend' | 'none', delayMinutes, reason }
 export function decideRevive({ kind = 'unknown', attempts = 0, decommissioned = false,
-                              xellStatus = null, resumable = true } = {}) {
+                              xellStatus = null, resumable = true, signal = null } = {}) {
+  const cause = signal === HOST_RESTART_DEATH.signal
+    ? 'the zeehive machine restarted under this turn'
+    : 'a transient provider error';
   if (decommissioned) return { action: 'none', delayMinutes: null, reason: 'the zee has been decommissioned — there is no session to revive' };
   if (xellStatus === 'retired' || xellStatus === 'tearing-down') {
     return { action: 'none', delayMinutes: null, reason: `the xell is ${xellStatus} — its cxell is gone` };
@@ -117,14 +125,14 @@ export function decideRevive({ kind = 'unknown', attempts = 0, decommissioned = 
   }
   if (!resumable) {
     return { action: 'none', delayMinutes: null,
-             reason: 'a transient provider error, but this turn died before it had a session to resume (the cage was never built or was removed)' };
+             reason: `${cause}, but this turn died before it had a session to resume (the cage was never built or was removed)` };
   }
   if (attempts >= MAX_REVIVE_ATTEMPTS) {
     return { action: 'tend', delayMinutes: null,
-             reason: `the queenzee has already revived this zee ${attempts} time(s) and it keeps dying on the provider — a human is raised instead of a fourth retry` };
+             reason: `the queenzee has already revived this zee ${attempts} time(s) and the turn keeps dying — a human is raised instead of a fourth retry` };
   }
   return { action: 'revive', delayMinutes: REVIVE_BACKOFF_MIN[attempts],
-           reason: `a transient provider error — revive attempt ${attempts + 1} of ${MAX_REVIVE_ATTEMPTS}, in ${REVIVE_BACKOFF_MIN[attempts]} minute(s)` };
+           reason: `${cause} — revive attempt ${attempts + 1} of ${MAX_REVIVE_ATTEMPTS}, in ${REVIVE_BACKOFF_MIN[attempts]} minute(s)` };
 }
 
 // DID THIS RESUMED TURN DIE THE SAME WAY A SPAWNED ONE DOES?

@@ -67,6 +67,15 @@ ok(classifyTurnDeath('').kind === 'unknown',
 ok(decideRevive({ ...HOST_RESTART_DEATH, attempts: 0 }).action === 'revive'
    && decideRevive({ ...HOST_RESTART_DEATH, attempts: 0 }).delayMinutes === REVIVE_BACKOFF_MIN[0],
    'so it rides the SAME ladder a 529 does (5/15/45, three attempts, then a human) — no second policy');
+// …and the ladder SAYS the right thing about it. The schedule line is what a human reads in the log
+// to find out what happened, and "a transient provider error" would send them to the provider's
+// status page for a reboot of our own machine. The POLICY must not branch (one ladder), the WORDS
+// must (proved by asserting the default is untouched).
+ok(/the zeehive machine restarted under this turn/.test(decideRevive({ ...HOST_RESTART_DEATH, attempts: 0 }).reason)
+   && !/provider/.test(decideRevive({ ...HOST_RESTART_DEATH, attempts: 0 }).reason),
+   'the revive it schedules is explained as the machine restarting — not as a provider error it never was');
+ok(/a transient provider error/.test(decideRevive({ kind: 'transient', signal: '529', attempts: 0 }).reason),
+   'and every OTHER transient death still reads exactly as it did — the wording branches on the signal, nothing else');
 
 const prompt = hostRestartRevivePrompt({ minutes: 7, attempt: 1, max: 3 });
 ok(/THE ZEEHIVE MACHINE RESTARTED/.test(prompt) && !/PROVIDER ERROR/.test(prompt),
