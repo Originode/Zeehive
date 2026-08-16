@@ -42,12 +42,14 @@
 //     answers nothing, and the containers.js doctrine is absolute: a probe that cannot run is
 //     UNKNOWN, never a false 'down' — a false down here would restart nothing and log a fleet
 //     outage that is not happening. The next tick asks again.
-//   • it never resumes a turn in a cage it could not SEAL (below).
+//   • it never resumes a turn in a cage it could not SEAL — it stops that cage again (a stop is not
+//     a teardown; nothing of the zee's is lost) and raises a human, because a running cage with no
+//     iptables rules is strictly more exposed than the stopped one it found.
 import { q, one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { recordEvent, setTend } from '../lib/status.js';
-import { cxellName, cxellState, startCxell, restartCxellSshd, sealCxell } from '../lib/cxell.js';
+import { cxellName, cxellState, startCxell, stopCxell, restartCxellSshd, sealCxell } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { markZeeTurn } from '../lib/turn-record.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
@@ -79,8 +81,11 @@ const STARTABLE = ['exited', 'created', 'dead'];
 let sweeping = false;
 
 // Every live cxell the queenzee owns, newest zee per xell. Same shape as the boot renderer sweep's
-// query, plus what the seal and the turn release need.
-async function liveCxells() {
+// query, plus what the seal and the turn release need. INJECTABLE (see recoverStoppedCxells's
+// `list`) for the same reason refreshZeeLiveInLiveCxells takes its lister: this sweep WRITES to the
+// zee rows it visits, and a test run against a SHARED meta-DB must be able to say "these xells and
+// no others" rather than reaching across somebody else's fleet.
+export async function liveCxells() {
   return q(
     `SELECT DISTINCT ON (x.id)
             x.id AS xell_id, x.slug, x.project_id, x.db_coupling, x.status AS xell_status,
@@ -153,21 +158,32 @@ async function recoverOne(row, { reason, mode }) {
     blockTcp = await prodDbBlockList({ projectId: row.project_id, dbCoupling: row.db_coupling });
     await sealCxell({ ctx: 'default', name: cxellName(slug), blockTcp });
   } catch (e) {
-    // The cage is up and UNSEALED, which is strictly more exposed than the stopped cage we found —
-    // so this is the one path that raises a human rather than logging. It deliberately does NOT
-    // resume a turn: an agent running in an unsealed cage is exactly the reachable-production case
-    // the firewall exists to prevent, and no work is worth restoring on those terms.
+    // A RUNNING CAGE WITH NO SEAL IS WORSE THAN A STOPPED ONE, so the restart is UNDONE: default-allow
+    // egress with the fleet's live production databases reachable is precisely what the firewall
+    // exists to prevent, and the cage we found a moment ago could reach nothing at all. Stopping it
+    // also makes the next tick a clean retry of the WHOLE sequence (start → door → seal → resume),
+    // which is how this heals itself once whatever broke the seal is fixed. No turn is resumed
+    // either way — that is the interlock, and it is not negotiable.
+    let stopped = true;
+    try { await stopCxell({ ctx: 'default', slug }); }
+    catch (e2) { stopped = false; logline('cxell-recover', `${slug}: could not stop the unsealed cage again (${String(e2.message).slice(0, 140)})`); }
     const why = `This xell's cxell was restarted after the zeehive machine came back, but its EGRESS `
-      + `FIREWALL COULD NOT BE RE-APPLIED (${String(e.message).slice(0, 200)}). The cage is running with `
-      + `default-allow egress — the fleet's production databases are reachable from it — and the `
-      + `queenzee has deliberately NOT resumed the zee's turn in it. Re-seal it (or stop the cage) `
-      + `before letting anything run in there.`;
-    logline('cxell-recover', `${slug}: RESTARTED BUT NOT SEALED (${String(e.message).slice(0, 140)}) — no turn resumed, raised a tend`);
+      + `FIREWALL COULD NOT BE RE-APPLIED (${String(e.message).slice(0, 200)}). `
+      + (stopped
+        ? 'The queenzee STOPPED the cage again rather than leave it running with default-allow egress '
+          + '(the fleet\'s production databases would be reachable from it), and did NOT resume the zee\'s '
+          + 'turn. Nothing of the zee\'s work is lost — a stop is not a teardown. Fix what is refusing the '
+          + 'firewall exec and the queenzee retries the whole restart on its next pass.'
+        : 'The queenzee could not stop the cage again either, so it is RUNNING WITH DEFAULT-ALLOW EGRESS '
+          + 'right now — the fleet\'s production databases are reachable from it. No turn was resumed. '
+          + 'Seal or stop this cage by hand.');
+    logline('cxell-recover', `${slug}: RESTARTED BUT NOT SEALED (${String(e.message).slice(0, 140)}) — `
+      + `${stopped ? 'cage stopped again' : 'AND STILL RUNNING'}, no turn resumed, raised a tend`);
     await recordEvent({ source: 'queenzee', hook_event_name: 'cxell-recover', zee_id: row.zee_id,
                         xell_id: row.xell_id, raw: { slug, state: probe.state, reason, sealed: false,
-                                                     error: String(e.message).slice(0, 300) } });
+                                                     stopped, error: String(e.message).slice(0, 300) } });
     await setTend(row.xell_id, true, { reason: why, zeeId: row.zee_id, source: 'queenzee' });
-    return { slug, verdict: 'unsealed', error: e.message };
+    return { slug, verdict: 'unsealed', stopped, error: e.message };
   }
 
   logline('cxell-recover', `${slug}: cxell was ${probe.state} after ${reason} — RESTARTED, `
@@ -195,13 +211,14 @@ async function recoverOne(row, { reason, mode }) {
 // ONE SWEEP over every live cxell. Exported so the boot path, the loop and the test can all force a
 // pass. NEVER throws: this runs during boot, and a queenzee that will not come up because a docker
 // probe failed is a worse outage than the one it is recovering from.
-export async function recoverStoppedCxells({ reason = 'boot', mode = PROVISION_MODE } = {}) {
+export async function recoverStoppedCxells({ reason = 'boot', mode = PROVISION_MODE,
+                                             list = liveCxells } = {}) {
   if (sweeping) return { skipped: 'a sweep is already running' };
   sweeping = true;
   const tally = { checked: 0, running: 0, restarted: 0, resumed: 0, missing: 0, unknown: 0,
                   held: 0, unsealed: 0, failed: 0, would_restart: 0, results: [] };
   try {
-    const rows = await liveCxells();
+    const rows = await list();
     tally.checked = rows.length;
     for (const row of rows) {
       let r;

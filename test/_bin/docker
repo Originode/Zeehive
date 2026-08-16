@@ -6,6 +6,39 @@ LOG="${DOCKER_LOG:-/tmp/fake-docker.log}"
 {
   echo "=== docker $* ==="
 } >> "$LOG"
+# CXELL STATE simulation: `docker inspect -f {{.State.Status}} cxell_<slug>` is the probe the host-
+# restart recovery starts from (lib/cxell.js cxellState), and its THREE answers are three different
+# actions — a stopped cage is restarted, a 'missing' one is reported and never rebuilt, and one the
+# daemon could not be asked about is left ALONE (a probe that cannot run is UNKNOWN, never a false
+# down). Only a knob that can say all three lets a test prove the difference:
+#   exited|created|dead|running|paused|restarting → printed as the container's state
+#   missing      → the daemon ANSWERED and has no such container (exit 1, "No such object")
+#   unreachable  → the daemon could not be asked at all (exit 1, no verdict either way)
+# Answered before anything else, because inspect is a read and must never fall through to the
+# exec/stdin simulations below.
+if [ -n "${DOCKER_FAKE_CXELL_STATE:-}" ]; then
+  for a in "$@"; do
+    if [ "$a" = "inspect" ]; then
+      case "$DOCKER_FAKE_CXELL_STATE" in
+        missing)     echo "Error response from daemon: No such object: ${*: -1}" >&2; exit 1;;
+        unreachable) echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock." >&2; exit 1;;
+        *)           printf '%s\n' "$DOCKER_FAKE_CXELL_STATE"; exit 0;;
+      esac
+    fi
+  done
+fi
+# SEAL-FAILS simulation: the one restart step whose failure must stop everything after it — a cage
+# running with no iptables rules can reach the fleet's production databases. Matches the firewall
+# script only, so the start and the sshd exec in the same sequence still succeed and the test sees
+# what the recovery does about a cage it brought up but could not seal.
+if [ -n "${DOCKER_FAKE_SEAL_EXIT:-}" ]; then
+  for a in "$@"; do
+    if [ "$a" = "/usr/local/bin/cxell-firewall.sh" ]; then
+      echo "fake docker: iptables refused (DOCKER_FAKE_SEAL_EXIT=${DOCKER_FAKE_SEAL_EXIT})" >&2
+      exit "$DOCKER_FAKE_SEAL_EXIT"
+    fi
+  done
+fi
 # EARLY-CLOSE simulation: read only a few bytes then exit WITHOUT draining stdin, so a large
 # payload write hits a closing pipe (EPIPE) mid-stream — the exact failure a multi-MB image
 # attachment can trigger against `docker exec -i`. Lets the message test prove dk surfaces it.

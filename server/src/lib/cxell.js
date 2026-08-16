@@ -312,6 +312,17 @@ export async function startCxell({ ctx = 'default', slug, timeoutMs = 60000 }) {
   return { started: true, name, out: String(r.out || '').trim() };
 }
 
+// Stop a cage again — the UNDO of startCxell, and it exists for exactly one caller: a restart whose
+// egress RE-SEAL failed (queenzee/cxell-recover.js). A running cage with no iptables rules can reach
+// the fleet's live production databases, which is strictly more exposed than the stopped cage the
+// recovery found, so the honest move is to put it back where it was and try the whole sequence again
+// next tick. It stops a container; it removes nothing, so the zee's work is untouched.
+export async function stopCxell({ ctx = 'default', slug, timeoutMs = 60000 }) {
+  const name = cxellName(slug);
+  const r = await dk(ctx, ['stop', name], { timeoutMs });
+  return { stopped: true, name, out: String(r.out || '').trim() };
+}
+
 // Re-run cxell-sshd.sh to bring the attend door back up after a restart: sshd is a process, so it
 // died with the container even though its host keys, its config and the zee's authorized_keys did
 // not. The script is idempotent and re-reads what is already on disk.
