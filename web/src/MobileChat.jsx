@@ -237,7 +237,7 @@ export default function MobileChat() {
 }
 
 // ── list: one box per xell ──────────────────────────────────────────────────────
-function XellBox({ x, onClick }) {
+export function XellBox({ x, onClick }) {
   const color = hiveColor(x.hive_status);
   const label = hiveStatusLabel(x);
   const total = x.stack?.length || 0;
@@ -262,7 +262,7 @@ function XellBox({ x, onClick }) {
 }
 
 // ── detail: header + tabs (Activity / Chat) ─────────────────────────────────────
-function XellDetail({ xell, onBack }) {
+export function XellDetail({ xell, onBack }) {
   const [tab, setTab] = useState('chat');
   const [turns, setTurns] = useState([]);
   const [msgs, setMsgs] = useState([]);
@@ -319,7 +319,7 @@ function XellDetail({ xell, onBack }) {
 }
 
 // ── observability: the per-turn ledger, compact ────────────────────────────────
-function ObsList({ turns, openTurn, setOpenTurn }) {
+export function ObsList({ turns, openTurn, setOpenTurn }) {
   if (!turns.length) return <div className="mob-empty">No turns recorded yet.</div>;
   return (
     <div className="mob-obs">
@@ -332,7 +332,7 @@ function ObsList({ turns, openTurn, setOpenTurn }) {
   );
 }
 
-function TurnCard({ turn, open, onToggle }) {
+export function TurnCard({ turn, open, onToggle }) {
   const [events, setEvents] = useState(null);
   const [busy, setBusy] = useState(false);
   const tokens = Number(turn.input_tokens || 0) + Number(turn.output_tokens || 0)
@@ -372,7 +372,7 @@ function TurnCard({ turn, open, onToggle }) {
 }
 
 // One play-by-play event, rendered as a readable line (the console's eventLine, compact).
-function EventLine({ ev }) {
+export function EventLine({ ev }) {
   let raw = ev?.raw && typeof ev.raw === 'object' ? ev.raw : {};
   if (!raw || typeof raw !== 'object') { try { raw = JSON.parse(ev?.raw || '{}'); } catch { raw = {}; } }
   const ts = ev?.ts ? new Date(ev.ts).toLocaleTimeString() : '';
@@ -404,7 +404,7 @@ function EventLine({ ev }) {
 }
 
 // ── chat: message bubbles + input ───────────────────────────────────────────────
-function ChatPane({ xell, msgs }) {
+export function ChatPane({ xell, msgs }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -467,7 +467,7 @@ function ChatPane({ xell, msgs }) {
 }
 
 // ── terminal: deep-link into the xell's viewer ──────────────────────────────────
-function TerminalSheet({ x, onClose }) {
+export function TerminalSheet({ x, onClose }) {
   const url = x.viewer_url;
   const kind = x.viewer_kind;
   const isWeb = kind === 'web' || (url && /^https?:/.test(url));
