@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   getFleet, getProjects, dispatchTask,
   getXellObservability, getTurnEvents, getXellMessages, sendXellMessage,
