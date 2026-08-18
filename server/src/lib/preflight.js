@@ -117,10 +117,12 @@ async function dsnCheck(xell, { dsn, source, binding_is_prod: bindingIsProd }, {
       + 'the live database; a human granted this bind and only they may exercise it');
   }
   if (!dsn) {
-    // Not a fault by itself: a compose-runner xell on the shared dev db legitimately gets no
-    // DATABASE_URL (its stack resolves the db by network alias), and a pooled xell may have no db
-    // row yet. Reported as skipped-with-a-reason so the absence is visible rather than invented as
-    // either a pass or a failure.
+    // Not a fault by itself: a pooled xell may have no db row yet, and a db-shared-dev xell with
+    // NO shared dev db linked has nothing to project. (A db-shared-dev xell WITH its shared dev db
+    // linked now DOES get a DATABASE_URL — resolveXellDsn emits the used container's conn_ref for
+    // every runner type — so this branch is the genuinely db-less states only.) Reported as
+    // skipped-with-a-reason so the absence is visible rather than invented as either a pass or a
+    // failure.
     return skip('db-open', `no DATABASE_URL is projected for this xell (coupling ${xell.db_coupling || 'none'})`);
   }
   const r = await checkDsnOpens(dsn, { timeout });

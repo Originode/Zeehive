@@ -23,8 +23,9 @@
 // WHAT IS FENCED HERE:
 //   A. the STORY (pure): a hand-restarted cage is its own signal with its own wording, and the zee
 //      is told a HUMAN did it — the host-restart prompt would blame a machine that never rebooted;
-//   B. the SURFACE (static): the route, the API wrapper, and the two places the button appears —
-//      the xell card and the terminal modal, which is where a dead cage is actually discovered;
+//   B. the SURFACE (static): the route, the API wrapper, and the THREE places the button appears —
+//      the honeycomb flower (with its context menu), the xell card, and the terminal modal, which is
+//      where a dead cage is actually discovered;
 //   C. the RESTART: the order against the real docker seam, the released turn, and the IMMEDIATE
 //      resume (a human is standing there — five minutes of blank terminal reads as "it failed");
 //   D. the REFUSALS: running-without-force, missing, unprobeable, retired, simulate;
@@ -132,6 +133,89 @@ ok(/\['error', 'closed'\]\.includes\(status\)/.test(term),
    '…highlighted exactly when the socket failed, which is the moment the operator is looking for it');
 ok(term.includes("import { restartXellCage } from './cage.js'") && app.includes("from './cage.js'"),
    'both call the SAME handler (App imports ZeeTerminal, so the shared confirm text lives in its own module)');
+
+// THE HONEYCOMB. A verb that exists only on the xell card is, in practice, a verb that does not
+// exist: the flower is the surface operators watch, and the first report back on this feature was
+// "i don't see the restart". So the cage verb must be IN petalVerbs — which is the single list the
+// flower buttons AND the right-click context menu are both built from.
+const hive = read('web/src/hive/HiveCanvas.jsx');
+const sessionPetal = hive.slice(hive.indexOf('  v[2] = cxell'), hive.indexOf('  v[2] = cxell') + 220);
+ok(/'terminal', 'nudge', 'cage'/.test(sessionPetal) && /xPaused \?/.test(sessionPetal),
+   'the flower\'s SESSION petal carries ⟳ cage beside the terminal — for a cxell in either pause state, '
+   + 'because a paused xell is exactly one that may need its cage bounced');
+ok(/: \(xPaused \? \['resume'\] : \['pause'\]\);/.test(sessionPetal),
+   '…and NOT for a xell with no caged zee: there is no container to restart, and a button that can only '
+   + 'return a refusal is worse than no button');
+ok(/cage: '⟳'/.test(hive) && /cage: '⟳ Restart cage'/.test(hive)
+   && /cage: 'Restart this zee/.test(hive),
+   'it is drawn, named in the right-click menu, and tooltipped — an unlabelled glyph on a canvas is '
+   + 'not a surfaced verb');
+ok(/const VERB_MENU_TONE = \{[^}]*cage: 'danger'/.test(hive)
+   && /const VERB_ACCENT = \{[\s\S]{0,220}cage: 'error'/.test(hive),
+   '…in the destructive tone it shares with pause and done: if a turn is live in there, this ends it');
+ok(/if \(kind === 'cage'\) \{ restartXellCage\(x, refresh\); return; \}/.test(app),
+   'and the flower\'s click dispatches to the SAME shared handler as the card and the terminal — three '
+   + 'surfaces, one confirm, one set of refusals');
+
+// …and it is actually DRAWN where it can be clicked. The flower buttons are a canvas row clipped to
+// their petal, while their hit-rects are NOT clipped — so a row too wide for the hexagon is the one
+// failure that looks like the feature working: a button half-cut (or invisible) whose rect still
+// answers clicks. Adding a fourth verb to the SESSION petal is exactly the change that can cause it,
+// so this runs the REAL drawing code (esbuild JSX→JS, like manager-hexagon.test.mjs) and checks the
+// geometry rather than trusting the eye. Sizes: the honeycomb's flower at ordinary zoom up to the
+// layout max (168). At the layout FLOOR (24) rows overflow and are clipped — including the MACHINE
+// petal's four that predate this — and a 24px hexagon with 15px pills is unusable either way.
+console.log('\n── B2. the flower row still fits inside its petal with the fourth verb on it ──');
+const { transformSync } = await import('esbuild');
+const { writeFileSync, rmSync } = await import('node:fs');
+const { pointInHex, flowerCenters } = await import('../web/src/hive/hex.js');
+const tmpMod = join(ROOT, 'web/src/hive/.cxell-restart.test-build.mjs');
+writeFileSync(tmpMod, transformSync(hive, { loader: 'jsx', format: 'esm' }).code);
+let drawFlowerButtons, petalVerbs, xellContextMenuItems;
+try { ({ drawFlowerButtons, petalVerbs, xellContextMenuItems } = await import(tmpMod)); }
+finally { rmSync(tmpMod, { force: true }); }
+
+// A canvas recorder whose measureText is PESSIMISTIC about emoji: one em per glyph (⟳ and ⏸ are
+// narrower than that in Segoe UI, 💬 about that). Measuring optimistically here would pass a row
+// that clips in a browser, which is the whole thing being tested.
+const recorder = () => new Proxy({
+  font: '', canvas: { width: 1, height: 1 },
+  measureText(t) {
+    const px = Number((/(\d+(?:\.\d+)?)px/.exec(this.font || '') || [0, 12])[1]);
+    return { width: [...String(t)].length * px };
+  },
+}, { get: (t, p) => (p in t ? t[p] : () => {}), set: (t, p, v) => { t[p] = v; return true; } });
+
+const caged = { id: 'X', slug: 'cage-flower', zee_type: 'worker', status: 'claimed', task_id: 't',
+  hive_status: 'occ-working', viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x',
+  stack: [{ role: 'server' }, { role: 'webapp' }] };
+ok(petalVerbs(caged, { ahead: 2 })[2].includes('cage')
+   && !petalVerbs({ ...caged, viewer_kind: null, viewer_url: null }, { ahead: 2 })[2]?.includes('cage')
+   && Object.keys(petalVerbs({ ...caged, is_production: true }, null)).length === 0,
+   'the REAL petalVerbs offers it for a cxell, withholds it from a xell with no cage, and production '
+   + 'keeps no verbs at all');
+ok(xellContextMenuItems(caged, { ahead: 2 }).some((i) => i.kind === 'cage' && /Restart cage/.test(i.label)
+     && i.tone === 'danger'),
+   'and the right-click menu — the surface that needs no aiming at a 20px pill — lists it in words');
+
+let clipped = [];
+for (const size of [40, 60, 90, 120, 168]) {
+  const centers = flowerCenters(0, 0, size);
+  const rects = drawFlowerButtons(recorder(), centers, size, caged, { ahead: 2, behind: 0 });
+  for (const r of rects) {
+    const mx = r.x + r.w / 2, my = r.y + r.h / 2;
+    // its OWN petal: the clip is per-petal, so spilling into the neighbour is still spilling
+    const c = centers.reduce((a, b) => (Math.hypot(b[0] - mx, b[1] - my) < Math.hypot(a[0] - mx, a[1] - my) ? b : a));
+    const corners = [[r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h]];
+    if (!corners.every(([px, py]) => pointInHex(px, py, c[0], c[1], size))) clipped.push(`${r.kind}@${size}`);
+  }
+}
+ok(clipped.length === 0,
+   `every flower button — all four session verbs among them — is drawn wholly inside its own petal at `
+   + `every ordinary flower size${clipped.length ? ` (spilled: ${clipped.join(', ')})` : ''}`);
+const wide = drawFlowerButtons(recorder(), flowerCenters(0, 0, 60), 60, caged, { ahead: 2, behind: 0 });
+ok(wide.some((r) => r.kind === 'cage') && wide.filter((r) => r.kind === 'cage').length === 1,
+   '…and the cage button is one of them, exactly once');
 
 // ── C/D/E. THE RESTART ITSELF (throwaway postgres + the fake docker on PATH) ──────────────────
 const DOCKER_LOG = join(process.env.TMPDIR || '/tmp', `cxell-restart-docker-${process.pid}.log`);
