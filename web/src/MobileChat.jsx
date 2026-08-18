@@ -1,10 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  getFleet, getProjects, dispatchTask,
+  getFleet, getDiffs, getProjects, dispatchTask,
   getXellObservability, getTurnEvents, getXellMessages, sendXellMessage,
-  nudgeXell, pauseXell, resumeXell,
+  nudgeXell, pauseXell, resumeXell, buildXell, pullXell, pushXell, prXell, requestShipXell,
 } from './api.js';
 import { hiveColor, hiveStatusLabel } from './hive/status.js';
+import { xellContextMenuItems } from './hive/HiveCanvas.jsx';
+// Re-exported so a render test can assert the menu is exactly the hexagon's list.
+export { xellContextMenuItems } from './hive/HiveCanvas.jsx';
 
 // ────────────────────────────────────────────────────────────────────────────────
 // MOBILE CHAT UI — /m?project=<name>
@@ -95,6 +98,7 @@ export default function MobileChat() {
   const [projectId, setProjectId] = useState(null);
   const [fleet, setFleet] = useState(null);
   const [xells, setXells] = useState([]);
+  const [diffs, setDiffs] = useState({});
   const [selId, setSelId] = useState(null);
   const [err, setErr] = useState(null);
   const [notice, setNotice] = useState(null);
@@ -137,6 +141,16 @@ export default function MobileChat() {
     return () => { dead = true; clearInterval(iv); };
   }, [projectId]);
 
+  // The per-xell diffstats (fed to the hexagon's context menu for land/ship readiness).
+  // Loaded once per project and refreshed when the ⋮ menu opens — the console only
+  // re-reads these on git events, not on every fleet poll.
+  const loadDiffs = async (pid) => {
+    try { const d = await getDiffs(pid); setDiffs(d || {}); } catch { /* keep last */ }
+  };
+  useEffect(() => {
+    if (projectId) loadDiffs(projectId);
+  }, [projectId]);
+
   // Pick up a deeplinked ?xell= id when the project resolves.
   useEffect(() => {
     setSelId(readParam(XELL_PARAM) || null);
@@ -174,7 +188,8 @@ export default function MobileChat() {
   return (
     <div className="mob">
       {selected ? (
-        <XellDetail xell={selected} projectName={project?.name}
+        <XellDetail xell={selected} projectName={project?.name} diffs={diffs}
+                    refreshDiffs={() => loadDiffs(projectId)}
                     onBack={() => { setSelId(null); writeParams({ [XELL_PARAM]: null }); }} />
       ) : (
         <div className="mob-list">
@@ -264,13 +279,14 @@ export function XellBox({ x, onClick }) {
 }
 
 // ── detail: header + tabs (Activity / Chat) ─────────────────────────────────────
-export function XellDetail({ xell, projectName, onBack }) {
+export function XellDetail({ xell, projectName, diffs, refreshDiffs, onBack }) {
   const [tab, setTab] = useState('chat');
   const [turns, setTurns] = useState([]);
   const [msgs, setMsgs] = useState([]);
   const [openTurn, setOpenTurn] = useState(null);
   const [termOpen, setTermOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [directivesOpen, setDirectivesOpen] = useState(false);
   const [err, setErr] = useState(null);
 
   useEffect(() => {
@@ -291,6 +307,20 @@ export function XellDetail({ xell, projectName, onBack }) {
   const color = hiveColor(xell.hive_status);
   const label = hiveStatusLabel(xell);
 
+  // The ⋮ menu reuses the HEXAGON's own context menu — the same items and labels a
+  // right-click on the xell's hexagon shows (xellContextMenuItems in hive/HiveCanvas.jsx),
+  // fed the same per-xell diff so land/ship readiness matches. Actions that live in a
+  // console-only panel (diff viewer, env panel, swap picker, the done flow) hand off to
+  // the full console in a new tab; the rest dispatch here.
+  const menuItems = xellContextMenuItems(xell, diffs?.[xell.id]);
+  const onSurface = (kind) => {
+    setMenuOpen(false);
+    if (kind === 'terminal') setTermOpen(true);
+    else if (kind === 'message') setTab('chat');
+    else if (kind === 'observability') setTab('obs');
+    else if (kind === 'directives') setDirectivesOpen(true);
+  };
+
   return (
     <div className="mob-detail">
       <header className="mob-dtop">
@@ -310,7 +340,11 @@ export function XellDetail({ xell, projectName, onBack }) {
       </header>
 
       {termOpen && <TerminalSheet x={xell} onClose={() => setTermOpen(false)} />}
-      {menuOpen && <XellMenu x={xell} projectName={projectName} onClose={() => setMenuOpen(false)} />}
+      {directivesOpen && <DirectivesSheet x={xell} onClose={() => setDirectivesOpen(false)} />}
+      {menuOpen && (
+        <XellMenu x={xell} projectName={projectName} items={menuItems}
+                  onSurface={onSurface} onClose={() => setMenuOpen(false)} refreshDiffs={refreshDiffs} />
+      )}
 
       <div className="mob-tabs">
         <button className={`mob-tab${tab === 'obs' ? ' on' : ''}`} onClick={() => setTab('obs')}>Activity</button>
@@ -322,6 +356,27 @@ export function XellDetail({ xell, projectName, onBack }) {
       {tab === 'obs'
         ? <ObsList turns={turns} openTurn={openTurn} setOpenTurn={setOpenTurn} />
         : <ChatPane xell={xell} msgs={msgs} />}
+    </div>
+  );
+}
+
+// The xell's brief — the directive the hexagon's 🧭 opens. The mobile chat shows the
+// text it was given (task_text / zee_title); the full conversation is the Chat tab.
+export function DirectivesSheet({ x, onClose }) {
+  const brief = x.zee_title || x.task_text || null;
+  return (
+    <div className="mob-sheet-back" onClick={onClose}>
+      <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-title">Directive <span className="mob-menu-sub">{x.slug}</span></div>
+        <div className="mob-sheet-body">
+          {brief ? (
+            <p className="mob-directive-text">{brief}</p>
+          ) : (
+            <p className="mob-sheet-hint">No directive recorded for this xell.</p>
+          )}
+        </div>
+        <button className="mob-sheet-close" onClick={onClose}>Close</button>
+      </div>
     </div>
   );
 }
@@ -475,40 +530,55 @@ export function ChatPane({ xell, msgs }) {
 }
 
 // ── context actions: the ⋮ menu for one xell ────────────────────────────────────
-// A pure item list (like the console's xellContextMenuItems) so the menu can be
-// render-tested without a browser. Order: live verbs first (nudge/pause/resume —
-// only on a cxell zee, which has a live SSH session to reach), then the escape
-// hatch to the full console, then the copy rows.
-export function xellMenuItems(x) {
-  const items = [];
-  const cxell = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
-  const xPaused = x.hive_status === 'occ-paused' || x.xell_paused === true;
-  if (cxell) {
-    items.push({ kind: 'nudge', label: '💬 Nudge zee' });
-    items.push(xPaused
-      ? { kind: 'resume', label: '▶ Resume' }
-      : { kind: 'pause', label: '⏸ Pause', danger: true });
-  }
-  items.push({ kind: 'console', label: '🖥 Open in console' });
-  if (x.branch) items.push({ kind: 'copyBranch', label: '⑂ Copy branch', copy: x.branch });
-  items.push({ kind: 'copyId', label: '🆔 Copy xell ID', copy: x.id });
-  const task = x.zee_title || x.task_text;
-  if (task) items.push({ kind: 'copyTask', label: '📋 Copy task', copy: task });
-  if (x.viewer_url) items.push({ kind: 'copyUrl', label: '🔗 Copy terminal link', copy: x.viewer_url });
-  return items;
-}
-
-// The bottom sheet the ⋮ button opens: one row per context action, with inline
-// feedback for the async verbs (nudge/pause/resume) and the copy rows.
-export function XellMenu({ x, projectName, onClose }) {
+// The menu IS the hexagon's context menu: `items` are xellContextMenuItems(x, diff) from
+// hive/HiveCanvas.jsx — the exact options a right-click on the xell's hexagon shows, fed
+// the same per-xell diff. Nothing is invented here; each kind either maps to a mobile
+// surface (terminal / chat / activity / directives), dispatches through the same API the
+// console uses (pause/resume/nudge/build/pull/land/pr/ship/sendLand/sendShip), or hands
+// off to the full console for the actions that only live there (diff viewer, env panel,
+// swap picker, the done flow).
+export function XellMenu({ x, projectName, items, onSurface, onClose, refreshDiffs }) {
   const [busy, setBusy] = useState(null);   // the kind currently running
   const [msg, setMsg] = useState(null);     // { tone: 'ok'|'err', text }
-  const items = xellMenuItems(x);
+
+  // The land/ship rows read the per-xell diff; refresh it as the menu opens so the
+  // readiness is as current as the console's (which re-reads on git events).
+  useEffect(() => { refreshDiffs?.(); }, [refreshDiffs]);
 
   const done = (tone, text) => { setMsg({ tone, text }); setTimeout(onClose, tone === 'ok' ? 900 : 2600); };
+  // Console-only actions (diff viewer, env panel, swap picker, the done flow) hand off to
+  // the full console — the honest place for a surface the mobile chat does not have.
+  const openConsole = () => {
+    window.open(`/?project=${encodeURIComponent(projectName || '')}`, '_blank', 'noopener');
+    onClose();
+  };
+  // Destructive / confirmation verbs keep the same gate the console uses before acting.
+  const confirm = async (it) => {
+    const src = x.remote_source?.ref || 'its xource';
+    const msgText = {
+      pull: `Pull ${src} into ${x.slug}?`,
+      land: `Land ${x.slug} → ${src}?`,
+      push: `Land ${x.slug} → ${src}?`,
+      pr: `Raise a PR from ${x.slug} → ${src}?`,
+      ship: `Request ship of ${x.slug} to production?`,
+    }[it.kind];
+    if (!msgText) return true;
+    try { return window.confirm(msgText); } catch { return true; }
+  };
 
   const run = async (it) => {
     if (busy) return;
+    // Surface jumps first — no API, just switch the detail screen.
+    if (it.kind === 'terminal' || it.kind === 'message' || it.kind === 'observability' || it.kind === 'directives') {
+      onSurface?.(it.kind);
+      return;
+    }
+    // Console-only panels.
+    if (it.kind === 'srcdiff' || it.kind === 'owndiff' || it.kind === 'env' || it.kind === 'swap' || it.kind === 'done') {
+      openConsole();
+      return;
+    }
+    if (!(await confirm(it))) return;
     try {
       if (it.kind === 'nudge') {
         setBusy(it.kind);
@@ -525,12 +595,35 @@ export function XellMenu({ x, projectName, onClose }) {
         const r = await resumeXell(x.id);
         if (r?.ok) done('ok', 'Resumed ✓');
         else done('err', r?.reason || 'Server refused.');
-      } else if (it.kind === 'console') {
-        window.open(`/?project=${encodeURIComponent(projectName || '')}`, '_blank', 'noopener');
-        onClose();
-      } else if (it.copy) {
-        try { await navigator.clipboard.writeText(it.copy); done('ok', 'Copied ✓'); }
-        catch { done('err', 'Clipboard unavailable.'); }
+      } else if (it.kind === 'build') {
+        setBusy(it.kind);
+        await buildXell(x.id, false);
+        done('ok', 'Build started ✓');
+      } else if (it.kind === 'pull') {
+        setBusy(it.kind);
+        const r = await pullXell(x.id);
+        if (r?.merged === false) done('err', r?.reason || 'Pull refused.');
+        else done('ok', 'Pulled ✓');
+      } else if (it.kind === 'land' || it.kind === 'push') {
+        setBusy(it.kind);
+        const r = await pushXell(x.id);
+        if (r?.landed === false) done('err', r?.reason || 'Push held at the gate.');
+        else done('ok', 'Land ✓ (or held at the gate)');
+      } else if (it.kind === 'pr') {
+        setBusy(it.kind);
+        await prXell(x.id);
+        done('ok', 'PR raised ✓');
+      } else if (it.kind === 'ship') {
+        setBusy(it.kind);
+        const r = await requestShipXell(x.id, `ship ${x.slug} from the mobile chat`);
+        if (r?.ok) done('ok', 'Ship requested ✓');
+        else done('err', r?.reason || 'Ship refused.');
+      } else if (it.kind === 'sendLand' || it.kind === 'sendShip') {
+        const verb = it.kind === 'sendLand' ? 'land' : 'ship';
+        setBusy(it.kind);
+        const r = await sendXellMessage(x.id, { text: `zee ${verb}` });
+        if (r?.sent) done('ok', `Sent “zee ${verb}” ✓`);
+        else done('err', r?.reason || r?.error || 'No live zee to reach.');
       }
     } catch (e) { done('err', e?.message || String(e)); }
     finally { setBusy(null); }
@@ -543,7 +636,7 @@ export function XellMenu({ x, projectName, onClose }) {
         {msg && <div className={`mob-menu-msg ${msg.tone}`}>{msg.text}</div>}
         <div className="mob-menu-items">
           {items.map((it) => (
-            <button key={it.kind} className={`mob-menu-item${it.danger ? ' danger' : ''}`}
+            <button key={it.kind} className={`mob-menu-item${it.tone === 'danger' ? ' danger' : ''}`}
                     onClick={() => run(it)} disabled={busy !== null}>
               <span className="mob-menu-lbl">{it.label}</span>
               {busy === it.kind ? <span className="mob-menu-busy">…</span> : null}

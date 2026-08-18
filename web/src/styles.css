@@ -3432,9 +3432,12 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* ════════════════════════════════════════════════════════════════════════════════
    MOBILE CHAT UI (/m?project=…) — web/src/MobileChat.jsx
    A phone-first sibling of the console. Every class is prefixed .mob- so it can never
-   collide with the console's classes. Capped to a phone width and centred on desktop.
+   collide with the console's classes. It owns the FULL screen: no width cap, no centering —
+   a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with
+   100dvh as the refinement, so webviews that predate dvh still fill the viewport.
    ════════════════════════════════════════════════════════════════════════════════ */
-.mob { max-width: 520px; margin: 0 auto; min-height: 100dvh; display: flex; flex-direction: column;
+.mob { width: 100%; max-width: none; margin: 0; min-height: 100vh; min-height: 100dvh;
+  display: flex; flex-direction: column; overflow-x: hidden;
   background: var(--bg); color: var(--text); }
 .mob-list { display: flex; flex-direction: column; flex: 1; padding: 0 12px calc(16px + env(safe-area-inset-bottom)); }
 
@@ -3612,3 +3615,6 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .mob-menu-item.danger { color: var(--down); }
 .mob-menu-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mob-menu-busy { color: var(--muted); font-size: 13px; }
+.mob-directive-text { font-size: 14px; line-height: 1.55; color: var(--text);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow-y: auto; }
