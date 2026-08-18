@@ -519,18 +519,39 @@ export function ChatPane({ xell, msgs, convo }) {
   const realBodies = new Set(msgs.map((m) => m.body));
   const optimistic = sent
     .filter((o) => !realBodies.has(o.body))
-    .map((o) => ({ id: o.id, at: o.at, body: o.body, delivered: false, mine: true, captured: false }));
+    .map((o) => ({ id: o.id, at: o.at, body: o.body, delivered: false, mine: true, actor: 'you', captured: false }));
   const items = [
-    ...[...msgs].reverse().map((m) => ({
-      id: `m-${m.id}`, at: m.at, body: m.body, from: m.from,
-      delivered: m.delivered === false,
-      mine: m.from_xell_id !== xell.id,   // operator side (from_xell_id NULL for console)
-      captured: false,
-    })),
+    ...[...msgs].reverse().map((m) => {
+      // A message stream can carry THREE sources, and each must read as itself:
+      //   from_xell_id === this xell   → the zee's own report/reflection (left, "zee")
+      //   from_xell_id === another xell → a directive/report from ANOTHER zee (left, "from <slug>")
+      //   from_xell_id NULL + human@   → the operator (right, "you")
+      //   from_xell_id NULL + named zee → recorded by slug only (e.g. "zee:manager-…"), left, "from <slug>"
+      // The console's messages table carries from_slug/from_xell_id precisely so the audit
+      // surfaces the source — collapse every non-self sender into "you" and a manager's
+      // directive reads as the human having typed it.
+      const fromSelf = m.from_xell_id === xell.id;
+      const fromOther = m.from_xell_id != null && m.from_xell_id !== xell.id;
+      const fromOperator = !fromSelf && !fromOther
+        && (!m.from || String(m.from).startsWith('human@'));
+      const actor = fromOperator ? 'you'
+        : fromSelf ? 'zee'
+        : fromOther ? `from ${m.from || 'zee'}`
+        : (m.from ? `from ${m.from}` : 'zee');
+      return {
+        id: `m-${m.id}`, at: m.at, body: m.body, from: m.from,
+        delivered: m.delivered === false,
+        mine: fromOperator,
+        actor,
+        kind: m.kind,
+        captured: false,
+      };
+    }),
     ...[...(convo || [])].reverse().map((c, i) => ({
       id: `c-${i}-${c.ts}`, at: c.ts, body: c.text,
       delivered: false,
       mine: false,
+      actor: 'zee',
       // conversation → a "captured" speech bubble (what the zee SAID, from the feed);
       // thinking → a dimmed 💭 aside (the thinking stream, kept out of the talk).
       captured: c.kind === 'conversation',
@@ -575,7 +596,8 @@ export function ChatPane({ xell, msgs, convo }) {
               <div className="mob-msg-bubble">
                 <span className="mob-msg-body">{it.body}</span>
                 <span className="mob-msg-meta">
-                  {it.mine ? 'you' : (it.from || 'zee')}
+                  {it.actor}
+                  {it.kind && !it.mine ? ` · ${it.kind}` : ''}
                   {it.captured ? ' · spoke' : ''}
                   {it.delivered ? ' · unsent' : ''} · {fmtTime(it.at)}
                 </span>
