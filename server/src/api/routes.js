@@ -64,6 +64,7 @@ import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, lan
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
+import { restartXellCxell, probeXellCxell } from '../queenzee/cxell-recover.js';
 import { pauseFleet, resumeFleet, pauseProject, resumeProject,
          pauseXell, resumeXell } from '../queenzee/pause.js';
 import { pauseState, projectPauseState } from '../lib/fleet-pause.js';
@@ -1558,6 +1559,27 @@ router.post('/xells/:id/pull', async (req, res) => {
 router.post('/xells/:id/pr', async (req, res) => {
   try { res.json(await requestPullIn(req.params.id, { by: req.body?.by || 'human@console', note: req.body?.note || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── RESTART THIS XELL'S CAGE, because a human said it is wedged ──────────────────────────────────
+// The console's only cure for the failure the recovery loop cannot see: a cxell docker still calls
+// running, with a dead terminal and a silent agent inside it. GET reports what the cage is doing
+// right now (so the confirm dialog can be TRUE about whether a live turn is about to be killed);
+// POST runs the queenzee's own restart sequence — stop (only with `force`) → start → sshd → SEAL →
+// resume the session. Loop-owned work, so an API-only instance must refuse it rather than act
+// without the single-queenzee lock. Both answer 200 with a verdict, including their refusals
+// ('running', 'missing', 'unsealed', 'no-cxell'): each of those is something an operator needs to
+// read, not a 500 to guess at.
+router.get('/xells/:id/cxell', requireQueenzeeLoops, async (req, res) => {
+  try { res.json(await probeXellCxell(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.post('/xells/:id/cxell/restart', requireQueenzeeLoops, async (req, res) => {
+  try {
+    res.json(await restartXellCxell(req.params.id, {
+      by: req.body?.by || 'human@console', force: !!req.body?.force }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // Nudge the xell's live cxell zee for a STATUS UPDATE — the flower's "nudge" button. Best-effort:

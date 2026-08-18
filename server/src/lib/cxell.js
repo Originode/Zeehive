@@ -312,8 +312,9 @@ export async function startCxell({ ctx = 'default', slug, timeoutMs = 60000 }) {
   return { started: true, name, out: String(r.out || '').trim() };
 }
 
-// Stop a cage again — the UNDO of startCxell, and it exists for exactly one caller: a restart whose
-// egress RE-SEAL failed (queenzee/cxell-recover.js). A running cage with no iptables rules can reach
+// Stop a cage again — the UNDO of startCxell, with two callers, both in queenzee/cxell-recover.js:
+// a restart whose egress RE-SEAL failed, and the first half of a human's forced restart of a cage
+// that docker calls running while nothing inside it answers. A running cage with no iptables rules can reach
 // the fleet's live production databases, which is strictly more exposed than the stopped cage the
 // recovery found, so the honest move is to put it back where it was and try the whole sequence again
 // next tick. It stops a container; it removes nothing, so the zee's work is untouched.

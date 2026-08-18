@@ -101,7 +101,9 @@ const recover = read('server/src/queenzee/cxell-recover.js');
 ok(/recoverStoppedCxells\(\{ reason: 'boot' \}\)[\s\S]{0,120}\.catch\(/.test(recover),
    'the boot sweep has a .catch — a docker probe that fails must never stop the queenzee coming up');
 // The live half below hands the sweep its own lister, so the guards of the REAL one are asserted here.
-const lister = recover.slice(recover.indexOf('export async function liveCxells'),
+// (From the shared CXELL_COLS/CXELL_WHERE pair down: the sweep's lister and the console button's
+// single-xell lookup are built from ONE where-clause, precisely so these guards cannot drift apart.)
+const lister = recover.slice(recover.indexOf('const CXELL_COLS'),
                              recover.indexOf('// END THE TURN THE REBOOT KILLED'));
 ok(/viewer_kind = 'ssh-terminal'/.test(lister) && /entrypoint = 'cxell-cli'/.test(lister),
    'the fleet-wide lister visits cxell zees only — the only ones that HAVE a cage to restart');

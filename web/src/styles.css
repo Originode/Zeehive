@@ -2271,6 +2271,22 @@ a.cbox:hover { border-color: var(--accent); }
 .term-x.talk.on { border-color: var(--accent); color: var(--accent); }
 .term-x.talk.urge { border-color: #e0a53b; color: #f0c46a; background: rgba(224,165,59,.12); }
 
+/* ── ⟳ cage: restart the container this terminal could not reach ──
+   Same shape as 💬 talk (a word, in the header, next to the doors that are failing), and MUTED
+   until it is the answer: `.urge` fires only when the socket errored or closed, which is when an
+   operator is looking at a dead pane wondering what they are allowed to do about it. It is a
+   destructive-ish action, so it never LOOKS like the primary one — the confirm dialog carries the
+   warning, not the button. */
+.term-x.cage { font-size: 11.5px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px;
+  margin-right: 6px; background: var(--panel2); color: var(--muted); white-space: nowrap; }
+.term-x.cage:hover { border-color: var(--error); color: var(--text); }
+.term-x.cage.urge { border-color: var(--error); color: #f0a09a; background: rgba(229,85,78,.12); }
+
+/* The same verb on the xell card, beside ⌨ terminal: a .termbtn, dimmed, because the card is a
+   place you READ and this is the one control on it that stops something. */
+.termbtn.cagebtn { color: var(--muted); }
+.termbtn.cagebtn:hover { border-color: var(--error); color: var(--text); }
+
 /* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
    These first shipped as bare .term-chips and came straight back as "it's too difficult to see if
    the buttons are pressed or not" — correct: .term-chip carries no COLOUR (the queenzee-log chips
