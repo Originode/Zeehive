@@ -3436,6 +3436,12 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
    a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with
    100dvh as the refinement, so webviews that predate dvh still fill the viewport.
    ════════════════════════════════════════════════════════════════════════════════ */
+/* MobileChat.jsx adds `mob-page` to <html>/<body> on mount; these rules therefore apply ONLY
+   at /m and never leak into the console. Height chain + overflow-x so a phone never renders a
+   desktop-width page scaled down (the "shrunk UI" failure), and text-size-adjust so iOS keeps
+   the authored font sizes instead of inflating them. */
+html.mob-page, html.mob-page body { height: 100%; }
+html.mob-page body { margin: 0; overflow-x: hidden; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .mob { width: 100%; max-width: none; margin: 0; min-height: 100vh; min-height: 100dvh;
   display: flex; flex-direction: column; overflow-x: hidden;
   background: var(--bg); color: var(--text); }
@@ -3504,7 +3510,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .mob-box-meta { white-space: nowrap; }
 
 /* detail header */
-.mob-detail { display: flex; flex-direction: column; flex: 1; min-height: 100dvh; }
+.mob-detail { display: flex; flex-direction: column; flex: 1; width: 100%; min-height: 100vh; min-height: 100dvh; }
 .mob-dtop { display: flex; align-items: center; gap: 8px; padding: 12px 10px 8px;
   border-bottom: 1px solid var(--line); }
 .mob-back { background: none; border: none; color: var(--text); font-size: 22px; cursor: pointer;
@@ -3586,7 +3592,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* terminal sheet */
 .mob-sheet-back { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 40;
   display: flex; align-items: flex-end; justify-content: center; }
-.mob-sheet { width: 100%; max-width: 520px; background: var(--panel); border-top: 1px solid var(--line);
+.mob-sheet { width: 100%; max-width: none; background: var(--panel); border-top: 1px solid var(--line);
   border-radius: 16px 16px 0 0; padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
   display: flex; flex-direction: column; gap: 10px; }
 .mob-sheet-title { font-weight: 700; font-size: 15px; }

@@ -106,6 +106,18 @@ export default function MobileChat() {
   const [promptText, setPromptText] = useState('');
   const [dispatching, setDispatching] = useState(false);
 
+  // The mobile page owns the FULL viewport. Mark <html>/<body> so rules that must NOT leak
+  // into the desktop console (height:100%, overflow-x, text-size-adjust) can scope to /m.
+  useEffect(() => {
+    const el = document.documentElement;
+    const body = document.body;
+    const prevEl = el.className;
+    const prevBody = body.className;
+    el.className += ' mob-page';
+    body.className += ' mob-page';
+    return () => { el.className = prevEl; body.className = prevBody; };
+  }, []);
+
   // Load the project list and pick the active project: URL param wins, then the
   // last-used project, then the first.
   useEffect(() => {
