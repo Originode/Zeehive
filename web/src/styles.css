@@ -1045,6 +1045,12 @@ a.cbox:hover { border-color: var(--accent); }
   background: none; border: 1px solid transparent; color: var(--muted); cursor: pointer;
   font-size: 15px; line-height: 1; padding: 2px 7px; border-radius: 6px; margin-right: 6px;
 }
+.cs-mobile {
+  color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 600;
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin-right: 6px;
+  white-space: nowrap;
+}
+.cs-mobile:hover { color: var(--accent); border-color: var(--accent); background: var(--panel2); }
 .cs-gear:hover { color: var(--text); border-color: var(--line); background: var(--panel2); }
 .console-settings {
   width: min(440px, 92vw); background: var(--panel); border: 1px solid var(--line);

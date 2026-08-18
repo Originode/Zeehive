@@ -1223,6 +1223,9 @@ export default function App() {
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided in the composer
               (or by the router on a router-gated fleet), opened from the single "+ prompt" button. */}
+          {/* The phone-first mobile chat UI (/m) — a same-tab switch, preserving the project. */}
+          <a className="cs-mobile" href={`./m?project=${encodeURIComponent(project.name)}`}
+             title="Open the phone-first mobile chat UI">📱 Mobile</a>
           {/* Console settings (browser-local): terminal engine xterm↔wterm, etc. Not project setup. */}
           <button type="button" className="cs-gear" data-testid="console-settings-btn"
                   title="Console settings — terminal engine and other browser-local preferences"
