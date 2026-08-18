@@ -3576,6 +3576,18 @@ html.mob-page body { margin: 0; overflow-x: hidden; -webkit-text-size-adjust: 10
   border: 1px solid var(--line); border-bottom-left-radius: 4px; }
 .mob-msg-meta { font-size: 10px; opacity: .7; }
 .mob-msg.mine .mob-msg-meta { text-align: right; }
+/* The zee's CAPTURED speech (feed-captured conversation, no tool call): a slightly-dashed
+   bubble so the operator can tell "the zee actually said this while working" from a door
+   message the zee deliberately sent. */
+.mob-msg.theirs.captured .mob-msg-bubble { border-style: dashed; border-color: var(--accent); }
+.mob-msg.captured .mob-msg-meta { opacity: .6; }
+/* The THINKING stream — kept out of the talk, shown as a dimmed italic aside. */
+.mob-msg.think { justify-content: flex-start; }
+.mob-think-bubble { max-width: 88%; display: flex; flex-direction: column; gap: 2px;
+  padding: 7px 12px; border-radius: 12px; font-size: 12px; line-height: 1.45;
+  word-break: break-word; background: transparent; color: var(--muted);
+  border: 1px solid var(--line); opacity: .75; font-style: italic; }
+.mob-msg.think .mob-msg-meta { font-style: normal; }
 
 /* composer */
 .mob-composer { border-top: 1px solid var(--line); padding: 8px 10px calc(8px + env(safe-area-inset-bottom));

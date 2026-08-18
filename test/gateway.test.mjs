@@ -35,7 +35,8 @@ import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
          requestsForXell, gatewayHello, usageFromStream, modelFromStream, providerUpstreamUrl,
-         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf, extractRateLimit } from '../server/src/lib/gateway.js';
+         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf, extractRateLimit,
+         classifyResponseText } from '../server/src/lib/gateway.js';
 
 // providerUpstreamUrl reads these from the PROCESS env (the queenzee's own operator overrides).
 // This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
@@ -249,6 +250,53 @@ const grokStream = 'event: response.created\ndata: {"type":"response.created","r
 eq(usageFromStream(grokStream, 'messages')?.input_tokens, 12, 'xAI nested response.usage → input tokens');
 eq(usageFromStream(grokStream, 'messages')?.output_tokens, 7, 'xAI nested response.usage → output tokens');
 
+// ── F2. classifyResponseText — the conversation vs thinking classifier ───────────────────────
+console.log('\n── F2. classifyResponseText — which is talk, which is thinking ──');
+// Anthropic SSE streaming: text_delta → conversation, thinking_delta → thinking, tool_use → neither.
+const antSse = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"plan the steps"}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan the steps"}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I will implement"}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" the feature."}}\n\n';
+const antSpeech = classifyResponseText(antSse, 'messages');
+eq(antSpeech.conversation.join(''), 'I will implement the feature.', 'anthropic SSE: text_delta text is the conversation');
+eq(antSpeech.thinking.join(''), 'plan the steps', 'anthropic SSE: thinking_delta is the thinking stream');
+// Anthropic non-streaming message body: content blocks carry text and thinking in one JSON.
+const antBody = JSON.stringify({ type: 'message', content: [
+  { type: 'thinking', thinking: 'internal reasoning' },
+  { type: 'redacted_thinking', data: '[redacted reasoning]' },
+  { type: 'text', text: 'Here is the answer.' },
+  { type: 'tool_use', name: 'Bash', input: { command: 'ls' } },
+] });
+const antBodySpeech = classifyResponseText(antBody, 'messages');
+eq(antBodySpeech.conversation.length, 1, 'non-streaming: one conversation text block');
+eq(antBodySpeech.conversation[0], 'Here is the answer.', 'non-streaming: the text block is the conversation');
+eq(antBodySpeech.thinking.length, 2, 'non-streaming: thinking + redacted_thinking both counted');
+ok(antBodySpeech.thinking[1].includes('redacted'), 'non-streaming: redacted thinking captured');
+// OpenAI SSE: delta.content (string) is conversation; deepseek-reasoner's reasoning_content is thinking.
+const oaiSse = 'data: {"choices":[{"delta":{"reasoning_content":"mull it over","content":""}}]}\n\n'
+  + 'data: {"choices":[{"delta":{"content":"The result is 4."}}]}\n\n'
+  + 'data: [DONE]\n\n';
+const oaiSpeech = classifyResponseText(oaiSse, 'chat-completions');
+eq(oaiSpeech.conversation.join(''), 'The result is 4.', 'openai SSE: delta.content is the conversation');
+eq(oaiSpeech.thinking.join(''), 'mull it over', 'openai SSE: delta.reasoning_content is the thinking stream');
+// OpenAI non-streaming message body.
+const oaiBody = JSON.stringify({ choices: [{ message: { content: 'Final answer', reasoning_content: 'deep thought' } }] });
+const oaiBodySpeech = classifyResponseText(oaiBody, 'chat-completions');
+eq(oaiBodySpeech.conversation[0], 'Final answer', 'openai body: message.content is the conversation');
+eq(oaiBodySpeech.thinking[0], 'deep thought', 'openai body: message.reasoning_content is the thinking stream');
+// xAI Responses API (grok, dispatched as kind 'messages'): output_text deltas vs reasoning_summary.
+const grokSpeechSse = 'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
+  + 'data: {"type":"response.output_text.delta","delta":" there"}\n\n'
+  + 'data: {"type":"response.reasoning_summary.delta","delta":"hmm"}\n\n'
+  + 'data: {"type":"response.completed","response":{}}\n\n';
+const grokSpeech = classifyResponseText(grokSpeechSse, 'messages');
+eq(grokSpeech.conversation.join(''), 'Hello there', 'xAI SSE: output_text.delta is the conversation');
+eq(grokSpeech.thinking.join(''), 'hmm', 'xAI SSE: reasoning_summary.delta is the thinking stream');
+// Empty / null / not-JSON all degrade to empty buckets (never throw).
+eq(JSON.stringify(classifyResponseText('')), '{"conversation":[],"thinking":[]}', 'empty text → empty buckets');
+eq(JSON.stringify(classifyResponseText('not json at all')), '{"conversation":[],"thinking":[]}', 'non-JSON → empty buckets');
+eq(JSON.stringify(classifyResponseText(null)), '{"conversation":[],"thinking":[]}', 'null → empty buckets');
+
 // ── C. the round-trip ────────────────────────────────────────────────────────────────────────
 console.log('\n── C. record → complete → read ──');
 let projectId = null, xourceId = null, xellId = null, zeeId = null, rid = null, autoRid = null;
@@ -326,7 +374,12 @@ try {
   await completeRequest(rid, { status: 200, input: 1, output: 1, cost: 0, meta: { unpriced: { provider: 'deepseek', model: 'no-such-model' } } });
   const metaRow = await one(`SELECT meta FROM llm_gateway_request WHERE id=$1`, [rid]);
   eq(metaRow?.meta?.unpriced?.model, 'no-such-model', 'the meta note lands on the row (an unpriced model says WHY it is 0)');
-  await completeRequest(rid, { status: 200, input: 6, output: 9, cost: 0 });
+  // The gateway's conversation-vs-thinking classification ALSO merges into meta.speech (the same
+  // merge the proxy's finish() uses), so the mobile chat can read it off the row.
+  await completeRequest(rid, { status: 200, input: 6, output: 9, cost: 0, meta: { speech: classifyResponseText(antBody, 'messages') } });
+  const speechRow = await one(`SELECT meta FROM llm_gateway_request WHERE id=$1`, [rid]);
+  eq(speechRow?.meta?.speech?.conversation?.[0], 'Here is the answer.', 'meta.speech.conversation lands on the row');
+  eq(speechRow?.meta?.speech?.thinking?.length, 2, 'meta.speech.thinking lands on the row');
 
   // ── G. zee/turn linkage — a request is attributed to the live zee + open turn ──────────────
   console.log('\n── G. zee/turn linkage — zee_id + turn_id at record time ──');

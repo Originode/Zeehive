@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   getFleet, getDiffs, getProjects, dispatchTask,
   getXellObservability, getTurnEvents, getXellMessages, sendXellMessage,
+  getXellConversation,
   nudgeXell, pauseXell, resumeXell, buildXell, pullXell, pushXell, prXell, requestShipXell,
 } from './api.js';
 import { hiveColor, hiveStatusLabel } from './hive/status.js';
@@ -295,6 +296,10 @@ export function XellDetail({ xell, projectName, diffs, refreshDiffs, onBack }) {
   const [tab, setTab] = useState('chat');
   const [turns, setTurns] = useState([]);
   const [msgs, setMsgs] = useState([]);
+  // The zee's CAPTURED CONVERSATION — the actual text the zee's model produced during its turns
+  // (assistant feed events classified at capture time into conversation vs thinking). Rendered in
+  // the Chat tab so the zee's speech surfaces WITHOUT the zee making any tool call.
+  const [convo, setConvo] = useState([]);
   const [openTurn, setOpenTurn] = useState(null);
   const [termOpen, setTermOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -311,8 +316,12 @@ export function XellDetail({ xell, projectName, diffs, refreshDiffs, onBack }) {
       try { const r = await getXellMessages(xell.id); if (!dead) setMsgs(r || []); }
       catch (e) { if (!dead) setErr(e.message); }
     };
-    loadObs(); loadMsgs();
-    const iv = setInterval(() => { loadObs(); loadMsgs(); }, POLL_MS);
+    const loadConvo = async () => {
+      try { const r = await getXellConversation(xell.id, { limit: 50 }); if (!dead) setConvo(r?.items || []); }
+      catch (e) { if (!dead) setErr(e.message); }
+    };
+    loadObs(); loadMsgs(); loadConvo();
+    const iv = setInterval(() => { loadObs(); loadMsgs(); loadConvo(); }, POLL_MS);
     return () => { dead = true; clearInterval(iv); };
   }, [xell.id]);
 
@@ -367,7 +376,7 @@ export function XellDetail({ xell, projectName, diffs, refreshDiffs, onBack }) {
 
       {tab === 'obs'
         ? <ObsList turns={turns} openTurn={openTurn} setOpenTurn={setOpenTurn} />
-        : <ChatPane xell={xell} msgs={msgs} />}
+        : <ChatPane xell={xell} msgs={msgs} convo={convo} />}
     </div>
   );
 }
@@ -479,17 +488,36 @@ export function EventLine({ ev }) {
 }
 
 // ── chat: message bubbles + input ───────────────────────────────────────────────
-export function ChatPane({ xell, msgs }) {
+export function ChatPane({ xell, msgs, convo }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const endRef = useRef(null);
-  // API returns newest-first; a chat reads oldest-first.
-  const sorted = [...msgs].reverse();
+  // API returns newest-first; a chat reads oldest-first. The CAPTURED conversation — the zee's
+  // model speech + thinking, from the observability feed (getXellConversation) — rides in the
+  // SAME stream so the zee's actual output appears here WITHOUT the zee ever calling a tool.
+  // Items carry either a zee_message id (m-…) or a feed event ts (c-…); both sort by time.
+  const items = [
+    ...[...msgs].reverse().map((m) => ({
+      id: `m-${m.id}`, at: m.at, body: m.body, from: m.from,
+      delivered: m.delivered === false,
+      mine: m.from_xell_id !== xell.id,   // operator side (from_xell_id NULL for console)
+      captured: false,
+    })),
+    ...[...(convo || [])].reverse().map((c, i) => ({
+      id: `c-${i}-${c.ts}`, at: c.ts, body: c.text,
+      delivered: false,
+      mine: false,
+      // conversation → a "captured" speech bubble (what the zee SAID, from the feed);
+      // thinking → a dimmed 💭 aside (the thinking stream, kept out of the talk).
+      captured: c.kind === 'conversation',
+      think: c.kind === 'thinking',
+    })),
+  ].sort((a, b) => new Date(a.at || 0) - new Date(b.at || 0));
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: 'end' });
-  }, [msgs.length]);
+  }, [items.length]);
 
   const send = async () => {
     const t = text.trim();
@@ -506,21 +534,31 @@ export function ChatPane({ xell, msgs }) {
   return (
     <div className="mob-chat">
       <div className="mob-msgs">
-        {sorted.map((m) => {
-          const mine = m.from_xell_id !== xell.id;   // operator side (from_xell_id NULL for console)
+        {items.map((it) => {
+          if (it.think) {
+            return (
+              <div key={it.id} className="mob-msg think">
+                <div className="mob-think-bubble">
+                  <span className="mob-think-body">{it.body}</span>
+                  <span className="mob-msg-meta">💭 thinking · {fmtTime(it.at)}</span>
+                </div>
+              </div>
+            );
+          }
           return (
-            <div key={m.id} className={`mob-msg ${mine ? 'mine' : 'theirs'}`}>
+            <div key={it.id} className={`mob-msg ${it.mine ? 'mine' : 'theirs'}${it.captured ? ' captured' : ''}`}>
               <div className="mob-msg-bubble">
-                <span className="mob-msg-body">{m.body}</span>
+                <span className="mob-msg-body">{it.body}</span>
                 <span className="mob-msg-meta">
-                  {mine ? 'you' : (m.from || 'zee')}
-                  {m.delivered === false ? ' · unsent' : ''} · {fmtTime(m.at)}
+                  {it.mine ? 'you' : (it.from || 'zee')}
+                  {it.captured ? ' · spoke' : ''}
+                  {it.delivered ? ' · unsent' : ''} · {fmtTime(it.at)}
                 </span>
               </div>
             </div>
           );
         })}
-        {!sorted.length && <div className="mob-empty">No messages yet — say hi.</div>}
+        {!items.length && <div className="mob-empty">No messages yet — say hi.</div>}
         <div ref={endRef} />
       </div>
       <div className="mob-composer">

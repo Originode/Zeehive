@@ -463,6 +463,11 @@ export const setXellEnvironment = (xellId, environmentId) =>
 // A xell's message history — the manager⇄worker conversation (directives a manager sent, reports a
 // worker sent back). Human-facing audit: marks NOTHING read (only the agent's own `zee inbox` does).
 export const getXellMessages = (xellId) => siteCall(`/api/xells/${xellId}/messages`, 'GET');
+// A xell's CAPTURED CONVERSATION — the actual text the zee's model produced during its turns
+// (assistant events classified by the observability feed into conversation vs thinking). The mobile
+// chat renders this, so a zee's speech surfaces WITHOUT the zee calling any tool.
+export const getXellConversation = (xellId, { limit = 100 } = {}) =>
+  siteCall(`/api/xells/${xellId}/conversation?limit=${limit}`, 'GET');
 // Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
 // full .env text — the "pull out what this xell is running with" reveal.
 export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');

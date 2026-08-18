@@ -3,12 +3,18 @@
 //
 // What this file covers:
 //   A. lastAssistantText — the pure "what did the turn say" summariser, no DB.
+//   A2. classifyAssistantEvent — the pure thinking-vs-conversation classifier the mobile
+//      chat's captured conversation rides on (no DB).
 //   B. The SQL round-trip — startTurn → endTurn → turnsForXell → eventsForTurn against
 //      DATABASE_URL with a throwaway project/xell/zee, torn down in a `finally` whatever
 //      happens (house rule 1: no test data).
+//   B2. recordFeedEvent → conversationForXell — an assistant event captured via the feed
+//      classifier is read back as the zee's conversation/thinking (the /xells/:id/conversation
+//      read model the mobile chat renders).
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
-import { startTurn, endTurn, turnsForXell, eventsForTurn, lastAssistantText } from '../server/src/lib/turn-ledger.js';
+import { startTurn, endTurn, turnsForXell, eventsForTurn, lastAssistantText,
+         classifyAssistantEvent, recordFeedEvent, conversationForXell } from '../server/src/lib/turn-ledger.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -27,6 +33,30 @@ eq(lastAssistantText({ message: { content: [
 ] } }), 'Implemented the feature', 'the LAST text block wins');
 eq(lastAssistantText({ message: { content: [{ type: 'text', text: 'x'.repeat(800) }] } }).length, 500,
    'the summary is bounded to 500 chars');
+
+// ── A2. classifyAssistantEvent — the thinking vs conversation classifier (pure) ───────────────
+console.log('\n── A2. classifyAssistantEvent — conversation vs thinking vs tools ──');
+eq(JSON.stringify(classifyAssistantEvent(null)), '{"conversation":[],"thinking":[],"tools":[]}', 'null event → empty buckets');
+eq(JSON.stringify(classifyAssistantEvent({ type: 'tool_use', name: 'Bash' })), '{"conversation":[],"thinking":[],"tools":[]}',
+   'a non-assistant event → empty buckets');
+const cls = classifyAssistantEvent({ type: 'assistant', message: { content: [
+  { type: 'thinking', thinking: 'first, reason' },
+  { type: 'redacted_thinking', data: '[hidden reasoning]' },
+  { type: 'text', text: 'Hello, I will do it.' },
+  { type: 'tool_use', name: 'Bash', input: { command: 'ls' } },
+] } });
+eq(cls.conversation.length, 1, 'one conversation text block');
+eq(cls.conversation[0], 'Hello, I will do it.', 'the text block IS the conversation');
+eq(cls.thinking.length, 2, 'thinking + redacted_thinking both captured');
+ok(cls.thinking[1].includes('hidden'), 'redacted thinking captured');
+eq(cls.tools.length, 1, 'the tool_use is captured separately');
+eq(cls.tools[0].name, 'Bash', 'the tool name is captured');
+// A string content (a provider collapsed the blocks) is ALL conversation.
+eq(classifyAssistantEvent({ type: 'assistant', message: { content: 'plain text reply' } }).conversation[0],
+   'plain text reply', 'a string content block is conversation');
+// Whitespace-only blocks are skipped — never empty bubbles.
+eq(classifyAssistantEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '  ' }] } }).conversation.length, 0,
+   'whitespace-only text is skipped');
 
 // ── B. SQL round-trip ─────────────────────────────────────────────────────────────────────────
 console.log('\n── B. the turn ledger round-trip (start → end → read) ──');
@@ -87,6 +117,33 @@ try {
   eq(evs.length, 1, 'eventsForTurn finds the attributed event');
   eq(evs[0]?.turn_id, turn.id, 'the event carries the turn_id');
   eq(evs[0]?.hook_event_name, 'assistant', 'the event type is preserved');
+
+  // ── B2. recordFeedEvent → conversationForXell — the captured conversation read model ─────────
+  console.log('\n── B2. recordFeedEvent → conversationForXell (the mobile chat conversation) ──');
+  // The event carries BOTH thinking and conversation blocks — recordFeedEvent must classify at
+  // CAPTURE time (raw.capture) and conversationForXell must read the classification back.
+  const rec = await recordFeedEvent({
+    turnId: turn.id, zeeId, xellId,
+    event: { type: 'assistant', message: { content: [
+      { type: 'thinking', thinking: 'step one internally' },
+      { type: 'text', text: 'I deployed the zee.' },
+    ] } },
+  });
+  ok(!!rec, 'recordFeedEvent writes the event');
+  const convo = await conversationForXell(xellId, { limit: 20 });
+  const convoItem = convo.find((c) => c.text === 'I deployed the zee.');
+  const thinkItem = convo.find((c) => c.text === 'step one internally');
+  ok(!!convoItem, 'conversationForXell returns the conversation text');
+  eq(convoItem?.kind, 'conversation', 'the text block is classified as conversation');
+  ok(!!thinkItem, 'conversationForXell returns the thinking stream');
+  eq(thinkItem?.kind, 'thinking', 'the thinking block is classified as thinking');
+  eq(thinkItem?.turn_id, turn.id, 'the captured item carries the turn attribution');
+  // The persisted raw carries the classification (capture-time enrichment).
+  const enriched = await one(
+    `SELECT raw FROM session_event WHERE xell_id=$1 AND hook_event_name='assistant' ORDER BY ts DESC LIMIT 1`,
+    [xellId]);
+  eq(enriched?.raw?.capture?.conversation?.[0], 'I deployed the zee.', 'recordFeedEvent enriches raw.capture at write time');
+  eq(enriched?.raw?.capture?.thinking?.[0], 'step one internally', 'recordFeedEvent captures the thinking stream');
 
   // endTurn on a missing id is a no-op, not a throw
   const noop = await endTurn(null, { status: 'ended' });
