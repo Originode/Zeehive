@@ -3432,9 +3432,18 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* ════════════════════════════════════════════════════════════════════════════════
    MOBILE CHAT UI (/m?project=…) — web/src/MobileChat.jsx
    A phone-first sibling of the console. Every class is prefixed .mob- so it can never
-   collide with the console's classes. Capped to a phone width and centred on desktop.
+   collide with the console's classes. It owns the FULL screen: no width cap, no centering —
+   a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with
+   100dvh as the refinement, so webviews that predate dvh still fill the viewport.
    ════════════════════════════════════════════════════════════════════════════════ */
-.mob { max-width: 520px; margin: 0 auto; min-height: 100dvh; display: flex; flex-direction: column;
+/* MobileChat.jsx adds `mob-page` to <html>/<body> on mount; these rules therefore apply ONLY
+   at /m and never leak into the console. Height chain + overflow-x so a phone never renders a
+   desktop-width page scaled down (the "shrunk UI" failure), and text-size-adjust so iOS keeps
+   the authored font sizes instead of inflating them. */
+html.mob-page, html.mob-page body { height: 100%; }
+html.mob-page body { margin: 0; overflow-x: hidden; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+.mob { width: 100%; max-width: none; margin: 0; min-height: 100vh; min-height: 100dvh;
+  display: flex; flex-direction: column; overflow-x: hidden;
   background: var(--bg); color: var(--text); }
 .mob-list { display: flex; flex-direction: column; flex: 1; padding: 0 12px calc(16px + env(safe-area-inset-bottom)); }
 
@@ -3501,7 +3510,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .mob-box-meta { white-space: nowrap; }
 
 /* detail header */
-.mob-detail { display: flex; flex-direction: column; flex: 1; min-height: 100dvh; }
+.mob-detail { display: flex; flex-direction: column; flex: 1; width: 100%; min-height: 100vh; min-height: 100dvh; }
 .mob-dtop { display: flex; align-items: center; gap: 8px; padding: 12px 10px 8px;
   border-bottom: 1px solid var(--line); }
 .mob-back { background: none; border: none; color: var(--text); font-size: 22px; cursor: pointer;
@@ -3511,8 +3520,11 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   white-space: nowrap; }
 .mob-dsub { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 12px; }
 .mob-dbranch { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-dactions { display: flex; align-items: center; gap: 6px; }
 .mob-term { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; width: 38px; height: 38px; font-size: 18px; cursor: pointer; }
+.mob-term:active { border-color: var(--accent); }
+.mob-menu-btn { font-size: 20px; line-height: 1; }
 
 /* tabs */
 .mob-tabs { display: flex; gap: 4px; padding: 8px 10px 4px; }
@@ -3557,13 +3569,26 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .mob-msg.mine { justify-content: flex-end; }
 .mob-msg.theirs { justify-content: flex-start; }
 .mob-msg-bubble { max-width: 82%; display: flex; flex-direction: column; gap: 2px;
-  padding: 8px 11px; border-radius: 14px; font-size: 14px; line-height: 1.4; word-break: break-word; }
+  padding: 8px 11px; border-radius: 14px; font-size: 14px; line-height: 1.4; word-break: break-word;
+  white-space: pre-wrap; }
 .mob-msg.mine .mob-msg-bubble { background: var(--accent); color: #fff;
   border-bottom-right-radius: 4px; }
 .mob-msg.theirs .mob-msg-bubble { background: var(--panel2); color: var(--text);
   border: 1px solid var(--line); border-bottom-left-radius: 4px; }
 .mob-msg-meta { font-size: 10px; opacity: .7; }
 .mob-msg.mine .mob-msg-meta { text-align: right; }
+/* The zee's CAPTURED speech (feed-captured conversation, no tool call): a slightly-dashed
+   bubble so the operator can tell "the zee actually said this while working" from a door
+   message the zee deliberately sent. */
+.mob-msg.theirs.captured .mob-msg-bubble { border-style: dashed; border-color: var(--accent); }
+.mob-msg.captured .mob-msg-meta { opacity: .6; }
+/* The THINKING stream — kept out of the talk, shown as a dimmed italic aside. */
+.mob-msg.think { justify-content: flex-start; }
+.mob-think-bubble { max-width: 88%; display: flex; flex-direction: column; gap: 2px;
+  padding: 7px 12px; border-radius: 12px; font-size: 12px; line-height: 1.45;
+  word-break: break-word; background: transparent; color: var(--muted);
+  border: 1px solid var(--line); opacity: .75; font-style: italic; }
+.mob-msg.think .mob-msg-meta { font-style: normal; }
 
 /* composer */
 .mob-composer { border-top: 1px solid var(--line); padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
@@ -3580,7 +3605,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* terminal sheet */
 .mob-sheet-back { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 40;
   display: flex; align-items: flex-end; justify-content: center; }
-.mob-sheet { width: 100%; max-width: 520px; background: var(--panel); border-top: 1px solid var(--line);
+.mob-sheet { width: 100%; max-width: none; background: var(--panel); border-top: 1px solid var(--line);
   border-radius: 16px 16px 0 0; padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
   display: flex; flex-direction: column; gap: 10px; }
 .mob-sheet-title { font-weight: 700; font-size: 15px; }
@@ -3592,3 +3617,23 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .mob-sheet-actions { display: flex; gap: 8px; }
 .mob-sheet-close { background: none; border: none; color: var(--muted); font-size: 13px;
   cursor: pointer; padding: 4px; align-self: center; }
+
+/* the ⋮ context-actions sheet */
+.mob-menu-sub { color: var(--muted); font-size: 12px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-menu-msg { font-size: 13px; padding: 8px 10px; border-radius: 8px; }
+.mob-menu-msg.ok { background: color-mix(in srgb, var(--up) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--up) 40%, var(--line)); }
+.mob-menu-msg.err { background: color-mix(in srgb, var(--down) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--down) 40%, var(--line)); word-break: break-word; }
+.mob-menu-items { display: flex; flex-direction: column; }
+.mob-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: none; border: none; border-top: 1px solid var(--line); color: var(--text);
+  padding: 13px 4px; font-size: 14px; font-weight: 600; text-align: left; cursor: pointer; width: 100%; }
+.mob-menu-item:disabled { opacity: .5; cursor: default; }
+.mob-menu-item.danger { color: var(--down); }
+.mob-menu-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-menu-busy { color: var(--muted); font-size: 13px; }
+.mob-directive-text { font-size: 14px; line-height: 1.55; color: var(--text);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow-y: auto; }

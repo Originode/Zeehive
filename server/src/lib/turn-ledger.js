@@ -29,6 +29,43 @@ import { logline } from './logbus.js';
 export const TURN_KIND = { spawn: 'spawn', resume: 'resume', interactive: 'interactive' };
 export const TURN_STATUS = { started: 'started', ended: 'ended', errored: 'errored', paused: 'paused' };
 
+// ── THINKING vs CONVERSATION — the classifier the whole feature rides on ──────────────
+// An assistant feed event's content blocks carry BOTH the model's internal reasoning and the
+// text it actually outputs. Anthropic's extended thinking names the first
+// {type:'thinking'} (or {type:'redacted_thinking'} when the provider withheld it); the real
+// reply is {type:'text'}. OpenAI-dialect CLIs collapse reasoning into text at the parser, so
+// the distinction only arrives STRUCTURED on the Anthropic wire — which is the reference
+// shape every vendor adapter normalises to (cxell-runtimes.js). The mobile chat shows
+// conversation text as chat bubbles and thinking as a dimmed aside; both must be captured
+// SEPARATELY at the observability layer, never mixed. This is the pure classifier used at
+// CAPTURE time (recordFeedEvent enriches the persisted raw) and at READ time (rows written
+// before the classifier existed fall back to it).
+export function classifyAssistantEvent(event) {
+  const out = { conversation: [], thinking: [], tools: [] };
+  if (!event || typeof event !== 'object' || event.type !== 'assistant') return out;
+  const blocks = event.message?.content;
+  if (typeof blocks === 'string') {
+    if (String(blocks).trim()) out.conversation.push(String(blocks));
+    return out;
+  }
+  if (!Array.isArray(blocks)) return out;
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    const t = b.type;
+    if (t === 'text') {
+      const txt = String(b.text ?? '');
+      if (txt.trim()) out.conversation.push(txt);
+    } else if (t === 'thinking' || t === 'redacted_thinking') {
+      const th = b.thinking ?? b.data ?? (typeof b.text === 'string' ? b.text : '');
+      if (String(th ?? '').trim()) out.thinking.push(String(th));
+    } else if (t === 'tool_use') {
+      out.tools.push({ name: b.name || 'tool', input: b.input || {} });
+    }
+    // Anything else (tool_result echoes, a provider-only block type) is not speech — skip.
+  }
+  return out;
+}
+
 // The last assistant TEXT a turn produced — the closest thing a turn has to "what it said".
 // Clude-shaped assistant messages carry content blocks ({type:'text', text} | {type:'tool_use'}).
 // Returns a bounded string (the first 500 chars) or null. The final `result` event may also
@@ -140,6 +177,56 @@ export async function eventsForTurn(turnId, { limit = 500 } = {}) {
       [turnId, Math.min(Math.max(Number(limit) || 500, 1), 2000)]);
   } catch (e) {
     logline('turn', `eventsForTurn failed (${String(e.message).slice(0, 120)})`);
+    return [];
+  }
+}
+
+// Extract the conversation/thinking/tools from a session_event row's raw. Rows written AFTER the
+// classifier exists carry `raw.capture` (enriched at write time by recordFeedEvent); OLDER rows
+// fall back to classifying the raw event itself — the same result, computed on read.
+export function extractCaptureFromEvent(raw) {
+  const ev = raw && typeof raw === 'object' ? raw : {};
+  if (ev.capture && (Array.isArray(ev.capture.conversation) || Array.isArray(ev.capture.thinking))) {
+    return {
+      conversation: ev.capture.conversation || [],
+      thinking: ev.capture.thinking || [],
+      tools: ev.capture.tools || [],
+    };
+  }
+  return classifyAssistantEvent(ev);
+}
+
+// The zee's CAPTURED CONVERSATION output — the actual text the zee's model produced during its
+// turns (from the feed's assistant events), NOT the operator↔zee message door. Each assistant
+// event's content is classified at capture time (recordFeedEvent → raw.capture); this reads the
+// classification and returns it newest-first: [{ ts, kind: 'conversation'|'thinking', text, turn_id }].
+// The mobile chat's Chat tab renders these as the zee's speech WITHOUT the zee calling any tool —
+// the feed captured it while the zee worked. Best-effort like every observability read.
+export async function conversationForXell(xellId, { limit = 100 } = {}) {
+  if (!xellId) return [];
+  try {
+    const rows = await q(
+      `SELECT ts, raw, turn_id
+         FROM session_event
+        WHERE xell_id=$1 AND source='cxell-feed' AND hook_event_name='assistant'
+        ORDER BY ts DESC
+        LIMIT $2`,
+      [xellId, Math.min(Math.max(Number(limit) || 100, 1), 500)]);
+    const out = [];
+    for (const r of rows) {
+      let raw = r.raw;
+      if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { raw = {}; } }
+      const cap = extractCaptureFromEvent(raw);
+      for (const text of cap.conversation || []) {
+        out.push({ ts: r.ts, kind: 'conversation', text: String(text), turn_id: r.turn_id || null });
+      }
+      for (const text of cap.thinking || []) {
+        out.push({ ts: r.ts, kind: 'thinking', text: String(text), turn_id: r.turn_id || null });
+      }
+    }
+    return out;   // rows are newest-first; items inside one event share its ts
+  } catch (e) {
+    logline('turn', `conversationForXell failed (${String(e.message).slice(0, 120)})`);
     return [];
   }
 }
@@ -259,6 +346,10 @@ export async function recordFeedEvent({ turnId, zeeId = null, xellId = null, eve
   try {
     // $1..$8 contiguous — do NOT start at $2 with a literal source. Postgres cannot type an
     // unreferenced $1 and the insert then fails every time (the fleet-empty play-by-play bug).
+    // The persisted raw is ENRICHED with the thinking/conversation classification
+    // (classifyAssistantEvent) so a reader — the mobile chat's conversation view, the console's
+    // event log — can tell the model's reasoning from its actual output WITHOUT re-parsing.
+    const enriched = { ...event, capture: classifyAssistantEvent(event) };
     const row = await one(
       `INSERT INTO session_event
          (source, hook_event_name, zee_id, xell_id, turn_id, claude_session_id, tool_name, raw)
@@ -266,7 +357,7 @@ export async function recordFeedEvent({ turnId, zeeId = null, xellId = null, eve
        RETURNING id, ts, source, hook_event_name, turn_id, zee_id, xell_id, tool_name`,
       ['cxell-feed', event.type, zeeId || null, xellId || null, turnId,
        event.session_id || sessionId || null, toolName,
-       JSON.stringify(event)]);
+       JSON.stringify(enriched)]);
     _feedOk += 1;
     return row;
   } catch (e) {
@@ -278,7 +369,8 @@ export async function recordFeedEvent({ turnId, zeeId = null, xellId = null, eve
 }
 
 export default {
-  startTurn, endTurn, turnsForXell, eventsForTurn,
+  startTurn, endTurn, turnsForXell, eventsForTurn, conversationForXell,
+  classifyAssistantEvent, extractCaptureFromEvent,
   recordFeedEvent, feedWriteStats, resetFeedWriteStats,
   TURN_KIND, TURN_STATUS,
 };

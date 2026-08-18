@@ -2089,6 +2089,21 @@ router.get('/turns/:id/events', async (req, res) => {
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// THE ZEE'S CAPTURED CONVERSATION — the actual text the zee's model produced during its turns,
+// from the observability feed (assistant events classified at capture time by lib/turn-ledger.js
+// into conversation vs thinking). The mobile chat's Chat tab renders this, so a zee's speech
+// surfaces WITHOUT the zee calling any tool. Newest-first; `limit` caps the count (default 100).
+// Read-only, same 503-not-throw contract as the other read models.
+router.get('/xells/:id/conversation', async (req, res) => {
+  try {
+    const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    const { conversationForXell } = await import('../lib/turn-ledger.js');
+    const items = await conversationForXell(req.params.id, { limit: req.query.limit || 100 });
+    res.json({ ok: true, xell_id: req.params.id, items });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // THE LLM GATEWAY LEDGER for one xell — the transport-layer record of every AI call that crossed
 // the queenzee gateway (lib/gateway.js → llm_gateway_request). Read-only; the gateway writes it.
 // Same 503-not-throw contract as the other read models.

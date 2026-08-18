@@ -155,6 +155,119 @@ export function modelFromStream(text = '') {
   return m ? m[1] : null;
 }
 
+// Classify a response body into the CONVERSATION text vs the THINKING stream — the observability
+// gateway is the one place every model's output crosses, so this is where "which thinking stream,
+// which actual conversation text" is answered PER ROW. The result is stored on the ledger row in
+// meta.speech (the gateway's completeRequest) and the mobile chat renders the conversation WITHOUT
+// the zee needing to call a tool. `kind` is the same dialect the usage parser uses:
+//   'messages'          — Anthropic dialect (text/thinking/redacted_thinking content blocks, SSE
+//                         content_block_delta events) PLUS the xAI Responses API (grok routes
+//                         through /responses; output_text.delta / reasoning_summary.delta) which
+//                         is dispatched as kind 'messages'.
+//   'chat-completions'  — OpenAI dialect (choices[].delta.content / choices[].message.content,
+//                         deepseek-reasoner's delta.reasoning_content thinking stream).
+// Pure so the classification is testable without an upstream (test/gateway.test.mjs).
+export function classifyResponseText(text = '', kind = 'messages') {
+  const out = { conversation: [], thinking: [] };
+  if (!text) return out;
+
+  const push = (arr, v) => {
+    if (v == null) return;
+    const s = typeof v === 'string' ? v : (v?.text ?? v?.content ?? '');
+    if (String(s).trim()) arr.push(String(s));
+  };
+  const eachBlock = (blocks, fn) => {
+    if (Array.isArray(blocks)) blocks.forEach(fn);
+  };
+
+  // Anthropic SSE delivers a thinking block's FULL text TWICE: content_block_start carries it AND
+  // the thinking_delta repeats it (unlike text, whose deltas are incremental). Track the indexes
+  // whose start block already emitted the whole stream so the delta does not duplicate it.
+  const thinkingEmitted = new Set();
+
+  const parseData = (j) => {
+    if (!j || typeof j !== 'object') return;
+    // OpenAI dialect: choices[] with delta/message content (a string or an array of text parts)
+    // and deepseek-reasoner's reasoning_content thinking stream.
+    if (Array.isArray(j.choices)) {
+      for (const c of j.choices) {
+        const m = c?.message || c?.delta || {};
+        push(out.conversation, m.content);
+        push(out.thinking, m.reasoning_content);
+        eachBlock(m.content, (b) => {
+          if (b && typeof b === 'object' && (b.type === 'text' || b.type === 'output_text')) push(out.conversation, b.text);
+        });
+      }
+      return;
+    }
+    // xAI Responses API SSE: output_text deltas (conversation) and reasoning_summary (thinking).
+    if (j.type === 'response.output_text.delta') push(out.conversation, j.delta);
+    if (j.type === 'response.output_text.done') push(out.conversation, j.text);
+    if (j.type === 'response.reasoning_summary.delta') push(out.thinking, j.delta);
+    if (j.type === 'response.reasoning_summary.done') push(out.thinking, j.text);
+    // Anthropic non-streaming message content + xAI non-streaming output[].
+    if (Array.isArray(j.content)) {
+      eachBlock(j.content, (b) => {
+        if (!b || typeof b !== 'object') return;
+        if (b.type === 'text' || b.type === 'output_text' || b.type === 'input_text') push(out.conversation, b.text);
+        if (b.type === 'thinking') push(out.thinking, b.thinking ?? b.data ?? b.text);
+        if (b.type === 'redacted_thinking') push(out.thinking, b.data ?? b.thinking ?? b.text);
+        if (b.type === 'reasoning') push(out.thinking, b.summary ?? b.text ?? b.data);
+      });
+    }
+    if (Array.isArray(j.output)) {
+      eachBlock(j.output, (item) => {
+        if (!item || typeof item !== 'object') return;
+        if (item.type === 'message') {
+          eachBlock(item.content, (b) => {
+            if (!b || typeof b !== 'object') return;
+            if (b.type === 'output_text' || b.type === 'input_text') push(out.conversation, b.text);
+            if (b.type === 'reasoning') push(out.thinking, b.summary ?? b.text ?? b.data);
+          });
+        }
+        if (item.type === 'reasoning') push(out.thinking, item.summary ?? item.text ?? item.data);
+      });
+    }
+    // Anthropic SSE streaming: content_block_start carries the full first block; content_block_delta
+    // carries text_delta / thinking_delta / redacted_thinking_delta. Thinking is emitted ONCE: the
+    // start block has the whole stream and the delta repeats it, so the index set skips the repeat.
+    if (j.type === 'content_block_start') {
+      const b = j.content_block || {};
+      if (b.type === 'text') push(out.conversation, b.text);
+      if (b.type === 'thinking' && String(b.thinking ?? b.text ?? '').trim()) {
+        push(out.thinking, b.thinking ?? b.text);
+        thinkingEmitted.add(j.index);
+      }
+      if (b.type === 'redacted_thinking' && String(b.data ?? b.text ?? '').trim()) {
+        push(out.thinking, b.data ?? b.text);
+        thinkingEmitted.add(j.index);
+      }
+    }
+    if (j.type === 'content_block_delta') {
+      const d = j.delta || {};
+      if (d.type === 'text_delta') push(out.conversation, d.text);
+      if (d.type === 'thinking_delta' && !thinkingEmitted.has(j.index)) {
+        push(out.thinking, d.thinking ?? d.text);
+        thinkingEmitted.add(j.index);
+      }
+      if (d.type === 'redacted_thinking_delta' && !thinkingEmitted.has(j.index)) {
+        push(out.thinking, d.data ?? d.text);
+        thinkingEmitted.add(j.index);
+      }
+    }
+    // A bare JSON body with a string content (rare, non-SSE, no choices wrapper).
+    if (typeof j.content === 'string') push(out.conversation, j.content);
+  };
+
+  for (const m of text.matchAll(/data: (\{.*\})/g)) {
+    try { parseData(JSON.parse(m[1])); } catch { /* partial event at a chunk boundary */ }
+  }
+  if (!text.includes('data: {')) {
+    try { parseData(JSON.parse(text)); } catch { /* not JSON (or a partial chunk) */ }
+  }
+  return out;
+}
+
 // Look up a model's $/1M token prices from ai_model_spec (migration 163). The ledger records the
 // WIRE id the CLI sent (claude-opus-5); the spec row is keyed by the SHORT alias (opus) and lists
 // its known wire ids in wire_ids (migration 164 — GROUND TRUTH, an explicit per-id alias, never a
@@ -824,6 +937,18 @@ export async function gatewayProxy(req, res) {
           token: upstream.token,
         });
       }
+      // THE CONVERSATION vs THE THINKING STREAM — the gateway is the one place every model's
+      // output crosses, so each row captures what the model SAID (meta.speech.conversation) and
+      // what it THOUGHT (meta.speech.thinking), classified from the reassembled response body.
+      // The mobile chat's Chat tab reads this, so a zee's speech surfaces WITHOUT the zee making
+      // any tool call. Only when capture is on (the per-project body-capture switch) — same gate
+      // as persistBodies below, so no row is held to a higher cost than the project chose.
+      if (captureOn && respText) {
+        const speech = classifyResponseText(respText, upstream.kind);
+        if (speech.conversation.length || speech.thinking.length) {
+          metaPatch = { ...(metaPatch || {}), speech };
+        }
+      }
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
         cost: costOf({ upstreamCost, price, usage: u }),
@@ -900,6 +1025,7 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
+                 classifyResponseText,
                  extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
                  probeDeepseekBalance,
                  providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
