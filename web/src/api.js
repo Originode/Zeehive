@@ -1185,6 +1185,25 @@ export const prXell = (id, note) => xellVerb(id, 'pr', { note });
 // means there was no live cxell zee to reach.
 export const nudgeXell = (id) => xellVerb(id, 'nudge');
 
+// ── the cage itself ──────────────────────────────────────────────────────────
+// What is this xell's cxell container doing right now? One `docker inspect`, read-only, asked
+// on demand (never on a dashboard render) so the restart confirm can be TRUE about what it is
+// about to end. Resolves { ok, state, missing, mid_turn, zee_status, name, mode }.
+export async function cxellStatus(id) {
+  const r = await fetch(`/api/xells/${id}/cxell`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || 'could not read the cxell state');
+  return data;
+}
+
+// Restart the cage: the queenzee stops it (only with force), starts it, re-opens its ssh door,
+// RE-SEALS its egress firewall and resumes the zee's session. `force` is required for a container
+// docker still calls running — that is the wedged case, and stopping it ends the live turn.
+// Resolves { ok, verdict, … } for every outcome, including the refusals ('running' without force,
+// 'missing', 'unsealed', 'no-cxell'): they are answers, not errors.
+export const restartXellCxell = (id, { force = false } = {}) =>
+  xellVerb(id, 'cxell/restart', { force });
+
 // Send a composed operator message — long text and/or FILE attachments ([{ name, type, data }],
 // data being a base64 / data-URL string) — to the xell's live cxell zee. Files and long text are
 // handed over as files in the cxell's .zee-inbox with a pointer typed into the live session; short

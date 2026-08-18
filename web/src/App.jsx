@@ -15,6 +15,7 @@ import XellEnvironment from './XellEnvironment.jsx';
 import Directives from './Directives.jsx';
 import XellObservability from './XellObservability.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
+import { restartXellCage } from './cage.js';
 import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
@@ -1816,6 +1817,15 @@ function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing
             {cxell && (
               <button className="termbtn" title="Open a live terminal into this cxell zee"
                       onClick={(e) => { e.stopPropagation(); setTermOpen(true); }}>⌨ terminal</button>
+            )}
+            {/* …and when that terminal will not attach, the cure. Restarting the CAGE (not the xell,
+                not the stack) is the only operator move for a cxell whose sshd or agent has died
+                inside a container docker still reports as running — the recovery loop only acts on
+                cages that are EXITED. It probes and confirms before it touches anything. */}
+            {cxell && (
+              <button className="termbtn cagebtn" data-testid="restart-cage"
+                      title="Restart this zee's cxell container (stop → start → ssh → re-seal → resume the session)"
+                      onClick={(e) => { e.stopPropagation(); restartXellCage(x, onDone); }}>⟳ cage</button>
             )}
           </div>
         )}

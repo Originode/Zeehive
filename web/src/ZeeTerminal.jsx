@@ -5,6 +5,7 @@ import FeedChips from './FeedChips.jsx';
 import MessageComposer from './MessageComposer.jsx';
 import { baseUrl } from './api.js';
 import { mountTerm } from './termHost.js';
+import { restartXellCage } from './cage.js';
 import { getTermEngine, getTermTheme, setTermTheme } from './termPref.js';
 
 // A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
@@ -326,6 +327,19 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                       onClick={toggleExplorer}
                       title={showFx ? 'Hide file explorer (Shift+drag a path first to open that file)'
                                     : 'File explorer — Shift+drag a path (or click one in the output) to open that file'}>📁</button>
+            )}
+            {/* ⟳ CAGE — the cure for the state this pane is the usual witness of. A cxell whose
+                sshd or agent has died still runs as far as docker is concerned, so nothing in the
+                queenzee will ever restart it; the operator finds out here, when the socket refuses
+                or drops. Urged (highlighted) exactly then. It probes and confirms before it acts,
+                and the zee door only — a plain container shell has no cage to bounce. */}
+            {xell?.id && explorerZeeId && (
+              <button className={`term-x cage${['error', 'closed'].includes(status) ? ' urge' : ''}`}
+                      data-testid="term-restart-cage"
+                      onClick={() => restartXellCage(xell, null)}
+                      title="Restart this zee's cxell container — stop → start → re-open ssh → re-apply the egress firewall → resume the session. Use it when this terminal will not attach.">
+                ⟳ cage
+              </button>
             )}
             <button className="term-x" onClick={() => setFull(!full)} title={full ? 'Exit fullscreen' : 'Fullscreen'}>{full ? '⇲' : '⛶'}</button>
             <button className="term-x" onClick={onClose} title="Close">✕</button>

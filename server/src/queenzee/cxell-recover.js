@@ -45,6 +45,11 @@
 //   • it never resumes a turn in a cage it could not SEAL — it stops that cage again (a stop is not
 //     a teardown; nothing of the zee's is lost) and raises a human, because a running cage with no
 //     iptables rules is strictly more exposed than the stopped one it found.
+//
+// AND WHAT IT CANNOT SEE AT ALL — the reason restartXellCxell (at the bottom) exists. Every verdict
+// above is read off `docker inspect`, so the cage that is RUNNING while nothing inside it works —
+// sshd dead, the agent hung, the turn silent — is the sweep's happiest case and the operator's worst
+// one. That one needs a human to say "it is wedged", which is a button in the console, not a loop.
 import { q, one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
@@ -55,8 +60,10 @@ import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { markZeeTurn } from '../lib/turn-record.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
 import { endTurn } from '../lib/turn-ledger.js';
-import { HOST_RESTART_DEATH } from '../lib/turn-death.js';
-import { noteTurnDeath } from './revive.js';
+import { HOST_RESTART_DEATH, CAGE_RESTART_DEATH, MAX_REVIVE_ATTEMPTS } from '../lib/turn-death.js';
+import { noteTurnDeath, cageRestartRevivePrompt } from './revive.js';
+import { nudgeXellForTurnDeath } from './nudge.js';
+import { xellPaused } from '../lib/fleet-pause.js';
 
 // The same switch every other real-side-effect module reads. A NESTED queenzee's meta-DB is a CLONE
 // of the fleet's, so the cages named by its rows are OTHER ZEES' LIVE CAGES — starting, re-sealing
@@ -77,6 +84,17 @@ const TICK_MS = Number(process.env.CXELL_RECOVER_INTERVAL_MS) || 600000;
 // one operation a human has for freezing a cage meaningful.
 const STARTABLE = ['exited', 'created', 'dead'];
 
+// What the zee row, the ledger and the tend RECORD as the cause of the turn that died. The sweep's
+// (a machine went down) and the console button's (a human bounced this cage) — the same sentence in
+// every place someone later reads to find out what happened to a turn.
+const HOST_RESTART_REASON =
+  'the zeehive machine restarted and stopped this cxell mid-turn; the queenzee started the cage '
+  + 'again, re-opened its ssh door and re-applied its egress firewall';
+const CAGE_RESTART_REASON = (by, forced) =>
+  `${by} restarted this cxell by hand from the console`
+  + (forced ? ' while it was still running (it had stopped answering)' : '')
+  + '; the queenzee started the cage again, re-opened its ssh door and re-applied its egress firewall';
+
 // One sweep at a time. Two overlapping sweeps would race on the same `docker start` (harmless) and
 // on the same phantom-turn release (not harmless: two revive schedules for one zee).
 let sweeping = false;
@@ -86,17 +104,32 @@ let sweeping = false;
 // `list`) for the same reason refreshZeeLiveInLiveCxells takes its lister: this sweep WRITES to the
 // zee rows it visits, and a test run against a SHARED meta-DB must be able to say "these xells and
 // no others" rather than reaching across somebody else's fleet.
+// ONE definition of "a cage this module may touch", so the sweep and the console's single-xell
+// button cannot drift into disagreeing about it — a manual restart that accepted a decommissioned
+// zee or a tearing-down xell would be a hole in exactly the rules the sweep spells out above.
+const CXELL_COLS = `x.id AS xell_id, x.slug, x.project_id, x.db_coupling, x.status AS xell_status,
+                    z.id AS zee_id, z.status AS zee_status, z.claude_session_id`;
+const CXELL_WHERE = `z.viewer_kind = 'ssh-terminal'
+                     AND z.decommissioned_at IS NULL
+                     AND z.entrypoint = 'cxell-cli'
+                     AND x.status NOT IN ('retired', 'tearing-down')`;
+
 export async function liveCxells() {
   return q(
-    `SELECT DISTINCT ON (x.id)
-            x.id AS xell_id, x.slug, x.project_id, x.db_coupling, x.status AS xell_status,
-            z.id AS zee_id, z.status AS zee_status, z.claude_session_id
+    `SELECT DISTINCT ON (x.id) ${CXELL_COLS}
        FROM zee z JOIN xell x ON x.id = z.xell_id
-      WHERE z.viewer_kind = 'ssh-terminal'
-        AND z.decommissioned_at IS NULL
-        AND z.entrypoint = 'cxell-cli'
-        AND x.status NOT IN ('retired', 'tearing-down')
+      WHERE ${CXELL_WHERE}
       ORDER BY x.id, z.created_at DESC`);
+}
+
+// The same row for ONE xell (the console's button), newest zee, or null if this xell has no cage
+// this module may touch.
+async function cxellFor(xellId) {
+  return one(
+    `SELECT DISTINCT ON (x.id) ${CXELL_COLS}
+       FROM zee z JOIN xell x ON x.id = z.xell_id
+      WHERE ${CXELL_WHERE} AND x.id = $1
+      ORDER BY x.id, z.created_at DESC`, [xellId]);
 }
 
 // END THE TURN THE REBOOT KILLED, so something can start another one.
@@ -124,11 +157,23 @@ async function releasePhantomTurn({ zeeId, zeeStatus, slug, reason }) {
 
 // Recover ONE xell's cage. Returns a verdict word so the sweep can count without re-deciding:
 // 'running' | 'missing' | 'unknown' | 'held' | 'restarted' | 'unsealed' | 'failed' | 'would-restart'.
-async function recoverOne(row, { reason, mode }) {
+//
+// The options past `reason`/`mode` are all the MANUAL restart's (restartXellCxell below), and they
+// exist so a human's button runs THIS sequence rather than a second copy of it: `force` lets it stop
+// a cage docker still calls running (the wedged case, which the sweep by design cannot see),
+// `death`/`deathReason`/`unsealedLead` make everything a human or an agent reads say what actually
+// happened, and `resumeNow` asks for the session back immediately instead of in five minutes.
+async function recoverOne(row, { reason, mode, force = false, by = 'the queenzee',
+                                 death = HOST_RESTART_DEATH, deathReason = HOST_RESTART_REASON,
+                                 unsealedLead = 'after the zeehive machine came back',
+                                 resumeNow = false, resumePrompt = null }) {
   const slug = row.slug;
   const probe = await cxellState({ ctx: 'default', slug });
 
-  if (probe.state === 'running') return { slug, verdict: 'running' };
+  // A cage that is already up is the sweep's happy path and the manual button's question: docker
+  // says RUNNING for a container whose sshd died, whose agent hung and whose turn has gone silent,
+  // so `force` is the operator answering "yes, it is wedged, bounce it anyway".
+  if (probe.state === 'running' && !force) return { slug, verdict: 'running' };
   if (probe.missing) {
     // Reported once per sweep and NEVER rebuilt: a cage that is gone took the zee's uncollected work
     // with it, and a fresh one wearing the same name would quietly claim to be it.
@@ -137,12 +182,24 @@ async function recoverOne(row, { reason, mode }) {
     return { slug, verdict: 'missing' };
   }
   if (probe.state === 'unknown') return { slug, verdict: 'unknown', error: probe.error };
-  if (!STARTABLE.includes(probe.state)) return { slug, verdict: 'held', state: probe.state };
+  if (probe.state !== 'running' && !STARTABLE.includes(probe.state)) {
+    return { slug, verdict: 'held', state: probe.state };
+  }
 
   if (mode !== 'real') {
     logline('cxell-recover', `${slug}: cxell is ${probe.state} — NOT restarted. PROVISION_MODE=simulate: `
       + `this queenzee models the fleet, and ${cxellName(slug)} is the REAL fleet's cage.`);
     return { slug, verdict: 'would-restart', state: probe.state };
+  }
+
+  // 0. THE FORCED STOP — only ever on the manual path, and only for a cage docker calls running.
+  //    It is a stop, not a teardown: nothing of the zee's is removed, and the turn it kills is the
+  //    turn the operator already decided was stuck. Everything below then treats this cage exactly
+  //    like one a reboot stopped, which is the point.
+  if (probe.state === 'running') {
+    logline('cxell-recover', `${slug}: cxell is RUNNING and ${by} asked for a restart anyway — `
+      + 'stopping it first (this ends whatever turn was live inside it)');
+    await stopCxell({ ctx: 'default', slug });
   }
 
   // 1. THE CAGE.
@@ -168,7 +225,7 @@ async function recoverOne(row, { reason, mode }) {
     let stopped = true;
     try { await stopCxell({ ctx: 'default', slug }); }
     catch (e2) { stopped = false; logline('cxell-recover', `${slug}: could not stop the unsealed cage again (${String(e2.message).slice(0, 140)})`); }
-    const why = `This xell's cxell was restarted after the zeehive machine came back, but its EGRESS `
+    const why = `This xell's cxell was restarted ${unsealedLead}, but its EGRESS `
       + `FIREWALL COULD NOT BE RE-APPLIED (${String(e.message).slice(0, 200)}). `
       + (stopped
         ? 'The queenzee STOPPED the cage again rather than leave it running with default-allow egress '
@@ -201,20 +258,52 @@ async function recoverOne(row, { reason, mode }) {
                       xell_id: row.xell_id, raw: { slug, state: probe.state, reason, sealed: true,
                                                    ssh: door, blocked: blockTcp.length } });
 
-  // 4. THE ZEE. Only now, and only if the reboot actually caught it mid-turn.
-  const deathReason = 'the zeehive machine restarted and stopped this cxell mid-turn; the queenzee '
-    + 'started the cage again, re-opened its ssh door and re-applied its egress firewall';
+  // 4. THE ZEE. Only now, and only if the restart actually caught it mid-turn.
   const released = await releasePhantomTurn({ zeeId: row.zee_id, zeeStatus: row.zee_status, slug,
                                               reason: deathReason });
   if (!released.released) return { slug, verdict: 'restarted', resumed: false };
   // File it as the death it was. noteTurnDeath decides everything from here (and refuses a zee with
   // no session to resume, a paused fleet, a spent ladder…) — this loop holds no revive policy.
   const filed = await noteTurnDeath({ zeeId: row.zee_id, xellId: row.xell_id, slug,
-                                      reason: deathReason, source: 'host restart',
-                                      death: HOST_RESTART_DEATH });
+                                      reason: deathReason, source: death.signal, death });
+  // 5. THE RESUME, for the manual path only. The sweep leaves the ladder to do it (5 minutes is
+  //    nothing to a machine that just rebooted, and a fleet coming back all at once should not
+  //    resume every zee it owns in the same second) — but a human standing at the console who just
+  //    unwedged a cage is WAITING, and five minutes of a blank terminal reads as "it did not work".
+  //    So the manual path asks for the session back now, and the schedule noteTurnDeath just wrote
+  //    is only cleared once the resume is actually delivered: if the nudge cannot land (a paused
+  //    fleet, a runtime that cannot resume, a session id that was never captured), the ladder is
+  //    left exactly as it is and picks the zee up in ~5 minutes with the same prompt.
+  let resumed = !!filed?.scheduled;
+  let now = false;
+  // A REVIVE IS A TURN, so every level of the pause switch refuses it — and nudgeCxell enforces only
+  // the FLEET-wide one, because the ladder (reviveTick) checks all three before it ever calls in.
+  // This path skips the ladder, so it has to ask the same question: a human who paused one project
+  // and then unwedges a cage in it wants the CAGE back, not a turn the pause is holding.
+  const paused = resumeNow && filed?.scheduled
+    ? await xellPaused({ id: row.xell_id, project_id: row.project_id }) : false;
+  if (paused) {
+    logline('cxell-recover', `${slug}: cage is back, but the fleet/project/xell is PAUSED — the resume is `
+      + `HELD, not dropped (the ladder carries it, and play resumes it)`);
+  }
+  if (resumeNow && filed?.scheduled && !paused) {
+    const r = await nudgeXellForTurnDeath(row.xell_id, {
+      signal: death.signal, message: deathReason, attempt: 1, max: MAX_REVIVE_ATTEMPTS,
+      mode, by, prompt: resumePrompt, why: `${by} restarted this cxell under the turn` });
+    if (r?.nudged) {
+      now = true;
+      await q(`UPDATE zee SET revive_next_at = NULL, revived_at = now() WHERE id = $1`, [row.zee_id]);
+      logline('cxell-recover', `${slug}: resumed the session in the restarted cage right away (${by} is waiting on it)`);
+    } else {
+      logline('cxell-recover', `${slug}: could not resume the session right away `
+        + `(${r?.reason || r?.error || 'unknown'}) — left on the revive ladder, which retries in `
+        + `${filed.in_minutes} minute(s)`);
+    }
+  }
   const zee = await one(`SELECT * FROM zee WHERE id=$1`, [row.zee_id]).catch(() => null);
   if (zee) broadcast('zee', zee);
-  return { slug, verdict: 'restarted', resumed: !!filed?.scheduled, in_minutes: filed?.in_minutes || null };
+  return { slug, verdict: 'restarted', resumed, resumed_now: now, held_paused: paused,
+           in_minutes: now ? 0 : (filed?.in_minutes || null) };
 }
 
 // ONE SWEEP over every live cxell. Exported so the boot path, the loop and the test can all force a
@@ -259,6 +348,77 @@ export async function recoverStoppedCxells({ reason = 'boot', mode = PROVISION_M
     return { ...tally, error: e.message };
   } finally {
     sweeping = false;
+  }
+}
+
+// ── THE MANUAL RESTART: one xell's cage, because a human pressed the button ───────────────────────
+//
+// WHY A BUTTON EXISTS AT ALL, when a loop already restarts stopped cages. The loop can only act on
+// what docker will admit to: a cage that is `exited`. The failure an operator actually sits in front
+// of is the other one — the container is RUNNING, the terminal will not attach, the agent has not
+// said anything for an hour, and every automatic pass above walks straight past it as healthy
+// ('running' is the sweep's first and cheapest verdict). Until now the only cure was a host session
+// with a docker socket, which most operators of a hive do not have and no cxell zee ever has.
+//
+// It is the SAME sequence as the sweep — deliberately, down to the refusals: a missing cage is never
+// recreated, an unprobeable one is never guessed at, a retired xell is refused, PROVISION_MODE gates
+// the whole thing, and a cage that comes back but cannot be SEALED is stopped again with a tend
+// raised and no turn resumed. What a human adds is the two things a loop must not decide for itself:
+// FORCE (stop a cage docker still calls running — this kills the live turn, so the console asks
+// first) and IMMEDIACY (resume the session now rather than on the 5-minute ladder).
+//
+// Returns { ok, verdict, … } and NEVER throws — the route reports the verdict as-is, because
+// "already running", "gone", "paused fleet" and "sealed but not resumed" are all answers an operator
+// needs to see rather than a 500.
+export async function restartXellCxell(xellId, { by = 'a human', force = false,
+                                                 mode = PROVISION_MODE } = {}) {
+  try {
+    const x = await one(`SELECT id, slug, status FROM xell WHERE id = $1`, [xellId]);
+    if (!x) return { ok: false, verdict: 'no-xell', reason: 'no such xell' };
+    const row = await cxellFor(xellId);
+    if (!row) {
+      // Two different "no" answers, and an operator staring at a dead terminal deserves the right
+      // one: the xell is on its way out, or it never had a caged zee in the first place.
+      return { ok: false, verdict: 'no-cxell', slug: x.slug,
+               reason: ['retired', 'tearing-down'].includes(x.status)
+                 ? `this xell is ${x.status} — its cxell has already been torn down`
+                 : 'this xell has no live caged zee (no cxell to restart)' };
+    }
+    const forced = force;
+    const r = await recoverOne(row, {
+      reason: `a manual restart by ${by}`, mode, force, by,
+      death: CAGE_RESTART_DEATH, deathReason: CAGE_RESTART_REASON(by, forced),
+      unsealedLead: 'by hand from the console',
+      resumeNow: true, resumePrompt: cageRestartRevivePrompt({ by }),
+    });
+    await recordEvent({ source: 'human', hook_event_name: 'cxell-restart', zee_id: row.zee_id,
+                        xell_id: row.xell_id, raw: { slug: row.slug, by, force, mode, ...r } })
+      .catch(() => {});
+    return { ok: r.verdict === 'restarted' || r.verdict === 'would-restart', xell_id: row.xell_id, ...r };
+  } catch (e) {
+    logline('cxell-recover', `manual restart of xell ${String(xellId).slice(0, 8)} failed `
+      + `(${String(e.message).slice(0, 160)})`);
+    return { ok: false, verdict: 'failed', error: String(e.message).slice(0, 300) };
+  }
+}
+
+// What the console shows BEFORE it asks. The confirm text has to be true — "this will end the turn
+// running inside it" is only true for a cage that is actually up — so the button probes first
+// rather than guessing from the dashboard's cached xell row. Read-only: one `docker inspect`, no
+// mode gate (reading the fleet's state is not acting on it), and it NEVER throws.
+export async function probeXellCxell(xellId) {
+  try {
+    const row = await cxellFor(xellId);
+    if (!row) return { ok: false, verdict: 'no-cxell', state: null };
+    const probe = await cxellState({ ctx: 'default', slug: row.slug });
+    return { ok: true, slug: row.slug, name: cxellName(row.slug), state: probe.state,
+             missing: !!probe.missing, error: probe.error || null,
+             zee_status: row.zee_status,
+             // "Restarting this ends a live turn" is this, and only this.
+             mid_turn: MID_TURN_STATUSES.includes(String(row.zee_status)),
+             mode: PROVISION_MODE };
+  } catch (e) {
+    return { ok: false, verdict: 'unknown', state: 'unknown', error: String(e.message).slice(0, 300) };
   }
 }
 
