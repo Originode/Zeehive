@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   getFleet, getProjects, dispatchTask,
   getXellObservability, getTurnEvents, getXellMessages, sendXellMessage,
+  nudgeXell, pauseXell, resumeXell,
 } from './api.js';
 import { hiveColor, hiveStatusLabel } from './hive/status.js';
 
@@ -173,7 +174,8 @@ export default function MobileChat() {
   return (
     <div className="mob">
       {selected ? (
-        <XellDetail xell={selected} onBack={() => { setSelId(null); writeParams({ [XELL_PARAM]: null }); }} />
+        <XellDetail xell={selected} projectName={project?.name}
+                    onBack={() => { setSelId(null); writeParams({ [XELL_PARAM]: null }); }} />
       ) : (
         <div className="mob-list">
           <header className="mob-top">
@@ -262,12 +264,13 @@ export function XellBox({ x, onClick }) {
 }
 
 // ── detail: header + tabs (Activity / Chat) ─────────────────────────────────────
-export function XellDetail({ xell, onBack }) {
+export function XellDetail({ xell, projectName, onBack }) {
   const [tab, setTab] = useState('chat');
   const [turns, setTurns] = useState([]);
   const [msgs, setMsgs] = useState([]);
   const [openTurn, setOpenTurn] = useState(null);
   const [termOpen, setTermOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [err, setErr] = useState(null);
 
   useEffect(() => {
@@ -299,10 +302,15 @@ export function XellDetail({ xell, onBack }) {
             <span className="mono mob-dbranch">{shortBranch(xell.branch)}</span>
           </div>
         </div>
-        <button className="mob-term" onClick={() => setTermOpen((v) => !v)} title="terminal">⌨</button>
+        <div className="mob-dactions">
+          <button className="mob-term" onClick={() => setTermOpen((v) => !v)} title="terminal">⌨</button>
+          <button className="mob-term mob-menu-btn" onClick={() => setMenuOpen((v) => !v)}
+                  title="context actions" aria-label="xell actions" aria-expanded={menuOpen}>⋮</button>
+        </div>
       </header>
 
       {termOpen && <TerminalSheet x={xell} onClose={() => setTermOpen(false)} />}
+      {menuOpen && <XellMenu x={xell} projectName={projectName} onClose={() => setMenuOpen(false)} />}
 
       <div className="mob-tabs">
         <button className={`mob-tab${tab === 'obs' ? ' on' : ''}`} onClick={() => setTab('obs')}>Activity</button>
@@ -461,6 +469,88 @@ export function ChatPane({ xell, msgs }) {
           />
           <button className="mob-send" onClick={send} disabled={busy || !text.trim()} aria-label="send">➤</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── context actions: the ⋮ menu for one xell ────────────────────────────────────
+// A pure item list (like the console's xellContextMenuItems) so the menu can be
+// render-tested without a browser. Order: live verbs first (nudge/pause/resume —
+// only on a cxell zee, which has a live SSH session to reach), then the escape
+// hatch to the full console, then the copy rows.
+export function xellMenuItems(x) {
+  const items = [];
+  const cxell = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
+  const xPaused = x.hive_status === 'occ-paused' || x.xell_paused === true;
+  if (cxell) {
+    items.push({ kind: 'nudge', label: '💬 Nudge zee' });
+    items.push(xPaused
+      ? { kind: 'resume', label: '▶ Resume' }
+      : { kind: 'pause', label: '⏸ Pause', danger: true });
+  }
+  items.push({ kind: 'console', label: '🖥 Open in console' });
+  if (x.branch) items.push({ kind: 'copyBranch', label: '⑂ Copy branch', copy: x.branch });
+  items.push({ kind: 'copyId', label: '🆔 Copy xell ID', copy: x.id });
+  const task = x.zee_title || x.task_text;
+  if (task) items.push({ kind: 'copyTask', label: '📋 Copy task', copy: task });
+  if (x.viewer_url) items.push({ kind: 'copyUrl', label: '🔗 Copy terminal link', copy: x.viewer_url });
+  return items;
+}
+
+// The bottom sheet the ⋮ button opens: one row per context action, with inline
+// feedback for the async verbs (nudge/pause/resume) and the copy rows.
+export function XellMenu({ x, projectName, onClose }) {
+  const [busy, setBusy] = useState(null);   // the kind currently running
+  const [msg, setMsg] = useState(null);     // { tone: 'ok'|'err', text }
+  const items = xellMenuItems(x);
+
+  const done = (tone, text) => { setMsg({ tone, text }); setTimeout(onClose, tone === 'ok' ? 900 : 2600); };
+
+  const run = async (it) => {
+    if (busy) return;
+    try {
+      if (it.kind === 'nudge') {
+        setBusy(it.kind);
+        const r = await nudgeXell(x.id);
+        if (r?.nudged) done('ok', 'Nudged ✓');
+        else done('err', r?.reason || r?.error || 'No live zee to reach.');
+      } else if (it.kind === 'pause') {
+        setBusy(it.kind);
+        const r = await pauseXell(x.id);
+        if (r?.ok) done('ok', 'Paused ✓');
+        else done('err', r?.reason || 'Server refused.');
+      } else if (it.kind === 'resume') {
+        setBusy(it.kind);
+        const r = await resumeXell(x.id);
+        if (r?.ok) done('ok', 'Resumed ✓');
+        else done('err', r?.reason || 'Server refused.');
+      } else if (it.kind === 'console') {
+        window.open(`/?project=${encodeURIComponent(projectName || '')}`, '_blank', 'noopener');
+        onClose();
+      } else if (it.copy) {
+        try { await navigator.clipboard.writeText(it.copy); done('ok', 'Copied ✓'); }
+        catch { done('err', 'Clipboard unavailable.'); }
+      }
+    } catch (e) { done('err', e?.message || String(e)); }
+    finally { setBusy(null); }
+  };
+
+  return (
+    <div className="mob-sheet-back" onClick={onClose}>
+      <div className="mob-sheet mob-menu" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-title">Actions <span className="mob-menu-sub">{x.slug}</span></div>
+        {msg && <div className={`mob-menu-msg ${msg.tone}`}>{msg.text}</div>}
+        <div className="mob-menu-items">
+          {items.map((it) => (
+            <button key={it.kind} className={`mob-menu-item${it.danger ? ' danger' : ''}`}
+                    onClick={() => run(it)} disabled={busy !== null}>
+              <span className="mob-menu-lbl">{it.label}</span>
+              {busy === it.kind ? <span className="mob-menu-busy">…</span> : null}
+            </button>
+          ))}
+        </div>
+        <button className="mob-sheet-close" onClick={onClose}>Close</button>
       </div>
     </div>
   );

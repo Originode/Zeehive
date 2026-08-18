@@ -3495,8 +3495,11 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   white-space: nowrap; }
 .mob-dsub { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 12px; }
 .mob-dbranch { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-dactions { display: flex; align-items: center; gap: 6px; }
 .mob-term { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; width: 38px; height: 38px; font-size: 18px; cursor: pointer; }
+.mob-term:active { border-color: var(--accent); }
+.mob-menu-btn { font-size: 20px; line-height: 1; }
 
 /* tabs */
 .mob-tabs { display: flex; gap: 4px; padding: 8px 10px 4px; }
@@ -3576,3 +3579,20 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .mob-sheet-actions { display: flex; gap: 8px; }
 .mob-sheet-close { background: none; border: none; color: var(--muted); font-size: 13px;
   cursor: pointer; padding: 4px; align-self: center; }
+
+/* the ⋮ context-actions sheet */
+.mob-menu-sub { color: var(--muted); font-size: 12px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-menu-msg { font-size: 13px; padding: 8px 10px; border-radius: 8px; }
+.mob-menu-msg.ok { background: color-mix(in srgb, var(--up) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--up) 40%, var(--line)); }
+.mob-menu-msg.err { background: color-mix(in srgb, var(--down) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--down) 40%, var(--line)); word-break: break-word; }
+.mob-menu-items { display: flex; flex-direction: column; }
+.mob-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: none; border: none; border-top: 1px solid var(--line); color: var(--text);
+  padding: 13px 4px; font-size: 14px; font-weight: 600; text-align: left; cursor: pointer; width: 100%; }
+.mob-menu-item:disabled { opacity: .5; cursor: default; }
+.mob-menu-item.danger { color: var(--down); }
+.mob-menu-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-menu-busy { color: var(--muted); font-size: 13px; }
