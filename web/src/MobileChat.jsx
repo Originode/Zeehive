@@ -109,6 +109,10 @@ export default function MobileChat() {
 
   // The mobile page owns the FULL viewport. Mark <html>/<body> so rules that must NOT leak
   // into the desktop console (height:100%, overflow-x, text-size-adjust) can scope to /m.
+  // Also tell the browser the layout viewport should SHRINK when the on-screen keyboard opens
+  // (interactive-widget=resizes-content) so the composer stays above it — scoped here and
+  // restored on unmount, so the desktop console keeps its current viewport behaviour. Browsers
+  // that do not know the prop ignore it.
   useEffect(() => {
     const el = document.documentElement;
     const body = document.body;
@@ -116,7 +120,15 @@ export default function MobileChat() {
     const prevBody = body.className;
     el.className += ' mob-page';
     body.className += ' mob-page';
-    return () => { el.className = prevEl; body.className = prevBody; };
+    let meta = null; let prevContent = null;
+    try {
+      meta = document.querySelector('meta[name="viewport"]');
+      if (meta) { prevContent = meta.getAttribute('content'); meta.setAttribute('content', 'width=device-width, initial-scale=1.0, interactive-widget=resizes-content'); }
+    } catch { /* meta unavailable — non-fatal */ }
+    return () => {
+      el.className = prevEl; body.className = prevBody;
+      try { if (meta && prevContent != null) meta.setAttribute('content', prevContent); } catch {}
+    };
   }, []);
 
   // Load the project list and pick the active project: URL param wins, then the
@@ -492,11 +504,22 @@ export function ChatPane({ xell, msgs, convo }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [sent, setSent] = useState([]);   // optimistic copies of THIS session's sends
   const endRef = useRef(null);
   // API returns newest-first; a chat reads oldest-first. The CAPTURED conversation — the zee's
   // model speech + thinking, from the observability feed (getXellConversation) — rides in the
   // SAME stream so the zee's actual output appears here WITHOUT the zee ever calling a tool.
-  // Items carry either a zee_message id (m-…) or a feed event ts (c-…); both sort by time.
+  // Items carry either a zee_message id (m-…), a feed event ts (c-…), or this session's send
+  // (o-…); both sort by time.
+  //
+  // Optimistic sends show instantly — the fleet poll only returns the real message on the next
+  // 5s tick, and on a phone a send with no visible echo for 5s reads as "it failed". Each sent
+  // message is added here at send-time, and dropped once the poll delivers the real row (matched
+  // by body) so the optimistic copy never survives alongside the server's.
+  const realBodies = new Set(msgs.map((m) => m.body));
+  const optimistic = sent
+    .filter((o) => !realBodies.has(o.body))
+    .map((o) => ({ id: o.id, at: o.at, body: o.body, delivered: false, mine: true, captured: false }));
   const items = [
     ...[...msgs].reverse().map((m) => ({
       id: `m-${m.id}`, at: m.at, body: m.body, from: m.from,
@@ -513,6 +536,7 @@ export function ChatPane({ xell, msgs, convo }) {
       captured: c.kind === 'conversation',
       think: c.kind === 'thinking',
     })),
+    ...optimistic,
   ].sort((a, b) => new Date(a.at || 0) - new Date(b.at || 0));
 
   useEffect(() => {
@@ -525,7 +549,8 @@ export function ChatPane({ xell, msgs, convo }) {
     setBusy(true); setErr(null);
     try {
       const r = await sendXellMessage(xell.id, { text: t });
-      if (r?.sent === false && r?.reason) setErr(r.reason);
+      if (r?.sent === false && r?.reason) { setErr(r.reason); return; }
+      setSent((s) => [...s, { id: `o-${Date.now()}`, at: new Date().toISOString(), body: t }]);
       setText('');
     } catch (e) { setErr(e.message || String(e)); }
     finally { setBusy(false); }
