@@ -2452,8 +2452,13 @@ export function petalVerbs(x, diff) {
   // Checks both hive_status (for fleet-wide and project pauses) and xell_paused (for
   // per-xell individual pauses from the xell_pause_state table).
   const xPaused = x.hive_status === 'occ-paused' || x.xell_paused === true;
+  // ⟳ CAGE joins them for a cxell: restart the container the zee lives in. It sits HERE, beside the
+  // terminal, because that is where the failure it cures is noticed — a cage docker still calls
+  // 'running' with a dead ssh door or a silent agent, which the recovery loop (exited-only) never
+  // sees. The honeycomb is the surface an operator actually watches, so a verb that exists only on
+  // the xell card is a verb that does not exist. Last in the row: least used, most disruptive.
   v[2] = cxell
-    ? (xPaused ? ['resume', 'terminal', 'nudge'] : ['pause', 'terminal', 'nudge'])
+    ? (xPaused ? ['resume', 'terminal', 'nudge', 'cage'] : ['pause', 'terminal', 'nudge', 'cage'])
     : (xPaused ? ['resume'] : ['pause']);
   // MACHINE petal — env / message / directives. Directives is ALWAYS offered: every xell
   // has a brief it was given (task_text), and the panel shows that first even when there is no
@@ -2495,10 +2500,10 @@ export function petalVerbs(x, diff) {
 const VERB_LABEL = {
   build: '🔨', terminal: '⌨', nudge: '💬', env: '❖', message: '📨',
   pull: '↓', land: '⬆', pr: 'PR', ship: '🚀', swap: '♻',
-  pause: '⏸', resume: '▶', directives: '🧭', observability: '◉',
+  pause: '⏸', resume: '▶', directives: '🧭', observability: '◉', cage: '⟳',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
-  done: 'error', swap: 'working', pause: 'error', resume: 'working' };
+  done: 'error', swap: 'working', pause: 'error', resume: 'working', cage: 'error' };
 // Verb tooltips shown when hovering an icon-only button on the canvas flower.
 const VERB_TOOLTIP = {
   terminal: 'Open a live terminal into this cxell zee',
@@ -2516,6 +2521,7 @@ const VERB_TOOLTIP = {
   resume: 'Resume this xell — calls the zee back',
   directives: 'See this xell\'s directive — the brief it was given (a manager\'s programme), and the conversation around it',
   observability: 'Open the per-turn observability ledger — what the zee did, what it cost',
+  cage: 'Restart this zee\'s cxell container — stop → start → re-open the ssh door → re-apply the egress firewall → resume the session',
 };
 
 // The RIGHT-CLICK context menu (a DOM overlay on the honeycomb) reuses the SAME verb list as the
@@ -2526,10 +2532,11 @@ const VERB_MENU_LABEL = {
   env: '❖ Environment', message: '📨 Message', directives: '🧭 Directives',
   observability: '◉ Observability',
   pull: '↓ Pull', land: '⬆ Land', pr: 'PR', ship: '🚀 Ship',
-  swap: '♻ Swap zee', pause: '⏸ Pause', resume: '▶ Resume',
+  swap: '♻ Swap zee', pause: '⏸ Pause', resume: '▶ Resume', cage: '⟳ Restart cage',
 };
 // Which menu rows carry the destructive tone (the flower paints the same kinds with COL.error).
-const VERB_MENU_TONE = { done: 'danger', pause: 'danger' };
+// The cage restart earns it: if a turn is live in there, the restart ends it.
+const VERB_MENU_TONE = { done: 'danger', pause: 'danger', cage: 'danger' };
 
 // Mark-done reads its state (confirm / mark / clean up). The FLOWER draws a short icon (doneIcon)
 // so the branch petal stays inside the hexagon next to ♻; the CONTEXT MENU keeps the full words
@@ -2584,7 +2591,7 @@ export function xellContextMenuItems(x, diff) {
   return items;
 }
 
-function drawFlowerButtons(ctx, centers, size, x, diff) {
+export function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];
   const verbs = petalVerbs(x, diff);
   const R = COL.ready, D = COL.error, G = COL.working, P = COL.prod;
@@ -2611,14 +2618,33 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
     const yMax = size * (1 - total / (4 * halfW)) - h / 2 - inset;
     return Math.max(size * 0.28, Math.min(yOff, yMax));   // fit, but keep clear of the facet text above
   };
+  // …and RAISING a row can only buy so much: the hex is widest at its waist, so a row wider than
+  // flat-to-flat does not fit at ANY depth. Raising it then hits the floor and the clip cuts the
+  // outer buttons in half — while their hit-rects, which are not clipped, go on answering clicks on
+  // a button nobody can see. The SESSION petal reached four verbs (pause · terminal · nudge · cage)
+  // and crossed that line, so a row that cannot fit as measured is TIGHTENED — less padding, a
+  // narrower gap — until it does. Rows that already fit measure exactly as they always did.
+  const maxTotal = 4 * halfW * (size * 0.72 - h / 2 - inset) / size;   // widest row the floor depth allows
+  const fitRow = (btns) => {
+    const labels = btns.reduce((a, b) => a + ctx.measureText(b.label).width, 0);
+    const n = btns.length;
+    let p = padX, g = gap;
+    const width = () => labels + p * 2 * n + g * (n - 1);
+    // Squeeze padding and gap together, down to a floor that still reads as separate pills.
+    while (width() > maxTotal && p > size * 0.055) {
+      p = Math.max(size * 0.055, p - size * 0.004);
+      g = Math.max(size * 0.03, g - size * 0.003);
+    }
+    return { padX: p, gap: g, total: width() };
+  };
   const row = (i, btns) => {
     if (!btns.length || !at(i)) return;
-    const total = btns.reduce((a, b) => a + ctx.measureText(b.label).width + padX * 2, 0) + gap * (btns.length - 1);
+    const fit = fitRow(btns);
     const [px, py] = at(i);
     ctx.save();
     hexPath(ctx, px, py, size - 1.5);
     ctx.clip();
-    rects.push(...drawPetalRow(ctx, px, py + rowDepth(total), btns, opts));
+    rects.push(...drawPetalRow(ctx, px, py + rowDepth(fit.total), btns, { ...opts, padX: fit.padX, gap: fit.gap }));
     ctx.restore();
   };
 

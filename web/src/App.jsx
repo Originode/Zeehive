@@ -904,6 +904,10 @@ export default function App() {
     if (x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
+    // ⟳ CAGE — restart the cxell container. The SAME handler the xell card and the terminal modal
+    // call (web/src/cage.js): it probes the live cage first and owns every confirm and refusal, so
+    // the three surfaces cannot drift into three different policies.
+    if (kind === 'cage') { restartXellCage(x, refresh); return; }
     if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/file composer
     if (kind === 'directives') { setDirectivesXell(x); return; } // read the manager⇄worker conversation
     if (kind === 'env') {
