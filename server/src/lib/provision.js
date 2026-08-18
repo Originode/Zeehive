@@ -176,18 +176,30 @@ export async function resolveXellDsn(xell, project, containers = []) {
       } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
     }
   }
-  // db-shared-dev on a PROCESS-runner project: the xell's server is a bare process, so unlike a
-  // compose stack there is no network alias handing it a database — the projection must carry
-  // the shared dev db's conn_ref outright. Scoped to process runners so compose projects keep
-  // their env exactly as it was. The §6.2 guard still applies unchanged.
+  // db-shared-dev — the shared dev database the xell is linked to as a USER (relation='uses'),
+  // for EVERY runner type. A PROCESS-runner server is a bare process with no network alias, so
+  // the projection must carry the shared dev db's conn_ref outright. A COMPOSE-runner xell's
+  // CONTAINERS reach the db by compose-network alias, but the CXELL zee — the agent in its cage —
+  // is not on that network: it has no docker and reaches postgres over TCP, so its .zeehive.env
+  // needs the same TCP door. Emitting it for compose too is safe: the generated compose already
+  // pins DATABASE_URL to its db alias for the containers, so the extra line only hands the zee a
+  // working address and never changes what the stack resolves. The §6.2 guard still applies
+  // unchanged (the reader-binding exemption in writeXellEnv is about the COUPLING, not the runner).
   const spin = project?.manifest?.tiers?.spinoff || {};
   const spinRunner = spin.runner || null;
-  if (!dbUrl && xell.db_coupling === 'db-shared-dev' && spinRunner === 'process') {
+  if (!dbUrl && xell.db_coupling === 'db-shared-dev') {
     const used = await one(
-      `SELECT c.conn_ref FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
-        WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' AND c.conn_ref IS NOT NULL LIMIT 1`,
-      [xellId]);
+      `SELECT c.conn_ref, c.host, c.host_port, c.docker_ctx
+         FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
+        WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' LIMIT 1`, [xellId]);
     if (used?.conn_ref) { dbUrl = used.conn_ref; source = 'shared-dev-container'; }
+    else if (used?.host && used?.host_port) {
+      // A shared dev db that records no conn_ref but IS published: derive the TCP DSN the same
+      // way the prod path does (derivedTcpDsn), so a caged zee still gets a door rather than
+      // falling through to a docker-exec psql a cxell cannot run.
+      const dsn = derivedTcpDsn(used, await dbIdentity(xell.project_id));
+      if (dsn) { dbUrl = dsn; source = 'shared-dev-derived'; }
+    }
   }
   // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
   // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may

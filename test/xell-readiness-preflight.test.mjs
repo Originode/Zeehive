@@ -14,7 +14,10 @@
 //   • a xell that fails preflight does NOT read as `ready` on the hive — it reads `dirty`
 //   • PRODUCTION is never opened: a prod-coupled xell reports db-open SKIPPED, and the proof it did
 //     not probe is that the prod DSN points at an address that could only ever time out
-//   • no DATABASE_URL projected (a compose xell on the shared dev db) is SKIPPED, not failed
+//   • no DATABASE_URL projected (a db-shared-dev xell with NO shared dev db linked — e.g. the
+//     pool before a dev db is wired) is SKIPPED, not failed. (A db-shared-dev xell WITH its shared
+//     dev db linked now DOES get a DATABASE_URL — resolveXellDsn emits the used container's
+//     conn_ref for every runner type — so this state is the genuinely db-less one only.)
 //   • the probe is READ-ONLY: nothing in the database changes across a preflight
 //   • the probe is BOUNDED: an unroutable address returns a verdict instead of hanging
 import { randomUUID } from 'node:crypto';
@@ -142,7 +145,7 @@ try {
   const noneV = await preflightXell(none.id);
   const noneCheck = noneV.checks.find((c) => c.check === 'db-open');
   ok(noneV.ok === true && noneCheck?.skipped === true,
-     'a compose xell that gets its db by network alias is not a broken xell');
+     'a db-shared-dev xell with no shared dev db linked is not a broken xell');
   ok(/no DATABASE_URL/.test(noneCheck?.detail || ''), `…and the reason is on the record (${noneCheck?.detail})`);
 
   // ── the verdict reaches the read model, not just the row ────────────────────────────────────
