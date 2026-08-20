@@ -1855,6 +1855,24 @@ a.cbox:hover { border-color: var(--accent); }
    the honeycomb on anything wider than a laptop). The panels pane still scrolls, so it loses
    nothing but width. */
 .hive-pane.honey  { flex: 3 1 0; position: relative; }
+/* ── the honeycomb LEVEL breadcrumb (the work-node hierarchy) ─────────────────
+   Floats over the canvas' top-left corner: where in the tree this honeycomb is, and the way back
+   up. The active (last) crumb is the CONTEXT every new prompt is cut under. */
+.hive-crumbs {
+  position: absolute; top: 8px; left: 10px; z-index: 5;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap; max-width: calc(100% - 20px);
+  pointer-events: none;   /* the strip itself must never eat a canvas drag… */
+}
+.hive-crumbs .hive-crumb {
+  pointer-events: auto;   /* …but its buttons stay clickable */
+  background: rgba(22, 27, 36, 0.88); color: #8b97a8;
+  border: 1px solid #2a3242; border-radius: 12px;
+  font: 600 11px 'Segoe UI', sans-serif; padding: 3px 10px; cursor: pointer;
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hive-crumbs .hive-crumb:hover { color: #e6ebf2; border-color: #7f95c2; }
+.hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
+.hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
 .hive-pane.panels { flex: 2 1 0; overflow: auto; }
 
 /* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The

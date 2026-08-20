@@ -610,7 +610,13 @@ const WIRE_PITCH = 6;
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, harnessPosRef, onGeometry, onAction, onContainerMenu,
                                     hoverRef, setHover, subscribeHover, redrawKey, showHarness = true,
-                                    queenzeeActivity = [], shipping = [], onQueenzeeTerminal, onQueenzeeLogs }) {
+                                    queenzeeActivity = [], shipping = [], onQueenzeeTerminal, onQueenzeeLogs,
+                                    // ── the WORK-NODE hierarchy (App's hive levels) ──────────────
+                                    // The list is not only xells any more: a cell whose `hex_kind` is
+                                    // 'project' is a top-level work_node (a project), and 'worknode'
+                                    // is a child work_node with no live xell (a vacant seat). Clicks
+                                    // on them route here instead of the flower.
+                                    onOpenProject, onOpenNode, onNodeAssign }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null });
@@ -803,12 +809,24 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // honeycomb + flower, on the pan/zoom world transform
     ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
     geomRef.current.hexes = hexes;
+    geomRef.current.nodeBtns = [];      // the work-node chips (assign / open-children), re-hit each draw
     for (const hx of hexes) {
       if (expanded && hx.id === expanded.id) continue;     // the flower draws it
       const hovered = isHov(hx.id);
       const rel = related.get(hx.id) || null;
       const dim = hexDim({ hexId: hx.id, expandedId, hovered, hoverActive, related: rel });
       const relArgs = { related: rel, relatedTo: rel ? focus?.slug || null : null, relColor };
+      // WORK-NODE cells first: a project (top level) or a vacant child work_node — neither is a
+      // xell, so none of the xell dress (provider coin, harness, diff) applies to them.
+      if (hx.x.hex_kind === 'project') {
+        drawProjectHex(ctx, hx, { hover: hovered, dim });
+        continue;
+      }
+      if (hx.x.hex_kind === 'worknode') {
+        const chips = drawWorkNodeHex(ctx, hx, { hover: hovered, dim });
+        if (chips?.assign) geomRef.current.nodeBtns.push({ ...chips.assign, kind: 'assign', id: hx.id });
+        continue;
+      }
       // the AI PROVIDER's coin is the badge (providerArt.js): the same image cache as the harness
       // art, so a logo loading triggers exactly one redraw like everything else here
       const providerImg = getImg(providerArtOf(hx.x)?.logo);
@@ -820,6 +838,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         const workerHarness = harnessOf(hx.id);
         drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines,
           harness: workerHarness, harnessImg: getImg(workerHarness?.avatar_url), providerImg, ...relArgs });
+      }
+      // a xell-backed work_node that HAS children gets an "open" chip: clicking it drills into the
+      // node's level (the flower stays the hex's own click, exactly as before)
+      if (hx.x.work_children > 0 && hx.size >= 34) {
+        const r = drawChildrenChip(ctx, hx, { hover: hovered, dim });
+        if (r) geomRef.current.nodeBtns.push({ ...r, kind: 'children', id: hx.id });
       }
     }
     geomRef.current.flower = null;
@@ -1124,6 +1148,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     for (const r of cs) if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) return r.c;
     return null;
   }, []);
+  // the work-node chips: 'assign' on a vacant node, 'children' on a xell whose card has children
+  const hitNodeBtn = useCallback((wx, wy) => {
+    for (const b of geomRef.current.nodeBtns || []) {
+      if (wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h) return b;
+    }
+    return null;
+  }, []);
   // a dot in the open manager's CREW petal → that worker (circular targets, so distance not a box)
   const hitCrew = useCallback((wx, wy) => {
     for (const d of geomRef.current.crew || []) {
@@ -1256,10 +1287,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         tooltip.el.style.display = 'none';
       }
       // Xell tooltip — the directive + status of the xell under the cursor. A button's own tooltip
-      // wins (hx is null over a button); a crew dot and a plain hex both name a xell.
+      // wins (hx is null over a button); a crew dot and a plain hex both name a xell. A work-node /
+      // project cell is not a xell — its hexagon already says everything the tooltip would.
       if (cw) showXellTooltip(xellOf(cw.id), e);
-      else if (hx) showXellTooltip(xellOf(hx.id), e);
+      else if (hx && !xellOf(hx.id)?.hex_kind) showXellTooltip(xellOf(hx.id), e);
       else hideXellTooltip();
+      if (hitNodeBtn(wx, wy)) cursor = 'pointer';
     } else {
       const qzb = hitQueenzeeLogs(wx, wy);
       if (qzb) { cursor = 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
@@ -1268,7 +1301,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         if (hx) {
           emitHover({ id: hx.id, commit: null, harness: null });   // a hex is ONE xell → key on id
           cursor = 'pointer';
-          showXellTooltip(xellOf(hx.id), e);
+          // a work-node / project cell is not a xell — no directive tooltip for it
+          if (xellOf(hx.id)?.hex_kind) hideXellTooltip();
+          else showXellTooltip(xellOf(hx.id), e);
         } else {
           const qz = hitQueenzee(wx, wy);
           if (qz) { cursor = 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
@@ -1334,8 +1369,20 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         }
         return;                                              // petal clicks keep the flower open
       }
+      // the work-node chips answer before the hex under them (assign a zee / open the children)
+      const nb = hitNodeBtn(wx, wy);
+      if (nb) {
+        const x = (xells || []).find((xx) => xx.id === nb.id);
+        if (x) { if (nb.kind === 'assign') onNodeAssign?.(x.work_item, x); else onOpenNode?.(x.work_item, x); }
+        return;
+      }
       const hx = hitHex(wx, wy);
-      if (hx && hx.id !== expandedId) { setExpandedId(hx.id); return; }
+      if (hx && hx.id !== expandedId) {
+        const x = (xells || []).find((xx) => xx.id === hx.id);
+        if (x?.hex_kind === 'project') { onOpenProject?.(x.project); return; }
+        if (x?.hex_kind === 'worknode') { onOpenNode?.(x.work_item, x); return; }
+        setExpandedId(hx.id); return;
+      }
       // the QUEENZEE node stays reachable even while a bloom is open: the logs button opens the
       // activity log, the node itself opens a shell into the queenzee machine.
       if (hitQueenzeeLogs(wx, wy)) { onQueenzeeLogs?.(); return; }
@@ -1346,10 +1393,22 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // the QUEENZEE node — logs button first (the smaller target), then the node itself.
     if (hitQueenzeeLogs(wx, wy)) { onQueenzeeLogs?.(); return; }
     if (hitQueenzee(wx, wy)) { onQueenzeeTerminal?.(); return; }
+    // the work-node chips answer before the hex under them
+    const nb = hitNodeBtn(wx, wy);
+    if (nb) {
+      const x = (xells || []).find((xx) => xx.id === nb.id);
+      if (x) { if (nb.kind === 'assign') onNodeAssign?.(x.work_item, x); else onOpenNode?.(x.work_item, x); }
+      return;
+    }
     const hx = hitHex(wx, wy);
     if (hx) {
+      const x = (xells || []).find((xx) => xx.id === hx.id);
+      // a PROJECT hexagon opens the project's level; a vacant WORK-NODE hexagon opens its children —
+      // the drill-down IS the click, exactly as the task model reads (a node with a xell keeps the
+      // flower as its click, and drills through its ⬡ chip instead).
+      if (x?.hex_kind === 'project') { onOpenProject?.(x.project); return; }
+      if (x?.hex_kind === 'worknode') { onOpenNode?.(x.work_item, x); return; }
       if (e.shiftKey) {
-        const x = (xells || []).find((xx) => xx.id === hx.id);
         if (x?.viewer_url && !x.is_production) {
           onOpenSession?.(x);
           return;
@@ -1406,7 +1465,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       }
     }
     const hx = hitHex(wx, wy);
-    if (hx) {
+    if (hx && !xellOf(hx.id)?.hex_kind) {   // a work-node/project cell has no xell verbs to offer
       e.preventDefault(); e.stopPropagation();
       setCtxXell({ x: e.clientX, y: e.clientY, id: hx.id });
       return;
@@ -1609,6 +1668,141 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
 // reaches it: drawManagerHex draws that one instead (no sha, no diffstat, a persona and its crew).
 // exported for the same reason drawManagerHex is: the crew highlight is a DRAWN state (there is no DOM
 // per cell), so the only honest way to assert it is to run this against a recording 2D context
+// ── WORK-NODE + PROJECT hexagons (the honeycomb hierarchy) ────────────────────
+// A hexagon is not always a xell any more. At the TOP level every hexagon is a PROJECT — a root
+// work_node — and inside a level a child work_node with no live xell is drawn as a VACANT SEAT:
+// dashed (the same not-a-work-cell language the manager badge uses), carrying its title, status,
+// child count and an "assign zee" chip that deploys a worker onto the card. Clicking either routes
+// to onOpenProject / onOpenNode (a drill-down), never to the flower — the flower stays a xell's.
+const NODE = { stroke: '#7f95c2', fill: '#141926', text: '#dce4f2', muted: '#8b97a8', chip: '#5b8cff' };
+
+// Greedy two-line word wrap, second line ellipsised by fit(). For the node/project titles — a
+// hexagon can hold two short lines where one would truncate half the words away.
+function wrapTwo(ctx, text, maxW) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  if (!words.length) return [''];
+  let first = words[0];
+  let i = 1;
+  while (i < words.length && ctx.measureText(first + ' ' + words[i]).width <= maxW) first += ' ' + words[i++];
+  if (i >= words.length) return [first];
+  return [first, fit(ctx, words.slice(i).join(' '), maxW)];
+}
+
+export function drawProjectHex(ctx, hx, { hover, dim }) {
+  const { cx, cy, size, x } = hx;
+  const p = x.project || {};
+  const w = hexWidth(size);
+  ctx.save();
+  if (dim) ctx.globalAlpha = 0.3;
+  hexPath(ctx, cx, cy, size);
+  const g = ctx.createLinearGradient(cx, cy - size, cx, cy + size);
+  g.addColorStop(0, withAlpha(NODE.stroke, hover ? 0.30 : 0.22));
+  g.addColorStop(1, withAlpha(NODE.fill, 0.95));
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = hover ? 2.6 : 1.6;
+  ctx.strokeStyle = hover ? NODE.stroke : withAlpha(NODE.stroke, 0.7);
+  ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (size < 30) {
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.22), 0, Math.PI * 2);
+    ctx.fillStyle = NODE.stroke; ctx.fill();
+    ctx.restore(); return;
+  }
+  ctx.font = `600 ${Math.max(8, size * 0.12)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = NODE.muted;
+  ctx.fillText('⬢ PROJECT', cx, cy - size * 0.42);
+  ctx.font = `700 ${Math.max(10, size * 0.2)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = NODE.text;
+  const lines = wrapTwo(ctx, p.name || x.slug || '—', w * 0.72);
+  const lh = Math.max(11, size * 0.23);
+  const y0 = cy - ((lines.length - 1) * lh) / 2 - size * 0.04;
+  lines.forEach((ln, i) => ctx.fillText(ln, cx, y0 + i * lh));
+  ctx.font = `${Math.max(8, size * 0.13)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = NODE.muted;
+  const n = Number(p.xell_count) || 0;
+  ctx.fillText(`${n} xell${n === 1 ? '' : 's'} · open ⬡`, cx, cy + size * 0.4);
+  ctx.restore();
+}
+
+// Returns { assign: {x,y,w,h} | null } so the caller can hit-test the chip.
+export function drawWorkNodeHex(ctx, hx, { hover, dim }) {
+  const { cx, cy, size, x } = hx;
+  const it = x.work_item || {};
+  const w = hexWidth(size);
+  ctx.save();
+  if (dim) ctx.globalAlpha = 0.3;
+  hexPath(ctx, cx, cy, size);
+  ctx.fillStyle = withAlpha(NODE.fill, hover ? 0.98 : 0.9);
+  ctx.fill();
+  ctx.setLineDash([6, 4]);
+  ctx.lineWidth = hover ? 2.2 : 1.3;
+  ctx.strokeStyle = withAlpha(NODE.stroke, hover ? 1 : 0.6);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (size < 30) {
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.22), 0, Math.PI * 2);
+    ctx.fillStyle = withAlpha(NODE.stroke, 0.8); ctx.fill();
+    ctx.restore(); return null;
+  }
+  // kind + child count — "⬡ 3" says this node opens into a level of its own
+  ctx.font = `600 ${Math.max(8, size * 0.12)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = NODE.muted;
+  const kids = Number(x.work_children) || 0;
+  ctx.fillText(fit(ctx, `${(it.kind || 'task').toUpperCase()}${kids ? ` · ⬡ ${kids}` : ''}`, w * 0.55), cx, cy - size * 0.48);
+  // the card's title, two lines
+  ctx.font = `600 ${Math.max(9, size * 0.155)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = NODE.text;
+  const lines = wrapTwo(ctx, it.title || x.slug || '—', w * 0.7);
+  const lh = Math.max(10, size * 0.185);
+  const y0 = cy - size * 0.16 - ((lines.length - 1) * lh) / 2 + lh / 2;
+  lines.forEach((ln, i) => ctx.fillText(ln, cx, y0 + i * lh));
+  // status word — the board's vocabulary, muted (this seat has no zee to colour it)
+  ctx.font = `${Math.max(8, size * 0.125)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = NODE.muted;
+  ctx.fillText(it.status || 'queued', cx, cy + size * 0.3);
+  // the ASSIGN chip — deploys a worker onto this card (the console's deployWorkItem)
+  let assign = null;
+  if (size >= 40) {
+    const chH = Math.max(14, size * 0.2);
+    ctx.font = `600 ${Math.max(8, chH * 0.58)}px 'Segoe UI', sans-serif`;
+    const label = '＋ assign zee';
+    const chW = Math.min(w * 0.62, ctx.measureText(label).width + chH);
+    const chX = cx - chW / 2, chY = cy + size * 0.44;
+    ctx.beginPath(); ctx.roundRect(chX, chY, chW, chH, chH / 2);
+    ctx.fillStyle = withAlpha(NODE.chip, hover ? 0.95 : 0.75); ctx.fill();
+    ctx.fillStyle = '#0d1017';
+    ctx.fillText(label, cx, chY + chH / 2 + 0.5);
+    assign = { x: chX, y: chY, w: chW, h: chH };
+  }
+  ctx.restore();
+  return { assign };
+}
+
+// The "this xell's card has children" chip on a XELL hexagon — pinned under the lower vertex area
+// so it never fights the card's own rows. Clicking it drills into the node's level; the hexagon
+// itself keeps its click (the flower). Returns the chip rect for hit-testing.
+export function drawChildrenChip(ctx, hx, { hover, dim }) {
+  const { cx, cy, size, x } = hx;
+  const kids = Number(x.work_children) || 0;
+  if (!kids) return null;
+  ctx.save();
+  if (dim) ctx.globalAlpha = 0.3;
+  const chH = Math.max(13, size * 0.17);
+  ctx.font = `600 ${Math.max(8, chH * 0.58)}px 'Segoe UI', sans-serif`;
+  const label = `⬡ ${kids}`;
+  const chW = ctx.measureText(label).width + chH * 0.9;
+  const chX = cx - chW / 2, chY = cy + size * 0.66;
+  ctx.beginPath(); ctx.roundRect(chX, chY, chW, chH, chH / 2);
+  ctx.fillStyle = withAlpha('#0a0d13', 0.85); ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(NODE.stroke, hover ? 1 : 0.6); ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = NODE.text;
+  ctx.fillText(label, chX + chW / 2, chY + chH / 2 + 0.5);
+  ctx.restore();
+  return { x: chX, y: chY, w: chW, h: chH };
+}
+
 export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = null, relatedTo = null, relColor = null,
                                           harness = null, harnessImg = null, providerImg = null }) {
   const { cx, cy, size, x } = hx;

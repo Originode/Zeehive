@@ -54,6 +54,8 @@ import ZeeAvatar from './ZeeAvatar.jsx';
 import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
 import WorkConsole from './work/WorkConsole.jsx';
+// the honeycomb's WORK-NODE hierarchy reads the same plan the board does
+import { listWorkItems, deployWorkItem } from './work/workApi.js';
 import DeliveryTelemetry from './DeliveryTelemetry.jsx';
 import Toasts from './Toasts.jsx';
 
@@ -264,6 +266,15 @@ export default function App() {
   // without flipping the truthy check.)
   const [showDispatch, setShowDispatch] = useState(false);
   const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
+  // ── the honeycomb's WORK-NODE hierarchy (hive levels) ─────────────────────────
+  // 'projects' = the TOP level: every hexagon is a project (its root work_node) — what the console
+  // opens on. 'nodes' = inside a project: the level named by nodePath (empty = the project root's
+  // children), where a child work_node is a hexagon — the assigned xell when it has one, a vacant
+  // dashed seat when it does not — and drilling into a node makes IT the context every new prompt
+  // is cut under (parent_work_item on the dispatch).
+  const [hiveMode, setHiveMode] = useState('projects');
+  const [nodePath, setNodePath] = useState([]);      // [{id,title}] from the project root downward
+  const [workItems, setWorkItems] = useState([]);    // the selected project's plan (flat, from /work-items)
   const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
@@ -406,6 +417,19 @@ export default function App() {
     return ps;
   }, []);
 
+  // The selected project's PLAN — the flat work-item list the honeycomb's node levels are computed
+  // from. `pid` is explicit because the default project's id is only known from the fleet snapshot.
+  const loadWorkItemsFor = useCallback(async (pid) => {
+    if (!pid) return;
+    try {
+      const items = await listWorkItems(pid);
+      // stale-guard, same rule as loadAll: never paint the previous project's plan
+      if (!projectIdRef.current || projectIdRef.current === pid) {
+        setWorkItems(Array.isArray(items) ? items : []);
+      }
+    } catch { /* keep last */ }
+  }, []);
+
   // Load EVERYTHING for the selected project: the fleet snapshot, the git graph and the diffs.
   // This is the full-resolve path — a project switch, or a landing/ship (which moves main, so the
   // graph and diffs all change at once). Live churn routes through the cheaper streamChange below,
@@ -424,9 +448,10 @@ export default function App() {
       if (d) setDiffs(d);
       syncXells(f?.xells || []);    // adopt the snapshot's decorated xells — no extra NDJSON stream
       loadProjects();               // keep the switcher's xell counts fresh
+      loadWorkItemsFor(pid || f?.project?.id);   // …and the plan the honeycomb's node levels read
       setVersion((v) => v + 1);
     } catch { /* keep last */ }
-  }, [projectId, loadProjects, applyFleet, syncXells]);
+  }, [projectId, loadProjects, applyFleet, syncXells, loadWorkItemsFor]);
 
   // An EXPLICIT re-read (the caller just acted — dispatch, build, pause, a gate decision…): full.
   const refresh = useCallback(async () => {
@@ -457,11 +482,12 @@ export default function App() {
         getTimeline(pid).then((t) => { if (projectIdRef.current === pid && t) { setTimeline(t); setVersion((v) => v + 1); } });
         getDiffs(pid).then((d) => { if (projectIdRef.current === pid && d) setDiffs(d); });
       }
+      if (type === 'work') loadWorkItemsFor(pid);   // a plan change moves the honeycomb's node levels
       f.catch(() => {});
       loadProjects();
     };
     refreshTimer.current = setTimeout(work, git ? 120 : 400);
-  }, [applyFleet, syncXells, loadProjects]);
+  }, [applyFleet, syncXells, loadProjects, loadWorkItemsFor]);
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
@@ -734,6 +760,10 @@ export default function App() {
     setProjectId(id);
     localStorage.setItem(PROJECT_KEY, id);
     writeProjectParam(projectsRef.current.find((p) => p.id === id));
+    // a project switch lands at ITS root level — the previous project's node path means nothing here
+    setHiveMode('nodes');
+    setNodePath([]);
+    setWorkItems([]);
   }, []);
 
   const handleCreate = useCallback(async (body) => {
@@ -867,6 +897,90 @@ export default function App() {
   };
   const xells = [...gridXells].sort((a, b) =>
     (rank(a) - rank(b)) || ((order[a.id] ?? 9999) - (order[b.id] ?? 9999)));
+
+  // ── the honeycomb's WORK-NODE hierarchy: what THIS level's hexagons are ───────
+  // Top level ('projects'): one hexagon per project — the root work_nodes. Inside a project
+  // ('nodes'): the children of the context node (nodePath's tail, or the project root), each drawn
+  // as its live xell when one is assigned, or as a vacant work-node seat when not; PLUS, at the
+  // root level only, every xell carrying no open card (the provisioned pool, managers, the router,
+  // production). A xell assigned to a deeper node shows at ITS level, not here. The cards pane, the
+  // git graph and the wires keep reading the FULL xell list — only the honeycomb is levelled.
+  const TERMINAL_WORK = ['done', 'cancelled'];
+  const openItems = (workItems || []).filter((i) => i.kind !== 'project' && !TERMINAL_WORK.includes(i.status));
+  const rootWorkItem = (workItems || []).find((i) => i.kind === 'project') || null;
+  const workItemById = new Map((workItems || []).map((i) => [i.id, i]));
+  const nodeChildCount = new Map();
+  for (const i of openItems) if (i.parent_id) nodeChildCount.set(i.parent_id, (nodeChildCount.get(i.parent_id) || 0) + 1);
+  const ctxItemId = hiveMode === 'nodes'
+    ? (nodePath.length ? nodePath[nodePath.length - 1].id : rootWorkItem?.id || null) : null;
+  let hiveCells;
+  if (hiveMode === 'projects') {
+    hiveCells = (projects || []).map((p) => ({ id: `proj:${p.id}`, hex_kind: 'project', slug: p.name, project: p }));
+  } else {
+    const xellById = new Map(xells.map((x) => [x.id, x]));
+    const openXellItem = new Set(openItems.map((i) => i.xell_id).filter(Boolean));
+    const level = ctxItemId ? openItems.filter((i) => i.parent_id === ctxItemId) : [];
+    const seen = new Set();
+    hiveCells = [];
+    // the opened node's OWN xell first — clicking a work node opens its flower, so its zee leads the level
+    if (nodePath.length && ctxItemId) {
+      const ctxItem = workItemById.get(ctxItemId);
+      const zx = ctxItem?.xell_id ? xellById.get(ctxItem.xell_id) : null;
+      if (zx) { seen.add(zx.id); hiveCells.push({ ...zx, work_item: ctxItem, work_children: nodeChildCount.get(ctxItem.id) || 0 }); }
+    }
+    for (const it of level) {
+      const zx = it.xell_id ? xellById.get(it.xell_id) : null;
+      if (zx && !seen.has(zx.id)) {
+        seen.add(zx.id);
+        hiveCells.push({ ...zx, work_item: it, work_children: nodeChildCount.get(it.id) || 0 });
+      } else if (!zx) {
+        hiveCells.push({ id: `wn:${it.id}`, hex_kind: 'worknode', slug: it.title, work_item: it,
+                         work_children: nodeChildCount.get(it.id) || 0, project_id: it.project_id });
+      }
+    }
+    if (!nodePath.length) {
+      for (const x of xells) if (!openXellItem.has(x.id) && !seen.has(x.id)) hiveCells.push(x);
+    }
+  }
+
+  // drill into a project: select it and land at its root level
+  const openProjectLevel = (p) => {
+    if (!p?.id) return;
+    if (p.id !== projectId) selectProject(p.id);
+    else { setHiveMode('nodes'); setNodePath([]); }
+    setExpandedId(null);
+  };
+  // drill into a work node: it becomes the context (new prompts are cut under it); its own live
+  // xell — if it has one — opens as the flower at the new level
+  const openNodeLevel = (item) => {
+    if (!item?.id) return;
+    setHiveMode('nodes');
+    setNodePath((path) => {
+      const at = path.findIndex((n) => n.id === item.id);
+      return at >= 0 ? path.slice(0, at + 1) : [...path, { id: item.id, title: item.title }];
+    });
+    const zx = item.xell_id ? xells.find((x) => x.id === item.xell_id) : null;
+    setExpandedId(zx ? zx.id : null);
+  };
+  // the vacant seat's "assign zee" chip → deploy a fresh worker onto the card (the board's verb)
+  const assignNodeZee = async (item) => {
+    if (!item?.id) return;
+    if (!(await showConfirm(`Deploy a zee onto “${item.title}”?\n\nSpawns a real worker, briefed from the card itself, `
+      + 'and assigns it — the same deploy the board runs.', { okLabel: 'Deploy' }))) return;
+    const id = `deploy-${item.id}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: `Deploying a zee onto “${item.title}”…`,
+      body: 'Claiming a ready xell and spawning — briefed from the card itself.' });
+    try {
+      const r = await deployWorkItem(item.id, {});
+      updateToast(id, { kind: 'success', title: 'Zee deployed', onRetry: null,
+        body: r?.xell?.slug ? `Running in ${r.xell.slug}.` : 'The zee is on it.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 7000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', title: 'Deploy failed', body: e?.message || String(e),
+        onRetry: () => { dismissToast(id); assignNodeZee(item); } });
+    }
+  };
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
@@ -1053,7 +1167,28 @@ export default function App() {
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey" style={split != null ? { flex: `${split} 1 0` } : undefined}>
-        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
+        {/* the LEVEL breadcrumb: where in the work-node tree this honeycomb is, and the way back up.
+            Every new prompt is cut under the level you are standing on (parent_work_item). */}
+        <div className="hive-crumbs">
+          <button className={`hive-crumb${hiveMode === 'projects' ? ' on' : ''}`}
+                  onClick={() => { setHiveMode('projects'); setExpandedId(null); }}>⬢ projects</button>
+          {hiveMode === 'nodes' && (
+            <>
+              <span className="hive-crumb-sep">›</span>
+              <button className={`hive-crumb${!nodePath.length ? ' on' : ''}`}
+                      onClick={() => { setNodePath([]); setExpandedId(null); }}>{project.name || '…'}</button>
+              {nodePath.map((n, i) => (
+                <React.Fragment key={n.id}>
+                  <span className="hive-crumb-sep">›</span>
+                  <button className={`hive-crumb${i === nodePath.length - 1 ? ' on' : ''}`}
+                          onClick={() => { setNodePath(nodePath.slice(0, i + 1)); setExpandedId(null); }}>
+                    {n.title}</button>
+                </React.Fragment>
+              ))}
+            </>
+          )}
+        </div>
+        <HiveCanvas xells={hiveCells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
                     expandedId={expandedId} onExpand={setExpandedId}
@@ -1062,6 +1197,7 @@ export default function App() {
                     showHarness={showHarness} redrawKey={version}
                     queenzeeActivity={qzActivity}
                     shipping={fleet.shipping || []}
+                    onOpenProject={openProjectLevel} onOpenNode={openNodeLevel} onNodeAssign={assignNodeZee}
                     onQueenzeeTerminal={openQueenzeeTerminal}
                     onQueenzeeLogs={() => setShowTerm(true)} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
@@ -1422,7 +1558,14 @@ export default function App() {
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
                   onClose={() => setShowDispatch(false)}
-                  onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
+                  onDispatch={(payload) => {
+                    setShowDispatch(false);
+                    // the prompt is cut under the honeycomb level it was written from: the new
+                    // work_node becomes a child of the opened node (server default: project root)
+                    runDispatch({ ...payload,
+                      ...(hiveMode === 'nodes' && nodePath.length
+                        ? { parent_work_item: nodePath[nodePath.length - 1].id } : {}) });
+                  }} />
       )}
       {showSetup && (
         <ProjectSetup project={project} onClose={() => setShowSetup(false)} onChanged={refresh} />
