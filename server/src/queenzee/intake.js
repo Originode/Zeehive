@@ -943,9 +943,16 @@ export async function setZeeMode(zeeId, permissionMode) {
 // Best-effort: no live cxell → nothing to do; NEVER throws.
 // GENERATE this project's entry-point docs (AGENTS.md/CLAUDE.md …) into a cxell. Same trigger as the
 // harness files — a zee being assigned — because they answer the same question for a zee arriving with
-// no context: what is this project and how do I work in it. Never overwrites a git-tracked path
-// (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
-// and a zee never received is exactly the silence this whole mechanism exists to remove.
+// no context: what is this project and how do I work in it.
+//
+// The meta-DB row is the SOURCE of truth (docs/entry-point-doc-source.md, Option B) — every xell gets
+// the generated file at deployment, including at a path the repo has committed (this repo's CLAUDE.md
+// is exactly that). So the injector is called with overwriteTracked:true for these entry-point paths:
+// the paths are ones project_doc rows own, and lib/cxell.js then writes over the committed copy,
+// git-excludes it and skip-worktrees it. An UNRELATED tracked path (a file no row claims) stays
+// protected — the same lib/cxell.js decision, with the caller's flag defaulting to false there.
+// Every outcome is logged: a doc an operator wrote and a zee never received is exactly the silence
+// this whole mechanism exists to remove.
 export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
   // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
   // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
@@ -956,7 +963,7 @@ export async function injectProjectDocsIntoXell({ ctx = 'default', slug, project
   const skipped = [];
   for (const f of files) {
     try {
-      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text });
+      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text, overwriteTracked: true });
       if (r.written) written++; else skipped.push(r.reason || `${f.relPath} not written`);
     } catch (e) {
       failed++;
@@ -1688,7 +1695,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       catch (e) { logline('cxell', `${name}: could not inject harness file ${f.relPath} (${String(e.message).slice(0, 100)})`); }
     }
     // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
-    // provider actually looks for. Generated, never written over a file the project itself committed.
+    // provider actually looks for. The row is the SOURCE (Option B, docs/entry-point-doc-source.md):
+    // the injector supersedes a tracked entry-point path the row owns — this repo's committed
+    // CLAUDE.md included — rather than skipping it.
     await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working

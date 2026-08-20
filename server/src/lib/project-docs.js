@@ -13,12 +13,14 @@
 // with THIS XELL's stack inventory (lib/xell-stack.js) — the half of an agent's context that is
 // different in every xell and that nobody could write by hand.
 //
-// THE ONE HARD RULE: never write over a git-TRACKED file. A project that has committed its own
-// CLAUDE.md has said what it wants an agent to read, and a generated copy landing on top of it would
-// (a) replace the project's own instructions with an operator's, (b) dirty every xell's worktree, and
-// (c) put a file nobody wrote into a landing diff for a human to approve. So the injector asks git
-// first and SKIPS with a reason. Untracked is the contract; the file is then git-excluded like the
-// harness files beside it, so it can never travel into a commit either.
+// THE ROW IS THE SINGLE SOURCE (docs/entry-point-doc-source.md, Option B — decided). A tracked
+// entry-point path the row owns (this repo's committed CLAUDE.md) is SUPERSEDED, not protected: the
+// injector writes the generated copy over it, git-excludes it and skip-worktrees it so it can never
+// dirty a landing diff. That is the whole fix for "the generated CLAUDE.md never lands". An UNRELATED
+// tracked path — a file no row claims, like a project's own README.md — stays protected exactly as
+// before; lib/cxell.js owns the git decision and the caller (lib/queenzee/intake.js) names the
+// exemption. Editing the generated copy changes nothing: it is an artefact the next assignment
+// overwrites, and content changes go through the Docs tab / a ticket.
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { DEFAULT_TARGET_KEYS, resolveTargets, targetByKey } from './agent-docs.js';
@@ -275,7 +277,9 @@ export function docBanner(relPath, { reads = [], siblings = [] } = {}) {
     L.push('     They are copies of one text; editing them separately is how they drift apart.');
   }
   L.push('     Written into this xell when a zee was assigned to it, and rewritten whenever it changes.');
-  L.push('     Editing THIS copy changes nothing: it is git-excluded, lands in no diff, and is overwritten. -->');
+  L.push('     Editing THIS copy changes nothing: it is git-excluded, lands in no diff, and is overwritten.');
+  L.push('     To change what a zee reads, edit the source in the ZEEHIVE console (Project → Docs) or via a');
+  L.push('     ticket — never this file. -->');
   return L.join('\n');
 }
 
