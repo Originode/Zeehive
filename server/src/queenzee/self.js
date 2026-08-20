@@ -1781,6 +1781,9 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   try {
     out = await dispatchXell({
       task: brief, project: xell.project_id, title: title || null,
+      // A manager deploy is always FOR a card (itemless `zee dispatch` is refused above), and the
+      // assignment is deployWorkItem's — the prompt→work_node auto-cut must not double the card.
+      work_item_id: work_item_id || null,
       ...(provisioned?.id ? { xell_id: provisioned.id } : {}),
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),

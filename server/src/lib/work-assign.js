@@ -368,6 +368,9 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
     const { dispatchXell } = await import('../queenzee/intake.js');
     out = await dispatchXell({
       task: brief, project: full.project_id, title: title || full.title,
+      // THIS dispatch is already FOR a card — the assignment below is ours, so the prompt→work_node
+      // auto-cut (lib/prompt-work-node.js) must not cut a second one for the same job.
+      work_item_id: full.id,
       ...(model ? { model } : {}), ...(mode ? { mode } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
       ...(visual_verify ? { visual_verify: true } : {}),

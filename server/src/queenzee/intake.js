@@ -297,6 +297,13 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
                                      // said worker" are different inputs, and the old default made
                                      // them indistinguishable. See the effective-type block below.
                                      zee_type = null, manager_xell_id = null,
+                                     // THE PROMPT'S WORK_NODE (lib/prompt-work-node.js). work_item_id
+                                     // = this dispatch is already FOR a card (deployWorkItem /
+                                     // `zee assign`) — the caller assigns it, no card is cut here.
+                                     // parent_work_item = the honeycomb context the prompt was
+                                     // written under; the auto-cut card hangs beneath it (advisory —
+                                     // unknown/foreign falls back to the project root).
+                                     work_item_id = null, parent_work_item = null,
                                      // PER-XELL VISUAL VERIFICATION (opt-in at dispatch time): the human
                                      // asked this xell's zee to build the webapp and OFFER the live link
                                      // in the console. Stored on the xell so the binding and briefing can
@@ -566,9 +573,29 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
      VALUES ($1,$2,'dispatch','assigned',$3,$4, now())`,
     [projectId, taskText, spawned.xell_id, spawned.zee_id]);
 
+  // ── ANY NEW PROMPT IS A WORK_NODE (the honeycomb's work tree) ────────────────
+  // Every worker dispatch guarantees a card: the caller's own (work_item_id — the caller assigns it
+  // after this returns), the open card the target xell already carries (a swap/re-dispatch), or a
+  // fresh task item cut under parent_work_item — the honeycomb context the prompt was written from,
+  // default the project root. The item's dual-write is what creates the work_node, so the model and
+  // the annex stay in step. A MANAGER takes no card (it runs a crew; it is not a unit of work), and
+  // the cut is NON-FATAL by design: the zee is already running, so a card that could not be cut
+  // must never read back as a dispatch that failed.
+  let workItem = null;
+  if (effectiveType !== 'manager') {
+    try {
+      const { ensurePromptWorkItem } = await import('../lib/prompt-work-node.js');
+      workItem = await ensurePromptWorkItem({ projectId, xellId: spawned.xell_id,
+        workItemId: work_item_id, parentWorkItem: parent_work_item, title: from, prompt: task });
+    } catch (e) {
+      logline('intake', `no work_node could be cut for this prompt (dispatch unaffected): ${e.message}`);
+    }
+  }
+
   logline('intake', `dispatched a zee into ${xell?.slug} — confirmed working (${runtime || 'default runtime'}, mode ${m.key})`);
   return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path,
-           mode: m.key, mode_label: m.label, ...spawned };
+           mode: m.key, mode_label: m.label, ...spawned,
+           ...(workItem ? { work_item: workItem } : {}) };
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
