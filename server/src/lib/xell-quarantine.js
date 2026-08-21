@@ -14,6 +14,23 @@
 // UNCHANGED: a pause neither proves the cage healthy nor is it a death, and allowing it to reset the
 // streak would let a pause launder a death run.
 //
+// WHAT THE COUNTER READS FROM — and the blind-death audit beside it. `consecutive_deaths` is fed
+// ONLY through noteTurnDeath (revive.js), the classifier's choke point. That is deliberate: it is
+// the only signal whose RESET is tied to actual turn outcomes, and where the death policy already
+// lives. But it is not the whole truth, and saying "the cage has N deaths" off it alone would
+// UNDERCOUNT by exactly the paths that write status='errored' without ever reaching the classifier
+// (a separate defect — the headless stream catch, the headless spawn timeout, a cxell build/spawn
+// failure, a remote spawn failure, the langchain driver). Those are the ugly ones: a cage that dies
+// at SPAWN twice in a row is the precise case quarantine exists for. So the QUARANTINE TRIGGER is
+// the union of the classified streak and a ledger-derived BLIND count (xellBlindDeathCount): errored
+// exits since the last clean turn/unquarantine that have NO turn-death event — the only durable
+// record those paths leave. The card always says how many of its count were classified and how many
+// were seen only via the ledger, so the number never looks more complete than it is. Why not
+// recompute the whole streak from zee rows instead? A zee row hosts MANY turns (the revive ladder:
+// three deaths on one row), a swap retires only live-status zees, and revive_class_source is the
+// provenance of CLASSIFICATION, not a death ledger — the bypassed rows are source NULL, the same
+// value a healthy finish has. A recompute would trade a known undercount for a different, hidden one.
+//
 // THE THRESHOLD. QUARANTINE_AFTER_DEATHS = 2. One death is every-day provider weather (a 429 here,
 // a killed process there) and does not name the cage. Two in a row means the cage has now killed two
 // consecutive agents — the exact pattern of the incident — and the odds that a third will be different
@@ -92,7 +109,13 @@ export async function quarantineBrief(xellId) {
 
 // The human sentence a quarantined xell's tend carries: the count, what died, and — because the
 // card's whole point is "show what is unlanded before anyone reaps it" — what has and has not landed.
-export function quarantineTendReason({ slug, count, death = {}, reason = '', brief = null } = {}) {
+//
+// `classified` and `blind` name WHERE the deaths were seen, so the number never looks more complete
+// than it is (the counter's known limit): classified deaths went through the classifier's choke
+// point (noteTurnDeath); blind ones were errored exits the classifier never saw — counted only via
+// the ledger (zee_turn/zee status), which is all those paths leave. `count` is their sum, the thing
+// the threshold is judged on.
+export function quarantineTendReason({ slug, count, classified = count, blind = 0, death = {}, reason = '', brief = null } = {}) {
   const landed = brief?.landings?.count ?? 0;
   const d = brief?.diff;
   const unlanded = d
@@ -103,12 +126,104 @@ export function quarantineTendReason({ slug, count, death = {}, reason = '', bri
             : 'no unlanded diff against source (the work may already be landed)'))
     : 'unlanded work could NOT be measured (its cage/worktree is gone)';
   const diedOn = death.signal || death.kind || 'a turn death';
+  const provenance = blind > 0
+    ? ` (${classified} via the classifier, ${blind} seen only via the ledger — those deaths never reached the classifier)`
+    : ' (all via the classifier)';
   const quoted = String(reason || '').replace(/\s+/g, ' ').slice(0, 240);
-  return `${slug} is QUARANTINED after ${count} consecutive turn deaths (last: ${diedOn}). `
+  return `${slug} is QUARANTINED after ${count} consecutive turn deaths (last: ${diedOn})${provenance}. `
     + `What has NOT landed: ${landed} landing(s), ${unlanded}. `
     + `No new agent will be fed into it until a human decides — REAP it (worktree + branch deleted) or `
     + `RESCUE the branch (clear the quarantine, then re-dispatch).`
     + (quoted ? ` The last death said: "${quoted}".` : '');
+}
+
+// THE BLIND-DEATH AUDIT — the counter's other half (see the header).
+//
+// Where a death bypasses the classifier (noteTurnDeath), the classified streak cannot see it — and
+// a counter that read only noteTurnDeath would let a cage die at SPAWN twice in a row without ever
+// firing, the exact quarantine the incident demands. Those paths still leave durable records: an
+// errored zee_turn (intake.js's headless stream catch) or an errored zee with no turn at all (the
+// spawn/build/remote failures, the langchain driver). This counts those errored exits since the last
+// RESET POINT — a clean 'ended' turn, a 'none'-classified death, or a quarantine clear (all three
+// are exactly what resets the classified streak, so the two counters share one window and move
+// together). An exit that HAS a turn-death event is the classified streak's business; this counts
+// only the ones the classifier never saw, so the two never double-count.
+//
+// ⚠ THE SOURCE OF TRUTH FOR "THIS TURN DIED" IS `status='errored'` — the EXPLICIT death signal the
+// turn machinery writes (intake.js endTurn(status:'errored'), the zee row's status='errored'). It is
+// NEVER `ended_at IS NULL` or `status='started'` as a proxy for a bad ending. The live meta-DB leaks
+// OPEN zee_turn rows — 104 with ended_at IS NULL / status='started' as of 2026-08-21, most on
+// already-'retired' xells, some open for weeks — and that is PURE BOOKKEEPING RESIDUE, not death
+// evidence: a turn that never ended is not a turn that died. 'errored' is only ever written ON
+// PURPOSE, by the code that closed a turn on a death, so it is the one status no leak produces. Do
+// not "simplify" this query to count non-ended turns — it would quarantine healthy xells.
+//
+// `exceptZeeId` is the zee a death is CURRENTLY being classified for (noteTurnDeath → bump): its
+// errored rows already exist (intake writes them before the classifier runs) but its turn-death
+// event is not written yet, so without the exclusion the audit would count the in-flight death as
+// blind and double it into a premature quarantine. Excluding the whole zee is safe — a blind death
+// schedules no revive and ends the zee, so a zee being classified now hosts no earlier blind deaths
+// worth counting.
+//
+// NEVER THROWS, best-effort like the rest of this file.
+export async function xellBlindDeathCount(xellId, { exceptZeeId = null } = {}) {
+  if (!xellId) return { blind: 0, reset: null };
+  try {
+    const row = await one(`
+      WITH reset AS (
+        SELECT GREATEST(
+          COALESCE((SELECT MAX(t.ended_at) FROM zee_turn t WHERE t.xell_id = $1 AND t.status = 'ended'),
+                   '-infinity'::timestamptz),
+          COALESCE((SELECT MAX(se.ts) FROM session_event se
+                     WHERE se.xell_id = $1 AND se.hook_event_name = 'turn-death' AND se.stop_reason = 'none'),
+                   '-infinity'::timestamptz),
+          COALESCE((SELECT MAX(se.ts) FROM session_event se
+                     WHERE se.xell_id = $1 AND se.hook_event_name = 'tend-clear'
+                       AND se.raw->>'reason' ILIKE 'quarantine cleared%'),
+                   '-infinity'::timestamptz)
+        ) AS ts
+      )
+      SELECT
+        (SELECT count(*)::int FROM zee_turn t
+          WHERE t.xell_id = $1 AND t.status = 'errored' AND t.ended_at > (SELECT ts FROM reset)
+            AND t.zee_id IS DISTINCT FROM $2
+            AND NOT EXISTS (SELECT 1 FROM session_event se
+                             WHERE se.turn_id = t.id AND se.hook_event_name = 'turn-death'))
+        + (SELECT count(*)::int FROM zee z
+          WHERE z.xell_id = $1 AND z.status = 'errored' AND z.created_at > (SELECT ts FROM reset)
+            AND z.id IS DISTINCT FROM $2
+            AND NOT EXISTS (SELECT 1 FROM zee_turn t WHERE t.zee_id = z.id AND t.status = 'errored')
+            AND NOT EXISTS (SELECT 1 FROM session_event se
+                             WHERE se.zee_id = z.id AND se.hook_event_name = 'turn-death'))
+        AS blind,
+        (SELECT ts FROM reset) AS reset
+    `, [xellId, exceptZeeId || null]).catch(() => null);
+    return { blind: row?.blind || 0, reset: row?.reset || null };
+  } catch (e) {
+    logline('quarantine', `could not audit blind deaths for xell ${String(xellId).slice(0, 8)} `
+      + `(${String(e.message).slice(0, 140)})`);
+    return { blind: 0, reset: null };
+  }
+}
+
+// THE ONE place a quarantine actually gets STAMPED — the conditional UPDATE (quarantined_at IS
+// NULL) makes it a one-shot even if two writers race the same tick, and only the winner raises the
+// tend. Shared by bumpXellConsecutiveDeaths (a classified death crossed the threshold) and
+// quarantineFromBlindAudit (the pool sweep saw the cage die blindly). Never throws.
+async function stampQuarantine({ xellId, slug, count, classified = count, blind = 0,
+                                 death = {}, reason = '', source = 'turn' }) {
+  const brief = await quarantineBrief(xellId).catch(() => null);
+  const why = quarantineTendReason({ slug, count, classified, blind, death, reason, brief });
+  const stamped = await one(
+    `UPDATE xell SET quarantined_at = now(), quarantine_deaths = $2, quarantine_reason = $3
+      WHERE id = $1 AND quarantined_at IS NULL RETURNING id`, [xellId, count, why]).catch(() => null);
+  if (stamped) {
+    await setTend(xellId, true, { reason: why, source: 'queenzee' }).catch(() => {});
+    logline('quarantine', `${slug}: QUARANTINED after ${count} consecutive turn deaths `
+      + `(${death.signal || death.kind}${blind ? `, ${blind} via the ledger` : ''}) — a human must decide `
+      + `between rescue and reap: ${why}`);
+  }
+  return !!stamped;
 }
 
 // Called from noteTurnDeath (revive.js) the moment a turn death is filed. Best-effort and NEVER
@@ -117,7 +232,13 @@ export function quarantineTendReason({ slug, count, death = {}, reason = '', bri
 //
 // When the streak crosses the threshold it ALSO stamps the quarantine columns and raises the tend —
 // so the caller does not need to remember that a crossing is a quarantine; bump IS the quarantine.
-export async function bumpXellConsecutiveDeaths({ xellId, death = {}, reason = '', source = 'turn' } = {}) {
+// The threshold is judged on the UNION of the classified streak and the blind audit: a cage with
+// one classified death and one blind death has killed two agents even though the classifier only
+// saw one of them.
+// `zeeId` is the zee whose death is being filed — passed through as the audit's exceptZeeId so the
+// in-flight death (already written 'errored' by intake, but its turn-death event not yet recorded)
+// is not double-counted as a blind death.
+export async function bumpXellConsecutiveDeaths({ xellId, zeeId = null, death = {}, reason = '', source = 'turn' } = {}) {
   if (!xellId) return { count: 0, quarantined: false, already: false, slug: null };
   try {
     const row = await one(
@@ -125,10 +246,13 @@ export async function bumpXellConsecutiveDeaths({ xellId, death = {}, reason = '
         WHERE id = $1
         RETURNING consecutive_deaths, quarantined_at, quarantine_deaths, slug`, [xellId]);
     if (!row) return { count: 0, quarantined: false, already: false, slug: null };
-    const { quarantine, count } = decideXellQuarantine({ consecutive_deaths: row.consecutive_deaths });
+    const { blind } = await xellBlindDeathCount(xellId, { exceptZeeId: zeeId });
+    const count = row.consecutive_deaths + blind;
+    const { quarantine } = decideXellQuarantine({ consecutive_deaths: count });
     if (!quarantine) {
-      logline('quarantine', `${row.slug}: turn death #${count} (${death.signal || death.kind}) — `
-        + `${QUARANTINE_AFTER_DEATHS - count} more before the cage is quarantined`);
+      logline('quarantine', `${row.slug}: turn death #${row.consecutive_deaths} (${death.signal || death.kind})`
+        + (blind ? ` + ${blind} blind via the ledger` : '')
+        + ` — ${Math.max(QUARANTINE_AFTER_DEATHS - count, 0)} more before the cage is quarantined`);
       return { count, quarantined: false, already: false, slug: row.slug };
     }
     // Already quarantined: a late death (a resumed turn dying after the threshold) updates the count
@@ -137,23 +261,44 @@ export async function bumpXellConsecutiveDeaths({ xellId, death = {}, reason = '
       logline('quarantine', `${row.slug}: turn death #${count} (${death.signal || death.kind}) — already QUARANTINED`);
       return { count, quarantined: true, already: true, slug: row.slug };
     }
-    const brief = await quarantineBrief(xellId).catch(() => null);
-    const why = quarantineTendReason({ slug: row.slug, count, death, reason, brief });
-    // The conditional stamp (quarantined_at IS NULL) makes the quarantine a one-shot even if two
-    // deaths race the same tick; only the winner raises the tend.
-    const stamped = await one(
-      `UPDATE xell SET quarantined_at = now(), quarantine_deaths = $2, quarantine_reason = $3
-        WHERE id = $1 AND quarantined_at IS NULL RETURNING id`, [xellId, count, why]).catch(() => null);
-    if (stamped) {
-      await setTend(xellId, true, { reason: why, source: 'queenzee' }).catch(() => {});
-      logline('quarantine', `${row.slug}: QUARANTINED after ${count} consecutive turn deaths `
-        + `(${death.signal || death.kind}) — a human must decide between rescue and reap: ${why}`);
-    }
-    return { count, quarantined: true, already: false, slug: row.slug };
+    const stamped = await stampQuarantine({ xellId, slug: row.slug, count,
+      classified: row.consecutive_deaths, blind, death, reason, source });
+    return { count, quarantined: stamped || true, already: false, slug: row.slug };
   } catch (e) {
     logline('quarantine', `could not bump consecutive deaths for xell ${String(xellId).slice(0, 8)} `
       + `(${String(e.message).slice(0, 140)})`);
     return { count: 0, quarantined: false, already: false, slug: null };
+  }
+}
+
+// THE ALL-BLIND ARM — the pool sweep calls this on the xells it can see (the ready list), because a
+// cage that dies at SPAWN twice in a row is released back to 'ready' and the classified streak never
+// moves for it: noteTurnDeath is never called on those paths. This is what makes "a quarantine that
+// silently never fires" impossible — it sums the classified streak with the blind audit and stamps
+// the quarantine when the union crosses the threshold. A quarantined xell is left alone (already).
+// Returns { quarantine, count, blind, already, slug }.
+export async function quarantineFromBlindAudit(xellId) {
+  if (!xellId) return { quarantine: false, count: 0, blind: 0, already: false, slug: null };
+  try {
+    const row = await one(
+      `SELECT slug, consecutive_deaths, quarantined_at FROM xell WHERE id=$1`, [xellId]);
+    if (!row) return { quarantine: false, count: 0, blind: 0, already: false, slug: null };
+    if (row.quarantined_at) return { quarantine: true, count: 0, blind: 0, already: true, slug: row.slug };
+    const { blind } = await xellBlindDeathCount(xellId);
+    const classified = row.consecutive_deaths || 0;
+    const count = classified + blind;
+    if (!decideXellQuarantine({ consecutive_deaths: count }).quarantine) {
+      return { quarantine: false, count, blind, already: false, slug: row.slug };
+    }
+    const stamped = await stampQuarantine({ xellId, slug: row.slug, count, classified, blind,
+      death: { signal: 'ledger', kind: 'unknown' },
+      reason: `repeated errored exits that never reached the turn-death classifier — seen only via `
+              + `the zee/zee_turn ledger`, source: 'pool' });
+    return { quarantine: stamped || true, count, blind, already: false, slug: row.slug };
+  } catch (e) {
+    logline('quarantine', `could not quarantine from the blind-death audit for xell `
+      + `${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 140)})`);
+    return { quarantine: false, count: 0, blind: 0, already: false, slug: null };
   }
 }
 
@@ -202,4 +347,5 @@ export async function clearXellQuarantine(xellId, { by = 'human@console' } = {})
 export default {
   QUARANTINE_AFTER_DEATHS, decideXellQuarantine, xellQuarantineRefusal, quarantineBrief,
   quarantineTendReason, bumpXellConsecutiveDeaths, resetXellConsecutiveDeaths, clearXellQuarantine,
+  xellBlindDeathCount, quarantineFromBlindAudit,
 };

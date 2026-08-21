@@ -154,7 +154,7 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     // is the same either way.)
     const xellQ = notADeath
       ? await resetXellConsecutiveDeaths(zee.xell_id)
-      : await bumpXellConsecutiveDeaths({ xellId: zee.xell_id, death, reason: scrubbedReason, source });
+      : await bumpXellConsecutiveDeaths({ xellId: zee.xell_id, zeeId: zee.id, death, reason: scrubbedReason, source });
     const xellQuarantined = !!xellQ?.quarantined;
 
     // AUTH-TERMINAL → quarantine the account this zee ran on (ticket #50). Happens BEFORE the tend

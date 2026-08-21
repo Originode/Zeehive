@@ -168,6 +168,120 @@ try {
   ok(again.ok === true && again.was_quarantined === false,
      'clearing a clean xell is an idempotent no-op — a stale console button never 409s');
 
+  // ── F. the BLIND-DEATH AUDIT — the counter's other half ─────────────────────────────────────
+  // The classifier is not the whole truth: paths that write status='errored' without ever calling
+  // noteTurnDeath (a spawn/build failure, the headless stream catch, the langchain driver) would
+  // otherwise let a cage die twice at SPAWN with no quarantine ever firing. Those paths leave
+  // durable records — an errored zee_turn, or an errored zee with no turn at all — and the audit
+  // counts exactly those, since the last RESET POINT, excluding anything the classifier HAS seen.
+  console.log('\n── F. the blind-death audit: errored exits the classifier never saw ──');
+  const {
+    xellBlindDeathCount, quarantineFromBlindAudit,
+  } = await import('../server/src/lib/xell-quarantine.js');
+
+  const xB = await mkXell('xq-blind');
+  const a0 = await xellBlindDeathCount(xB.id);
+  ok(a0.blind === 0, 'a fresh xell has no blind deaths');
+
+  // A BLIND death: an errored zee_turn with NO turn-death event (the headless stream catch shape).
+  const zB = await mkZee(xB.id);
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','errored', now())`, [zB.id, xB.id]);
+  const a1 = await xellBlindDeathCount(xB.id);
+  ok(a1.blind === 1, 'one errored turn with no turn-death event reads as one blind death');
+  ok((await xellRow(xB.id)).consecutive_deaths === 0,
+     'but the CLASSIFIED streak has not moved — the audit is separate');
+
+  // A leak (the manager\'s measurement): an OPEN 'started' turn is bookkeeping residue, NOT a death.
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','started', NULL)`, [zB.id, xB.id]);
+  const a2 = await xellBlindDeathCount(xB.id);
+  ok(a2.blind === 1, 'an open \'started\' turn (ended_at NULL) is NOT counted as a death — the leak is excluded');
+
+  // A zee row that is errored with NO errored turn is also a blind death (a spawn failure shape).
+  const zB2 = await mkZee(xB.id);
+  const a3 = await xellBlindDeathCount(xB.id);
+  ok(a3.blind === 2, 'an errored zee with no errored turn counts as a second blind death');
+
+  // A death the CLASSIFIER has seen must not be double-counted as blind: give zB2 a turn-death event.
+  await q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id)
+            VALUES ('queenzee','turn-death',$1,$2)`, [zB2.id, xB.id]);
+  const a4 = await xellBlindDeathCount(xB.id);
+  ok(a4.blind === 1, 'a zee with a turn-death event is the classified streak\'s business, not the audit\'s');
+
+  // A CLEAN 'ended' turn is a RESET POINT: everything errored before it is not "consecutive" anymore.
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','ended', now())`, [zB.id, xB.id]);
+  const a5 = await xellBlindDeathCount(xB.id);
+  ok(a5.blind === 0 && !!a5.reset, 'a clean \'ended\' turn resets the blind window — consecutive means after the last clean turn');
+
+  // ── G. the UNION fires the quarantine — the pool sweep catches an all-blind cage ────────────
+  console.log('\n── G. the union: classified + blind cross the threshold together ──');
+  const xU = await mkXell('xq-union');
+  // ONE classified death (noteTurnDeath) …
+  const u1 = await die(xU.id);
+  ok(u1.xell_quarantined === false && (await xellRow(xU.id)).consecutive_deaths === 1,
+     'one classified death alone does not fire');
+  // …plus ONE blind death (errored turn the classifier never saw) = the SECOND consecutive death.
+  const zU = await mkZee(xU.id);
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','errored', now())`, [zU.id, xU.id]);
+  const g = await quarantineFromBlindAudit(xU.id);
+  ok(g.quarantine === true && g.count === 2 && g.blind === 1,
+     'a classified death + a blind death fire the quarantine (count 2, 1 blind)');
+  const ux = await xellRow(xU.id);
+  ok(!!ux.quarantined_at && ux.quarantine_deaths === 2,
+     'the pool-sweep arm stamps the quarantine like any other');
+  ok(/seen only via the ledger/.test(ux.quarantine_reason || ''),
+     'and the card says the deaths came via the ledger, not the classifier');
+  ok(/1 via the classifier, 1 seen only via the ledger/.test(ux.quarantine_reason || ''),
+     'and it names the provenance split so the number never looks more complete than it is');
+
+  // The audit does not re-stamp an ALREADY-quarantined xell.
+  const g2 = await quarantineFromBlindAudit(xU.id);
+  ok(g2.already === true && g2.quarantine === true,
+     'the audit leaves an already-quarantined xell alone (already)');
+
+  // A cage that dies at spawn twice (TWO blind, no classified) fires via the audit too.
+  const xB2 = await mkXell('xq-blind2');
+  const z1 = await mkZee(xB2.id);
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','errored', now())`, [z1.id, xB2.id]);
+  const z2 = await mkZee(xB2.id);
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','errored', now())`, [z2.id, xB2.id]);
+  const b2 = await quarantineFromBlindAudit(xB2.id);
+  ok(b2.quarantine === true && b2.blind === 2,
+     'two blind spawn deaths — the case the classifier can never see — DO fire the quarantine');
+
+  // ── H. in-flight classification is not double-counted (the exceptZeeId guard) ───────────────
+  console.log('\n── H. a death being classified right now is not double-counted ──');
+  // Simulate intake writing 'errored' before noteTurnDeath runs: the zee has an errored turn but
+  // NO turn-death event YET. bumpXellConsecutiveDeaths must not count it as blind.
+  const xE = await mkXell('xq-except');
+  const zE = await mkZee(xE.id);
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','errored', now())`, [zE.id, xE.id]);
+  const f = await revive.noteTurnDeath({ zeeId: zE.id, xellId: xE.id,
+    slug: (await xellRow(xE.id)).slug, reason: DEATH, source: 'turn' });
+  ok(f.xell_quarantined === false && (await xellRow(xE.id)).consecutive_deaths === 1,
+     'a single classified death with a pre-existing errored turn does not fire (the in-flight zee is excluded)');
+  const eBlind = await xellBlindDeathCount(xE.id, { exceptZeeId: zE.id });
+  ok(eBlind.blind === 0, 'and after the fact, the classified zee reads as zero blind deaths');
+
+  // And the production union path: a SECOND classified death landing on a xell that already carries
+  // a blind death fires BUMP itself (classified streak 2 + 1 blind = 3) — the audit is not the only
+  // door. The first classified zee now has its turn-death event, so it is the audit's exclusion, not
+  // a blind death; the new blind zee is the one the union is judged on.
+  const zEbl = await mkZee(xE.id);
+  await q(`INSERT INTO zee_turn (zee_id, xell_id, kind, status, ended_at)
+            VALUES ($1,$2,'spawn','errored', now())`, [zEbl.id, xE.id]);
+  const f2 = await revive.noteTurnDeath({ zeeId: (await mkZee(xE.id)).id, xellId: xE.id,
+    slug: (await xellRow(xE.id)).slug, reason: DEATH, source: 'turn' });
+  ok(f2.xell_quarantined === true, 'a classified death on a xell that already has a blind death FIRES bump itself');
+  ok((await xellRow(xE.id)).consecutive_deaths === 2 && !! (await xellRow(xE.id)).quarantined_at,
+     'the classified streak is 2 and the xell is stamped');
+
 } finally {
   await cleanup();
   await pool.end().catch(() => {});

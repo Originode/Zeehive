@@ -34,6 +34,7 @@ import { poolMachines, implicitPoolMachine, liveXellCount, machinePoolSize, quee
 import { reapXell } from './reaper.js';
 import { reconcileXell } from './landing.js';
 import { takeReadyXellForSweep, untakeSweptXell, explainSweepSkip, currentXells } from '../lib/xell-claim.js';
+import { quarantineFromBlindAudit } from '../lib/xell-quarantine.js';
 import { logline } from '../lib/logbus.js';
 import { spawnPrepFor, bakesImage } from '../lib/spawn-prep.js';
 import { ensurePreppedImage } from '../lib/cxell.js';
@@ -118,6 +119,16 @@ async function reconcileProject(projectId, target) {
            AND quarantined_at IS NULL
          ORDER BY ready_at DESC NULLS LAST, created_at DESC LIMIT 25`, [projectId]);
     for (const x of pooled) {
+      // THE BLIND-DEATH AUDIT (ticket #81, part two). A cage that dies at SPAWN twice in a row is
+      // released back to 'ready' and never reaches noteTurnDeath, so the CLASSIFIED streak cannot
+      // move for it — and a quarantine that never fires is worse than none (a trusted guard that
+      // silently does nothing). The pool owns the ready list, so the pool is where the ledger-only
+      // half of the count is collected: sum the classified streak with the errored exits the
+      // classifier never saw and stamp the quarantine when the union crosses the threshold. Already-
+      // quarantined xells are excluded from this SELECT (quarantined_at IS NULL above); one that
+      // quiesces between audit and stamp is handled by the conditional stamp inside.
+      const audit = await quarantineFromBlindAudit(x.id).catch(() => null);
+      if (audit?.quarantine) continue; // the quarantine card is up — this xell is a human's call now
       const { verdict, res } = await reconcileXell(x, src);
       if (verdict === 'decommission') {
         await sweepDecommission(x, `stale:${res?.reason || 'drift'}`,
