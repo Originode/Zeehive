@@ -23,6 +23,15 @@ import {
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
 
+// Cap for container.last_build_error — same ceiling runBuild already keeps in memory. A tooltip and
+// a zee --wait print both need the reason; neither needs the full docker scrollback. Exported so
+// the test can assert the contract without standing up a build.
+export function formatBuildFailure(err, fallback = 'see docker output') {
+  const text = String(err ?? '').trim();
+  if (!text) return fallback;
+  return text.length > 1500 ? text.slice(-1500) : text;
+}
+
 // The registry a split build hands its image through: the project's own, else the global default.
 // null when neither is set → split builds are simply unavailable (validated where build_ctx is set).
 async function registryFor(projectId) {
@@ -166,7 +175,11 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     BUILD_IMAGE: c.image_tag,
   };
 
-  const building = await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING *`, [containerId]);
+  // Clear any prior failure when a fresh build starts — the chip must not keep showing a stale
+  // reason under a spinner, and a success later clears it again explicitly.
+  const building = await one(
+    `UPDATE container SET health='building', last_build_error=NULL WHERE id=$1 RETURNING *`,
+    [containerId]);
   broadcast('container', building);
   const where = target.buildCtx !== target.runCtx ? ` — compiling on ${target.buildCtx} → run on ${target.runCtx}` : '';
   logline('build', `${hot ? 'HOT ' : ''}build started: ${c.name} (${MODE}) from ${xell.slug}${where}`);
@@ -175,17 +188,19 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   (async () => {
     const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded });
     const ok = !!json && json.ok !== false;
+    const failReason = ok ? null : formatBuildFailure(err);
     const row = await one(
       `UPDATE container
           SET health = $2::container_health, hot_build = $3,
               last_build_commit = COALESCE($4, last_build_commit),
-              last_built_at = CASE WHEN $5 THEN now() ELSE last_built_at END
+              last_built_at = CASE WHEN $5 THEN now() ELSE last_built_at END,
+              last_build_error = $6
         WHERE id=$1 RETURNING *`,
-      [containerId, ok ? 'up' : 'down', !!hot && ok, json?.head && json.head !== 'unknown' ? json.head : null, ok]);
+      [containerId, ok ? 'up' : 'down', !!hot && ok, json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason]);
     broadcast('container', row);
     logline('build', ok
       ? `${hot ? 'HOT ' : ''}build OK: ${c.name} @ ${json?.head} (${json?.method})`
-      : `build FAILED: ${c.name} — ${(err || 'see docker output').split('\n').filter(Boolean).pop()}`);
+      : `build FAILED: ${c.name} — ${(failReason || 'see docker output').split('\n').filter(Boolean).pop()}`);
   })().catch(async (e) => {
     // The ONLY thing that can move this row off 'building' is this callback — the health monitor
     // deliberately skips 'building' so it can't clobber a live build. So an unhandled throw in
@@ -193,11 +208,16 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     // see the note in index.js; that exact blip has already taken this orchestrator down once)
     // strands the container at 'building' FOREVER, spinner and all, with no build behind it.
     // Land it on a terminal state and say so, rather than leave a permanent lie on the chip.
+    // Persist the thrown message too — the catch used to mark down with NO reason on the row.
+    const failReason = formatBuildFailure(e?.message || e, 'build errored');
     try {
-      const row = await one(`UPDATE container SET health='down' WHERE id=$1 AND health='building' RETURNING *`, [containerId]);
+      const row = await one(
+        `UPDATE container SET health='down', last_build_error=$2
+          WHERE id=$1 AND health='building' RETURNING *`,
+        [containerId, failReason]);
       if (row) broadcast('container', row);
     } catch { /* the DB is what failed — the boot-time recoverOrphanBuilds() is the backstop */ }
-    logline('build', `build ERRORED: ${c.name} — ${e?.message || e} (marked down; rebuild when ready)`);
+    logline('build', `build ERRORED: ${c.name} — ${failReason} (marked down; rebuild when ready)`);
   });
 
   return { status: 'building', container: c.name, role: c.role, hot, mode: MODE };
@@ -231,7 +251,7 @@ function startProcessRole(c, xell, project) {
     const reachHost = processRoleReachableHost();
     const reachUrl = processRolePublishedUrl(c.host_port);
     const building = await one(
-      `UPDATE container SET health='building', host=$2, url=$3 WHERE id=$1 RETURNING *`,
+      `UPDATE container SET health='building', host=$2, url=$3, last_build_error=NULL WHERE id=$1 RETURNING *`,
       [c.id, reachHost, reachUrl]);
     broadcast('container', building);
     logline('build', `process start: ${c.name} (${MODE}) — "${startCmd}" in ${xell.slug} @ ${reachHost}:${c.host_port}`);
@@ -256,25 +276,33 @@ function startProcessRole(c, xell, project) {
         p.on('error', (e) => res({ json: null, err: String(e.message) }));
       });
       const ok = !!json && json.ok !== false;
+      const failReason = ok ? null : formatBuildFailure(
+        err || json?.method, 'see .zeehive log');
       const row = await one(
         `UPDATE container
             SET health = $2::container_health, hot_build = false,
                 last_build_commit = COALESCE($3, last_build_commit),
-                last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END
+                last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END,
+                last_build_error = $5
           WHERE id=$1 RETURNING *`,
-        [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok]);
+        [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason]);
       broadcast('container', row);
       logline('build', ok
         ? `process UP: ${c.name} @ ${json?.head} (${json?.method})`
-        : `process start FAILED: ${c.name} — ${(err || '').split('\n').filter(Boolean).pop() || json?.method || 'see .zeehive log'}`);
+        : `process start FAILED: ${c.name} — ${(failReason || 'see .zeehive log').split('\n').filter(Boolean).pop()}`);
     })().catch(async (e) => {
       // Same stranded-'building' hazard as the docker path: this callback is the only thing that
-      // can move the row off 'building', so it must always land somewhere terminal.
+      // can move the row off 'building', so it must always land somewhere terminal. Persist the
+      // thrown message — same contract as the docker catch (ticket #173).
+      const failReason = formatBuildFailure(e?.message || e, 'process start errored');
       try {
-        const row = await one(`UPDATE container SET health='down' WHERE id=$1 AND health='building' RETURNING *`, [c.id]);
+        const row = await one(
+          `UPDATE container SET health='down', last_build_error=$2
+            WHERE id=$1 AND health='building' RETURNING *`,
+          [c.id, failReason]);
         if (row) broadcast('container', row);
       } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
-      logline('build', `process start ERRORED: ${c.name} — ${e?.message || e} (marked down; hammer again when ready)`);
+      logline('build', `process start ERRORED: ${c.name} — ${failReason} (marked down; hammer again when ready)`);
     });
 
     return { status: 'building', container: c.name, role: c.role, hot: false, mode: MODE, runner: 'process' };
@@ -302,7 +330,7 @@ export async function getBuildStatus(xellId) {
 
   const cs = await q(
     `SELECT c.id, c.name, c.role, c.health, c.last_build_commit, c.last_built_at, c.hot_build,
-            c.docker_ctx, c.build_ctx, c.project_id, c.url, c.host, c.host_port
+            c.last_build_error, c.docker_ctx, c.build_ctx, c.project_id, c.url, c.host, c.host_port
        FROM container c WHERE c.owner_xell_id=$1 AND c.role = ANY($2) ORDER BY c.role`,
     [xellId, [...BUILDABLE]]);
 
