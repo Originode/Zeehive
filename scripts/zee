@@ -1053,6 +1053,7 @@ switch (cmd) {
           + ` · +${c.diff.insertions}/−${c.diff.deletions} in ${c.diff.files} file(s) (read from its ${c.diff.source})`
         : 'not measurable (no worktree on disk and no live cxell) — do NOT read that as "produced nothing"'}`);
       if (c.waiting_on_human?.length) console.log(`      ⚠ waiting: ${c.waiting_on_human.join('; ')}`);
+      if (c.done_held) console.log(`      ✓ done HELD (approved ${c.done_held_reason ? `— ${c.done_held_reason}` : ''})`);
       if (c.last_message) console.log(`      last message: ${c.last_message.replace(/\s+/g, ' ').slice(0, 120)}`);
     }
     if (j.message) console.log(`\n${j.message}`);

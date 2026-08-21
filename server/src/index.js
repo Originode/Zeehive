@@ -11,6 +11,7 @@ import { startContextReconcile } from './queenzee/context-reconcile-loop.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { startWorkSync } from './queenzee/worksync.js';
+import { startHeldDoneReaper } from './queenzee/done-held.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
@@ -238,6 +239,10 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // hive status (worksync.js). It only ever moves a card BETWEEN the in-flight statuses — finishing
   // is a human's decision, never a tick's.
   startWorkSync();
+  // A done approval that landed mid-turn is HELD ('approved-held') and applied here the moment the
+  // turn ends — without it a finished xell holds its slot (containers + db) until a human notices
+  // (ticket #75). Small and independent: a bad tick never touches another loop.
+  startHeldDoneReaper();
   startHarnessBridge();
 });
 // THE LLM GATEWAY — the transparent LiteLLM-style door every cxell CLI points its base URL at.
