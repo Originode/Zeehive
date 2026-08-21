@@ -116,13 +116,27 @@ try {
      'the manager is told ONCE at hold time — "the decision is HELD" (1 message, not per retry)');
 
   // ── 2. a re-check while the turn is still in flight stays HELD ─────────────
+  // This is the manager's live repro (message 16:41): a manager speaking to a finished zee RESUMES it
+  // (idle → working, TKT-57), so the teardown reads 'working' and the ACTIVE guard refuses. The held
+  // intent must survive that flicker — for as long as ANYONE speaks to it — and apply the moment the
+  // turn actually ends. Not a single retry: PERSIST until it executes or a human withdraws it.
   console.log('\n── still mid-turn: the reaper holds ──');
+  // Deliver the resume itself: a manager's message is what flips a finished zee back to working.
+  await client.query(
+    `INSERT INTO zee_message (project_id, from_xell_id, to_xell_id, body, kind, delivered)
+       VALUES ($1,$2,$3,'status check?','message',true)`, [PID, mgr.id, busy.id]);
   const stillTick = await heldDoneTick();
   ok(stillTick.scanned === 1 && stillTick.applied === 0,
      `a sweep while the turn is in flight scans it and applies nothing (scanned=${stillTick.scanned}, applied=${stillTick.applied})`);
   ok((await rowOf(sug.suggestion.id)).status === 'approved-held',
-     'the row is STILL approved-held — the refusal is kept, no live turn torn down');
+     'the row is STILL approved-held after the resume — the intent was NOT lost');
+  ok((await rowOf(sug.suggestion.id)).decided_by === 'test@human',
+     '…and the approver survives the flicker (the decision was not reverted or dropped)');
   ok(await xellStatus(busy.id) === 'working', 'the worker is untouched and still working');
+  // A SECOND flicker — the xell bounces idle→working→working: still held, still not lost.
+  const stillTick2 = await heldDoneTick();
+  ok(stillTick2.applied === 0 && (await rowOf(sug.suggestion.id)).status === 'approved-held',
+     'a second sweep over the resumed turn also holds — the intent PERSISTS across flickers');
   const boxAfterHoldTick = await inboxFor(mgr.id);
   ok(boxAfterHoldTick.length === 0, 'and NO new message from the re-check — told once at hold time, not per tick');
 
@@ -135,6 +149,8 @@ try {
   const doneRow = await rowOf(sug.suggestion.id);
   ok(doneRow.status === 'approved' && doneRow.result?.ok === true,
      'the row is finalized approved with the apply result recorded');
+  ok(doneRow.result?.applied_by === 'reaper@queenzee' && doneRow.decided_by === 'test@human',
+     '…applied AUTOMATICALLY by the reaper — nobody re-approved; the human approved exactly once');
   ok(await xellStatus(busy.id) === 'retired', 'the xell is actually retired');
   ok((await client.query(`SELECT status FROM task WHERE xell_id=$1`, [busy.id])).rows[0].status === 'done',
      'and its task is marked done');
