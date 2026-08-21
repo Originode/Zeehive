@@ -18,7 +18,7 @@
 // the same way, so a prompt that hands the zee an image path can actually Read it. Work products
 // stay in the container until collected (exportCxellDiff) — landing them is the human-gated step.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -34,6 +34,7 @@ import { prepUserScript, prepRootScript, parsePrepSteps, summarizePrepSteps,
          hasAptStep, normalizeSpawnPrep, preppedImageTag, preppedDockerfile,
          templateHash, bakesImage } from './spawn-prep.js';
 import { classifyMergeOutput } from '../queenzee/xellgit.js';
+import { clearStaleIndexLock } from './index-lock.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
 // ghcr — matching the CXELL_IMAGE the self-ship scripts already honor for their rebuild.
@@ -1547,32 +1548,9 @@ export async function exportCxellDiff({ ctx, name, toDir }) {
   return out;
 }
 
-// A git index.lock older than this is STALE — no live git op holds one this long (a lock lives for
-// the duration of a single index-touching command: merge/stash/commit/…, seconds at most). A
-// crashed or killed process leaves one behind forever, and every later index-touching command then
-// dies with "Unable to create '.../index.lock': File exists". The 5-minute margin is generous
-// enough that a genuinely live op is never mistaken for a stale lock.
-const STALE_INDEX_LOCK_MS = 5 * 60 * 1000;
-
-// If a STALE index.lock exists in the worktree admin dir (for a linked worktree that is
-// <repo>/.git/worktrees/<name>, which is exactly where every `git -C <worktree>` index-touching
-// command looks for it), remove it and log the FULL path so `zee ops --alerts` finally names the
-// file. Returns true when a lock was removed. A FRESH lock is NEVER deleted — a live git process
-// may be holding it; the caller then fails exactly as today.
-function clearStaleIndexLock(adminDir, slug) {
-  const lockPath = join(adminDir, 'index.lock');
-  let st;
-  try { st = statSync(lockPath); } catch { return false; }
-  if (Date.now() - st.mtimeMs < STALE_INDEX_LOCK_MS) return false;
-  try {
-    rmSync(lockPath, { force: true });
-    logline('cxell', `${slug}: cleared a STALE index.lock at ${lockPath} `
-      + `(${Math.round((Date.now() - st.mtimeMs) / 1000)}s old) so the collect could retry`);
-    return true;
-  } catch {
-    return false;
-  }
-}
+// The stale-index.lock safety rule (threshold + clear-if-stale) is shared with the catch-up path
+// in xellgit.js — it lives in lib/index-lock.js, once, so the two can never drift on "when is it
+// safe to delete a lock". clearStaleIndexLock is imported at the top of this module.
 
 // COLLECT the cxell's commits onto its HOST worktree so they can be landed through the normal gate.
 // This is the missing piece for a cxell zee: its work is committed INSIDE the container, but the
