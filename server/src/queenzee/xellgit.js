@@ -236,7 +236,7 @@ export async function pushToXource(xellId, by = 'human@console', { mode = PROVIS
 
   logline('landgate', `${by} pushed ${x.slug} → ${ref}`);
   // the honeycomb's xell→queenzee line: this xell pushed to the xource
-  activity('x2q', x.id, 'push');
+  activity('x2q', x.id, 'push', x.project_id);
   // ASYNC push (see gitAsyncPush): this is the call whose `update` hook curls back into this server,
   // so a synchronous push self-deadlocks and the gate raises nothing.
   const r = await gitAsyncPush(x.worktree_path, ['push', '.', `HEAD:${fullRef}`]);
