@@ -119,6 +119,42 @@ async function resolveShipCommit(project, shipSite, main) {
   return { commit, migrations: mig.pending || [], bootMigrations: boot };
 }
 
+// Is the diff between what prod currently RUNS and this ship's candidate commit docs-only?
+// The auto-approve policy uses this so a docs-only landing does not restart the live
+// orchestrator for a payload that is not even in the prod images (neither Dockerfile.server
+// nor Dockerfile.web copies docs/). A human can still ship such a request manually — this
+// only stops POLICY from auto-approving it.
+//
+// THE DIRECTION OF SAFETY. The dangerous failure is NOT a needless restart, it is a REAL
+// change misread as docs-only and never deployed. So this predicate is conservative in one
+// direction only:
+//   - SKIP (return true) only when the changed-path set is non-empty AND every path in it is
+//     under docs/. A docs-only restart is cheap; an undeployed fix is not.
+//   - Every uncomputable case — no deployed sha yet, containers at DIFFERENT deployed shas, a
+//     git failure/timeout, an empty result — returns false, so the existing auto-approve runs
+//     unchanged. Do NOT "simplify" this into a symmetric check.
+async function docsOnlySinceDeployed(project, commit, { targets = SHIPPABLE } = {}) {
+  const deployed = await q(
+    `SELECT DISTINCT c.last_build_commit FROM container c
+      WHERE c.project_id=$1 AND c.tier='prod' AND c.role = ANY($2)
+        AND c.build_script IS NOT NULL AND c.last_build_commit IS NOT NULL`,
+    [project.id, targets]);
+  // no deployed sha yet → cannot know what changed → do NOT skip
+  if (!deployed.length) return false;
+  // containers at different deployed shas → the diff is ambiguous → do NOT skip
+  if (deployed.length > 1) return false;
+
+  const from = deployed[0].last_build_commit;
+  const r = spawnSync('git', ['-C', project.repo_root, 'diff', '--name-only', '-z', from, commit],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+  // git failed / timed out → cannot know → do NOT skip
+  if (r.status !== 0) return false;
+  const paths = r.stdout.split('\0').filter(Boolean);
+  // empty diff (deployed == candidate) → nothing to skip on → do NOT skip
+  if (!paths.length) return false;
+  return paths.every((p) => p === 'docs' || p.startsWith('docs/'));
+}
+
 // ── the zee's only prod verb ─────────────────────────────────────────────────
 // skipDb: the zee scoped this ship to CODE ONLY — runShip will NOT apply pending migration/ops
 // files (recorded on the row; the human approves the scope with the click, the results show the
@@ -220,7 +256,22 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // no human in the loop. Still goes through the SAME decideShip → runShip path (lock, build from
   // main, countdown) — nothing about the deploy itself is bypassed, only the human decision. The
   // landed-work refusal above still applies, so an unlanded ship is refused even under auto-approve.
+  //
+  // One deliberate exception: if the diff from what prod already RUNS to this candidate touches
+  // only docs/**, the auto-approve does NOT fire — the prod images do not copy docs/, so the ship
+  // would only restart the live orchestrator for nothing. The request stays pending; a human can
+  // still ship it manually. The skip is said out loud in the note and the ship log, never silent.
   if (project.auto_approve_ship) {
+    if (await docsOnlySinceDeployed(project, commit, { targets: t })) {
+      logline('ship', `auto-ship SKIPPED for ${xell.slug} @ ${String(commit).slice(0, 8)}`
+        + `${shipSite ? ` → site ${shipSite.key}` : ''} — the diff from the deployed build touches `
+        + `only docs/**, which neither prod image copies; the request is left pending for a human to `
+        + `ship manually`);
+      return { ok: true, request: row,
+        note: 'auto-ship skipped — the diff since the deployed build touches only docs/**, which the '
+          + 'prod images do not copy, so this ship would only restart prod with no code change. The '
+          + 'request is left pending for a human to ship manually.' };
+    }
     logline('ship', `AUTO-APPROVING ship from ${xell.slug} @ ${String(commit).slice(0, 8)}`
       + `${shipSite ? ` → site ${shipSite.key}` : ''} — auto-approve policy (no human review)`);
     const approved = await decideShip(row.id, 'approved', 'auto-approve@policy');
