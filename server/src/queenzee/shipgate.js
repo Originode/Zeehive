@@ -214,7 +214,7 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   await clearShipRefusal(xellId, { zeeId });
   broadcast('ship', row);
   // the honeycomb's xell→queenzee line: this xell raised a ship request
-  activity('x2q', xellId, 'ship');
+  activity('x2q', xellId, 'ship', project.id);
 
   // Operator policy: auto-approve ships for this project → the queenzee approves and deploys with
   // no human in the loop. Still goes through the SAME decideShip → runShip path (lock, build from
@@ -614,7 +614,7 @@ async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   const prods = await q(
     `SELECT id FROM xell WHERE project_id=$1 AND is_production AND status <> 'retired'`,
     [project.id]);
-  for (const p of prods) activity('q2x', p.id, 'ship');
+  for (const p of prods) activity('q2x', p.id, 'ship', project.id);
 
   // Production's BUILD SOURCE is local main — not the xell's worktree, and not the xource
   // checkout's wandering HEAD (which is what this actually built until 2026-07-16). origin is a

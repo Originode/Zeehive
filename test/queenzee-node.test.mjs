@@ -139,15 +139,15 @@ ok(Object.keys(cells).length === list.length, 'every xell still gets a seat');
 // ── 5. the ship path aims the arrow at PRODUCTION, not the work xell ─────────
 console.log('\nshipgate emits queenzee→production activity when a ship runs');
 const shipgate = readFileSync('server/src/queenzee/shipgate.js', 'utf8');
-ok(/activity\('q2x',\s*p\.id,\s*'ship'\)/.test(shipgate)
-  || /activity\("q2x",\s*p\.id,\s*"ship"\)/.test(shipgate),
-  "runShipBody emits activity('q2x', prodId, 'ship') for each production xell");
+ok(/activity\('q2x',\s*p\.id,\s*'ship'(?:,\s*[^)]+)?\)/.test(shipgate)
+  || /activity\("q2x",\s*p\.id,\s*"ship"(?:,\s*[^)]+)?\)/.test(shipgate),
+  "runShipBody emits activity('q2x', prodId, 'ship'[, projectId]) for each production xell");
 ok(/is_production AND status <> 'retired'/.test(shipgate)
   || (/is_production/.test(shipgate) && /activity\('q2x'/.test(shipgate)),
   'the ship activity targets is_production xells of the project');
 // the ask is still xell→queenzee (the human sees the request arrive)
-ok(/activity\('x2q',\s*xellId,\s*'ship'\)/.test(shipgate),
-  "requestShip still emits activity('x2q', xellId, 'ship') for the ask");
+ok(/activity\('x2q',\s*xellId,\s*'ship'(?:,\s*[^)]+)?\)/.test(shipgate),
+  "requestShip still emits activity('x2q', xellId, 'ship'[, projectId]) for the ask");
 // the asset is present for the webapp build to serve
 ok(existsSync('web/public/zeehive-logo.svg'), 'web/public/zeehive-logo.svg is committed for the console to serve');
 // byte-identical to the prompt attachment when present — do not "clean up" or re-export the mark

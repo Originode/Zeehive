@@ -257,7 +257,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
     broadcast('land', row);
     await syncXellAfterLand(xell?.id, newSha);
     // the honeycomb's xell→queenzee line: this xell pushed a land request
-    activity('x2q', xell?.id, 'land');
+    activity('x2q', xell?.id, 'land', projectId);
     logline('landgate',
       `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
       + `${xell?.slug || 'unknown'} (auto-approve policy, no human review)`);
@@ -287,7 +287,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
       [projectId, xell.id, ref, oldSha || null, newSha,
         JSON.stringify(commits), stat ? JSON.stringify(stat) : null, occupant.id]);
     broadcast('land', held);
-    activity('x2q', xell?.id, 'land');
+    activity('x2q', xell?.id, 'land', projectId);
     const position = await holdingPosition(held);
     logline('landgate',
       `HOLDING ${ref.replace('refs/heads/', '')} → ${newSha.slice(0, 8)} on ${project.name} — ${xell.slug} is `
@@ -304,7 +304,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
 
   broadcast('land', row);
   // the honeycomb's xell→queenzee line: this xell pushed a land request
-  activity('x2q', xell?.id, 'land');
+  activity('x2q', xell?.id, 'land', projectId);
   logline('landgate',
     `HELD ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
     + `${xell?.slug || 'unknown'} awaiting human verification`);

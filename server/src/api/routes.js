@@ -10,7 +10,7 @@ import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
-import { bus, broadcast } from '../lib/events.js';
+import { bus, broadcast, activityFanout } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
@@ -3135,10 +3135,13 @@ router.get('/stream', async (req, res) => {
     res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
   }
 
-  const onEvent = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
+  const send = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
+  // Project-scope + cap the queenzee-activity fan-out per connection (activityFanout); every
+  // other event type rides through unchanged.
+  const { onEvent, close } = activityFanout(req.query.project || null, send);
   bus.on('event', onEvent);
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);
-  req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
+  req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); close(); });
 });
 
 // ── XELL WEBAPP REVIEW — /xell-web/<slug>/* (compatibility redirect) ──────────────────────────
