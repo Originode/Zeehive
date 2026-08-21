@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { showConfirm, showPrompt } from '../Dialog.jsx';
-import { assignWorkItem, deployWorkItem, getAssignCandidates, unassignWorkItem } from './workApi.js';
+import { assignWorkItem, deployWorkItem, getAssignCandidates, getDeployOverlap, unassignWorkItem } from './workApi.js';
 import { ZeeChip } from './bits.jsx';
 
 // WORK TRACKER — WHO IS ON THIS ITEM: assign an existing xell, or deploy a new worker onto it.
@@ -74,12 +74,29 @@ export default function DeployZee({ item, zee, events = [], busy, onDone, onErro
       + 'starting point, a warning). Leave it empty and the item alone is the brief.',
       { okLabel: 'Next', defaultValue: '', placeholder: 'optional — extra context for the worker' });
     if (task === null) return;                       // cancelled at the wording step
+
+    // The overlap PREFLIGHT (#33/#64), read AFTER the task is known (the extra text can name a path
+    // or a ticket the item alone does not) and BEFORE the confirmation — so the final click has the
+    // facts in view. Advisory by construction: a failure answers "no warnings", and nothing here
+    // disables the button. The server's own NOTE is rendered verbatim — it says both halves (a live
+    // xell already in the work, and work already LANDED on it) in words written for this exact moment.
+    const overlap = await getDeployOverlap(item.id, { task: task.trim() || undefined }).catch(() => null);
+    const overlapNote = overlap?.warnings?.length ? (overlap.note || null) : null;
+
     const ok = await showConfirm(
-      `Deploy a worker onto “${item.title}”?\n\n`
-      + 'This SPAWNS A REAL ZEE: the queenzee claims a xell, starts an agent in it and it begins '
-      + 'working immediately. It is not a draft and it cannot be un-started — you would have to '
-      + 'stop the zee afterwards.\n\nThe item is assigned to that xell and its card starts moving '
-      + 'with the zee.',
+      <div>
+        <p>Deploy a worker onto “{item.title}”?</p>
+        <p>This SPAWNS A REAL ZEE: the queenzee claims a xell, starts an agent in it and it begins
+        working immediately. It is not a draft and it cannot be un-started — you would have to stop
+        the zee afterwards.</p>
+        {overlapNote && (
+          <div className="disp-overlap" data-testid="deploy-overlap">
+            {/* the server's own note, verbatim — newlines render via the dialog's pre-wrap */}
+            <span className="disp-overlap-note">{overlapNote}</span>
+          </div>
+        )}
+        <p>The item is assigned to that xell and its card starts moving with the zee.</p>
+      </div>,
       { okLabel: 'Deploy a worker', variant: 'danger' });
     if (!ok) return;
     await run(() => deployWorkItem(item.id, { task: task.trim() || undefined }));

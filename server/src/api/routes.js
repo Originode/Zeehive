@@ -116,7 +116,7 @@ import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
          raiseRotationRequest } from '../lib/credential-inject.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
-import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
+import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor, getWorkItemOverlap } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
          selfWorkItem } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
@@ -2869,6 +2869,20 @@ router.post('/work-items/:id/deploy', async (req, res) => {
       title: b.title || null, actor: b.actor || 'human@console',
       managerXellId: b.manager_xell_id || null }));
   } catch (err) { assignErr(res, err); }
+});
+// IS SOMEBODY ALREADY IN THIS WORK? — the board's DEPLOY preflight (the work-item mirror of
+// /xell/dispatch/overlap). Read-only, no side effects, and it exists so a human sees the answer
+// BEFORE they press "deploy a worker" rather than in the receipt afterwards. It builds the same
+// brief the deploy would and keys it on the item itself (the landed-warning half reads the tracker
+// link), and a failure inside it answers "no warnings" rather than an error — because a
+// coordination hint must never stand between a human and a dispatch.
+router.post('/work-items/:id/deploy/overlap', async (req, res) => {
+  try {
+    res.json(await getWorkItemOverlap(req.params.id, { task: req.body?.task || null }));
+  } catch (err) {
+    res.json({ warnings: [], note: null, checked: { xells: 0, paths: [], tickets: [], landings: 0 },
+              degraded: [`overlap check unavailable: ${err.message}`] });
+  }
 });
 // Which xells could take this item — so the console offers a picker instead of asking a human to
 // paste a uuid (the ready pool + live workers with no open item, in this project only).
