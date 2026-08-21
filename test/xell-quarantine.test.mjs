@@ -282,6 +282,44 @@ try {
   ok((await xellRow(xE.id)).consecutive_deaths === 2 && !! (await xellRow(xE.id)).quarantined_at,
      'the classified streak is 2 and the xell is stamped');
 
+  // ── I. the SKILL-CLAIM path refuses a quarantined xell (the convergence gap) ───────────────
+  // The manager's finding: claimReadyXellForSkill (intake.js) guards on status='ready' ALONE, and a
+  // quarantine stamp leaves status='ready', so a /xell claim could take a quarantined cage while the
+  // header promised "EVERY ... claim" refuses. This fence drives the REAL CAS — not a mock — so it
+  // goes RED on the pre-change predicate (the CAS returns a row) and GREEN once the guard is in.
+  console.log('\n── I. claimReadyXellForSkill — a /xell claim refuses a quarantined cage ──');
+  const intake = await import('../server/src/queenzee/intake.js');
+  const { claimReadyXellForSkill, skillClaimUnavailable } = intake;
+
+  // SIDE 1 (clean): a /xell claim of a clean ready xell SUCCEEDS — the skill-claim path still works.
+  const xS = await mkXell('xq-skill-clean');
+  await q(`UPDATE xell SET status='ready' WHERE id=$1`, [xS.id]);
+  const claimedSkill = await claimReadyXellForSkill(xS.id);
+  ok(!!claimedSkill && claimedSkill.status === 'claimed',
+     'a /xell claim of a CLEAN ready xell succeeds (the skill-claim path still works)');
+
+  // SIDE 2 (quarantined): the claim is REFUSED — returns null, the xell stays ready.
+  const xSq = await mkXell('xq-skill-quarantined');
+  await q(`UPDATE xell SET status='ready', quarantined_at=now(), quarantine_deaths=2,
+            quarantine_reason='test quarantine' WHERE id=$1`, [xSq.id]);
+  const refusedSkill = await claimReadyXellForSkill(xSq.id);
+  ok(refusedSkill === null,
+     'a /xell claim of a QUARANTINED ready xell is REFUSED (returns null) — the convergence gap is closed');
+  ok((await xellRow(xSq.id)).status === 'ready',
+     'and the quarantined xell stays ready — not claimed, not flipped');
+
+  // The refusal a human reads names the QUARANTINE, not a decommission.
+  const qerr = skillClaimUnavailable(xSq.id,
+    { slug: 'xq-skill-quarantined', status: 'ready', quarantined_at: new Date(),
+      quarantine_deaths: 2, quarantine_reason: 'test quarantine' });
+  ok(qerr.code === 'XELL_QUARANTINED' && /QUARANTINED/i.test(qerr.message)
+     && !/decommissioned/i.test(qerr.message),
+     'a quarantined claim refusal names the QUARANTINE (and both arms), not a decommission');
+  // The decommission path still says what it always said.
+  const derr = skillClaimUnavailable(xS.id, { slug: 'xq-skill-clean', status: 'tearing-down' });
+  ok(derr.code === 'XELL_UNAVAILABLE' && /decommissioned/.test(derr.message),
+     'a genuine decommission refusal still says decommissioned');
+
 } finally {
   await cleanup();
   await pool.end().catch(() => {});

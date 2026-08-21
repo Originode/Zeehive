@@ -144,18 +144,43 @@ class NeedsWorktree extends Error {
 //
 // Deliberately NO `AND NOT is_production` — unlike a dispatch, a /xell skill-claim of a production
 // xell is legitimate (the /xell-prod flow: a human standing in that worktree claims it), so this
-// claim must be able to transition a ready production xell. status='ready' is the whole guard.
+// claim must be able to transition a ready production xell. status='ready' + quarantined_at IS NULL
+// are the whole guard.
+//
+// QUARANTINE (ticket #81): a /xell claim is a RECOVERY path — it starts a fresh agent in the cage —
+// and the header of lib/xell-quarantine.js promises every one of them refuses a quarantined xell
+// until a human explicitly decides rescue vs reap. The readyXells SELECT upstream excludes
+// quarantined xells and the quarantinedHere guard tells a human standing in one — but both read
+// BEFORE this CAS, and a quarantine can stamp between that read and this write (readyXells sees the
+// xell clean, the quarantine fires, this claim then flips a NOW-quarantined cage to 'claimed' with
+// nobody told). Guarding the CAS itself closes that race: the claim is the last door, so refusing
+// HERE is what makes "a quarantined cage gets no new agent by ANY path" a fact rather than a list of
+// callers that remembered to check. The human is not blocked from working — they clear the
+// quarantine (the explicit rescue arm) and /xell again.
 export async function claimReadyXellForSkill(xellId) {
   if (!xellId) return null;
   return one(
-    `UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 AND status='ready' RETURNING *`, [xellId]);
+    `UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 AND status='ready' AND quarantined_at IS NULL RETURNING *`, [xellId]);
 }
 
-// The legible refusal when a skill-claim loses the race to a decommission. The session is bound to
-// the worktree it is physically standing in, so there is no "pick another" — the xell it was about
-// to claim is gone. Say exactly that, so the host session knows to open a fresh worktree and re-run
-// /xell there instead of retrying the same doomed one.
+// The legible refusal when a skill-claim cannot take the xell it is standing in. The session is
+// bound to the worktree it is physically standing in, so there is no "pick another" — say exactly
+// why, so the host session knows what to DO (clear the quarantine and re-run for a quarantined cage;
+// open a fresh worktree and re-run for a decommissioned one) instead of retrying the same doomed one.
 export function skillClaimUnavailable(xellId, state) {
+  // A QUARANTINED xell is NOT "being decommissioned" — the CAS refused it because the cage has
+  // killed agents and a human has not yet decided rescue vs reap. Naming a decommission would send
+  // the human to the wrong action (wait for reprovision vs. rescue the branch), so the quarantine
+  // gets its own sentence, naming both arms exactly like the card does.
+  if (state?.quarantined_at) {
+    const refusal = xellQuarantineRefusal(state)
+      || `${state.slug || xellId} is QUARANTINED — a /xell claim cannot take it until a human decides`;
+    const err = new Error(
+      `xell ${state.slug || xellId} is QUARANTINED — a /xell claim is a recovery path and is refused `
+      + `until a human decides between rescue and reap. ${refusal}`);
+    err.code = 'XELL_QUARANTINED';
+    return err;
+  }
   const err = new Error(
     `xell ${state?.slug || xellId} is ${state?.status || 'gone'} — it was decommissioned while this `
     + 'session was claiming it, so claiming it would resurrect a xell whose worktree is being removed. '
@@ -272,10 +297,14 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   // legibly: the session is bound to THIS worktree, so "pick another" is not available to it.
   const updatedXell = await claimReadyXellForSkill(xell.id);
   if (!updatedXell) {
-    const state = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xell.id]).catch(() => null);
+    // Read the quarantine columns too: the CAS now refuses a quarantined xell, and the refusal the
+    // human reads must name the QUARANTINE (rescue vs reap), not a decommission (reprovision).
+    const state = await one(
+      `SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`,
+      [xell.id]).catch(() => null);
     await q(`DELETE FROM zee WHERE id=$1`, [zee.id]).catch(() => {
       logline('intake', `warn: could not compensate zee ${zee.id} for unclaimable xell ${xell.slug} — `
-        + `a zee row may be left pointing at a decommissioned xell`);
+        + `a zee row may be left pointing at an unclaimable xell`);
     });
     throw skillClaimUnavailable(xell.id, state);
   }
