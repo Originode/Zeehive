@@ -157,7 +157,7 @@ async function trackerLandings(projectId, workItemId, tickets, cap) {
 // scan rather than a lookup.
 async function recentLandings(projectId, windowDays, cap) {
   return q(
-    `SELECT l.id, l.new_sha, l.old_sha, l.landed_at, x.id AS xell_id, x.slug AS xell_slug,
+    `SELECT l.id, l.new_sha, l.old_sha, l.landed_at, l.commits, x.id AS xell_id, x.slug AS xell_slug,
             (SELECT t.prompt_text FROM task t WHERE t.xell_id = x.id
                ORDER BY t.created_at DESC LIMIT 1) AS brief
        FROM land_request l LEFT JOIN xell x ON x.id = l.xell_id
@@ -380,4 +380,119 @@ export function overlapNote(overlap) {
     lines.push(`(partial answer: ${overlap.degraded.join('; ')} — so this list may be short, never long.)`);
   }
   return lines.join('\n');
+}
+
+// ── the SYNC/LAND half — what has LANDED on files THIS zee changed (ticket #77) ──
+// The dispatch half reads a brief and tells a MANAGER who else is in the work. This half reads the
+// zee's OWN branch and tells THE ZEE which sibling landings touched files it has touched — the
+// semantic-collision warning a clean merge cannot give ("a clean merge is the absence of overlapping
+// lines, not agreement"). Same machinery as the #64 landed half: the land ledger, the same path
+// scan, the same caps and budget — the read model TKT-64 built, keyed this time on the worker's own
+// changed-file set instead of a brief's prose.
+//
+// ADVISORY, AND THAT IS STRUCTURAL, NOT A SETTING — the property that outranks the feature. It is a
+// note, NEVER a block: nothing here can refuse a sync or a land, nothing here throws into the
+// caller's path, and every failure mode (an unreadable branch, a git timeout, a project whose repo
+// is gone) degrades to FEWER WARNINGS and a note saying so — never to a sync that did not happen or
+// a land that was refused. The caller appends the note to its message when present and never
+// branches on the result.
+export async function overlapForChangedFiles({ projectId, repoRoot, base, branch, excludeXellId = null,
+                                               gitTimeoutMs = 4000, budgetMs = 2500,
+                                               landedWindowDays = LANDED_WINDOW_DAYS,
+                                               landedCap = LANDED_CAP } = {}) {
+  const empty = { warnings: [], checked: { paths: [], landings: 0 }, degraded: [] };
+  if (!projectId || !repoRoot || !base || !branch) return empty;
+  const started = Date.now();
+  // The key: the zee's own changed-file set, its branch vs the base it was cut from. A branch the git
+  // cannot read (or one that has changed nothing) contributes NOTHING and says so — a hole in this
+  // answer must never look like "no sibling landed here".
+  const paths = changedFiles(repoRoot, base, branch, { timeoutMs: gitTimeoutMs }) || [];
+  if (!paths.length) return { ...empty, checked: { paths: [], landings: 0 } };
+  try {
+    const warnings = [];
+    const degraded = [];
+    const seenSha = new Set();
+    let scanned = 0, diffs = 0;
+    const recent = await recentLandings(projectId, landedWindowDays, LANDED_SCAN);
+    scanned = recent.length;
+    for (const l of recent) {
+      if (seenSha.has(l.new_sha)) continue;
+      // A zee already knows its OWN landings — they are its own history, not a sibling's.
+      if (excludeXellId && l.xell_id === excludeXellId) { seenSha.add(l.new_sha); continue; }
+      if (!l.old_sha || /^0+$/.test(l.old_sha)) continue;
+      if (diffs >= LANDED_DIFFS || Date.now() - started > budgetMs) {
+        degraded.push(`only the ${diffs} most recent landing(s) were read for file overlap`
+          + ` (of ${recent.length} in the last ${landedWindowDays} days)`);
+        break;
+      }
+      diffs++;
+      const files = changedFiles(repoRoot, l.old_sha, l.new_sha, { timeoutMs: gitTimeoutMs });
+      if (files == null) { degraded.push(`could not read what ${short(l.new_sha)} changed`); continue; }
+      const shared = paths.filter((p) => files.includes(p)
+        || files.some((f) => f.startsWith(`${p}/`) || p.startsWith(`${f}/`)));
+      if (!shared.length) continue;
+      seenSha.add(l.new_sha);
+      warnings.push({ kind: 'sibling-landing', sha: l.new_sha, short: short(l.new_sha),
+        landed_at: l.landed_at, ago: agoText(l.landed_at),
+        xell_slug: l.xell_slug || null, xell_id: l.xell_id || null,
+        paths: shared.slice(0, 6), more: Math.max(0, shared.length - 6),
+        via: 'changed by that landing', subject: firstSubject(l.commits) });
+      if (warnings.length >= landedCap) break;
+    }
+    return { warnings, checked: { paths, landings: scanned }, degraded, took_ms: Date.now() - started };
+  } catch (e) {
+    // A coordination hint must never be the reason a sync or a land fails. Say it went wrong and hand
+    // back nothing rather than throwing into the caller's path.
+    return { ...empty, checked: { paths, landings: 0 },
+             degraded: [`sibling-overlap check failed: ${e.message}`] };
+  }
+}
+
+// One paragraph a ZEE reads on `zee sync` / `zee land`. Different voice from overlapNote: that one
+// speaks to a manager deciding whether to cut a worker; this one speaks to the worker IN the work,
+// and the whole message is "read the sibling's commit before you continue — a clean merge is not
+// agreement". Null when there is nothing to say — the caller appends it or does not, and a clean
+// sync/land reads exactly as it always has.
+export function siblingOverlapNote(overlap) {
+  const ws = overlap?.warnings || [];
+  if (!ws.length) return null;
+  const lines = [];
+  lines.push(`⚠ ${ws.length} landing(s) on main touched files YOU have changed — this is INFORMATION, `
+    + 'not a block. A clean merge is the absence of overlapping lines, not agreement: `git show <sha>` '
+    + 'says what each sibling did, so you extend it rather than fight it.');
+  for (const w of ws) {
+    const from = w.xell_slug ? ` from ${w.xell_slug}` : '';
+    lines.push(`  · ${w.short} landed ${w.ago}${from} — changed ${w.paths.join(', ')}${w.more ? ` +${w.more} more` : ''}`
+      + (w.subject ? ` — "${w.subject}"` : ''));
+  }
+  if (overlap.degraded?.length) {
+    lines.push(`(partial answer: ${overlap.degraded.join('; ')} — so this list may be short, never long.)`);
+  }
+  return lines.join('\n');
+}
+
+// The SYNC/LAND entry point: everything a caller needs, resolved from the xell. Returns the overlap
+// shape (with `note` when there is something to say) or null when it cannot be resolved — and NEVER
+// throws. The outer catch returns null, because a coordination hint must never be the reason a sync
+// does not happen or a land is refused. The caller appends `note` to its message when present and
+// never branches on the result.
+export async function siblingOverlapForXell(xell, { budgetMs = 2500 } = {}) {
+  try {
+    if (!xell?.project_id || !xell?.branch || !xell?.id) return null;
+    const project = await one(`SELECT repo_root, main_branch FROM project WHERE id=$1`, [xell.project_id]);
+    if (!project?.repo_root || !project?.main_branch) return null;
+    // The window is bounded by BOTH the ledger's cap and the zee's own age: "since it was cut" is the
+    // point where its branch diverged from base, which is when it could no longer see a sibling's
+    // landing by reading the tree it was cut from. A brand-new xell still gets a 1-day floor so a
+    // landing made seconds after the cut is not missed.
+    const ageDays = Math.max(1, Math.round((Date.now() - new Date(xell.created_at).getTime()) / 86400000));
+    const overlap = await overlapForChangedFiles({
+      projectId: xell.project_id, repoRoot: project.repo_root, base: project.main_branch,
+      branch: xell.branch, excludeXellId: xell.id, budgetMs,
+      landedWindowDays: Math.min(LANDED_WINDOW_DAYS, ageDays),
+    });
+    return { ...overlap, note: siblingOverlapNote(overlap) };
+  } catch (e) {
+    return null;
+  }
 }

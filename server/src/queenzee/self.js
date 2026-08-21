@@ -354,6 +354,15 @@ export async function selfLand(xell) {
   }
   if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to land from` };
 
+  // (#77) WHICH SIBLING LANDINGS TOUCHED FILES THIS ZEE CHANGED — a note, never a block. Computed
+  // best-effort BEFORE any heal/catch-up so every outcome below carries it, including the conflict
+  // case where it is the most useful ("your commits CONFLICT" names the exact siblings to read).
+  // siblingOverlapForXell never throws and nothing below branches on it; a failure degrades to
+  // fewer warnings, never to a land that was refused.
+  const { siblingOverlapForXell } = await import('../lib/work-overlap.js');
+  const sibling = await siblingOverlapForXell(xell);
+  const withNote = (msg) => (sibling?.note ? `${msg}\n\n${sibling.note}` : msg);
+
   // Is a live cxell driving this xell? If so, reconciliation happens by delivering the xource INTO
   // the container and merging there (self-heal) — never by a behind-the-zee's-back worktree merge.
   const live = await cxellRunning({ ctx: 'default', slug: xell.slug });
@@ -432,7 +441,8 @@ export async function selfLand(xell) {
       ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp, healed,
       conflict: caughtUp.state === 'conflict' ? (caughtUp.output || null) : null,
       error: caughtUp.state === 'error' ? (caughtUp.output || null) : undefined,
-      message: msg,
+      message: withNote(msg),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -448,7 +458,8 @@ export async function selfLand(xell) {
   if (push.landed) {
     return {
       ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request: await landStatus(xell.id),
-      message: `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`,
+      message: withNote(`LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -466,14 +477,15 @@ export async function selfLand(xell) {
       ok: true, status: 'holding', landed: false, collected, catch_up: caughtUp, healed, request,
       position: request.holding_position,
       behind: ahead ? { xell_slug: ahead.xell_slug, new_sha: ahead.new_sha, status: ahead.status } : null,
-      message: `HOLDING at position ${request.holding_position} — ${ahead?.xell_slug || 'another xell'} already has a landing `
+      message: withNote(`HOLDING at position ${request.holding_position} — ${ahead?.xell_slug || 'another xell'} already has a landing `
         + `open on ${(request.ref || '').replace('refs/heads/', '') || 'main'}${ahead ? ` (${String(ahead.new_sha).slice(0, 8)}, ${ahead.status})` : ''}, and the runway takes ONE at a `
         + 'time. Your push was NOT rejected and NOT dropped: it is recorded (land_request '
         + `${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote} and your commits are safe on your branch. `
         + 'No card was raised for a human, deliberately — two landings on one ref is how one of them ends up stale. '
         + 'You do NOT need to poll or re-push: when the runway clears the queenzee RESUMES your session and tells you '
         + 'to `zee sync` and then `zee land` again. Keep working, or stop here. To leave the pattern instead, '
-        + '`zee land --withdraw --reason "…"`.',
+        + '`zee land --withdraw --reason "…"`.'),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -488,7 +500,7 @@ export async function selfLand(xell) {
     return {
       ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, healed, request,
       superseded: stale.map((r) => ({ id: r.id, new_sha: r.new_sha, status: r.status, requested_at: r.requested_at })),
-      message: `Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
+      message: withNote(`Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
         + `(land_request ${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote}. Your commits `
         + 'are safe on your branch; nothing lands until a human agrees. You do NOT need to re-run land: when a human '
         + 'approves, the queenzee lands it AND nudges you to continue. To block meanwhile, `zee land --wait` (or '
@@ -498,7 +510,8 @@ export async function selfLand(xell) {
             + `(${stale.map((r) => String(r.new_sha).slice(0, 8)).join(', ')}). A human sees one card each and cannot `
             + 'tell which one you still mean. Do not stack them up: `zee land --withdraw --reason "…"` un-asks your '
             + 'open landings, so the order is WITHDRAW first, then `zee land` again for one fresh card.'
-          : ''),
+          : '')),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -508,13 +521,14 @@ export async function selfLand(xell) {
     ok: false, status: request ? request.status : 'unknown', landed: false, collected, catch_up: caughtUp,
     request: request || null,
     push_output: push.output ? String(push.output).slice(-800) : null,
-    message: request
+    message: withNote(request
       ? (request.status === 'rejected'
         ? `A human REJECTED this exact sha (${String(request.new_sha).slice(0, 8)}) — re-pushing will not help; talk to them.`
         : `Push did not land and the latest land_request is '${request.status}' (sha ${String(request.new_sha).slice(0, 8)}), `
           + `not a fresh pending hold for ${String(push.head).slice(0, 8)}. Check the ZEEHIVE console — this is NOT a clean held landing.`)
       : 'Push did not land and NO land_request was raised — the gate held nothing (a non-fast-forward the catch-up '
-        + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.',
+        + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.'),
+    ...(sibling ? { sibling_overlap: sibling } : {}),
   };
 }
 
@@ -673,8 +687,18 @@ export async function selfSync(xell, { rebuild = true } = {}) {
   const ref = await xourceRef(xell.id);
   if (!ref) return { ok: false, status: 'error', error: `cannot resolve the xource ref for ${xell.slug}` };
 
+  // (#77) WHICH SIBLING LANDINGS TOUCHED FILES THIS ZEE CHANGED — a note, never a block. Computed
+  // best-effort BEFORE the merge so it describes the landings the merge is about to pull in (and the
+  // conflict case, where it is the most useful — "your commits CONFLICT" names the exact siblings to
+  // read). siblingOverlapForXell never throws and nothing below branches on it; a failure degrades to
+  // fewer warnings, never to a sync that did not happen.
+  const { siblingOverlapForXell } = await import('../lib/work-overlap.js');
+  const sibling = await siblingOverlapForXell(xell);
+  const withNote = (msg) => (sibling?.note ? `${msg}\n\n${sibling.note}` : msg);
+
   const heal = await selfHealSync(xell, ref);
-  if (!heal.ok) return heal;
+  if (!heal.ok) return { ...heal, message: heal.message ? withNote(heal.message) : heal.message,
+    ...(sibling ? { sibling_overlap: sibling } : {}) };
 
   // Clean merge (or already current). On an actual merge, collect the merged HEAD onto the worktree
   // and rebuild so the zee's containers run the reconciled code; re-verification is the zee's to do.
@@ -691,7 +715,8 @@ export async function selfSync(xell, { rebuild = true } = {}) {
     : `Merged current ${ref} into your cxell cleanly (HEAD ${String(heal.head).slice(0, 8)}).`
       + (built && !built.error ? ' A rebuild was started — run `zee build --wait` (background) to confirm it serves your HEAD, then re-run your tests.' : '')
       + (built && built.error ? ` (rebuild could not start: ${built.error})` : '');
-  return { ok: true, status: heal.state, ref, head: heal.head || null, collected, built, message: note };
+  return { ok: true, status: heal.state, ref, head: heal.head || null, collected, built,
+           message: withNote(note), ...(sibling ? { sibling_overlap: sibling } : {}) };
 }
 
 // ── POST /api/xell/self/catchup — roll THIS cxell's own db up to prod's schema ──
