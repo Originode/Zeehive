@@ -26,17 +26,19 @@ export async function spawnLangchainZee({ pid, xell, task, rt, model = null, m =
                                           headless = true, provider = 'claude', providerTokenId = null } = {}) {
   // Credentials first — a project with no connected account for this provider must fail cleanly
   // before anything claims the xell (same contract as spawnCxell).
-  const { token, accountLabel } = await spawnCreds(pid, provider, { tokenId: providerTokenId });
+  const { token, accountLabel, tokenId } = await spawnCreds(pid, provider, { tokenId: providerTokenId });
   if (accountLabel) logline('langchain', `dispatching a langchain zee on the "${accountLabel}" ${provider} account`);
 
   const ranModel = model;
   const zeeTitle = title || `xell : ${xell.slug}`;
+  // provider_token_id (migration 211): same attribution the cxell spawn writes — per-account burn
+  // and an auth-terminal quarantine both need to know which account this zee ran on.
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
-                      model, permission_mode, cwd, title)
-     VALUES ($1,'headless-spawn',$2,'none','working','headless','langchain',$3,'bypassPermissions',$4,$5)
+                      model, permission_mode, cwd, title, provider_token_id)
+     VALUES ($1,'headless-spawn',$2,'none','working','headless','langchain',$3,'bypassPermissions',$4,$5,$6)
      RETURNING *`,
-    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle]);
+    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle, tokenId || null]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
 

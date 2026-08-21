@@ -19,6 +19,10 @@
 //   • TERMINAL — 401, an invalid key, a disabled org, an unknown model, exhausted credit. Never
 //     revived, at any interval: no number of retries mends a credential, and every retry buries the
 //     one line a human needs. setTend, naming the provider and the account, quoting the error.
+//     An AUTH terminal death ALSO quarantines the account the zee ran on (zee.provider_token_id →
+//     setProviderAccountPaused) so the next dispatch cannot pick it again, and the spawn path may
+//     fail over once to a healthy sibling (lib/account-quarantine.js / ticket #50). Credit /
+//     account / model deaths are NOT quarantined — those are not "this key is bad".
 //
 // THE RULES IT MUST NOT BREAK, all of them for the same reason (a revive STARTS A TURN):
 //   – never under a fleet, project or xell PAUSE (lib/fleet-pause.js xellPaused — all three levels);
@@ -41,6 +45,7 @@ import { classifyTurnDeath, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MI
          HOST_RESTART_DEATH, CAGE_RESTART_DEATH } from '../lib/turn-death.js';
 import { providerForRuntimeKey } from '../lib/cxell-runtimes.js';
 import { raiseAuthDeathRequest, injectedRevivePrompt, scrubSecrets } from '../lib/credential-inject.js';
+import { quarantineOnAuthDeath } from '../lib/account-quarantine.js';
 import { nudgeXellForTurnDeath } from './nudge.js';
 
 // Same switch every other real-side-effect module reads. A revive resumes an agent's session in a
@@ -83,12 +88,14 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     if (!zeeId) return { classified: false };
     const zee = await one(
       `SELECT z.id, z.xell_id, z.revive_attempts, z.decommissioned_at, z.claude_session_id,
-              z.entrypoint, x.slug, x.status AS xell_status, x.project_id, rt.key AS runtime_key
+              z.entrypoint, z.provider_token_id, x.slug, x.status AS xell_status, x.project_id,
+              rt.key AS runtime_key
          FROM zee z JOIN xell x ON x.id = z.xell_id
          LEFT JOIN agent_runtime rt ON rt.id = z.runtime_id
         WHERE z.id = $1`, [zeeId]);
     if (!zee) return { classified: false };
     const name = slug || zee.slug || String(zee.xell_id).slice(0, 8);
+    const provider = providerForRuntimeKey(zee.runtime_key) || 'claude';
 
     const death = deathOverride
       ? { kind: deathOverride.kind, signal: deathOverride.signal, message: String(reason || '') }
@@ -118,11 +125,32 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     // A vendor error can ECHO THE KEY back ("your api key: sk-ant-… is invalid") — scrub token-
     // shaped substrings before the reason lands in the event log or the tend (finding [10]).
     const scrubbedReason = scrubSecrets(String(reason || ''));
+
+    // AUTH-TERMINAL → quarantine the account this zee ran on (ticket #50). Happens BEFORE the tend
+    // so the tend can say whether a healthy sibling remains, and so the spawn path can fail over
+    // once without the dead account still being the freshest pick. Best-effort; never throws.
+    let quarantine = { acted: false };
+    if (death.kind === 'terminal' && death.signal === 'auth') {
+      quarantine = await quarantineOnAuthDeath({
+        projectId: zee.project_id,
+        accountId: zee.provider_token_id,
+        provider,
+        reason: scrubbedReason,
+        kind: death.kind,
+        signal: death.signal,
+        by: 'queenzee',
+      });
+    }
+
     await recordEvent({ source: 'queenzee', hook_event_name: 'turn-death', zee_id: zee.id,
                         xell_id: zee.xell_id, stop_reason: death.kind,
                         raw: { kind: death.kind, signal: death.signal, action: verdict.action,
                                attempts: zee.revive_attempts || 0, delay_minutes: verdict.delayMinutes,
-                               source, message: scrubbedReason.slice(0, 1000) } });
+                               source, message: scrubbedReason.slice(0, 1000),
+                               quarantined: !!quarantine.paused,
+                               account_id: quarantine.accountId || zee.provider_token_id || null,
+                               sibling_id: quarantine.siblingId || null,
+                               no_sibling: !!quarantine.noSibling } });
 
     if (verdict.action === 'revive') {
       logline('revive', `${name}: turn died on ${death.signal} (TRANSIENT) — ${verdict.reason}`);
@@ -132,59 +160,102 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     }
 
     if (verdict.action === 'tend') {
-      const account = await accountFor(zee.project_id, zee.runtime_key);
-      const why = death.kind === 'terminal'
-        ? `This zee's turn died on a ${death.signal.toUpperCase()} error from ${account} and it will NOT be `
-          + `revived — retrying cannot mend a credential. The provider said, verbatim: "`
-          + `${scrubbedReason.replace(/\s+/g, ' ').slice(0, 600)}". Fix or re-connect the account in `
-          + 'Project setup (or re-dispatch this work on another account); the zee is idle in its cage until then.'
-        // "on the provider" is the usual case and stays said plainly; the two deaths that are OURS
-        // name themselves (DIED_WHERE) — telling a human the provider dropped their zee three times
-        // when the machine rebooted, or when they themselves bounced the cage three times, sends
-        // them to the wrong logs entirely.
-        : `This zee's turn has now died ${DIED_WHERE[death.signal] || 'on the provider'} `
-          + `${(zee.revive_attempts || 0) + 1} time(s) `
-          + `(last: ${death.signal}) and the queenzee has spent all ${MAX_REVIVE_ATTEMPTS} automatic revives. `
-          + `It said, verbatim: "${scrubbedReason.replace(/\s+/g, ' ').slice(0, 400)}". Nothing is wrong `
-          + 'with its work — its commits are on its branch — but it needs a human to decide whether to send it '
-          + 'again (📨 a message resumes it) or mark it done.';
-      await setTend(zee.xell_id, true, { reason: why, zeeId: zee.id, source: 'queenzee' });
-      logline('revive', `${name}: turn died on ${death.signal} (${death.kind.toUpperCase()}) — raised a tend for a human`);
+      // SPAWN + a healthy sibling: the intake catch will fail the dispatch over once. Do NOT raise
+      // a tend on this xell yet — a successful failover would leave "needs you" lit on a working
+      // zee, and a failed failover files a second death that tends with "no sibling remains".
+      const deferTendForFailover = source === 'spawn' && !!quarantine.siblingId;
+
+      if (!deferTendForFailover) {
+        const account = await accountFor(zee.project_id, zee.runtime_key, zee.provider_token_id);
+        let why;
+        if (death.kind === 'terminal') {
+          why = `This zee's turn died on a ${death.signal.toUpperCase()} error from ${account} and it will NOT be `
+            + `revived — retrying cannot mend a credential. The provider said, verbatim: "`
+            + `${scrubbedReason.replace(/\s+/g, ' ').slice(0, 600)}".`;
+          if (quarantine.paused) {
+            why += ` The account has been QUARANTINED (paused by the queenzee) so no further dispatch picks it.`;
+          }
+          if (death.signal === 'auth' && quarantine.noSibling) {
+            why += ` NO healthy sibling remains — every ${provider} account is paused or gone. Fix or`
+              + ` re-connect an account in Project setup before anything on this provider can dispatch again.`;
+          } else {
+            why += ` Fix or re-connect the account in Project setup (or re-dispatch this work on another`
+              + ` account); the zee is idle in its cage until then.`;
+          }
+        } else {
+          // "on the provider" is the usual case and stays said plainly; the two deaths that are OURS
+          // name themselves (DIED_WHERE) — telling a human the provider dropped their zee three times
+          // when the machine rebooted, or when they themselves bounced the cage three times, sends
+          // them to the wrong logs entirely.
+          why = `This zee's turn has now died ${DIED_WHERE[death.signal] || 'on the provider'} `
+            + `${(zee.revive_attempts || 0) + 1} time(s) `
+            + `(last: ${death.signal}) and the queenzee has spent all ${MAX_REVIVE_ATTEMPTS} automatic revives. `
+            + `It said, verbatim: "${scrubbedReason.replace(/\s+/g, ' ').slice(0, 400)}". Nothing is wrong `
+            + 'with its work — its commits are on its branch — but it needs a human to decide whether to send it '
+            + 'again (📨 a message resumes it) or mark it done.';
+        }
+        await setTend(zee.xell_id, true, { reason: why, zeeId: zee.id, source: 'queenzee' });
+        logline('revive', `${name}: turn died on ${death.signal} (${death.kind.toUpperCase()}) — raised a tend for a human`
+          + (quarantine.noSibling ? ' (no healthy sibling remains)' : ''));
+      } else {
+        logline('revive', `${name}: turn died on ${death.signal} (TERMINAL) — quarantined `
+          + `${quarantine.accountLabel ? `"${quarantine.accountLabel}"` : 'the account'}; `
+          + `spawn will fail over once to "${quarantine.siblingLabel || quarantine.siblingId}"`);
+      }
       broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
       // A TERMINAL AUTH death is the one a NEW KEY fixes: raise a credential-inject request scoped to
       // this xell so a human can approve injecting the current key into the live cage. 'credit',
       // 'account' and 'model' are NOT triggers — a new key does not fix an empty balance, a disabled
-      // org or a model the vendor never had.
+      // org or a model the vendor never had. Pass the EXACT account this zee ran on (not the
+      // freshest — that is what used to name the wrong sibling after a quarantine).
       if (death.kind === 'terminal' && death.signal === 'auth') {
         await raiseAuthDeathRequest({
           xellId: zee.xell_id, projectId: zee.project_id,
-          provider: providerForRuntimeKey(zee.runtime_key) || 'claude',
+          provider,
           reason, errorQuote: reason,
+          accountId: zee.provider_token_id || quarantine.accountId || null,
         });
       }
-      return { classified: true, kind: death.kind, signal: death.signal, tended: true };
+      return {
+        classified: true, kind: death.kind, signal: death.signal,
+        tended: !deferTendForFailover,
+        quarantined: !!quarantine.paused,
+        siblingId: quarantine.siblingId || null,
+        siblingLabel: quarantine.siblingLabel || null,
+        noSibling: !!quarantine.noSibling,
+      };
     }
 
     // 'none' — unknown, or nothing left to resume. Logged, never silent: a death this loop chose not
     // to act on must still be findable when someone asks why a xell went quiet.
     logline('revive', `${name}: turn ended — ${verdict.reason}`
       + (death.signal ? ` (${death.signal})` : ''));
-    return { classified: true, kind: death.kind, signal: death.signal, scheduled: false };
+    return { classified: true, kind: death.kind, signal: death.signal, scheduled: false,
+             quarantined: !!quarantine.paused,
+             siblingId: quarantine.siblingId || null,
+             noSibling: !!quarantine.noSibling };
   } catch (e) {
     logline('revive', `could not classify the death of zee ${String(zeeId).slice(0, 8)} (${String(e.message).slice(0, 140)})`);
     return { classified: false, error: e.message };
   }
 }
 
-// Name the account a human has to go and fix. The zee row does not store which provider_token the
-// dispatch used, so this is the account the project WOULD dispatch this provider on — read-only (no
-// last_used_at write, unlike tokenForSpawn) and best-effort: a tend that says "the claude account"
-// is still infinitely better than one that says "the provider".
-async function accountFor(projectId, runtimeKey) {
-  const provider = String(runtimeKey || '').includes('codex') ? 'openai'
-    : String(runtimeKey || '').includes('kimi') ? 'kimi'
-    : String(runtimeKey || '').includes('deepseek') ? 'deepseek' : 'claude';
+// Name the account a human has to go and fix. Prefer the account THIS zee actually ran on
+// (zee.provider_token_id — migration 211); fall back to the project's freshest of that provider
+// for zees that predate attribution. Read-only (no last_used_at write).
+async function accountFor(projectId, runtimeKey, providerTokenId = null) {
+  const provider = providerForRuntimeKey(runtimeKey) || 'claude';
   try {
+    if (providerTokenId) {
+      const pinned = await one(
+        `SELECT label FROM provider_token WHERE project_id = $1 AND id = $2`,
+        [projectId, providerTokenId]);
+      if (pinned) {
+        return pinned.label
+          ? `the ${provider} account "${pinned.label}"`
+          : `this project's ${provider} account`;
+      }
+    }
     const row = await one(
       `SELECT label FROM provider_token WHERE project_id = $1 AND provider = $2
         ORDER BY paused_at NULLS FIRST, created_at DESC LIMIT 1`, [projectId, provider]);

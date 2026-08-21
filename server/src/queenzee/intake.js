@@ -1502,7 +1502,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 // No viewer: the session JSONL lives inside the container, so claude:// cannot attach. The
 // live feed is the stream-json event stream, re-broadcast per-zee on the SSE bus as
 // 'zee-output' and narrated into the Terminal under the `zee:<slug>` scope.
-async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude', providerTokenId = null }) {
+async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude', providerTokenId = null,
+                            // Ticket #50: after an auth-terminal death quarantines the account, the
+                            // catch below retries ONCE on a healthy sibling. This flag stops a
+                            // second 401 from looping — one failover, then the human notice.
+                            authFailoverAttempted = false } = {}) {
   // Which vendor CLI runs inside the cxell — claude, codex, or kimi (see lib/cxell-runtimes.js).
   // Resolved before anything is claimed so an unknown runtime fails the dispatch cleanly.
   const adapter = adapterFor(rt?.key);
@@ -1552,12 +1556,16 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       + `runs "${ranModel}", and that is what the zee is recorded as running`);
   }
   const zeeTitle = title || `xell : ${xell.slug}`;
+  // provider_token_id (migration 211): attribute this zee to the account it will run on, so a
+  // 401 can quarantine THAT row (not "whatever is freshest later") and per-account burn is
+  // answerable in SQL. Written at INSERT — before the cage is built — because a spawn that dies
+  // on auth never reaches a later UPDATE.
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
-                      model, permission_mode, cwd, title)
-     VALUES ($1,'headless-spawn',$2,'none','spawning','headless','cxell-cli',$3,'bypassPermissions',$4,$5)
+                      model, permission_mode, cwd, title, provider_token_id)
+     VALUES ($1,'headless-spawn',$2,'none','spawning','headless','cxell-cli',$3,'bypassPermissions',$4,$5,$6)
      RETURNING *`,
-    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle]);
+    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle, tokenId || null]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
@@ -1933,13 +1941,30 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     const reason = `cxell spawn failed: ${String(err.message).slice(0, 300)}`;
     const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, scrubSecrets(reason).slice(0, 200)]);
     broadcast('zee', dead);
-    await releaseXell(xell.id);
     // A vendor CLI that died on startup is where a DEAD CREDENTIAL shows up (six zees, none of which
     // ever landed anything, and nobody was told which account). Nothing is resumable here — the cage
-    // has just been removed — but a terminal death still owes a human the account and the message.
-    await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug, reason: String(err.message),
-                          resumable: false, source: 'spawn' });
-    return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
+    // has just been removed — but a terminal auth death quarantines the account (so the next pick
+    // cannot be the same dead key) and, when a healthy sibling remains, fails the dispatch over
+    // ONCE onto it (ticket #50). Release the xell only when we are NOT about to retry.
+    const filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                        reason: String(err.message),
+                                        resumable: false, source: 'spawn' });
+    if (filed?.kind === 'terminal' && filed?.signal === 'auth'
+        && filed.siblingId && !authFailoverAttempted) {
+      logline('intake', `${xell.slug}: auth-terminal on `
+        + `${accountLabel ? `"${accountLabel}"` : 'the account'} — failing over once to `
+        + `"${filed.siblingLabel || filed.siblingId}"`);
+      // Keep the xell claimed for the retry (it still is — we have not released it). The dead
+      // zee stays on the row as errored; the retry INSERTs a new zee attributed to the sibling.
+      return spawnCxell({
+        pid, xell, task, rt, model, m, title, headless, provider,
+        providerTokenId: filed.siblingId,
+        authFailoverAttempted: true,
+      });
+    }
+    await releaseXell(xell.id);
+    return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason,
+             quarantined: !!filed?.quarantined, no_sibling: !!filed?.noSibling };
   }
 
   // Start the harness conversation bridge (docs §7): if the assigned harness declares a mirror,
