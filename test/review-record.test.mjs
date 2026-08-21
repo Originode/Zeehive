@@ -24,6 +24,14 @@ const { selfReview } = await import('../server/src/queenzee/self.js');
 const { listLandRequests } = await import('../server/src/queenzee/landgate.js');
 const { listShipRequests } = await import('../server/src/queenzee/shipgate.js');
 const { canTransition, nextStatuses } = await import('../server/src/lib/work-status.js');
+// The REAL express router + the identity-token hash + the in-process event bus: the route half of
+// this test does NOT reimplement the server — it mounts the actual routes.js router the same way
+// server/src/index.js does (express.json + app.use('/api', router)), and the broadcast half asserts
+// what the bus actually emits when selfReview runs.
+import express from 'express';
+const { router } = await import('../server/src/api/routes.js');
+const { hashToken } = await import('../server/src/lib/xell-token.js');
+const { bus } = await import('../server/src/lib/events.js');
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -123,6 +131,70 @@ try {
   const myLand2 = lands2.find((l) => l.id === land2.id);
   ok(Array.isArray(myLand2?.reviews) && myLand2.reviews.length === 0,
      'an unreviewed landing has an empty reviews array — nothing blocks it');
+
+  // ── 8. the REAL route: /xell/self/review over HTTP, auth + body + errors ────
+  // The db-sandbox half proves selfReview + the read models; THIS half proves the route wiring the
+  // container would otherwise be the only one to exercise — a real bearer token resolved through
+  // resolveSelf → xellForToken, express body parsing, and the route's own error envelope. It mounts
+  // the ACTUAL routes.js router exactly as server/src/index.js does; only the queenzee loops are
+  // absent (they are not part of the review path).
+  console.log('\n── the route is real: HTTP + bearer auth + error paths ──');
+  const TOKEN = 'review-test-route-token';
+  await q(`UPDATE xell SET self_token_hash=$2 WHERE id=$1`, [xell.id, hashToken(TOKEN)]);
+
+  const app = express();
+  app.use(express.json({ limit: '30mb' }));
+  app.use('/api', router);
+  const srv = await new Promise((res) => {
+    const s = app.listen(0, '127.0.0.1', () => res(s));
+    s.unref?.();
+  });
+  const routeBase = `http://127.0.0.1:${srv.address().port}/api`;
+  const viaRouteSha = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd';
+  try {
+    const noAuth = await fetch(`${routeBase}/xell/self/review`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    ok(noAuth.status === 401, `a missing bearer token is refused over HTTP (status ${noAuth.status})`);
+
+    const badSha = await fetch(`${routeBase}/xell/self/review`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ commit: 'nope' }) });
+    const badShaJson = await badSha.json();
+    ok(badSha.status === 200 && badShaJson.ok === false && /40-char/.test(badShaJson.error || ''),
+       'the route surfaces the selfReview refusal for a bad sha (no throw, ok:false envelope)');
+
+    const viaRoute = await fetch(`${routeBase}/xell/self/review`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ commit: viaRouteSha, verdict: 'clean', findings_count: 0, report: 'read over HTTP' }) });
+    const viaRouteJson = await viaRoute.json();
+    ok(viaRouteJson.ok === true && viaRouteJson.review?.commit_sha === viaRouteSha
+       && viaRouteJson.review?.reviewer === 'reviewer-slug',
+       `a real HTTP POST records the review (${viaRouteJson.review?.commit_sha?.slice(0, 10)} — route, not direct call)`);
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+
+  // ── 9. the broadcast path: selfReview emits review + xell events on the bus ──
+  // The SSE/websocket fan-out to a BROWSER is container territory, but the server half of that path
+  // is this in-process bus emission — the exact event frames /api/stream and /api/stream/ws relay.
+  // A connected console hears the `review` row AND the `xell` touch (which is in the client's
+  // STREAM_TYPES, so it re-reads the fleet and the landing/ship cards repaint with the new chip).
+  console.log('\n── the broadcast path fires ──');
+  const seenEvents = [];
+  const onBusEvent = (e) => { seenEvents.push(e); };
+  bus.on('event', onBusEvent);
+  try {
+    const revBcast = await selfReview(xell, { commit: viaRouteSha, verdict: 'clean', findings_count: 1, report: 'broadcast check' });
+    ok(revBcast.ok === true, 'a second review is recorded for the broadcast check');
+    const reviewEv = seenEvents.find((e) => e.type === 'review');
+    const xellEv = seenEvents.find((e) => e.type === 'xell');
+    ok(reviewEv && reviewEv.payload?.commit_sha === viaRouteSha && reviewEv.payload?.reviewer === 'reviewer-slug',
+       'the review row is broadcast as a `review` event frame');
+    ok(xellEv && xellEv.payload?.id === xell.id,
+       'a `xell` touch is broadcast so a connected console re-reads the cards');
+  } finally {
+    bus.removeListener('event', onBusEvent);
+  }
 } finally {
   // Clean up only our rows (house rule 1: no test data left behind).
   await q(`DELETE FROM review WHERE project_id=$1`, [project.id]);

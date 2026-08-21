@@ -17,7 +17,7 @@ const short = (s) => (s ? String(s).slice(0, 8) : '—');
 // human approving a PRODUCTION deploy sees whether anyone actually read the code, and what they
 // concluded. A record, never a gate: its absence never blocks a ship, and its presence is the
 // information the ticket said the system was missing — a review happened and nobody could see it.
-function ShipReviewNote({ req }) {
+export function ShipReviewNote({ req }) {
   const reviews = Array.isArray(req.reviews) ? req.reviews : [];
   if (!reviews.length) return null;
   return (

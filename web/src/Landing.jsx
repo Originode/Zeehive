@@ -78,7 +78,7 @@ export const holdsRunway = (r) => !!r?.runway_occupant && (r?.holders || 0) > 0;
 // approving a landing sees whether anyone actually READ it, and what they concluded. A record, not
 // a gate: its absence never blocks an approval, and its presence is the information the system was
 // missing — a review happened and nobody could see it.
-function ReviewNote({ req }) {
+export function ReviewNote({ req }) {
   const reviews = Array.isArray(req.reviews) ? req.reviews : [];
   if (!reviews.length) return null;
   return (
