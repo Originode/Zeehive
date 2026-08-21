@@ -335,6 +335,30 @@ try {
   const routes = readFileSync('server/src/api/routes.js', 'utf8');
   ok(/router\.post\('\/xell\/dispatch\/overlap'/.test(routes),
      'a PREFLIGHT route exists for the human surface — the answer before the button, not in the receipt');
+  // THE BOARD's deploy surface — the gap this card closes. The MANAGER's dispatch verb read the
+  // overlap; the board's deploy path (POST /work-items/:id/deploy → deployWorkItem →
+  // deployWorkItemHeld → dispatchXell) never did, so a HUMAN deploying from the console got no
+  // warning at all. Asserted here: the deploy path reads it too (before the spawn, keyed on the
+  // item, riding in the answer rather than gating it), the work-item preflight route exists, and
+  // the console's DeployZee dialog calls it and renders the note without ever disabling the button.
+  ok(/router\.post\('\/work-items\/:id\/deploy\/overlap'/.test(routes),
+     'and the WORK-ITEM deploy preflight route exists — the board\'s answer before the button');
+  const deploySrc = readFileSync('server/src/lib/work-assign.js', 'utf8');
+  const held = deploySrc.slice(deploySrc.indexOf('async function deployWorkItemHeld'),
+                               deploySrc.indexOf('export async function candidatesFor'));
+  ok(/overlapForBrief\(\{ projectId: full\.project_id, brief, workItemId: full\.id,\s*excludeXellId: managerXellId \|\| null \}\)/.test(held),
+     'the deploy path reads it BEFORE the spawn, keyed on the item (#64 — the landed half reads the tracker link)');
+  ok(/dispatch: out, brief, overlap,/.test(held),
+     'and it rides along in the deploy answer — it does not gate the verb');
+  const workApi = readFileSync('web/src/work/workApi.js', 'utf8');
+  ok(/export const getDeployOverlap = \(id, opts = \{\}\)/.test(workApi)
+     && /\/api\/work-items\/\$\{encodeURIComponent\(id\)\}\/deploy\/overlap/.test(workApi),
+     'and the console work client exposes getDeployOverlap()');
+  const dz = readFileSync('web/src/work/DeployZee.jsx', 'utf8');
+  ok(/getDeployOverlap\(item\.id, \{ task: task\.trim\(\) \|\| undefined \}\)/.test(dz),
+     'and the DeployZee dialog calls it AFTER the task is known (the extra text can name a path or ticket)');
+  ok(/data-testid="deploy-overlap"/.test(dz) && !/disabled=\{[^}]*overlap/.test(dz),
+     'it renders the warning and does NOT disable the deploy button anywhere');
   const dlg = readFileSync('web/src/Dispatch.jsx', 'utf8');
   ok(/dispatchOverlap\(\{ project: projectId, task \}\)/.test(dlg) && /setTimeout\(/.test(dlg),
      'and the console dispatch dialog actually CALLS it, debounced (a route nobody calls is dead code)');

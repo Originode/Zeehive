@@ -167,3 +167,10 @@ export const unassignWorkItem = (id) => call(`/api/work-items/${encodeURICompone
 // { task?, model?, mode?, harness? } — every field optional; the server holds the defaults, so an
 // omitted model is the server's choice and not a stale copy of one made in the browser.
 export const deployWorkItem = (id, opts = {}) => send(`/api/work-items/${encodeURIComponent(id)}/deploy`, 'POST', opts);
+// The overlap PREFLIGHT for the board's deploy dialog (#33/#64) — read-only, builds the same brief
+// a deploy would and keys it on the item itself, so a human sees the answer BEFORE pressing "deploy
+// a worker" rather than in the receipt afterwards. Advisory like the dispatch preflight: a failure
+// answers "no warnings", never an error — a coordination hint must never stand between a human and
+// a dispatch.
+export const getDeployOverlap = (id, opts = {}) =>
+  send(`/api/work-items/${encodeURIComponent(id)}/deploy/overlap`, 'POST', opts);

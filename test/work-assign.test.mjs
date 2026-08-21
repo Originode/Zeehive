@@ -264,6 +264,8 @@ try {
     const stub = async ({ task: brief, title }) => { seen = { brief, title }; return { xell_id: spare.id, slug: spare.slug }; };
     const out = await WA.deployWorkItem(item.id, { task: 'and mind the dates', actor: 'test@human', dispatchFn: stub });
     ok(out.ok && out.xell.id === spare.id, 'deploy assigns the dispatched worker to the item');
+    ok(out.overlap && typeof out.overlap === 'object' && Array.isArray(out.overlap.warnings),
+       'and the deploy answer carries the overlap read — the board\'s deploy path is not blind to it (#33/#64)');
     ok(/wa: the task/.test(seen.brief), 'the brief carries the item itself');
     ok(/wa: an activity/.test(seen.brief) && /YOUR item/.test(seen.brief),
        'and its ANCESTOR chain (the worker knows what it sits under)');
