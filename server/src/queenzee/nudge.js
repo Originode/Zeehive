@@ -695,10 +695,18 @@ export async function sendMessageToXell(xellId, { text = '', attachments = [], b
 // ── TURN-BUDGET WARNING — tell a zee its turn is approaching the vendor ceiling ─────────────────
 // The ONE message a zee gets when its turn's running token total crosses TURN_BUDGET_WARNING_TOKENS
 // (~12M, a named constant in lib/turn-ledger.js). Delivered through the SAME channel as every other
-// operator message (sendMessageToXell), which routes mid-turn to the talk queue — typed into the
-// zee's session the moment the turn ends — exactly the shape the card asks for (sendMessageToXell,
+// operator message (sendMessageToXell) — exactly the shape the card asks for (sendMessageToXell,
 // not nudgeCxell, which REFUSES a mid-turn zee by design). Best-effort by contract, and never ends
 // a turn: the vendor's ceiling does that, and this warning exists so a zee lands what it has first.
+//
+// THE HONEST SHAPE OF THE DELIVERY (do not let this rot into a claim that a zee "was warned"):
+// the warning fires MID-TURN by definition, and mid-turn delivery is QUEUED by zee-turn.js:77
+// (MID_TURN_STATUSES includes 'working') — the talk queue drains only when the turn ends (cxell.js
+// cxellTalkCommand / zee-attach.sh). So a turn that DIES at the ceiling will NOT receive this before
+// dying: it waits in the queue and reaches the RESUMED zee after the death — RECOVERY, not
+// PREVENTION, until a mid-turn channel exists. The verdict this returns (delivery: 'queued' in that
+// case) is recorded on the turn row by warnTurnBudget, so the data says how often the warning was
+// actually deliverable in time.
 export async function nudgeXellForTurnBudget(xellId, { tokens = 0, by = 'queenzee', mode = PROVISION_MODE } = {}) {
   return sendMessageToXell(xellId, { text: turnBudgetWarningMessage(tokens), by, mode });
 }

@@ -440,28 +440,56 @@ async function accumulateTurnBudget(turnId, xellId, event) {
 // outcomes) and tell the zee to land. The UPDATE's WHERE `meta->'turn_budget_warning' IS NULL`
 // makes the DB write a one-shot even if two processes race a turn — a turn can never be warned
 // twice. NEVER throws, and NEVER ends the turn: the ceiling does that, our job is only to warn
-// before it arrives. Returns { fired:true, tokens } (so the caller can assert it happened).
+// before it arrives. Returns { fired:true, tokens, delivery, sent } (so the caller can assert it).
+//
+// THE HONEST SHAPE OF THE DELIVERY — read this before touching the nudge. The warning fires
+// MID-TURN by definition: a turn only crosses TURN_BUDGET_WARNING_TOKENS while it is still running.
+// Mid-turn delivery is QUEUED by zee-turn.js decideMessageDelivery (MID_TURN_STATUSES includes
+// 'working' — server/src/lib/zee-turn.js:77), and the queue drains only when the turn ends
+// (cxell.js cxellTalkCommand / zee-attach.sh type it in the moment the headless run is over). So a
+// turn that DIES at the ceiling — the exact scenario this card exists for — will NOT receive the
+// warning before it dies: the message waits in the talk queue and reaches the RESUMED zee after the
+// death. That makes this RECOVERY (the zee is told its turn died near the ceiling) rather than
+// PREVENTION, until a mid-turn channel exists (an open question for a human — see the card). That is
+// exactly why the delivery verdict is recorded below: the first week of data answers "how often was
+// this warning actually deliverable in time" instead of us asserting a delivery that does not happen.
 async function warnTurnBudget(turnId, xellId, tokens) {
-  try {
-    await q(
-      `UPDATE zee_turn SET meta = meta || $2::jsonb
-        WHERE id = $1 AND meta->'turn_budget_warning' IS NULL`,
-      [turnId, JSON.stringify({ turn_budget_warning: { fired: true, tokens: Number(tokens) || 0 } })]);
-  } catch (e) {
-    logline('turn', `could not record turn-budget warning for turn ${String(turnId).slice(0, 8)} `
-      + `(${String(e.message).slice(0, 120)})`);
-  }
+  // Deliver FIRST so the record carries the verdict that actually happened.
+  let verdict = null;
   try {
     // Dynamic import to avoid a require cycle: nudge.js imports startTurn/endTurn/lastAssistantText
     // from THIS module, so a static import here would be circular. The nudge is best-effort — a zee
     // with no live cxell (viewer_kind !== 'ssh-terminal') is refused by sendMessageToXell, which is
-    // the correct behaviour for a turn whose warning cannot be typed anywhere.
+    // the correct behaviour for a turn whose warning cannot be typed anywhere (see the comment above
+    // for what 'queued' — the mid-turn verdict — actually means).
     const { nudgeXellForTurnBudget } = await import('../queenzee/nudge.js');
-    await nudgeXellForTurnBudget(xellId, { tokens: Number(tokens) || 0, by: 'queenzee' });
+    verdict = await nudgeXellForTurnBudget(xellId, { tokens: Number(tokens) || 0, by: 'queenzee' });
   } catch (e) {
     logline('turn', `could not nudge the zee about the turn-budget warning (${String(e.message).slice(0, 120)})`);
+    verdict = { sent: false, delivery: 'none', reason: `nudge threw: ${String(e.message).slice(0, 120)}` };
   }
-  return { fired: true, tokens: Number(tokens) || 0 };
+  const d = verdict && typeof verdict === 'object'
+    ? { sent: !!verdict.sent, delivery: verdict.delivery || 'none',
+        reason: String(verdict.reason || verdict.error || '').slice(0, 200) || null }
+    : { sent: false, delivery: 'none', reason: 'nudge returned no verdict' };
+  try {
+    await q(
+      `UPDATE zee_turn SET meta = meta || $2::jsonb
+        WHERE id = $1 AND meta->'turn_budget_warning' IS NULL`,
+      [turnId, JSON.stringify({
+        turn_budget_warning: {
+          fired: true,
+          tokens: Number(tokens) || 0,
+          delivery: d.delivery,
+          delivery_sent: d.sent,
+          delivery_reason: d.reason,
+        },
+      })]);
+  } catch (e) {
+    logline('turn', `could not record turn-budget warning for turn ${String(turnId).slice(0, 8)} `
+      + `(${String(e.message).slice(0, 120)})`);
+  }
+  return { fired: true, tokens: Number(tokens) || 0, delivery: d.delivery, sent: d.sent };
 }
 
 /**
