@@ -413,12 +413,13 @@ export function usageFromFeedEvent(event) {
 // warning fires (so a caller that AWAITS recordFeedEvent sees the row update deterministically), or
 // null otherwise. NEVER throws — the feed must never depend on the budget.
 //
-// The `result` event is deliberately NOT accumulated (usageFromFeedEvent returns all-zero for it):
-// its usage is the turn's CUMULATIVE checkpoint, and it arrives at the very END of the turn — too
-// late to warn a zee, and "warning" a zee whose turn just ended (to land NOW) would be noise at
-// best and a false alarm at worst. The warning is for the LIVE stream: message_start (this request's
-// input + cache writes) and message_delta (this request's output + cache reads), summed across every
-// request the turn makes.
+// The `result` event is deliberately NOT accumulated (usageFromFeedEvent returns all-zero for it).
+// DO NOT "fix" this by adding the result event back: its usage is the turn's CUMULATIVE checkpoint
+// — the sum of every request's deltas ALREADY in the running total — so adding it double-counts the
+// whole turn, and it arrives at the very END of the turn, after the only moment a warning could have
+// helped (warning a zee whose turn just ended, to land NOW, would be noise at best and a false alarm
+// at worst). The warning is for the LIVE stream: message_start (this request's input + cache writes)
+// and message_delta (this request's output + cache reads), summed across every request the turn makes.
 async function accumulateTurnBudget(turnId, xellId, event) {
   if (!turnId || !event) return null;
   const u = usageFromFeedEvent(event);
