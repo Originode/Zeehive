@@ -103,3 +103,18 @@ export async function updateProjectCondition(conditionId, body, { actor = null }
   if (!row) return { ok: false, error: `no condition ${conditionId}` };
   return { ok: true, condition: row };
 }
+
+// The manager's scoped edit — the twin of removeProjectConditionScoped, and the same rule: a
+// condition id names a row in SOME project, and a manager must only ever edit its OWN. The console
+// resolves the condition's project and passes it here; a mismatch refuses BY NAME rather than
+// editing a foreign row. (An id is not an authorisation; update and remove sit next to each other
+// and must refuse the same way, or the weaker one gets copied later.)
+export async function updateProjectConditionScoped(conditionId, projectId, body, { actor = null } = {}) {
+  const text = String(body || '').trim();
+  if (!text) return { ok: false, error: 'a condition line is required' };
+  const row = await one(
+    `UPDATE project_condition SET body=$2, updated_at=now(), updated_by=$3
+      WHERE id=$1 AND project_id=$4 RETURNING *`, [conditionId, text, actor || null, projectId]);
+  if (!row) return { ok: false, error: `no condition ${conditionId} in this project` };
+  return { ok: true, condition: row };
+}

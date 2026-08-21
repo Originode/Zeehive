@@ -32,7 +32,7 @@ const { q, one, pool } = await import('../server/src/db/pool.js');
 const { briefing } = await import('../server/src/queenzee/intake.js');
 const { listProjectConditions, addProjectCondition, removeProjectCondition,
         renderCurrentConditions, conditionDate,
-        removeProjectConditionScoped } = await import('../server/src/lib/current-conditions.js');
+        removeProjectConditionScoped, updateProjectConditionScoped } = await import('../server/src/lib/current-conditions.js');
 const { selfConditions } = await import('../server/src/queenzee/self.js');
 
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
@@ -123,6 +123,20 @@ try {
   ok(scoped.ok === false, 'the scoped delete refuses a row that is not in the caller project');
   await removeProjectCondition(addOther.condition.id);
 
+  // ── the scoped UPDATE refuses a foreign project's row too ──────────────────
+  // The manager's hard-check: update and remove must refuse the same way (an id is not an
+  // authorisation, and two functions sitting next to each other with different rules is how the
+  // weaker one gets copied later). So the deny-path matters, not just the allow-path.
+  console.log('\n── the scoped update refuses a foreign row, allows its own ──');
+  const mineUpd = await addProjectCondition(pid, 'a condition to update in the right project', { actor: 'test' });
+  const updForeign = await updateProjectConditionScoped(mineUpd.condition.id, pid2, 'someone else edits', { actor: 'test' });
+  ok(updForeign.ok === false, 'a cross-project UPDATE is REFUSED (no condition <id> in this project)');
+  const updMine = await updateProjectConditionScoped(mineUpd.condition.id, pid, 'updated in the right project', { actor: 'test' });
+  ok(updMine.ok === true && updMine.condition.body === 'updated in the right project',
+     'a same-project UPDATE succeeds and lands the new body');
+  ok(updMine.condition.updated_by === 'test', 'and stamps the actor who made the edit');
+  await removeProjectCondition(mineUpd.condition.id);
+
   // ── the CONSOLE write routes enforce the same manager wall (a bypass test) ──
   // The /xell/self wall only protects the route a zee's OWN CLI uses. A caged worker that can reach
   // the queenzee API at all could call the console's /projects/:id/conditions POST straight — so the
@@ -175,6 +189,14 @@ try {
   const putBody = await put.json().catch(() => ({}));
   ok(put.status === 403 && putBody.status === 'refused',
      'PUT /project-conditions/:id with a WORKER token → 403 refused');
+  const putHuman = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ body: 'a human edits (bare request)' }),
+  });
+  const putHumanBody = await putHuman.json().catch(() => ({}));
+  ok(putHuman.status === 200 && putHumanBody.ok === true,
+     'a bare PUT (no token — the human editing in the console) still works');
   const del = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
     method: 'DELETE',
     headers: { authorization: `Bearer ${workerToken}` },
