@@ -77,8 +77,8 @@ try {
   ok(S.statusFromHive('vac-ready') === null && S.statusFromHive('live-protected') === null
      && S.statusFromHive(undefined) === null,
      'anything else maps to NULL — a status is never invented from a hive state that implies none');
-  ok(S.nextStatuses('working').includes('cancelled') && S.nextStatuses('done').join(',') === 'queued,cancelled',
-     'anything may be cancelled; a terminal item reopens to queued');
+  ok(S.nextStatuses('working').includes('cancelled') && S.nextStatuses('done').join(',') === 'queued,review,cancelled',
+     'anything may be cancelled; a terminal item reopens to queued — and done may reopen to review (ticket #56)');
   ok(!S.canTransition('done', 'working') && S.canTransition('done', 'queued') && S.canTransition('queued', 'working'),
      'a done item cannot jump straight back to working — it reopens through queued');
   const vocab = S.workStatusVocabulary();

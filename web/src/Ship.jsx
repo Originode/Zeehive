@@ -13,6 +13,26 @@ import { shipFailureReport, shipHasFailureOutput } from './shipFailure.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
+// WHO READ THIS COMMIT (ticket #56) — the review records attached to the sha a ship carries, so a
+// human approving a PRODUCTION deploy sees whether anyone actually read the code, and what they
+// concluded. A record, never a gate: its absence never blocks a ship, and its presence is the
+// information the ticket said the system was missing — a review happened and nobody could see it.
+function ShipReviewNote({ req }) {
+  const reviews = Array.isArray(req.reviews) ? req.reviews : [];
+  if (!reviews.length) return null;
+  return (
+    <div className="land-reviews" data-testid="ship-reviews">
+      {reviews.map((r, i) => (
+        <span key={i} className={`review-chip review-${r.verdict}`}
+              title={r.report || `${r.reviewer}'s review of ${short(req.commit)}`}>
+          {r.verdict === 'clean' ? '✓' : '⚠'} reviewed by {r.reviewer} — {r.verdict.replace('_', '-')}
+          {Number(r.findings_count) > 0 ? ` · ${r.findings_count} finding${Number(r.findings_count) === 1 ? '' : 's'}` : ''}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // The schema half of the approve confirmation, in one line per set. Exported for the same reason
 // ShipSchema is: the "UNKNOWN, never none" rule is a contract, so it is read from real output.
 export function schemaConfirmLine(req) {
@@ -281,6 +301,11 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
       <div className="land-stat">
         builds local <b>main</b> @ <b>{short(req.commit)}</b> — not the xell's worktree, not origin
       </div>
+      {/* WHO READ THIS COMMIT (ticket #56) — the reviews recorded against the sha this ship carries,
+          so approving a deploy to PRODUCTION is done knowing whether the code was reviewed, and by
+          whom. A record, never a gate: its absence never blocks a ship, and its presence is the
+          information the ticket said the system was missing. */}
+      <ShipReviewNote req={req} />
       {/* THE SCHEMA THIS SHIP CARRIES — both sets, never merged (ticket #12). The card used to show
           nothing at all unless the ship was code-only, and `migrations` is empty for a project that
           migrates itself at BOOT: a Zeehive deploy told the approving human "no migrations" while

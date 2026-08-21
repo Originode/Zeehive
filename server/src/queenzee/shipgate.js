@@ -549,8 +549,16 @@ export async function withdrawShipRequest(id, by = 'zee', reason = null) {
 
 export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
+  // The reviews (224) carried on this ship's commit — so the human approving a deploy sees whether
+  // the code being shipped was READ, and by whom. A record, never a gate: nothing here waits on it.
   return q(
-    `SELECT s.*, x.slug AS xell_slug, ds.key AS site_key FROM ship_request s
+    `SELECT s.*, x.slug AS xell_slug, ds.key AS site_key,
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = s.commit) AS reviews
+       FROM ship_request s
        JOIN xell x ON x.id = s.xell_id
        LEFT JOIN deploy_site ds ON ds.id = s.site_id
        WHERE s.project_id=$1 ${where} ORDER BY s.requested_at DESC LIMIT 50`, [projectId]);

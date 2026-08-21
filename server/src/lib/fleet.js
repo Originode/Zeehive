@@ -658,7 +658,14 @@ export async function getFleet(projectId) {
                   AND (o.requested_at, o.id) < (lr.requested_at, lr.id)) AS runway_occupant,
             (SELECT count(*)::int FROM land_request h
                WHERE lr.kind = 'push' AND h.project_id = lr.project_id AND h.ref = lr.ref
-                 AND h.kind = 'push' AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders
+                 AND h.kind = 'push' AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders,
+            -- Who READ this landing's diff (224) — so approving a landing knows whether a review
+            -- exists and what it concluded. A record, never a gate: nothing here waits on it.
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = lr.new_sha) AS reviews
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
        WHERE lr.project_id = $1 AND lr.status IN ('pending','approved')
        ORDER BY lr.requested_at DESC`, [pid]);
@@ -675,7 +682,13 @@ export async function getFleet(projectId) {
   // instant the build ended took its result — and its build log — with it, so the human's only
   // view of a just-shipped (or just-failed) deploy was gone before they could read it.
   const shipping = await q(
-    `SELECT s.*, x.slug AS xell_slug FROM ship_request s JOIN xell x ON x.id = s.xell_id
+    `SELECT s.*, x.slug AS xell_slug,
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = s.commit) AS reviews
+       FROM ship_request s JOIN xell x ON x.id = s.xell_id
        WHERE s.project_id = $1 AND s.dismissed_at IS NULL
          AND (s.status IN ('pending','approved','shipping')
           OR (s.status IN ('shipped','failed')

@@ -1301,6 +1301,16 @@ a.cbox:hover { border-color: var(--accent); }
 .land-what { font-size: 14px; flex: 1; min-width: 0; }
 .land-meta { color: var(--muted); font-size: 12px;
   font-family: 'Cascadia Code', 'Consolas', monospace; }
+/* ── REVIEW CHIPS (ticket #56) ──────────────────────────────────────────────
+   Who READ the diff being landed/shipped, and what they concluded. A record, not a gate —
+   rendered quietly, never blocking the decision. Green for a clean review, amber when changes
+   were required. */
+.land-reviews { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 6px 0 2px; }
+.review-chip { font-size: 11.5px; padding: 2px 7px; border-radius: 10px;
+  background: var(--panel, rgba(0,0,0,.35)); border: 1px solid var(--line); color: var(--text);
+  cursor: help; white-space: nowrap; }
+.review-chip.review-clean { border-color: var(--up, #2ecc71); color: var(--up, #2ecc71); }
+.review-chip.review-changes_required { border-color: #e5a50a; color: #e5a50a; }
 .land-stat { color: var(--muted); font-size: 13px; font-weight: 600; margin: 6px 0 4px; }
 .land-stat .ins { color: var(--up); }
 .land-stat .del { color: var(--error); }

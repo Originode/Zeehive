@@ -529,6 +529,7 @@ function usage() {
  crew (a zee that has a manager, or IS one):
   zee report --message "..." [--kind reflection]   send your MANAGER a note (a question, a blocker, or your post-ship REFLECTION). The one reach outside your xell a worker is meant to have
   zee inbox [--all]                  read what other zees sent you (reading marks them read); --all shows the history
+  zee review --of <sha> [--verdict clean|changes-required] [--findings N] [--report "..."]   RECORD a review of a landed diff — WHO read it, the verdict, findings count and report. NOT a gate: nothing on the land/ship path waits on it; the landing/ship cards show it so an unreviewed ship is a knowing choice
 
  the work tracker (the PLAN this job is part of):
   zee conditions [--add "..." | --remove <id>]   YOUR PROJECT'S CURRENT CONDITIONS: the short, dated list of LIVE IMPEDIMENTS injected into every briefing (ticket #67) — read it any time, and trust it over any doc older than it is. READ is every zee's (NOT gated); --add/--remove are MANAGER-only, scoped to your own project by your token, and delete is trivial on purpose (stale conditions are worse than none)
@@ -1207,6 +1208,20 @@ switch (cmd) {
     }
     if (j.message) console.log(j.message);
     process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'review': {
+    // RECORD a review of a landed diff (ticket #56): WHO read it, the verdict, findings count and
+    // the report. NOT a gate — this is a plain INSERT, nothing on the land/ship path waits on it.
+    // The landing/ship cards surface reviews so an unreviewed change ships only as a knowing choice.
+    const commit = flag('of');
+    if (!commit) { console.error('review needs --of <sha> — the full 40-char commit sha you read'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/review', {
+      commit,
+      verdict: flag('verdict') || 'clean',
+      findings_count: Number(flag('findings')) || 0,
+      report: flag('report') || null,
+    }));
     break;
   }
   case 'conditions': {

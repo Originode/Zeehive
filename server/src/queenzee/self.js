@@ -2593,6 +2593,42 @@ export async function selfReport(xell, { message = null, kind = 'report' } = {})
       + deliveryReceipt(r.delivery?.delivery, manager.slug, r.delivery?.reason || r.delivery?.error || null) };
 }
 
+// POST /api/xell/self/review — RECORD a review of a landed diff (`zee review --of <sha>`).
+//
+// Ticket #56: a reviewer cast on a landed diff found a cross-project write hole and a
+// mass-assignment path within an hour, and the system recorded neither the review nor its findings.
+// This is the record: WHO read a landed commit, what they concluded (clean / changes-required), how
+// many findings, and the report. It is deliberately NOT a gate — nothing on the landing or ship path
+// waits on it, and recording one must never slow a landing. Its job is to make the landing/ship
+// cards say whether the code has been READ and by whom, so shipping an unreviewed change is a
+// human's knowing decision rather than an accident.
+export async function selfReview(xell, { commit = null, verdict = null, findings_count = 0, report = null } = {}) {
+  const sha = String(commit || '').trim();
+  if (!sha) return { ok: false, error: 'review needs --of <sha> — the full 40-char commit sha you read' };
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    return { ok: false, error: `"${sha}" is not a full 40-char commit sha — pass the tip of the landed diff you read (a landing's new_sha, a ship's commit)` };
+  }
+  // The CLI spells the verdict `changes-required`; the enum stores `changes_required`. Normalize.
+  const v = String(verdict || '').trim().replace(/-/g, '_');
+  if (!['clean', 'changes_required'].includes(v)) {
+    return { ok: false, error: 'review needs --verdict clean|changes-required' };
+  }
+  const n = Math.max(0, Math.floor(Number(findings_count) || 0));
+  const text = String(report || '').trim() || null;
+  const zee = await liveZee(xell.id);
+  const row = await one(
+    `INSERT INTO review (project_id, xell_id, zee_id, reviewer, commit_sha, verdict, findings_count, report)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [xell.project_id, xell.id, zee?.id || null, xell.slug, sha, v, n, text]);
+  broadcast('review', row);
+  broadcast('xell', { id: xell.id });
+  logline('review', `${xell.slug} recorded a ${v === 'clean' ? 'CLEAN' : 'CHANGES-REQUIRED'} review of ${sha.slice(0, 10)} (${n} finding${n === 1 ? '' : 's'})`);
+  return {
+    ok: true, review: row,
+    message: `Review of ${sha.slice(0, 10)} recorded — ${v === 'clean' ? 'clean' : 'changes required'}, ${n} finding${n === 1 ? '' : 's'}. `
+      + 'It is a record, not a gate: nothing on the landing or ship path waited on it.' };
+}
+
 // GET /api/xell/self/inbox — what other zees sent ME (`zee inbox`). Reading marks read.
 export async function selfInbox(xell, { all = false } = {}) {
   const rows = await inboxFor(xell.id, { all });

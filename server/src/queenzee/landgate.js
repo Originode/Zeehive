@@ -686,8 +686,15 @@ export async function listLandRequests(projectId, { open = true } = {}) {
   // Open view: undecided or still-working rows a human has NOT dismissed. A dismissed approval
   // keeps being retried by the reaper — it just stops being shown.
   const where = open ? `AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL` : '';
+  // The reviews (224) carried on this landing's sha — so a human approving a landing knows whether
+  // anyone READ the diff, and who. A record, never a gate: nothing here waits on a review.
   return q(
-    `SELECT lr.*, x.slug AS xell_slug
+    `SELECT lr.*, x.slug AS xell_slug,
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = lr.new_sha) AS reviews
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
        WHERE lr.project_id = $1 ${where}
        ORDER BY lr.requested_at DESC LIMIT 50`, [projectId]);

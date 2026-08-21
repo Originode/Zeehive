@@ -85,7 +85,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
-         selfSay, selfReport, selfInbox, selfA2ASend,
+         selfSay, selfReport, selfInbox, selfReview, selfA2ASend,
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
@@ -2028,6 +2028,16 @@ router.post('/xell/self/say', async (req, res) => {
 router.post('/xell/self/report', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfReport(x, { message: req.body?.message, kind: req.body?.kind || 'report' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// `zee review --of <sha>` — RECORD a review of a landed diff (ticket #56): reviewer, verdict,
+// findings count, report. A first-class record, NOT a gate — nothing on the land/ship path waits
+// on it. The landing/ship cards surface it so an unreviewed change ships only as a knowing choice.
+router.post('/xell/self/review', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfReview(x, {
+      commit: req.body?.commit, verdict: req.body?.verdict,
+      findings_count: req.body?.findings_count, report: req.body?.report })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // `zee a2a <card-url> --message "…"` — send an A2A SendMessage to an EXTERNAL agent card URL,

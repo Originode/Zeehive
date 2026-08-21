@@ -74,6 +74,26 @@ function ApproachQueue({ queue }) {
 // with the reason, and every button it always had.
 export const holdsRunway = (r) => !!r?.runway_occupant && (r?.holders || 0) > 0;
 
+// WHO READ THIS DIFF (ticket #56) — the review records attached to the sha being landed. A human
+// approving a landing sees whether anyone actually READ it, and what they concluded. A record, not
+// a gate: its absence never blocks an approval, and its presence is the information the system was
+// missing — a review happened and nobody could see it.
+function ReviewNote({ req }) {
+  const reviews = Array.isArray(req.reviews) ? req.reviews : [];
+  if (!reviews.length) return null;
+  return (
+    <div className="land-reviews" data-testid="land-reviews">
+      {reviews.map((r, i) => (
+        <span key={i} className={`review-chip review-${r.verdict}`}
+              title={r.report || `${r.reviewer}'s review of ${shortSha(req.new_sha)}`}>
+          {r.verdict === 'clean' ? '✓' : '⚠'} reviewed by {r.reviewer} — {r.verdict.replace('_', '-')}
+          {Number(r.findings_count) > 0 ? ` · ${r.findings_count} finding${Number(r.findings_count) === 1 ? '' : 's'}` : ''}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function LandCard({ req, onDone, onDismiss, queue = req.queue }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -161,6 +181,8 @@ export function LandCard({ req, onDone, onDismiss, queue = req.queue }) {
             {shortSha(req.old_sha)} → {shortSha(req.new_sha)} · {ago(req.requested_at)}
             {req.attempts > 1 && <> · <span title="pushes seen for this sha">{req.attempts} attempts</span></>}
           </div>
+
+          <ReviewNote req={req} />
 
           {/* The diffstat is the BUTTON now. You are being asked to let this reach main; the
               commit subjects say what the zee meant, and this says what it actually wrote. It
