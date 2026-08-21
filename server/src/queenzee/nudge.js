@@ -844,12 +844,22 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
     }
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
-              x.slug, x.project_id, x.execution_id, rt.key AS runtime_key
+              x.slug, x.project_id, x.execution_id, x.quarantined_at, rt.key AS runtime_key
          FROM zee z JOIN xell x ON x.id = z.xell_id
          LEFT JOIN agent_runtime rt ON rt.id = z.runtime_id
         WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
         ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
     if (!zee) return { nudged: false, reason: 'no cxell zee for this xell (nothing to nudge)' };
+    // A QUARANTINED cage is not nudged (ticket #81): a nudge is a TURN, and the quarantine's whole
+    // point is that no recovery path starts another turn in the cage until a human decides. This is
+    // the shared delivery every nudge caller funnels through — landing approved, stale landing,
+    // runway cleared, fleet resume, a console nudge — so refusing here is the one refusal that holds
+    // for all of them. (reviveTick refuses the same way; the ladder entry stays so a rescue resumes it.)
+    if (zee.quarantined_at) {
+      logline('nudge', `${zee.slug}: ${why} by ${by} — NOT delivered, the xell is QUARANTINED `
+        + '(no new turn in the cage until a human decides between rescue and reap)');
+      return { nudged: false, quarantine: true, reason: 'xell is quarantined' };
+    }
     // A LIVE cxell has an ssh-terminal viewer; a torn-down one does not.
     if (zee.viewer_kind !== 'ssh-terminal') return { nudged: false, reason: `zee is not in a live cxell (viewer_kind=${zee.viewer_kind})` };
     // The zee's own runtime dialect: claude/codex resume by session id, kimi by workdir

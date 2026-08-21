@@ -35,6 +35,7 @@ import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAd
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell, purgeDevXells } from '../queenzee/reaper.js';
+import { clearXellQuarantine } from '../lib/xell-quarantine.js';
 import { attachXellDb, dbAccessForCwd, DB_MODES } from '../lib/xell-db.js';
 import { attachProdStack, detachProdStack, prodStackStatus } from '../lib/xell-prod.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
@@ -1510,6 +1511,19 @@ router.post('/xells/:id/build', requireQueenzeeLoops, async (req, res) => {
 // means no button, and nothing ever reaps them. Production is refused by reapXell itself.
 router.post('/xells/:id/reap', requireQueenzeeLoops, async (req, res) => {
   try { res.json(await reapXell(req.params.id, req.body?.reason || 'human-cleanup', { force: !!req.body?.force })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── lift a quarantine (ticket #81: the RESCUE arm) ────────────────────────────
+// A quarantined xell is refused every agent until a human decides between rescuing the branch
+// and reaping the cage. Reap is the existing /xells/:id/reap above; THIS is the rescue — it
+// clears the quarantine (consecutive_deaths, quarantined_at, quarantine_deaths,
+// quarantine_reason) so a fresh agent may be dispatched into the same worktree. Deliberately
+// does NOT need queenzee loops: the stamp is a plain row update, and a console can only reach
+// here through the running API. Clearing is idempotent (clearing an un-quarantined xell is a
+// no-op), so the route never 409s — a human re-clicking a stale button should not be punished.
+router.post('/xells/:id/unquarantine', async (req, res) => {
+  try { res.json(await clearXellQuarantine(req.params.id, { by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

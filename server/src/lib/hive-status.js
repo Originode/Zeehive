@@ -57,6 +57,11 @@ export const HIVE_STATUS = {
   'occ-paused':       { label: 'paused',       group: 'occ' },
   'occ-doneRequest':  { label: 'done?',        group: 'occ' },
   'occ-done':         { label: 'done',         group: 'occ' },
+  // QUARANTINED (ticket #81) — the cage killed N consecutive zees and is REFUSED every agent until
+  // a human decides. Its own word because it is a FACT about the cage, not an ask: a quarantined
+  // xell renders nothing else (it is not working, it is not idle, it is not merely waiting on a
+  // human) until someone clears it or reaps it.
+  'occ-quarantined':  { label: 'quarantined',  group: 'occ' },
   'live-protected':   { label: 'protected',    group: 'live' },
   'live-unprotected': { label: 'unprotected',  group: 'live' },
 };
@@ -120,6 +125,13 @@ export function hiveStatus(x, sig = {}) {
   // board card reported a live zee on work whose agent no longer existed. Answering null says the
   // only true thing: this row has no place on the hive. hiveLabel(null) is already '—'.
   if (s === 'retired')                   return null;
+
+  // QUARANTINED (ticket #81) — below production and the terminal housekeeping states, above every
+  // other reading, because it is a FACT the operator must see: this cage killed N zees in a row and
+  // is refused every agent until a human decides. A quarantined xell can be sitting in any lifecycle
+  // status (ready, idle, errored) and every one of those readings would be a lie about why it is
+  // quiet.
+  if (x.quarantined_at)                  return 'occ-quarantined';
 
   // ── vacant pool xells (no zee has claimed them yet) ──
   if (s === 'provisioning')              return 'vac-provisioning';

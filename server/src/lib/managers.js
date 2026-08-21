@@ -179,7 +179,8 @@ async function captureDoneEvidence(target) {
 export async function crewFor(managerXellId) {
   const rows = await q(
     `SELECT x.id, x.slug, x.branch, x.status, x.head_commit, x.created_at, x.db_coupling,
-            x.worktree_path, p.main_branch,
+            x.worktree_path, x.consecutive_deaths, x.quarantined_at, x.quarantine_deaths,
+            x.quarantine_reason, p.main_branch,
             z.status AS zee_status, z.cli_active, z.title AS zee_title, z.model,
             (z.entrypoint = 'cxell-cli'
                AND z.status IN ('spawning','online','working','idle')) AS cxell_live,
@@ -307,6 +308,13 @@ export async function crewFor(managerXellId) {
       diff: d ? { ahead: d.ahead || 0, dirty: d.dirty || 0, files: d.files || 0,
                   insertions: d.insertions || 0, deletions: d.deletions || 0,
                   head: d.head || null, source: d.source } : null,
+      // QUARANTINE (ticket #81) — a cage that killed N zees in a row is refused every agent until a
+      // human decides. A manager must see it on the crew row the moment it is true, not discover it
+      // as a dispatch refusal; the reason carries the count and the unlanded-work brief.
+      quarantined: !!r.quarantined_at,
+      consecutive_deaths: r.consecutive_deaths || 0,
+      quarantine_deaths: r.quarantine_deaths || null,
+      quarantine_reason: r.quarantine_reason || null,
       waiting_on_human: waiting,
       // A HELD done approval is a distinct flag from `done_suggested` (which is only the PENDING,
       // un-decided card): this one is DECIDED and waiting to be APPLIED (ticket #75). The reason the

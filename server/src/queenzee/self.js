@@ -56,6 +56,7 @@ import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '.
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
          NO_PUSH_REASON } from '../lib/managers.js';
+import { xellQuarantineRefusal } from '../lib/xell-quarantine.js';
 // The harness DOMAIN (lib/harness.js) — listed/authored here for the manager harness verbs at the
 // bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
 // check: this file adds the manager REFUSALS, never a second copy of the rules.
@@ -1738,7 +1739,8 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // a manager xell handed to it is refused downstream (it would otherwise be downgraded off
   // production). If the only ready xell is a manager's, this pool IS dry — provision, don't grab it.
   const ready = await one(
-    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' AND COALESCE(zee_type,'worker') <> 'manager'
+    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' AND quarantined_at IS NULL
+       AND COALESCE(zee_type,'worker') <> 'manager'
       ORDER BY ready_at DESC NULLS LAST LIMIT 1`,
     [xell.project_id]);
   let provisioned = null;
@@ -2114,6 +2116,14 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
       `${target.slug} is RETIRED — its cxell is torn down and its worktree is gone, so there is no zee `
       + 'to replace and nothing for a new one to inherit. A swap keeps a LIVE xell and changes who is '
       + 'in it; starting fresh work is a dispatch.' };
+  }
+
+  // A QUARANTINED cage gets no new agent — and a swap IS feeding it a new agent (ticket #81). This
+  // is the swap CORE: both `zee swap` and the console's human swap pass through here, so one refusal
+  // covers both. A swap was the exact recovery path that happily re-caged the incident's xell.
+  const qRefusal = xellQuarantineRefusal(target);
+  if (qRefusal) {
+    return { ok: false, status: 'refused', error: qRefusal };
   }
 
   // A MANAGER xell is not re-crewed by anybody — not by its own kind (`zee swap` refuses it upstream

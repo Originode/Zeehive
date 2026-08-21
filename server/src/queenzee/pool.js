@@ -115,6 +115,7 @@ async function reconcileProject(projectId, target) {
     const pooled = await q(
       `SELECT id, slug, head_commit, worktree_path FROM xell
          WHERE project_id=$1 AND status='ready' AND NOT is_production
+           AND quarantined_at IS NULL
          ORDER BY ready_at DESC NULLS LAST, created_at DESC LIMIT 25`, [projectId]);
     for (const x of pooled) {
       const { verdict, res } = await reconcileXell(x, src);
@@ -227,13 +228,18 @@ async function reconcileProject(projectId, target) {
 // is the runaway this flag exists to avoid — while the machine's max_xells still caps the fill
 // below (liveXellCount counts NULL-ctx rows into the queenzee host).
 async function fillTrim(projectId, target, m) {
+  // A QUARANTINED xell is excluded from the ready set on both arms — it must not count toward the
+  // target (the pool should provision a fresh cage to take its place) and it must not land in the
+  // TRIM surplus either. Reaping the cage is the human's explicit choice (the other arm of the
+  // ticket #81 decision), never a pool-sweep accident; a quarantined row sits untouched until a
+  // human clears it or reaps it.
   const ready = m && !m.processLocal
     ? await q(
       `SELECT x.id, x.slug, x.worktree_path FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
-        WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND c.docker_ctx=$2
+        WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND x.quarantined_at IS NULL AND c.docker_ctx=$2
         ORDER BY x.ready_at DESC NULLS LAST, x.created_at DESC`, [projectId, m.docker_ctx])
     : await q(
-      `SELECT id, slug, worktree_path FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production
+      `SELECT id, slug, worktree_path FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production AND quarantined_at IS NULL
         ORDER BY ready_at DESC NULLS LAST, created_at DESC`, [projectId]);
 
   if (ready.length < target) {
