@@ -216,6 +216,30 @@ ok(/if \(!heal\.ok\) return \{ \.\.\.heal, message: heal\.message \? withNote\(h
 ok(/message: withNote\(note\)/.test(sync), 'and the clean-sync message carries it too');
 ok(!/if \(\s*sibling/.test(sync), 'and nothing branches on the result to change the sync\'s decision');
 
+// ── THE MANUAL. A note a zee can receive must be a note it was TOLD to expect ─
+// House rule: the manual, the briefing and the CLI move together. The manual zees actually read is
+// the one in the meta DB (harness zee-base), edited by migration — so this asserts the DATABASE,
+// not a file, and it passes only on a database the migrations have been applied to.
+console.log('\n── the worker manual teaches the note ──');
+const mig = readFileSync('db/migrations/220_sibling_overlap_note_manual.sql', 'utf8');
+ok(/sibling-landing note/.test(mig) && /never a block/.test(mig), '220 teaches the sibling-landing note, as a note that never blocks');
+ok(/harness_memory_get\('zee-base', 'cxell-zee-manual\.md'\)/.test(mig)
+   && /harness_memory_put\('zee-base', 'cxell-zee-manual\.md', txt\)/.test(mig),
+   'and it edits the manual BY PATH through the 076 helper — never a hand-rolled jsonb array');
+ok(/IF txt LIKE '%The sibling-landing note/.test(mig), 'guarded on text it writes itself, so a re-run is a no-op');
+ok(/read it before you land/.test(mig) && /INFORMATION, never a block/.test(mig),
+   'it tells the zee the note is a warning to READ, not a gate to fear');
+const stored = await one(
+  `SELECT a.e->>'text' AS t FROM harness h, LATERAL jsonb_array_elements(h.bundle->'memory') AS a(e)
+     WHERE h.key='zee-base' AND a.e->>'path'='cxell-zee-manual.md'`);
+const man = String(stored?.t || '');
+ok(/The sibling-landing note — a warning on `zee sync` and `zee land` that is never a block/.test(man),
+   'the stored manual really carries it after migrating');
+const syncAt = man.indexOf('### `zee sync`'), noteAt = man.indexOf('### The sibling-landing note'),
+      dbcAt = man.indexOf('### `zee db-catchup`');
+ok(syncAt > -1 && syncAt < noteAt && noteAt < dbcAt,
+   'and it sits at the end of the `zee sync` section — the seam where a zee reads about the two verbs that carry it');
+
 await pool.end().catch(() => {});
 console.log(fail ? `\n✗ ${fail} FAILED` : '\n✓ a sync/land tells the zee which sibling landings touched its files — and is never allowed to block');
 process.exit(fail ? 1 : 0);
