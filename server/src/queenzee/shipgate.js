@@ -133,26 +133,42 @@ async function resolveShipCommit(project, shipSite, main) {
 //   - Every uncomputable case — no deployed sha yet, containers at DIFFERENT deployed shas, a
 //     git failure/timeout, an empty result — returns false, so the existing auto-approve runs
 //     unchanged. Do NOT "simplify" this into a symmetric check.
+//
+// THIS IS A BEST-EFFORT OPTIMISATION, NOT A BOUNDARY. "The auto-approve skips a docs-only
+// diff" is only true when the diff can be computed AND resolves cleanly to docs-only. When it
+// cannot be computed, the skip does NOT apply and the ship AUTO-APPROVES — a docs-only diff
+// CAN still auto-deploy in those cases. Nothing here can refuse or delay a ship that would
+// otherwise go: the worst failure of this predicate is the one deploy it was meant to avoid,
+// and that failure is exactly today's behaviour. If this ever needs to be a hard guarantee,
+// that is a different design (e.g. refusing docs-only ships outright), not a tightening here.
 async function docsOnlySinceDeployed(project, commit, { targets = SHIPPABLE } = {}) {
-  const deployed = await q(
-    `SELECT DISTINCT c.last_build_commit FROM container c
-      WHERE c.project_id=$1 AND c.tier='prod' AND c.role = ANY($2)
-        AND c.build_script IS NOT NULL AND c.last_build_commit IS NOT NULL`,
-    [project.id, targets]);
-  // no deployed sha yet → cannot know what changed → do NOT skip
-  if (!deployed.length) return false;
-  // containers at different deployed shas → the diff is ambiguous → do NOT skip
-  if (deployed.length > 1) return false;
+  try {
+    const deployed = await q(
+      `SELECT DISTINCT c.last_build_commit FROM container c
+        WHERE c.project_id=$1 AND c.tier='prod' AND c.role = ANY($2)
+          AND c.build_script IS NOT NULL AND c.last_build_commit IS NOT NULL`,
+      [project.id, targets]);
+    // no deployed sha yet → cannot know what changed → do NOT skip
+    if (!deployed.length) return false;
+    // containers at different deployed shas → the diff is ambiguous → do NOT skip
+    if (deployed.length > 1) return false;
 
-  const from = deployed[0].last_build_commit;
-  const r = spawnSync('git', ['-C', project.repo_root, 'diff', '--name-only', '-z', from, commit],
-    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
-  // git failed / timed out → cannot know → do NOT skip
-  if (r.status !== 0) return false;
-  const paths = r.stdout.split('\0').filter(Boolean);
-  // empty diff (deployed == candidate) → nothing to skip on → do NOT skip
-  if (!paths.length) return false;
-  return paths.every((p) => p === 'docs' || p.startsWith('docs/'));
+    const from = deployed[0].last_build_commit;
+    const r = spawnSync('git', ['-C', project.repo_root, 'diff', '--name-only', '-z', from, commit],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+    // git failed / timed out → cannot know → do NOT skip
+    if (r.status !== 0) return false;
+    const paths = r.stdout.split('\0').filter(Boolean);
+    // empty diff (deployed == candidate) → nothing to skip on → do NOT skip
+    if (!paths.length) return false;
+    return paths.every((p) => p === 'docs' || p.startsWith('docs/'));
+  } catch {
+    // the DB query itself failed (e.g. a connection drop between the row insert above and this
+    // read) → cannot know what changed → do NOT skip. Same conservative direction as every other
+    // uncomputable case: fall through to the existing auto-approve rather than throwing, so a
+    // transient failure can never wedge a request into a state the gate did not intend.
+    return false;
+  }
 }
 
 // ── the zee's only prod verb ─────────────────────────────────────────────────
