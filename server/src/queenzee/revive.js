@@ -130,12 +130,14 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     await q(`UPDATE zee SET revive_class = $2, revive_signal = $3,
                             revive_next_at = CASE WHEN $4::int IS NULL THEN NULL
                                                   ELSE now() + ($4::int || ' minutes')::interval END,
-                            last_death_code = $5, last_death_stderr = $6, last_death_error = $7
+                            last_death_code = $5, last_death_stderr = $6, last_death_error = $7,
+                            revive_class_source = $8
                WHERE id = $1`,
             [zee.id, notADeath ? null : death.kind, notADeath ? null : death.signal,
              verdict.action === 'revive' ? verdict.delayMinutes : null,
              Number.isInteger(code) ? code : null,
-             errTail ? scrubSecrets(errTail) : null, scrubbedResult]);
+             errTail ? scrubSecrets(errTail) : null, scrubbedResult,
+             'live']);
     // A vendor error can ECHO THE KEY back ("your api key: sk-ant-… is invalid") — scrub token-
     // shaped substrings before the reason lands in the event log or the tend (finding [10]).
     const scrubbedReason = scrubSecrets(String(reason || ''));
