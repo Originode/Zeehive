@@ -530,6 +530,7 @@ function usage() {
   zee inbox [--all]                  read what other zees sent you (reading marks them read); --all shows the history
 
  the work tracker (the PLAN this job is part of):
+  zee conditions [--add "..." | --remove <id>]   YOUR PROJECT'S CURRENT CONDITIONS: the short, dated list of LIVE IMPEDIMENTS injected into every briefing (ticket #67) — read it any time, and trust it over any doc older than it is. READ is every zee's (NOT gated); --add/--remove are MANAGER-only, scoped to your own project by your token, and delete is trivial on purpose (stale conditions are worse than none)
   zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
   zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--after <sibling-id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". PARENT-FIRST: a task needs a home — cut the parent as --kind activity, nest tasks under it with --parent, or chain a task after an existing sibling with --after (which also adds the FS dependency: the new card waits for that sibling). Creating a card dispatches nobody
   zee item [<id>] --status <s> [--progress N] [--note "..."] [--estimate <hours>] [--starts-on YYYY-MM-DD] [--due-on YYYY-MM-DD]   report where the WORK has got to — and size the card for the gantt (--estimate/--starts-on/--due-on PATCH the work_item and dual-write the plan node). A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
@@ -1196,6 +1197,47 @@ switch (cmd) {
     }
     if (j.message) console.log(j.message);
     process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'conditions': {
+    // YOUR PROJECT'S CURRENT CONDITIONS — the short, dated list of LIVE IMPEDIMENTS injected into
+    // every briefing (ticket #67). READ is every zee's (GET); --add/--remove are MANAGER-only (POST),
+    // scoped to the caller's own project by its token. Each line renders with the date it was last
+    // touched; deleting one is trivial on purpose — stale conditions are worse than none, and this
+    // list must never become a second manual.
+    const add = flag('add');
+    const remove = flag('remove');
+    if (add != null || remove != null) {
+      const r = await req('POST', '/api/xell/self/conditions', {
+        action: add != null ? 'add' : 'remove',
+        body: add != null ? add : null,
+        id: remove != null ? remove : null,
+      });
+      if (rest.includes('--json')) { out(r); break; }
+      const j = r.json || {};
+      if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+      console.log(add != null
+        ? `added condition ${j.condition?.id || ''}`.trim()
+        : `removed condition ${j.removed || ''}`.trim());
+      break;
+    }
+    const r = await req('GET', '/api/xell/self/conditions');
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    const rows = j.conditions || [];
+    if (!rows.length) {
+      console.log('No current conditions for this project — nothing is known to be broken right now.');
+      break;
+    }
+    console.log('Current conditions (EPHEMERAL — true now, hopefully false soon):');
+    for (const c of rows) {
+      const d = String(c.updated_at || c.created_at || '').slice(0, 10);
+      console.log(`  [${d}] ${c.body}   (${c.id})`);
+    }
+    console.log('\nThese lines are injected into every briefing. If one stops being true, delete it '
+      + '(a manager: `zee conditions --remove <id>`; a human: the console). Stale conditions are '
+      + 'worse than none.');
     break;
   }
   case 'work': {
