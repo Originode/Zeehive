@@ -48,7 +48,7 @@ async function cleanup() {
 await client.connect();
 try {
   await client.query(`DELETE FROM project WHERE id=$1`, [PID]).catch(() => {});
-  const { requestShip, withdrawShipRequest, listShipRequests, shipStatus } =
+  const { requestShip, withdrawShipRequest, listShipRequests, shipStatus, runShipBody } =
     await import('../server/src/queenzee/shipgate.js');
   const { selfWithdrawShip, selfStatus } = await import('../server/src/queenzee/self.js');
   const { buildLandingPad } = await import('../server/src/queenzee/landingpad.js');
@@ -156,6 +156,35 @@ try {
   ok(/STARTED|started/.test(threw5b || ''), `a ship whose prod lock is taken is refused too (${threw5b})`);
   await client.query(`DELETE FROM deploy_lock WHERE ship_id=$1`, [r5b.request.id]);
   await client.query(`DELETE FROM ship_request WHERE id=$1`, [r5b.request.id]);
+
+  // ── 5c. the flip-to-shipping race — a withdraw landing in runShip's window stops the deploy ──
+  // runShip reads the row as 'approved' and takes the prod lock; if the zee withdraws in that window
+  // the row is 'withdrawn' by the time runShipBody flips it to 'shipping'. The flip is ATOMIC on
+  // status='approved', so the UPDATE matches ZERO rows, and runShipBody must RELEASE the lock and NOT
+  // deploy — it must never flip the withdrawn row (that is the specific race the whole card exists to
+  // close, and the reason the flip is not a blind `SET status='shipping' WHERE id=$1`).
+  console.log('\n── a withdraw landing in the runShip window stops the deploy (atomic flip) ──');
+  const r5c = await requestShip({ xellId: XELL, reason: 'ship it 5c' });
+  await client.query(
+    `UPDATE ship_request SET status='approved', decided_at=now(), decided_by='human@test' WHERE id=$1`, [r5c.request.id]);
+  const staleApproved = (await client.query(`SELECT * FROM ship_request WHERE id=$1`, [r5c.request.id])).rows[0];
+  // The zee withdraws in the window (no lock exists yet, so the withdraw is legal)…
+  await client.query(
+    `UPDATE ship_request SET status='withdrawn', withdrawn_at=now(), withdrawn_by='zee@ship-withdraw-cove'
+       WHERE id=$1`, [r5c.request.id]);
+  // …and runShip, which checked status BEFORE the withdraw, takes the prod lock as it would have.
+  await client.query(
+    `INSERT INTO deploy_lock (project_id, container, xell_id, phase, task, ship_id)
+       VALUES ($1,'prod',$2,'shipping','ship withdraw race test',$3)`, [PID, XELL, r5c.request.id]);
+  const proj = (await client.query(`SELECT * FROM project WHERE id=$1`, [PID])).rows[0];
+  await runShipBody(staleApproved, xell, proj, null, 'prod', 'simulate');
+  const r5cRow = await client.query(`SELECT status FROM ship_request WHERE id=$1`, [r5c.request.id]);
+  ok(r5cRow.rows[0]?.status === 'withdrawn',
+     `the withdrawn row was NOT flipped to shipping (atomic WHERE matched zero rows; still ${r5cRow.rows[0]?.status})`);
+  const lock5c = await client.query(`SELECT phase FROM deploy_lock WHERE ship_id=$1`, [r5c.request.id]);
+  ok(lock5c.rows[0]?.phase === 'released', 'runShipBody released the prod lock instead of deploying');
+  await client.query(`DELETE FROM deploy_lock WHERE ship_id=$1`, [r5c.request.id]);
+  await client.query(`DELETE FROM ship_request WHERE id=$1`, [r5c.request.id]);
 
   // ── 6. a terminal ship (shipped) is history — refused ───────────────────────
   console.log('\n── a SHIPPED ship is history ──');
