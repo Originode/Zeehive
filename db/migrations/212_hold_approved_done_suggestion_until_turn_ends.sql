@@ -12,7 +12,7 @@
 --
 -- The status CHECK (052) is replaced to admit the new value, and the open index — which the console
 -- reads to show still-live cards — is widened to include held rows so a held decision stays visible.
-ALTER TABLE done_suggestion DROP CONSTRAINT done_suggestion_status_check;
+ALTER TABLE done_suggestion DROP CONSTRAINT IF EXISTS done_suggestion_status_check;
 ALTER TABLE done_suggestion ADD CONSTRAINT done_suggestion_status_check
   CHECK (status IN ('pending','approved','approved-held','rejected','failed'));
 

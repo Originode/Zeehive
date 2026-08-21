@@ -98,6 +98,65 @@ async function crewDiff(row, branch) {
   return val;
 }
 
+// The unlanded/dirty GATE for executing a done approval (ticket #75). A held approval is applied
+// only when the xell is clean — no unlanded commits, no dirty files — because the thing actually
+// being protected is unlanded work: a zee with nothing uncommitted and nothing unlanded loses
+// nothing by being reaped; a zee holding a diff can lose everything. Same read as crewDiff (cxell
+// first, host worktree second) but FRESH — a gate must not decide from a 15s-old cache.
+//
+// Returns:
+//   { clean: true, ahead, dirty }           — provably nothing unlanded or uncommitted (the counts
+//                                             ride along for the approval-time evidence)
+//   { clean: false, reason, ahead, dirty }  — holds unlanded/dirty work (the legible reason), or the
+//                                             diff could not be read from something that exists
+//                                             (cxell unreachable, worktree read failed) — "cannot
+//                                             confirm clean" is not clean.
+// Unmeasurable with NOTHING to measure (no worktree on disk, no live cxell) is clean: there is no
+// work on disk to lose, and this is the simulate-mode shape every test uses.
+async function xellGate(row, branch) {
+  let d = null, existed = false;
+  if (row.cxell_live && row.head_commit) {
+    d = await cxellDiff({ ctx: 'default', slug: row.slug, base: row.head_commit }).catch(() => null);
+    existed = true;
+  }
+  if (!d && row.worktree_path && existsSync(row.worktree_path)) {
+    d = await worktreeDiff(row.worktree_path, branch).catch(() => null);
+    existed = true;
+  }
+  if (!d) return existed
+    ? { clean: false, reason: "the xell's work could not be measured — cannot confirm it is clean before tearing it down" }
+    : { clean: true, ahead: 0, dirty: 0 };
+  const ahead = d.ahead || 0, dirty = d.dirty || 0;
+  const parts = [];
+  if (ahead > 0) parts.push(`${ahead} unlanded commit(s)`);
+  if (dirty > 0) parts.push(`${dirty} dirty file(s)`);
+  return parts.length
+    ? { clean: false, reason: `it holds ${parts.join(' and ')}`, ahead, dirty }
+    : { clean: true, ahead, dirty };
+}
+
+// Evidence captured AT APPROVAL TIME for a HELD decision (ticket #75): what was true when the
+// approval landed — the last landed sha on master, the unlanded/dirty counts, the source shortstat —
+// so the held row's record says why the close was safe. This is the AUDIT half. The apply-time gate
+// (xellGate) STILL re-verifies before tearing down, because a resumed turn (the live repro: a manager
+// messaging a finished worker flips it back to working) can dirty the tree after the approval.
+async function captureDoneEvidence(target) {
+  if (!target?.id) return null;
+  const [landed, gate] = await Promise.all([
+    one(`SELECT count(*)::int AS n, max(new_sha) AS last_sha, max(landed_at) AS last_at
+           FROM land_request WHERE xell_id=$1 AND status='landed'`, [target.id]),
+    xellGate(target, target.main_branch || 'main').catch(() => null),
+  ]);
+  return {
+    at: new Date().toISOString(),
+    landed: { count: landed?.n || 0, last_sha: landed?.last_sha || null, landed_at: landed?.last_at || null },
+    clean: gate?.clean ?? null,
+    ahead: gate?.ahead ?? null,
+    dirty: gate?.dirty ?? null,
+    ...(gate?.reason ? { reason: gate.reason } : {}),
+  };
+}
+
 // ── the crew ─────────────────────────────────────────────────────────────────
 // Every worker this manager dispatched, with the live signals a manager actually decides on: what
 // the hive shows, whether it is waiting on a human, and its git position (unlanded work is the one
@@ -134,6 +193,13 @@ export async function crewFor(managerXellId) {
             tnd.reason AS tend_reason,
             EXISTS(SELECT 1 FROM done_suggestion ds WHERE ds.target_xell_id=x.id
                      AND ds.status='pending' AND ds.dismissed_at IS NULL) AS done_suggested,
+            -- A DECIDED-but-not-yet-applied done: the human (or policy) approved while the xell was
+            -- mid-turn and the approval is HELD until the turn ends (ticket #75). This must be told
+            -- apart from done_suggested -- 'proposed DONE (a human must confirm)' is FALSE for it:
+            -- the decision is already made, and it is waiting for the turn to end / the xell to be
+            -- clean, not for a human.
+            ds.done_status AS done_suggestion_status,
+            ds.done_result AS done_suggestion_result,
             (SELECT zm.body FROM zee_message zm WHERE zm.from_xell_id=x.id AND zm.to_xell_id=$1
                ORDER BY zm.created_at DESC LIMIT 1) AS last_message,
             (SELECT zm.created_at FROM zee_message zm WHERE zm.from_xell_id=x.id AND zm.to_xell_id=$1
@@ -156,6 +222,12 @@ export async function crewFor(managerXellId) {
          SELECT se.hook_event_name, se.raw->>'reason' AS reason FROM session_event se
           WHERE se.xell_id=x.id AND se.hook_event_name IN ('tend-request','tend-clear')
           ORDER BY se.ts DESC LIMIT 1) tnd ON true
+       LEFT JOIN LATERAL (
+         SELECT ds.status AS done_status, ds.result AS done_result
+           FROM done_suggestion ds
+          WHERE ds.target_xell_id = x.id AND ds.dismissed_at IS NULL
+            AND ds.status IN ('pending','approved-held')
+          ORDER BY ds.requested_at DESC LIMIT 1) ds ON true
       WHERE x.manager_xell_id = $1 AND x.status <> 'retired'
       ORDER BY x.created_at`, [managerXellId]);
 
@@ -176,6 +248,12 @@ export async function crewFor(managerXellId) {
         prodBindPending: r.prod_bind_pending, seedPending: r.seed_pending,
         doneSuggested: r.done_suggested, landHolding: r.land_holding },
     );
+    // A HELD done approval (ticket #75): the decision is made and the reaper will apply it once the
+    // turn ends and the xell is clean — so the legible "what it waits for" is that, NOT a human.
+    const doneHeld = r.done_suggestion_status === 'approved-held';
+    const doneHeldReason = r.done_suggestion_result?.gate?.reason
+      || r.done_suggestion_result?.error
+      || (r.done_suggestion_result?.held ? 'the turn has not ended yet' : null);
     const waiting = [
       r.land_pending && 'a landing is HELD for a human',
       r.ship_pending && 'a ship is awaiting a human',
@@ -184,6 +262,7 @@ export async function crewFor(managerXellId) {
       r.tend_pending && `it raised a TEND (needs a human)${why.brief ? `: ${why.brief}` : ''}`,
       r.status === 'awaiting-done' && 'it proposed DONE (a human must confirm)',
       r.done_suggested && 'you already suggested it is done (awaiting a human)',
+      doneHeld && `it is APPROVED and HELD for done — ${doneHeldReason || 'waiting for the turn to end'}`,
     ].filter(Boolean);
     return {
       xell_id: r.id, slug: r.slug, branch: r.branch, status: r.status,
@@ -215,6 +294,11 @@ export async function crewFor(managerXellId) {
                   insertions: d.insertions || 0, deletions: d.deletions || 0,
                   head: d.head || null, source: d.source } : null,
       waiting_on_human: waiting,
+      // A HELD done approval is a distinct flag from `done_suggested` (which is only the PENDING,
+      // un-decided card): this one is DECIDED and waiting to be APPLIED (ticket #75). The reason the
+      // apply is held — still mid-turn, or holding unlanded/dirty work — is legible in the text.
+      done_held: doneHeld,
+      done_held_reason: doneHeld ? (doneHeldReason || 'the turn has not ended yet') : null,
       tend: r.tend_pending ? { open: true, reason: why.brief, full: why.full } : null,
       last_message: r.last_message ? String(r.last_message).slice(0, 300) : null,
       last_message_at: r.last_message_at || null,
@@ -537,6 +621,22 @@ export async function dismissDoneSuggestion(id, by = 'human@console') {
 // apply time is reported separately by the reaper / the human path that finally closes the xell.
 async function refuseApproval({ id, row, manager, by, error, detail = null, hold = false, notify = true }) {
   const status = hold ? 'approved-held' : 'pending';
+  // Evidence captured AT APPROVAL TIME for a held decision (ticket #75): what was true then — landed
+  // sha, unlanded/dirty counts, source shortstat — so the held row's record says why the close was
+  // safe, even if a resumed turn (the live repro: a manager messaging a finished worker flips it back
+  // to working) dirties the tree afterwards. The apply-time gate still re-verifies.
+  const evidence = hold
+    ? await captureDoneEvidence(row.target_xell_id ? await one(
+        `SELECT x.*, p.main_branch,
+                (z.entrypoint = 'cxell-cli' AND z.status IN ('spawning','online','working','idle')) AS cxell_live
+           FROM xell x
+           LEFT JOIN project p ON p.id = x.project_id
+           LEFT JOIN LATERAL (
+             SELECT * FROM zee zz WHERE zz.xell_id = x.id
+              ORDER BY CASE WHEN zz.status IN ('spawning','online','working','idle') THEN 0 ELSE 1 END,
+                       zz.created_at DESC LIMIT 1) z ON true
+          WHERE x.id = $1`, [row.target_xell_id]) : null)
+    : null;
   const back = await one(
     // A held decision KEEPS decided_at/decided_by — the decision really was made, it just cannot be
     // applied yet. A plain refusal clears them, so the card reads as undecided again.
@@ -545,7 +645,7 @@ async function refuseApproval({ id, row, manager, by, error, detail = null, hold
             decided_by = CASE WHEN $2 = 'approved-held' THEN decided_by ELSE NULL END,
             result = $3::jsonb
        WHERE id=$1 RETURNING *`,
-    [id, status, JSON.stringify({ refused: true, held: hold, error, by, at: new Date().toISOString(), detail })]);
+    [id, status, JSON.stringify({ refused: true, held: hold, error, by, at: new Date().toISOString(), detail, evidence })]);
   broadcast('done-suggestion', back);
   if (row.target_xell_id) broadcast('xell', { id: row.target_xell_id });
   logline('crew', `done suggestion for ${row.target_slug} was APPROVED by ${by} but the xell was NOT closed `
@@ -689,7 +789,18 @@ export async function applyHeldDoneSuggestion(id, by = 'reaper@queenzee') {
     `SELECT * FROM done_suggestion WHERE id=$1 AND status='approved-held' AND dismissed_at IS NULL`, [id]);
   if (!row) return { ok: false, applied: false, error: 'no held done suggestion (already applied or decided?)' };
 
-  const target = row.target_xell_id ? await one(`SELECT * FROM xell WHERE id=$1`, [row.target_xell_id]) : null;
+  const target = row.target_xell_id ? await one(
+    // The gate (xellGate) needs the same read crewFor has: the LIVE zee's entrypoint/status to know
+    // whether to ask the cxell, plus the worktree_path/head_commit/main_branch to measure it against.
+    `SELECT x.*, p.main_branch,
+            (z.entrypoint = 'cxell-cli' AND z.status IN ('spawning','online','working','idle')) AS cxell_live
+       FROM xell x
+       LEFT JOIN project p ON p.id = x.project_id
+       LEFT JOIN LATERAL (
+         SELECT * FROM zee zz WHERE zz.xell_id = x.id
+          ORDER BY CASE WHEN zz.status IN ('spawning','online','working','idle') THEN 0 ELSE 1 END,
+                   zz.created_at DESC LIMIT 1) z ON true
+      WHERE x.id = $1`, [row.target_xell_id]) : null;
   const manager = row.manager_xell_id ? await one(`SELECT * FROM xell WHERE id=$1`, [row.manager_xell_id]) : null;
 
   // Already retired: the reap that retired it IS the apply this hold was waiting for, and the crash
@@ -703,6 +814,25 @@ export async function applyHeldDoneSuggestion(id, by = 'reaper@queenzee') {
     if (target) broadcast('xell', { id: target.id });
     logline('crew', `held done suggestion for ${row.target_slug} finalized by ${by} — the xell was already closed`);
     return { ok: true, applied: true, suggestion: done };
+  }
+
+  // THE GATE (ticket #75, STRICTER than a fresh approval): a held approval applies only when the
+  // turn is over AND the xell is clean — no unlanded commits, no dirty files. The turn boundary was
+  // already checked (we got here only because reapXell/markTaskDone refused while ACTIVE); this adds
+  // the two checks the fresh path never made. The thing being protected is unlanded work: a zee with
+  // nothing uncommitted and nothing unlanded loses nothing by being reaped; a zee holding a diff can
+  // lose everything. Unclean OR unmeasurable → stay held, next tick re-checks.
+  const gate = await xellGate(target, target.main_branch || 'main');
+  if (!gate.clean) {
+    // The reason is written to the ROW (not just returned) so a human, a manager, or the console
+    // can read why the approval is still held — "it waits for" must name the actual blocker.
+    const refused = await one(
+      `UPDATE done_suggestion SET result=$2::jsonb WHERE id=$1 AND status='approved-held' RETURNING *`,
+      [id, JSON.stringify({ refused: true, held: true, error: gate.reason, gate,
+                            by: row.decided_by || by, at: new Date().toISOString() })]);
+    broadcast('done-suggestion', refused);
+    logline('crew', `held done suggestion for ${row.target_slug} still held — ${gate.reason}`);
+    return { ok: false, applied: false, held: true, still_active: false, gate, error: gate.reason };
   }
 
   const { markTaskDone } = await import('../queenzee/tasks.js');

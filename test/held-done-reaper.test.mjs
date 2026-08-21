@@ -11,11 +11,21 @@
 //      it (the refusal is kept — a live turn is never torn down without force);
 //   2. the moment the turn ends (zee status → 'idle'), the SAME apply path the human's click takes
 //      closes the xell — no human needed a second time, and the row is finalized 'approved';
-//   3. the manager is told ONCE at hold time and ONCE at apply time — never per tick.
+//   3. a held approval is NEVER silently lost: after the refusal it is still queryable with its
+//      approver (decided_by) and timestamp (decided_at);
+//   4. the gate (STRICTER than a fresh approval): an idle xell that still holds UNLANDED commits or
+//      DIRTY files is NOT applied — the held approval stays held, with a legible reason;
+//   5. the manager is told ONCE at hold time and ONCE at apply time — never per tick.
 //
 // Isolated throwaway project in the real meta DB; PROVISION_MODE=simulate so the reap retires rows
 // and touches no machine. Everything it creates is torn down in a finally, whatever happens.
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import pg from 'pg';
+
+const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8' }).trim();
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
@@ -38,15 +48,31 @@ try {
   await client.connect();
   await cleanup();
 
+  // A real repo: the main branch + one shared worktree, so the diff gate can measure unlanded/dirty
+  // work against something that actually exists (simulate never touches a machine, but git reads do).
+  const tmp = mkdtempSync(join(tmpdir(), 'heldreap-'));
+  const repo = join(tmp, 'repo');
+  mkdirSync(repo);
+  git(repo, 'init', '-q', '-b', 'master');
+  git(repo, 'config', 'user.email', 't@t'); git(repo, 'config', 'user.name', 't');
+  writeFileSync(join(repo, 'base.txt'), 'base\n');
+  git(repo, 'add', '-A'); git(repo, 'commit', '-qm', 'base');
+  const mainHead = git(repo, 'rev-parse', 'HEAD');
+  const wtBusy = join(tmp, 'wt-busy');
+  git(repo, 'worktree', 'add', '-q', '-b', 'spinoff/hdbusy', wtBusy, 'master');
+  const wtDirty = join(tmp, 'wt-dirty');
+  git(repo, 'worktree', 'add', '-q', '-b', 'spinoff/hddirty', wtDirty, 'master');
+
   await client.query(
     `INSERT INTO project (id, name, repo_root, main_branch, db_name, db_user)
-       VALUES ($1,'heldreap-test','/nonexistent/heldreap','master','heldreaptest','postgres')`, [PID]);
+       VALUES ($1,'heldreap-test',$2,'master','heldreaptest','postgres')`, [PID, repo]);
   await client.query(`INSERT INTO xource (id, project_id, ref) VALUES ($1,$2,'master')`, [XID, PID]);
 
   const mkXell = async (slug, extra = {}) => (await client.query(
-    `INSERT INTO xell (project_id, xource_id, slug, branch, status, is_pooled, zee_type, manager_xell_id)
-       VALUES ($1,$2,$3,$4,'working',false,$5,$6) RETURNING *`,
-    [PID, XID, slug, `spinoff/${slug}`, extra.zee_type || 'worker', extra.manager || null])).rows[0];
+    `INSERT INTO xell (project_id, xource_id, slug, branch, status, is_pooled, zee_type, manager_xell_id, worktree_path, head_commit)
+       VALUES ($1,$2,$3,$4,'working',false,$5,$6,$7,$8) RETURNING *`,
+    [PID, XID, slug, `spinoff/${slug}`, extra.zee_type || 'worker', extra.manager || null,
+     extra.worktree || null, extra.head || mainHead])).rows[0];
   const mkZee = async (xell, status) => (await client.query(
     `INSERT INTO zee (xell_id, attach_mode, status, kind, entrypoint, cli_active, monitor_source,
                       last_monitor_at, last_event_at, last_stop_reason, viewer_kind)
@@ -58,9 +84,13 @@ try {
      RETURNING *`, [PID, xell.id])).rows[0];
 
   const mgr = await mkXell('hdmgr', { zee_type: 'manager' });
-  const busy = await mkXell('hdbusy', { manager: mgr.id });   // genuinely MID-TURN
+  const busy = await mkXell('hdbusy', { manager: mgr.id, worktree: wtBusy });   // genuinely MID-TURN
   await mkZee(busy, 'working');
   await mkTask(busy);
+  // Evidence at approval time: the busy worker has LANDED work on master — clean, so a close is safe.
+  await client.query(
+    `INSERT INTO land_request (project_id, xell_id, ref, status, new_sha, decided_at, decided_by, landed_at)
+       VALUES ($1,$2,'refs/heads/master','landed',$3,now(),'test@human',now())`, [PID, busy.id, mainHead]);
 
   const { suggestDone, decideDoneSuggestion, inboxFor } = await import('../server/src/lib/managers.js');
   const { heldDoneTick } = await import('../server/src/queenzee/done-held.js');
@@ -79,6 +109,7 @@ try {
   const heldRow = await rowOf(sug.suggestion.id);
   ok(heldRow.status === 'approved-held' && heldRow.decided_by === 'test@human',
      'the row is approved-held and the decision is preserved (decided_by kept)');
+  ok(heldRow.decided_at != null, '…and the timestamp of the approval is preserved (never silently lost)');
   ok(await xellStatus(busy.id) === 'working', 'and the busy xell is untouched');
   const heldBox = await inboxFor(mgr.id);
   ok(heldBox.filter((m) => /HELD/.test(m.body) && /hdbusy/.test(m.body)).length === 1,
@@ -118,12 +149,66 @@ try {
   ok(box.filter((m) => /HELD/.test(m.body)).length === 0,
      'and no duplicate HELD message from the apply sweep (that was already delivered once)');
 
+  // ── 5. the gate: an IDLE xell with UNLANDED work is NOT applied ─────────────
+  // A second worker, approved mid-turn, whose turn ends but which STILL holds unlanded commits or
+  // dirty files. The reap's ACTIVE guard would no longer refuse (it is idle), so the GATE must.
+  console.log('\n── idle but UNLANDED: the gate holds ──');
+  const wDirty = await mkXell('hddirty', { manager: mgr.id, worktree: wtDirty });
+  await mkZee(wDirty, 'working');
+  await mkTask(wDirty);
+  const dirtySug = await suggestDone({ manager: mgr, target: wDirty, reason: 'finished?' });
+  await inboxFor(mgr.id);   // drain
+  const dirtyDecided = await decideDoneSuggestion(dirtySug.suggestion.id, 'approved', 'test@human');
+  ok(dirtyDecided.refused === true && dirtyDecided.held === true,
+     'the human approves a MID-TURN xell → HELD');
+  await client.query(`UPDATE zee SET status='idle', last_stop_reason='end_turn' WHERE xell_id=$1`, [wDirty.id]);
+  // Now the worktree holds a REAL UNLANDED COMMIT — the branch is ahead of master, but nothing landed.
+  writeFileSync(join(wtDirty, 'unlanded.txt'), 'not on master yet\n');
+  git(wtDirty, 'add', '-A'); git(wtDirty, 'commit', '-qm', 'unlanded work');
+  const dirtyTick = await heldDoneTick();
+  ok(dirtyTick.scanned === 1 && dirtyTick.applied === 0,
+     `a sweep over an idle-but-unlanded xell applies NOTHING (scanned=${dirtyTick.scanned}, applied=${dirtyTick.applied})`);
+  const dirtyRow = await rowOf(dirtySug.suggestion.id);
+  ok(dirtyRow.status === 'approved-held',
+     'the row is STILL approved-held — the approval was NOT applied over unlanded work');
+  ok(dirtyRow.result?.gate?.clean === false && /unlanded commit/.test(dirtyRow.result?.gate?.reason || ''),
+     `…and the reason it stayed held is legible (unlanded commits): "${dirtyRow.result?.gate?.reason}"`);
+  ok(await xellStatus(wDirty.id) !== 'retired', 'and the dirty xell is NOT retired');
+
+  // ── 6. evidence captured AT APPROVAL TIME is on the held row ───────────────
+  console.log('\n── approval-time evidence ──');
+  // The busy worker was approved mid-turn while CLEAN and had LANDED work. Its held row must carry
+  // that evidence: why the close was safe, even though the apply is still waiting on the turn.
+  ok(heldRow.result?.evidence?.clean === true,
+     'the held row records that the xell was CLEAN at approval time');
+  ok(heldRow.result?.evidence?.landed?.count >= 1 && heldRow.result?.evidence?.landed?.last_sha,
+     '…and what had landed (the last sha on master)');
+  ok(heldRow.result?.evidence?.ahead === 0 && heldRow.result?.evidence?.dirty === 0,
+     '…with zero unlanded and zero dirty at that moment');
+  ok(heldRow.result?.evidence?.at != null, '…stamped with when the evidence was taken');
+
+  // ── 7. the crew view is LEGIBLE: `zee zees` says APPROVED & HELD, not "awaiting a human" ──
+  console.log('\n── crew-view legibility ──');
+  const { crewFor } = await import('../server/src/lib/managers.js');
+  const crew = await crewFor(mgr.id);
+  const dirtyCrew = crew.find((c) => c.slug === 'hddirty');
+  ok(dirtyCrew?.done_held === true,
+     'the crew row for a held approval carries done_held:true (it is decided, not awaiting a human)');
+  ok(/APPROVED and HELD/.test(dirtyCrew.waiting_on_human.join('; ')),
+     '…and zee zees says "APPROVED and HELD" with the legible reason');
+  ok(/1 unlanded commit/.test(dirtyCrew.waiting_on_human.join('; ')),
+     '…naming exactly what it waits for (the unlanded commits)');
+  const doneHeldText = dirtyCrew.waiting_on_human.join('; ');
+  ok(!/a human must confirm/.test(doneHeldText) && !/awaiting a human/.test(doneHeldText),
+     '…and it does NOT say "a human must confirm" (the human already approved)');
+
   console.log(fail ? `\n${fail} check(s) FAILED` : '\nall checks passed');
 } catch (err) {
   console.error('\nTEST ERROR:', err);
   fail++;
 } finally {
   await cleanup();
+  try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
   await client.end().catch(() => {});
 }
 process.exit(fail ? 1 : 0);
