@@ -79,6 +79,15 @@ async function waitForBuild() {
     for (const c of want) {
       if (c.health === 'up' && c.serving_head) {
         console.log(`  ✓ ${c.role} (${c.name}) is UP and serving your HEAD ${String(st.head).slice(0, 8)}`);
+      } else if (c.last_build_error) {
+        // Ticket #173: the build itself failed and left a reason on the row. Prefer this over the
+        // published-port branch — a failed finalize sets health=down AND the port probe also reads
+        // down, and without this order the zee only ever saw "port refused" with no stderr.
+        console.log(`  ✗ ${c.role} (${c.name}) is ${c.health.toUpperCase()} — the build FAILED.`);
+        console.log('  ── last build error ──');
+        for (const line of String(c.last_build_error).split('\n')) console.log(`  ${line}`);
+        console.log('  ─────────────────────');
+        ok = false;
       } else if (c.published_health === 'down') {
         const where = c.published_url || 'its published URL';
         console.log(`  ✗ ${c.role} (${c.name}) did not serve at ${where} — the published port refused or timed out. The server is not reachable from where a zee must use it.`);
@@ -98,7 +107,8 @@ async function waitForBuild() {
         console.log(`  ⚠ ${c.role} (${c.name}) is UP but built at ${String(c.last_build_commit).slice(0, 8)}, not your HEAD ${String(st.head).slice(0, 8)} — your newest commit is not in it. Rebuild.`);
         ok = false;
       } else {
-        console.log(`  ✗ ${c.role} (${c.name}) is ${c.health.toUpperCase()} — the build FAILED. Check the queenzee terminal (▚_) on the dashboard.`);
+        console.log(`  ✗ ${c.role} (${c.name}) is ${c.health.toUpperCase()} — the build FAILED.`);
+        console.log('  (no persisted reason on the row — check the queenzee terminal on the dashboard)');
         ok = false;
       }
     }

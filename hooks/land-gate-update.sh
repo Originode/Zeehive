@@ -20,6 +20,12 @@
 # stance to the sibling reference-transaction hook, which guards ordinary local work and must
 # never wedge it — this one guards a rare, deliberate, irreversible act.
 #
+# Under load the API can miss a single 10s deadline (curl rc=28) and decline a push a human
+# already approved. The remedy is retry-with-backoff inside a bounded wait — a busy queenzee
+# answers before we give up. On genuine exhaustion we still decline, with a message that names
+# the attempts and duration so it is not confused with a human rejection. A declined push costs
+# one re-push; a bypassed gate costs the fleet its only guarantee.
+#
 # Deliberate override (human, at the console, on purpose):
 #   git -c core.hooksPath=/dev/null push . HEAD:main     # or move this file aside
 set -u
@@ -100,14 +106,48 @@ command -v curl >/dev/null 2>&1 || decline "Gate unreachable: curl not found (fa
 
 BODY=$(printf '{"project_id":"%s","ref":"%s","old":"%s","new":"%s"}' "$PROJECT_ID" "$REF" "$OLD" "$NEW")
 
-# --fail-with-body so a 4xx/5xx is an error but we still see the message; short timeouts because
-# a human is watching a hung push.
-RESP=$(curl -s --max-time 10 --connect-timeout 3 \
-         -H 'Content-Type: application/json' \
-         -X POST "$API/api/land/check" -d "$BODY" 2>/dev/null)
-RC=$?
+# Ask the gate. Short per-attempt deadline (a human is watching a hung push); we retry below
+# rather than stretch a single curl into a minute-long stall with no progress.
+ask_gate() {
+  curl -s --max-time 10 --connect-timeout 3 \
+       -H 'Content-Type: application/json' \
+       -X POST "$API/api/land/check" -d "$BODY" 2>/dev/null
+}
 
-[ $RC -eq 0 ] || decline "Gate unreachable: queenzee at $API did not answer (curl rc=$RC). Failing closed."
+# Retry with linear backoff. Transient load (the measured cause) clears in seconds; three
+# attempts at 10s each, sleeping 1s then 2s between, covers a brief freeze without waiting
+# forever on a truly dead API. Bounded total wait ≈ 10+1+10+2+10 = 33s.
+RESP=""
+RC=1
+ATTEMPT=1
+MAX_ATTEMPTS=3
+STARTED_AT=$(date +%s 2>/dev/null || echo 0)
+while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+  RESP=$(ask_gate)
+  RC=$?
+  # A transport success with a body is an answer — even allow:false. Empty body with rc=0 is
+  # treated as unreachable (nothing to parse).
+  if [ "$RC" -eq 0 ] && [ -n "$RESP" ]; then
+    break
+  fi
+  if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+    echo "  ZEEHIVE: gate did not answer (attempt $ATTEMPT/$MAX_ATTEMPTS, curl rc=$RC) — retrying…" >&2
+    sleep "$ATTEMPT"
+  fi
+  ATTEMPT=$((ATTEMPT + 1))
+done
+
+if [ "$RC" -ne 0 ] || [ -z "$RESP" ]; then
+  ENDED_AT=$(date +%s 2>/dev/null || echo 0)
+  if [ "$STARTED_AT" -gt 0 ] && [ "$ENDED_AT" -ge "$STARTED_AT" ]; then
+    ELAPSED=$((ENDED_AT - STARTED_AT))
+  else
+    ELAPSED='?'
+  fi
+  # FAIL CLOSED. Name the attempts and duration so this is not read as a human rejection —
+  # the zee re-runs the same push once the queenzee is answering again. Nothing is lost.
+  decline "Gate did not answer — not a human rejection. Tried ${MAX_ATTEMPTS} times over ~${ELAPSED}s against $API (last curl rc=$RC). Re-run the SAME push when the queenzee is up; do not amend."
+fi
 
 case "$RESP" in
   *'"allow":true'*)

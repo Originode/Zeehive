@@ -915,6 +915,10 @@ export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } 
   // there is no re-entrancy; it still fires reference-transaction, whose non-ff guard is the
   // backstop, and we only reach here on a proven fast-forward anyway. The old-value arg makes it a
   // compare-and-swap: if the ref moved since ffState read it, this fails instead of clobbering.
+  //
+  // The hook now retries with backoff before that fail-closed, so a busy (not gone) queenzee
+  // answers before the push is declined. update-ref remains the primary land path so the
+  // server-initiated land never re-enters the hook at all.
   let u, now;
   try {
     u = spawnSync('git', ['-C', project.repo_root, 'update-ref', row.ref, row.new_sha, tip],
