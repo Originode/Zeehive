@@ -1,27 +1,30 @@
-// LAND-GATE TIMEOUT — proves a human approval is never undone by a busy/unreachable API.
+// LAND-GATE TIMEOUT — retry-with-backoff, still fail closed.
 //
-// The bug: hooks/land-gate-update.sh gave /api/land/check 10s and FAILED CLOSED on timeout
-// (curl rc=28). Under load that declined a push whose land_request was already 'approved' —
-// the human decision was silently reversed. The reflection ranked this the one thing to build.
+// The bug: hooks/land-gate-update.sh gave /api/land/check one 10s shot and FAILED CLOSED on
+// timeout (curl rc=28). Under load that declined a push whose land_request was already
+// approved — the human decision looked reversed. The remedy is retry-with-backoff inside a
+// bounded wait so a busy (not gone) queenzee answers before we give up. On genuine exhaustion
+// we still decline, with a message that names the attempts and duration so it is not confused
+// with a human rejection.
 //
-// The remedy (deliberate):
-//   1. retry-with-backoff (3 attempts, linear sleep) so brief freezes do not decline anything
-//   2. fail-open-with-audit on a LOCAL approval receipt the queenzee writes at approve-time
-//      (same pattern as zeehive-protected-refs) — unapproved pushes still fail closed
+// Deliberately NOT fail-open. A path that lets an unreachable gate allow a push turns "can I
+// write a local file" / "can I make the API miss for N seconds" into a landgate bypass. The
+// manager countermanded that option; a declined push costs one re-push, a bypassed gate costs
+// the fleet its only guarantee.
 //
-// This suite exercises the REAL hook template against REAL git repos. The HTTP seam is a tiny
-// server we control (hang / empty / eventually-allow), same shape as land-loop / land-queue.
-// Part B also hits decideLandRequest so the receipt is written by the real approve path.
+// Three cases against a stub HTTP server the REAL hook curls (same shape as land-loop):
+//   A. unreachable  → decline, message names attempts + "not a human rejection"
+//   B. slow-then-allow → retries, then proceeds on allow:true
+//   C. rejected     → decline as a human rejection (unchanged)
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const API_PORT = 47996;
 const API = `http://127.0.0.1:${API_PORT}`;
 process.env.ZEEHIVE_API = API;
-process.env.PROVISION_MODE = 'real';
 
 const REPO_ROOT = process.cwd();
 let failures = 0;
@@ -31,7 +34,6 @@ const git = (cwd, args) => {
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
   return (r.stdout || '').trim();
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Async push: the hook curls back into this process, so a sync push deadlocks against its own gate.
 const realPush = (wt) => new Promise((resolve) => {
@@ -47,17 +49,16 @@ const PROJECT_ID = '00000000-0000-4000-8000-000000000099';
 const tmp = mkdtempSync(join(tmpdir(), 'land-gate-timeout-'));
 const refsFile = join(tmp, 'zeehive-protected-refs');
 writeFileSync(refsFile, 'refs/heads/main\n');
-const approvalsDir = join(tmp, 'zeehive-land-approvals');
 
-function installHook(src, projectId = PROJECT_ID) {
+function installHook(src) {
   const hookTpl = readFileSync(join(REPO_ROOT, 'hooks', 'land-gate-update.sh'), 'utf8');
   const hook = hookTpl
     .replaceAll('__API__', API)
-    .replaceAll('__PROJECT_ID__', projectId)
+    .replaceAll('__PROJECT_ID__', PROJECT_ID)
     .replaceAll('__PROTECTED_REFS_FILE__', refsFile)
     .replaceAll('__MAIN_BRANCH__', 'main');
   const hookPath = join(src, '.git', 'hooks', 'update');
-  writeFileSync(hookPath, hook); chmodSync(hookPath, 0x1ed); // 0755
+  writeFileSync(hookPath, hook); chmodSync(hookPath, 0o755);
   return hookPath;
 }
 
@@ -81,25 +82,10 @@ function mkRepo(label) {
   return { src, wt, base, sha };
 }
 
-function writeReceipt({ newSha, ref = 'refs/heads/main', projectId = PROJECT_ID, decidedBy = 'human@test' }) {
-  mkdirSync(approvalsDir, { recursive: true });
-  const body = JSON.stringify({
-    project_id: projectId,
-    ref,
-    new_sha: newSha,
-    decided_by: decidedBy,
-    decided_at: new Date().toISOString(),
-    request_id: '11111111-1111-4111-8111-111111111111',
-  }) + '\n';
-  writeFileSync(join(approvalsDir, newSha), body);
-}
-
 // ── mode for the tiny check server ─────────────────────────────────────────────
-// 'hang'      — accept TCP, never respond (forces curl --max-time → rc=28). Too slow for
-//               every case; used only when we specifically want a real timeout.
-// 'down'      — do not listen (connection refused). Fast unreachable.
-// 'empty-then-allow' — empty body twice, then allow:true (exercises retry).
-// 'allow' / 'deny' — immediate answer.
+// 'down'             — nothing listening (connection refused). Fast unreachable.
+// 'empty-then-allow' — empty body twice, then allow:true (exercises retry → proceed).
+// 'reject'           — immediate allow:false reason=rejected.
 let mode = 'down';
 let hits = 0;
 let server = null;
@@ -114,19 +100,17 @@ function startServer() {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       hits += 1;
-      if (mode === 'hang') return; // never write, never end — curl hits --max-time
       if (mode === 'empty-then-allow') {
         if (hits <= 2) { res.end(''); return; }
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ allow: true, reason: 'approved' }));
         return;
       }
-      if (mode === 'allow') {
+      if (mode === 'reject') {
         res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ allow: true, reason: 'approved' }));
+        res.end(JSON.stringify({ allow: false, reason: 'rejected' }));
         return;
       }
-      // deny
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ allow: false, reason: 'pending' }));
     });
@@ -139,43 +123,24 @@ function stopServer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-console.log('\n── A. unreachable API + NO receipt → still fail closed ──');
+console.log('\n── A. unreachable API → FAIL CLOSED, message names attempts (not a human rejection) ──');
 {
-  const { src, wt, base, sha } = mkRepo('closed');
-  await stopServer(); // nothing listening
-  mode = 'down';
+  const { src, wt } = mkRepo('closed');
+  await stopServer();
   const before = git(src, ['rev-parse', 'main']);
   const { out, code } = await realPush(wt);
-  ok(code !== 0, `push declined without a receipt (exit ${code})`);
-  ok(/Gate unreachable|failing closed|Failing closed/i.test(out),
-    'hook says failing closed (no approval to fail open on)');
-  ok(!/fail-open-with-audit|ALLOWED ON RECORDED APPROVAL/i.test(out),
-    'and does NOT claim fail-open-with-audit');
-  ok(git(src, ['rev-parse', 'main']) === before, `main stayed at ${before.slice(0, 8)} — nothing landed`);
-  ok(sha !== base, 'sanity: the zee commit differs from base');
-  void src; void sha;
+  ok(code !== 0, `push declined when gate unreachable (exit ${code})`);
+  ok(/Gate did not answer|not a human rejection/i.test(out),
+    'decline names "gate did not answer" / "not a human rejection"');
+  ok(/Tried 3 times/i.test(out), 'and names how many attempts');
+  ok(/Re-run the SAME push/i.test(out), 'and tells the zee to re-run the same push');
+  ok(!/REJECTED this exact commit/i.test(out), 'and is NOT the human-rejection wording');
+  ok(!/fail-open|ALLOWED ON RECORDED|approval receipt/i.test(out),
+    'and contains no fail-open / receipt language');
+  ok(git(src, ['rev-parse', 'main']) === before, `main stayed put — nothing landed`);
 }
 
-console.log('\n── B. unreachable API + approval receipt → push LANDS (fail-open-with-audit) ──');
-{
-  const { src, wt, base, sha } = mkRepo('approved');
-  await stopServer();
-  writeReceipt({ newSha: sha, decidedBy: 'human@console' });
-  const { out, code } = await realPush(wt);
-  ok(code === 0, `push exited 0 under unreachable API when receipt present (exit ${code})`);
-  ok(/ALLOWED ON RECORDED APPROVAL|fail-open-with-audit/i.test(out),
-    'hook names fail-open-with-audit in its message');
-  ok(/human@console/.test(out), 'and names who approved');
-  ok(git(src, ['rev-parse', 'main']) === sha,
-    `main moved to the approved sha ${sha.slice(0, 8)}`);
-  ok(existsSync(join(approvalsDir, 'audit.log')), 'audit.log was written next to the receipt');
-  const audit = readFileSync(join(approvalsDir, 'audit.log'), 'utf8');
-  ok(audit.includes(sha) && /allow-on-receipt/.test(audit),
-    'audit.log records allow-on-receipt for this sha');
-  ok(base !== sha, 'sanity: base ≠ approved sha');
-}
-
-console.log('\n── C. retry-with-backoff: empty answers twice, then allow → lands ──');
+console.log('\n── B. slow-then-allow: empty ×2, then allow → retries and LANDS ──');
 {
   const { src, wt, sha } = mkRepo('retry');
   mode = 'empty-then-allow';
@@ -185,79 +150,42 @@ console.log('\n── C. retry-with-backoff: empty answers twice, then allow →
   ok(code === 0, `push exited 0 after retries (exit ${code})`);
   ok(hits === 3, `gate was asked 3 times (hits=${hits}) — two empties then allow`);
   ok(/retrying/i.test(out), 'hook told the pusher it was retrying');
-  ok(/landing approved by a human/i.test(out), 'final attempt was a normal allow, not fail-open');
+  ok(/landing approved by a human/i.test(out), 'final attempt followed the gate\'s real allow');
   ok(git(src, ['rev-parse', 'main']) === sha, `main moved to ${sha.slice(0, 8)} via the recovered API`);
   await stopServer();
 }
 
-console.log('\n── D. land-approvals lib + landgate wiring (no live DB required) ──');
+console.log('\n── C. rejected → decline as a human rejection (unchanged) ──');
 {
-  // The assigned shared-dev DATABASE_URL in this xell has no usable password for ad-hoc pg
-  // clients, so decideLandRequest is not exercised live here. The hook path above is the
-  // load-bearing proof; this section proves the receipt helper and that landgate.js wires it.
-  const { writeLandApproval, readLandApproval, clearLandApproval, landApprovalPath,
-          landApprovalsDir, refreshLandGateHookIfStale, installedLandGatePath } =
-    await import('../server/src/lib/land-approvals.js');
-
-  const { src, sha } = mkRepo('lib');
-  const dir = landApprovalsDir(src);
-  ok(!!dir && dir.endsWith('zeehive-land-approvals'),
-    `landApprovalsDir → …/zeehive-land-approvals (${dir})`);
-
-  // Stale-hook refresh: a pre-fix installed hook (ours, but no fail-open) gets rewritten.
-  const hookPath = installedLandGatePath(src);
-  ok(!!hookPath && existsSync(hookPath), `installedLandGatePath finds the update hook (${hookPath})`);
-  // Strip the new marker so the refresher treats it as stale, keep the ZEEHIVE marker.
-  const staleBody = readFileSync(hookPath, 'utf8')
-    .replaceAll('fail-open-with-audit', 'FAIL_OPEN_PLACEHOLDER');
-  ok(/ZEEHIVE LANDING GATE/.test(staleBody) && !/fail-open-with-audit/.test(staleBody),
-    'fixture hook is ours but stale');
-  writeFileSync(hookPath, staleBody);
-  const refreshed = refreshLandGateHookIfStale(src, { projectId: PROJECT_ID, mainBranch: 'main', apiBase: API });
-  ok(refreshed.refreshed === true, `refreshLandGateHookIfStale rewrote the stale hook (${refreshed.reason || 'ok'})`);
-  ok(/fail-open-with-audit/.test(readFileSync(hookPath, 'utf8')),
-    'installed hook now carries fail-open-with-audit again');
-  const again = refreshLandGateHookIfStale(src, { projectId: PROJECT_ID, mainBranch: 'main', apiBase: API });
-  ok(again.refreshed === false && again.reason === 'already-current',
-    'second call is a no-op (already-current)');
-
-  const path = writeLandApproval(src, {
-    projectId: PROJECT_ID,
-    ref: 'refs/heads/main',
-    newSha: sha,
-    decidedBy: 'human@wiring-test',
-    requestId: '22222222-2222-4222-8222-222222222222',
-  });
-  ok(!!path && existsSync(path), `writeLandApproval created a receipt at ${path}`);
-  ok(path === landApprovalPath(src, sha), 'landApprovalPath agrees with what was written');
-  const got = readLandApproval(src, sha);
-  ok(got?.decided_by === 'human@wiring-test', 'readLandApproval round-trips decided_by');
-  ok(got?.project_id === PROJECT_ID && got?.new_sha === sha && got?.ref === 'refs/heads/main',
-    'receipt carries project/ref/sha the hook greps for');
-  ok(clearLandApproval(src, sha) === true, 'clearLandApproval returns true when a file existed');
-  ok(!readLandApproval(src, sha) && !existsSync(path), 'receipt is gone after clear');
-  ok(clearLandApproval(src, sha) === false, 'clearLandApproval is idempotent on a missing file');
-
-  // Static wiring: decideLandRequest must write the receipt; spend/land/stale must clear it.
-  // (A source assertion, not a mock — the same shape nested-queenzee-land-ship-guard uses for
-  // "the hook reads ZEEHIVE_API".) If someone removes the call, A–C still pass against a
-  // hand-written receipt and the approve path silently stops protecting re-pushes under load.
-  const landgateSrc = readFileSync(join(REPO_ROOT, 'server/src/queenzee/landgate.js'), 'utf8');
-  ok(/import \{ writeLandApproval, clearLandApproval, refreshLandGateHookIfStale \}/.test(landgateSrc),
-    'landgate.js imports writeLandApproval + clearLandApproval + refreshLandGateHookIfStale');
-  ok(/writeLandApproval\(project\.repo_root/.test(landgateSrc),
-    'decideLandRequest writes the receipt on approve');
-  ok(/refreshLandGateHookIfStale\(project\.repo_root/.test(landgateSrc),
-    'decideLandRequest refreshes a stale installed hook before writing the receipt');
-  ok(/clearLandApproval\(project\.repo_root, newSha\)/.test(landgateSrc),
-    'checkPush clears the receipt when spending an approval');
-  ok(/clearApprovalReceipt\(stale\)/.test(landgateSrc),
-    'closeAsStale clears the receipt so a dead sha cannot fail-open later');
-  ok(/clearLandApproval\(project\.repo_root, row\.new_sha\)/.test(landgateSrc),
-    'landApproved clears the receipt after the ref moves (or is already there)');
+  const { src, wt } = mkRepo('reject');
+  mode = 'reject';
+  hits = 0;
+  await startServer();
+  const before = git(src, ['rev-parse', 'main']);
+  const { out, code } = await realPush(wt);
+  ok(code !== 0, `push declined on rejection (exit ${code})`);
+  ok(/REJECTED this exact commit/i.test(out), 'uses the human-rejection wording');
+  ok(!/Gate did not answer|not a human rejection/i.test(out),
+    'and does NOT use the unreachable-gate wording');
+  ok(hits === 1, `asked once (hits=${hits}) — a real answer needs no retry`);
+  ok(git(src, ['rev-parse', 'main']) === before, 'main stayed put');
+  await stopServer();
 }
 
-// ── done ──────────────────────────────────────────────────────────────────────
+console.log('\n── D. no fail-open residue in the tree ──');
+{
+  const hook = readFileSync(join(REPO_ROOT, 'hooks', 'land-gate-update.sh'), 'utf8');
+  ok(/MAX_ATTEMPTS=3/.test(hook), 'hook still retries (MAX_ATTEMPTS=3)');
+  ok(/not a human rejection/.test(hook), 'exhaustion message distinguishes from rejection');
+  ok(!/fail-open-with-audit|allow_on_receipt|zeehive-land-approvals|APPROVALS_DIR|RECEIPT=/.test(hook),
+    'hook has no fail-open / receipt path');
+  ok(!existsSync(join(REPO_ROOT, 'server/src/lib/land-approvals.js')),
+    'server/src/lib/land-approvals.js is gone');
+  const landgate = readFileSync(join(REPO_ROOT, 'server/src/queenzee/landgate.js'), 'utf8');
+  ok(!/land-approvals|writeLandApproval|clearLandApproval|refreshLandGateHookIfStale/.test(landgate),
+    'landgate.js imports none of the deleted receipt helpers');
+}
+
 await stopServer();
 console.log(`\n${failures === 0 ? 'ALL PASSED ✓' : `${failures} FAILURE(S) ✗`}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -15,18 +15,16 @@
 #     is untouched.
 #   - Worktrees share the common .git, so this one file covers every xell.
 #
-# FAILS CLOSED when there is no recorded approval. No approval service = no landing. A guard
-# that fails open on every outage is not a guard: the server being down is exactly when a silent
-# landing would go unnoticed. This is the opposite stance to the sibling reference-transaction
-# hook, which guards ordinary local work and must never wedge it — this one guards a rare,
-# deliberate, irreversible act.
+# FAILS CLOSED. No approval service = no landing. A guard that fails open is not a guard: the
+# server being down is exactly when a silent landing would go unnoticed. This is the opposite
+# stance to the sibling reference-transaction hook, which guards ordinary local work and must
+# never wedge it — this one guards a rare, deliberate, irreversible act.
 #
-# EXCEPTION — fail-open-with-audit for a RECORDED approval. A human who already approved THIS
-# EXACT sha must never have that decision silently undone by load. Under a busy/paused
-# queenzee the API can miss the 10s deadline (curl rc=28); declining then would reverse the
-# human's click. So: retry with backoff first; if still unreachable, look for a local approval
-# receipt the queenzee wrote at approve-time (sibling of zeehive-protected-refs). Receipt
-# present → allow and audit. Receipt absent → fail closed, as before.
+# Under load the API can miss a single 10s deadline (curl rc=28) and decline a push a human
+# already approved. The remedy is retry-with-backoff inside a bounded wait — a busy queenzee
+# answers before we give up. On genuine exhaustion we still decline, with a message that names
+# the attempts and duration so it is not confused with a human rejection. A declined push costs
+# one re-push; a bypassed gate costs the fleet its only guarantee.
 #
 # Deliberate override (human, at the console, on purpose):
 #   git -c core.hooksPath=/dev/null push . HEAD:main     # or move this file aside
@@ -108,46 +106,6 @@ command -v curl >/dev/null 2>&1 || decline "Gate unreachable: curl not found (fa
 
 BODY=$(printf '{"project_id":"%s","ref":"%s","old":"%s","new":"%s"}' "$PROJECT_ID" "$REF" "$OLD" "$NEW")
 
-# Approval receipts live next to the protected-refs list (git-common-dir). Derive from the baked
-# path so a missing list file still points at the right directory; fall back to git-common-dir.
-if [ -n "${PROTECTED_REFS_FILE:-}" ]; then
-  APPROVALS_DIR="$(dirname "$PROTECTED_REFS_FILE")/zeehive-land-approvals"
-else
-  APPROVALS_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/zeehive-land-approvals"
-fi
-RECEIPT="$APPROVALS_DIR/$NEW"
-
-# Allow on a local approval receipt. Called only after the API did not answer. The receipt is
-# bound to this exact sha (+ project + ref); anything that does not match stays fail-closed.
-allow_on_receipt() {
-  _why="$1"
-  [ -f "$RECEIPT" ] || return 1
-  # Cheap structural check without jq: the file must name THIS project, ref and sha.
-  grep -q "\"project_id\":\"$PROJECT_ID\"" "$RECEIPT" 2>/dev/null || return 1
-  grep -q "\"ref\":\"$REF\"" "$RECEIPT" 2>/dev/null || return 1
-  grep -q "\"new_sha\":\"$NEW\"" "$RECEIPT" 2>/dev/null || return 1
-  _by=$(sed -n 's/.*"decided_by":"\([^"]*\)".*/\1/p' "$RECEIPT" 2>/dev/null | head -n1)
-  [ -n "$_by" ] || _by="a human"
-  echo "" >&2
-  echo "  ┌─ ZEEHIVE ─────────────────────────────────────────────────────────────" >&2
-  echo "  │ LANDING ALLOWED ON RECORDED APPROVAL (fail-open-with-audit)." >&2
-  echo "  │" >&2
-  echo "  │ Gate unreachable ($_why), but a local approval receipt matches" >&2
-  echo "  │ $(echo "$NEW" | cut -c1-10) on ${REF#refs/heads/} (approved by $_by)." >&2
-  echo "  │ A human decision is never undone by load. The queenzee will reconcile" >&2
-  echo "  │ the land_request row on its next tick." >&2
-  echo "  └───────────────────────────────────────────────────────────────────────" >&2
-  echo "" >&2
-  # Audit trail next to the receipt — best-effort, must never block the allow.
-  {
-    mkdir -p "$APPROVALS_DIR" 2>/dev/null
-    printf '%s allow-on-receipt ref=%s sha=%s by=%s why=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')" \
-      "$REF" "$NEW" "$_by" "$_why" >> "$APPROVALS_DIR/audit.log"
-  } 2>/dev/null || true
-  exit 0
-}
-
 # Ask the gate. Short per-attempt deadline (a human is watching a hung push); we retry below
 # rather than stretch a single curl into a minute-long stall with no progress.
 ask_gate() {
@@ -158,11 +116,12 @@ ask_gate() {
 
 # Retry with linear backoff. Transient load (the measured cause) clears in seconds; three
 # attempts at 10s each, sleeping 1s then 2s between, covers a brief freeze without waiting
-# forever on a truly dead API.
+# forever on a truly dead API. Bounded total wait ≈ 10+1+10+2+10 = 33s.
 RESP=""
 RC=1
 ATTEMPT=1
 MAX_ATTEMPTS=3
+STARTED_AT=$(date +%s 2>/dev/null || echo 0)
 while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
   RESP=$(ask_gate)
   RC=$?
@@ -179,9 +138,15 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
 done
 
 if [ "$RC" -ne 0 ] || [ -z "$RESP" ]; then
-  # Last resort: a recorded approval must still land. No receipt → fail closed, as designed.
-  allow_on_receipt "curl rc=$RC after ${MAX_ATTEMPTS} attempts" \
-    || decline "Gate unreachable: queenzee at $API did not answer (curl rc=$RC after ${MAX_ATTEMPTS} attempts). Failing closed."
+  ENDED_AT=$(date +%s 2>/dev/null || echo 0)
+  if [ "$STARTED_AT" -gt 0 ] && [ "$ENDED_AT" -ge "$STARTED_AT" ]; then
+    ELAPSED=$((ENDED_AT - STARTED_AT))
+  else
+    ELAPSED='?'
+  fi
+  # FAIL CLOSED. Name the attempts and duration so this is not read as a human rejection —
+  # the zee re-runs the same push once the queenzee is answering again. Nothing is lost.
+  decline "Gate did not answer — not a human rejection. Tried ${MAX_ATTEMPTS} times over ~${ELAPSED}s against $API (last curl rc=$RC). Re-run the SAME push when the queenzee is up; do not amend."
 fi
 
 case "$RESP" in
