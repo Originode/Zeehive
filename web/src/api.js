@@ -441,6 +441,15 @@ export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${d
 export const previewProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}/preview`, 'GET');
 export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
 
+// ── CURRENT CONDITIONS — the short, dated, per-PROJECT list of live impediments injected into
+// every briefing (ticket #67). The console is the HUMAN's editor; a manager edits the same list
+// with `zee conditions --add/--remove`. Each line is dated and trivially deletable — there is
+// deliberately no archive, because a condition that stops being true should be GONE. ──
+export const getProjectConditions = (projectId) => fetch(`/api/projects/${projectId}/conditions`).then((r) => (r.ok ? r.json() : []));
+export const addProjectCondition = (projectId, body, actor) => siteCall(`/api/projects/${projectId}/conditions`, 'POST', { body, actor });
+export const updateProjectCondition = (condId, body, actor) => siteCall(`/api/project-conditions/${condId}`, 'PUT', { body, actor });
+export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditions/${condId}`, 'DELETE');
+
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
 export const updateEnvironment = (envId, body) => siteCall(`/api/environments/${envId}`, 'PATCH', body);

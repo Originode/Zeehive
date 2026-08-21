@@ -16,6 +16,7 @@ import {
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
   getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
   previewProjectDoc,
+  getProjectConditions, addProjectCondition, updateProjectCondition, deleteProjectCondition,
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
   getWireguard, mintWireguardPeer, setWireguardEndpoint,
   getProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
@@ -370,6 +371,7 @@ const SETUP_TABS = [
   { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest', 'compose_onboarding'] },
   { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
   { key: 'docs', label: 'Docs', gates: [] },
+  { key: 'conditions', label: 'Conditions', gates: [] },
   { key: 'env', label: 'Environments', gates: [] },
   { key: 'providers', label: 'Providers', gates: [] },
   { key: 'ticketapi', label: 'Ticket API', gates: [] },
@@ -416,6 +418,7 @@ function EditSections({ project, onChanged, onProject }) {
         <WireguardSection project={project} run={run} busy={busy} />
       </>}
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
+      {tab === 'conditions' && <ConditionsSection project={project} run={run} busy={busy} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'ticketapi' && <ApiKeysSection project={project} run={run} busy={busy} />}
@@ -2059,6 +2062,64 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
           {!targets.length && <div className="pc">(the provider catalogue could not be loaded — reload the console)</div>}
         </div>
       )}
+    </div>
+  );
+}
+
+// CURRENT CONDITIONS — the short, dated, per-PROJECT list of live impediments injected into every
+// briefing (ticket #67). The HUMAN's editor; a manager edits the same list with `zee conditions`.
+// Explicitly EPHEMERAL — each line renders with the date it was last touched and deleting one is a
+// plain button, with no confirm, because stale conditions are worse than none and this list must
+// never become a second manual.
+function ConditionsSection({ project, run, busy }) {
+  const [conds, setConds] = useState(null);
+  const [add, setAdd] = useState('');
+  const load = useCallback(() => getProjectConditions(project.id).then(setConds).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  return (
+    <div className="setup-sec" data-testid="conditions-section">
+      <h3>Current conditions <span className="pc">(the short, dated list of LIVE IMPEDIMENTS injected into every briefing — EPHEMERAL, the opposite of the docs)</span></h3>
+      <div className="pc">
+        Each line is a fact that is <b>true now and should be false soon</b> — "the shared dev DSN is
+        stale (TKT-47)", "these two tests are red on main and are not yours (TKT-54, TKT-59)". It is
+        injected into every zee briefing on this project, dated with the day it was last touched, and
+        read back with <code>zee conditions</code>. This is <b>not documentation</b>: when a line stops
+        being true, delete it — a stale line is worse than none, so there is no archive and no confirm.
+      </div>
+      {(conds || []).map((c) => {
+        const d = String(c.updated_at || c.created_at || '').slice(0, 10);
+        return (
+          <div key={c.id} className="setup-row" data-testid={`condition-${c.id}`}>
+            <input value={c.body} data-condition-id={c.id}
+                   onChange={(e) => { const v = e.target.value;
+                     const next = (conds || []).map((x) => (x.id === c.id ? { ...x, body: v } : x));
+                     setConds(next); }}
+                   onBlur={(e) => { const v = String(e.target.value || '').trim();
+                     if (v && v !== c.body) wrapped(() => updateProjectCondition(c.id, v, 'human')); }}
+                   style={{ minWidth: 360 }} />
+            <span className="pc" title="last touched (the date injected into briefings)">[<b>{d}</b>]</span>
+            <span className="pc">{c.updated_by || ''}</span>
+            <button type="button" className="hm-del" disabled={busy}
+                    onClick={() => wrapped(() => deleteProjectCondition(c.id))}
+                    title="Delete this line — trivial on purpose">🗑</button>
+          </div>
+        );
+      })}
+      {conds && conds.length === 0 && (
+        <div className="pc">No current conditions — nothing is known to be broken right now. When a
+          zee reports a broken environment it cannot fix, add one line here (with a ticket ref) so
+          the next zee does not rediscover it.</div>
+      )}
+      <div className="setup-row">
+        <input value={add} placeholder='e.g. "the shared dev DSN is stale (TKT-47) — use `zee db-sandbox`"'
+               onChange={(e) => setAdd(e.target.value)}
+               onKeyDown={(e) => { if (e.key === 'Enter' && add.trim() && !busy) {
+                 wrapped(() => addProjectCondition(project.id, add.trim(), 'human')).then(() => setAdd('')); } }} />
+        <button type="button" className="pill" disabled={busy || !add.trim()}
+                onClick={() => wrapped(() => addProjectCondition(project.id, add.trim(), 'human'))
+                  .then(() => setAdd(''))}>＋ Add condition</button>
+      </div>
     </div>
   );
 }
