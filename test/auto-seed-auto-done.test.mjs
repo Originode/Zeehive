@@ -165,11 +165,14 @@ try {
   ok(mgrBox.some((m) => /auto-done policy/.test(m.body) && /CONFIRMED/.test(m.body) && /autowork/.test(m.body)),
      '…and the manager is told the AUTO-DONE POLICY confirmed it, not a human');
 
-  // The reap's own guard is untouched: a genuinely mid-turn xell is still refused, and the card
-  // stays OPEN for a human rather than being consumed by a refusal (done-suggestion-refused-reap).
+  // The reap's own guard is untouched: a genuinely mid-turn xell is still refused, and the decision
+  // is HELD (approved-held) rather than consumed by a refusal (done-suggestion-refused-reap, ticket
+  // #75). The reaper applies it when the turn ends.
   const busyDone = await suggestDone({ manager: mgr, target: busy, reason: 'this one is busy' });
-  ok(busyDone.ok === true && busyDone.suggestion?.status === 'pending',
-     'a mid-turn xell is STILL refused under auto-done — the suggestion stays a pending card');
+  ok(busyDone.ok === true && busyDone.suggestion?.status === 'approved-held',
+     'a mid-turn xell is STILL refused under auto-done — the suggestion is HELD (approved-held) '
+     + `(got ${busyDone.suggestion?.status})`);
+  ok(busyDone.suggestion?.decided_by === 'auto-done@policy', '…the policy still decided it (the decision is held, not discarded)');
   ok(await xellStatus(busy.id) === 'working', '…and the busy xell is untouched');
 
   console.log(fail ? `\n${fail} check(s) FAILED` : '\nall checks passed');

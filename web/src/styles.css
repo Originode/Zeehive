@@ -1339,6 +1339,10 @@ a.cbox:hover { border-color: var(--accent); }
 .land-approve:hover:not(:disabled) { background: rgba(53,196,107,.12); }
 .land-reject { border-color: var(--error) !important; color: var(--error) !important; }
 .land-reject:hover:not(:disabled) { background: rgba(229,85,78,.12); }
+/* "Close it anyway" on a HELD done approval (ticket #75): still the approve action, but it tears a
+   live turn down NOW, so it is amber — a deliberate override, not the normal green. */
+.land-force { border-color: var(--building, #e0a53b) !important; color: var(--building, #e0a53b) !important; font-weight: 600; }
+.land-force:hover:not(:disabled) { background: rgba(224,165,59,.12); }
 /* Withdraw sits left of Reject and stays MUTED on purpose: it decides nothing (no rejection, no
    landing, the sha is not burned), so it must not read as a verdict competing with the two that are. */
 .land-withdraw { border-color: var(--line) !important; color: var(--muted) !important; margin-right: auto; }

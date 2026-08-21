@@ -160,9 +160,11 @@ async function fetchXellRows(pid) {
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('shiphint-request','shiphint-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'shiphint-request' AS ship_hint,
-            -- A MANAGER zee suggested this xell is finished: a held decision, raised by another
-            -- agent rather than by this xell's own zee, and it must be visible or a manager's
-            -- suggestion is as invisible as the prod-bind ask used to be.
+            -- A MANAGER zee suggested this xell is finished: a decision raised by another agent rather
+            -- than by this xell's own zee, and it must be visible or a manager's suggestion is as
+            -- invisible as the prod-bind ask used to be. Only 'pending' shows the 'done?' hexagon —
+            -- an 'approved-held' card (ticket #75) is a decision ALREADY made, waiting only for the
+            -- turn to end, and stays visible through listDoneSuggestions with its own banner instead.
             EXISTS(SELECT 1 FROM done_suggestion ds WHERE ds.target_xell_id = x.id
                      AND ds.status = 'pending' AND ds.dismissed_at IS NULL) AS done_suggested,
             -- the manager this xell reports to (its slug, for the card/hexagon)

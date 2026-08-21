@@ -460,10 +460,16 @@ export async function suggestDone({ manager, target, reason = null }) {
   if (manager.id === target.id) {
     throw new Error('a manager cannot suggest ITSELF done — use `zee done --summary "…"` for your own job');
   }
+  // An 'approved-held' row is the same ask still live — the decision was made but the reap is
+  // waiting on the turn to end, so raising a second card would stack a duplicate the human never asked for.
   const open = await one(
-    `SELECT * FROM done_suggestion WHERE target_xell_id=$1 AND status='pending' AND dismissed_at IS NULL`,
+    `SELECT * FROM done_suggestion WHERE target_xell_id=$1 AND status IN ('pending','approved-held') AND dismissed_at IS NULL`,
     [target.id]);
-  if (open) return { ok: true, suggestion: open, note: 'a done suggestion for that xell is already awaiting a human' };
+  if (open) {
+    return { ok: true, suggestion: open, note: open.status === 'approved-held'
+      ? 'a done decision for that xell is already made and being held until its turn ends'
+      : 'a done suggestion for that xell is already awaiting a human' };
+  }
   const row = await one(
     `INSERT INTO done_suggestion (project_id, manager_xell_id, manager_slug, target_xell_id, target_slug, reason)
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
@@ -502,7 +508,7 @@ export async function listDoneSuggestions(projectId, { open = true } = {}) {
        LEFT JOIN xell x ON x.id = ds.target_xell_id
        LEFT JOIN xell m ON m.id = ds.manager_xell_id
       WHERE ds.project_id=$1 AND ds.dismissed_at IS NULL
-        ${open ? `AND ds.status='pending'` : ''}
+        ${open ? `AND ds.status IN ('pending','approved-held')` : ''}
       ORDER BY ds.requested_at DESC LIMIT 50`, [projectId]);
 }
 
@@ -514,45 +520,72 @@ export async function dismissDoneSuggestion(id, by = 'human@console') {
   return row;
 }
 
-// An approval the queenzee could NOT carry out. The suggestion goes BACK to pending — it is still a
-// card, with the refusal attached — and the manager is told, the same way a rejection tells it.
+// An approval the queenzee could NOT carry out. With `hold` (the reap refused because the target is
+// MID-TURN) the decision is HELD: the row becomes 'approved-held' — still a card, the refusal
+// attached — and the reaper applies it the moment the turn ends. Without `hold` the suggestion goes
+// BACK to pending, exactly as before.
 //
 // This exists because the opposite was written first and it lost work-hours: the row was flipped out
 // of 'pending' BEFORE the reap, and stamped 'failed' when the reap refused. listDoneSuggestions()
 // only ever shows 'pending', so the card left the console, the worker stayed alive, the manager
 // heard nothing, and the human believed they had closed it. Five of one manager's crew sat in that
 // state in a single hour. A decision that did not happen must not consume the ask that raised it.
-async function refuseApproval({ id, row, manager, by, error, detail = null }) {
+//
+// `notify` gates the manager message. The FIRST hold of an approval tells the manager once ("it was
+// approved but the xell is mid-turn; it will close itself"); a re-hold of the SAME held card (a
+// human clicking approve again while it is still mid-turn) must not spam a second copy. Success at
+// apply time is reported separately by the reaper / the human path that finally closes the xell.
+async function refuseApproval({ id, row, manager, by, error, detail = null, hold = false, notify = true }) {
+  const status = hold ? 'approved-held' : 'pending';
   const back = await one(
-    `UPDATE done_suggestion SET status='pending', decided_at=NULL, decided_by=NULL, result=$2::jsonb
+    // A held decision KEEPS decided_at/decided_by — the decision really was made, it just cannot be
+    // applied yet. A plain refusal clears them, so the card reads as undecided again.
+    `UPDATE done_suggestion SET status=$2,
+            decided_at = CASE WHEN $2 = 'approved-held' THEN decided_at ELSE NULL END,
+            decided_by = CASE WHEN $2 = 'approved-held' THEN decided_by ELSE NULL END,
+            result = $3::jsonb
        WHERE id=$1 RETURNING *`,
-    [id, JSON.stringify({ refused: true, error, by, at: new Date().toISOString(), detail })]);
+    [id, status, JSON.stringify({ refused: true, held: hold, error, by, at: new Date().toISOString(), detail })]);
   broadcast('done-suggestion', back);
   if (row.target_xell_id) broadcast('xell', { id: row.target_xell_id });
   logline('crew', `done suggestion for ${row.target_slug} was APPROVED by ${by} but the xell was NOT closed `
-    + `(${error}) — the card stays open`);
-  if (manager) {
+    + `(${error}) — the card ${hold ? 'is HELD until the turn ends' : 'stays open'}`);
+  if (manager && notify) {
     await postMessage({ from: null, to: manager, kind: 'report', by,
-      body: `A human APPROVED your suggestion that ${row.target_slug} is done, but the queenzee could NOT `
-        + `close it: ${error} The suggestion is still open in the console — nothing was decided and `
-        + `nothing was lost. Check whether ${row.target_slug} really is finished before it is approved again.` })
+      body: hold
+        ? `A human APPROVED your suggestion that ${row.target_slug} is done, but the xell is mid-turn, so `
+          + `the queenzee could NOT close it yet: ${error} The decision is HELD — it will be applied `
+          + `automatically the moment the turn ends, so nothing more is needed from you.`
+        : `A human APPROVED your suggestion that ${row.target_slug} is done, but the queenzee could NOT `
+          + `close it: ${error} The suggestion is still open in the console — nothing was decided and `
+          + `nothing was lost. Check whether ${row.target_slug} really is finished before it is approved again.` })
       .catch(() => {});
   }
-  return { ...back, ok: false, refused: true, error };
+  return { ...back, ok: false, refused: true, held: hold, error };
 }
 
 // The HUMAN's decision on a done suggestion. Approve → the queenzee marks the xell's task done and
 // reaps it, exactly as the console's own "Mark done" does (same function, same reap, same commit
 // collection). Reject → the manager is told, and nothing happens to the xell. An approval the reap
-// REFUSES is not a decision at all — see refuseApproval above.
+// REFUSES because the target is MID-TURN is HELD ('approved-held') and applied by the reaper once
+// the turn ends — the decision is not thrown away. A human can override the hold with force:true,
+// which tears the xell down mid-turn deliberately.
 //
 // tasks.js is imported lazily: it reaches back into provisioning/reaping, and a top-level import
 // here would make lib ↔ queenzee circular for a call that runs once per human click.
 export async function decideDoneSuggestion(id, decision, by = 'human@console', { force = false } = {}) {
   if (!['approved', 'rejected'].includes(decision)) throw new Error(`bad decision: ${decision}`);
+  // An 'approved-held' row is the same decision already made — a re-click (or a force) re-attempts
+  // the apply rather than being told "already decided". A held card can only be re-decided as
+  // 'approved'; there is nothing to reject.
+  const prior = await one(`SELECT status FROM done_suggestion WHERE id=$1`, [id]);
+  const wasHeld = prior?.status === 'approved-held';
+  if (!prior || !(prior.status === 'pending' || (wasHeld && decision === 'approved'))) {
+    throw new Error('no such pending done suggestion (already decided?)');
+  }
   const row = await one(
     `UPDATE done_suggestion SET status=$2, decided_at=now(), decided_by=$3
-       WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by]);
+       WHERE id=$1 AND status IN ('pending','approved-held') RETURNING *`, [id, decision, by]);
   if (!row) throw new Error('no such pending done suggestion (already decided?)');
   broadcast('done-suggestion', row);
 
@@ -592,9 +625,15 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
     if (task) {
       result = await markTaskDone(task.id, by, { force });
       // The reap refused (an ACTIVE zee, a ship this queenzee is deploying right now). The task is
-      // NOT done and the xell is untouched, so the ask goes back on the board.
+      // NOT done and the xell is untouched. If the refusal is the ACTIVE-zee guard, HOLD the
+      // decision (approved-held) and let the reaper apply it when the turn ends; any other refusal
+      // goes back to pending.
       if (result?.blocked) {
+        // A held card that is re-attempted stays HELD on any refusal (the decision was already made;
+        // a ship deploying or a transient error does not un-make it). A fresh approval is held only
+        // on the ACTIVE-zee guard — that is the quiescence wait the ticket is about.
         return refuseApproval({ id, row, manager, by, detail: result,
+          hold: result.reap?.active === true || wasHeld, notify: !wasHeld,
           error: result.reap?.error || 'the queenzee refused to close that xell.' });
       }
     } else {
@@ -604,13 +643,17 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
       result = { reap: await reapXell(target.id, 'done-suggestion', { force }) };
       if (result.reap?.ok === false) {
         return refuseApproval({ id, row, manager, by, detail: result,
+          hold: result.reap?.active === true || wasHeld, notify: !wasHeld,
           error: result.reap?.error || 'the queenzee refused to close that xell.' });
       }
     }
   } catch (e) {
     // An operational failure is still "the xell was not closed" — same treatment, or the card
-    // disappears on a transient error and nobody ever learns the click did nothing.
-    return refuseApproval({ id, row, manager, by, error: `the teardown threw: ${e.message}` });
+    // disappears on a transient error and nobody ever learns the click did nothing. It is not an
+    // ACTIVE-zee guard, so a FRESH approval is never held as a quiescence wait; a HELD one stays
+    // held so the reaper can keep retrying it.
+    return refuseApproval({ id, row, manager, by, notify: !wasHeld, hold: wasHeld,
+      error: `the teardown threw: ${e.message}` });
   }
 
   const done = await one(`UPDATE done_suggestion SET result=$2::jsonb WHERE id=$1 RETURNING *`,
@@ -626,4 +669,85 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
         + 'down (its commits were collected first). One fewer worker in your crew.' }).catch(() => {});
   }
   return done;
+}
+
+// ── the reaper's half: apply a HELD approval the moment the turn ends ─────────
+//
+// A human (or the auto-done policy) approved a done suggestion whose target was mid-turn; the reap
+// refused, and refuseApproval recorded the decision as 'approved-held' rather than throwing it away.
+// This function re-attempts the apply (the SAME path the human's approve click takes), and is what
+// the held-done reaper loop calls on every tick:
+//
+//   • target's turn has ended → the reap succeeds → the suggestion is finalized 'approved' and the
+//     manager is told ONCE (the hold message at refuseApproval already told it the decision was held);
+//   • target is STILL mid-turn → the reap refuses with active:true → the row stays 'approved-held'
+//     and the next tick re-checks. No message — the manager was told once at hold time;
+//   • a DIFFERENT refusal (e.g. a ship is deploying) → also stays held so a later tick retries;
+//   • target already gone/retired → a reap that succeeded but crashed before finalizing; finalize.
+export async function applyHeldDoneSuggestion(id, by = 'reaper@queenzee') {
+  const row = await one(
+    `SELECT * FROM done_suggestion WHERE id=$1 AND status='approved-held' AND dismissed_at IS NULL`, [id]);
+  if (!row) return { ok: false, applied: false, error: 'no held done suggestion (already applied or decided?)' };
+
+  const target = row.target_xell_id ? await one(`SELECT * FROM xell WHERE id=$1`, [row.target_xell_id]) : null;
+  const manager = row.manager_xell_id ? await one(`SELECT * FROM xell WHERE id=$1`, [row.manager_xell_id]) : null;
+
+  // Already retired: the reap that retired it IS the apply this hold was waiting for, and the crash
+  // between reap and finalize left the row held. Finalize as applied rather than re-reap a gone xell.
+  if (!target || target.status === 'retired') {
+    const done = await one(
+      `UPDATE done_suggestion SET status='approved', result=$2::jsonb WHERE id=$1 AND status='approved-held' RETURNING *`,
+      [id, JSON.stringify({ ok: true, applied_by: by, note: 'the xell was already closed' })]);
+    if (!done) return { ok: false, applied: false, error: 'no held done suggestion (already applied or decided?)' };
+    broadcast('done-suggestion', done);
+    if (target) broadcast('xell', { id: target.id });
+    logline('crew', `held done suggestion for ${row.target_slug} finalized by ${by} — the xell was already closed`);
+    return { ok: true, applied: true, suggestion: done };
+  }
+
+  const { markTaskDone } = await import('../queenzee/tasks.js');
+  const task = await one(
+    `SELECT id FROM task WHERE xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [target.id]);
+  let result;
+  try {
+    if (task) {
+      result = await markTaskDone(task.id, by, { force: false });
+    } else {
+      const { reapXell } = await import('../queenzee/reaper.js');
+      result = { reap: await reapXell(target.id, 'done-suggestion-held', { force: false }) };
+    }
+  } catch (e) {
+    // An operational failure is transient — stay held, the next tick retries. The manager was told
+    // once at hold time; a retry must not spam.
+    logline('crew', `held done suggestion ${String(id).slice(0, 8)} apply threw: ${e.message}`);
+    return { ok: false, applied: false, held: true, error: `the teardown threw: ${e.message}` };
+  }
+
+  const refused = result?.blocked === true || result?.reap?.ok === false;
+  if (!refused) {
+    // Applied — the reap retired the xell (and markTaskDone marked the task done). Finalize.
+    const done = await one(
+      `UPDATE done_suggestion SET status='approved', result=$2::jsonb WHERE id=$1 AND status='approved-held' RETURNING *`,
+      [id, JSON.stringify({ ok: true, applied_by: by })]);
+    if (!done) return { ok: false, applied: false, error: 'no held done suggestion (already applied or decided?)' };
+    broadcast('done-suggestion', done);
+    broadcast('xell', { id: target.id });
+    logline('crew', `held done suggestion for ${row.target_slug} APPLIED by ${by} — the turn had ended and the xell is reaped`);
+    if (manager) {
+      await postMessage({ from: null, to: manager, kind: 'report', by,
+        body: `The done suggestion you made for ${row.target_slug} was approved while the xell was mid-turn; `
+          + `the turn has now ended and the xell has been closed automatically. Nothing more for you to do.` })
+        .catch(() => {});
+    }
+    return { ok: true, applied: true, suggestion: done };
+  }
+
+  // Refused. A still-mid-turn refusal is the normal "keep holding" case (the next tick re-checks).
+  // A different refusal (a ship deploying, a transient error) is also left held so a later tick
+  // retries — the manager was told once at hold time and must not be spammed per tick.
+  const active = result?.reap?.active === true || result?.active === true;
+  logline('crew', `held done suggestion for ${row.target_slug} still not applied (${result?.reap?.error || 'refused'}) — `
+    + (active ? 'the turn is still in flight; will re-check next tick' : 'will retry next tick'));
+  return { ok: false, applied: false, held: true, still_active: active,
+           error: result?.reap?.error || 'the queenzee refused to close that xell.' };
 }

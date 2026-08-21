@@ -335,7 +335,11 @@ and adds only this project's specifics.
 
 `zee suggest-done` raises a `done_suggestion` row, lights `occ-doneSuggest` (`done?`) on the target's
 hexagon and a card in the console. A human types **DONE** to confirm; that marks the task done and
-reaps the cxell (commits collected first). There is no `/xell/self/` route that decides one.
+reaps the cxell (commits collected first). There is no `/xell/self/` route that decides one. If the
+reap refuses because the xell is mid-turn, the decision is **held** (`approved-held`, ticket #75): the
+card stays up as "Approved — waiting for the turn to end", the held-done reaper closes the xell
+automatically the moment the turn ends, and a human can still close it immediately with **Close it
+anyway** — a deliberate force that tears the live turn down, typed **CLOSE**.
 
 ## The reflection stage
 
