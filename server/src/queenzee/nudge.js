@@ -23,7 +23,7 @@ import { predecessorActionDigest } from '../lib/predecessor-digest.js';
 // is the TURN LOCK half of the same module: a resume must CLAIM the turn atomically (refusing if one
 // is already in flight) instead of blindly marking 'working' over a live session (TKT-114-B).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
-import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
+import { startTurn, endTurn, lastAssistantText, turnBudgetWarningMessage } from '../lib/turn-ledger.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
 import { broadcast } from '../lib/events.js';
@@ -692,6 +692,25 @@ export async function sendMessageToXell(xellId, { text = '', attachments = [], b
   }
 }
 
+// ── TURN-BUDGET WARNING — tell a zee its turn is approaching the vendor ceiling ─────────────────
+// The ONE message a zee gets when its turn's running token total crosses TURN_BUDGET_WARNING_TOKENS
+// (~12M, a named constant in lib/turn-ledger.js). Delivered through the SAME channel as every other
+// operator message (sendMessageToXell) — exactly the shape the card asks for (sendMessageToXell,
+// not nudgeCxell, which REFUSES a mid-turn zee by design). Best-effort by contract, and never ends
+// a turn: the vendor's ceiling does that, and this warning exists so a zee lands what it has first.
+//
+// THE HONEST SHAPE OF THE DELIVERY (do not let this rot into a claim that a zee "was warned"):
+// the warning fires MID-TURN by definition, and mid-turn delivery is QUEUED by zee-turn.js:77
+// (MID_TURN_STATUSES includes 'working') — the talk queue drains only when the turn ends (cxell.js
+// cxellTalkCommand / zee-attach.sh). So a turn that DIES at the ceiling will NOT receive this before
+// dying: it waits in the queue and reaches the RESUMED zee after the death — RECOVERY, not
+// PREVENTION, until a mid-turn channel exists. The verdict this returns (delivery: 'queued' in that
+// case) is recorded on the turn row by warnTurnBudget, so the data says how often the warning was
+// actually deliverable in time.
+export async function nudgeXellForTurnBudget(xellId, { tokens = 0, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  return sendMessageToXell(xellId, { text: turnBudgetWarningMessage(tokens), by, mode });
+}
+
 // A DELIVERY THAT FAILED MUST CORRECT ITS OWN RECORD (TKT-60) — the same rule staleNudgeUndelivered
 // and clearanceUndelivered already apply to a land_request's note, one table over.
 //
@@ -793,10 +812,10 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
 // nudgeXellForTurnDeath above, and a static pair of imports would be a module cycle — the same
 // reason, and the same shape, as fleet-pause.js reaching status.js for recordEvent. Never throws:
 // this is already the failure path.
-async function reportTurnDeath({ zeeId, xellId, slug, reason }) {
+async function reportTurnDeath({ zeeId, xellId, slug, reason, code = null, err = '', result = null }) {
   try {
     const { noteTurnDeath } = await import('./revive.js');
-    await noteTurnDeath({ zeeId, xellId, slug, reason, source: 'resumed turn' });
+    await noteTurnDeath({ zeeId, xellId, slug, reason, code, err, result, source: 'resumed turn' });
   } catch (e) {
     logline('nudge', `${slug}: could not file the resumed turn's death (${String(e.message).slice(0, 120)})`);
   }
@@ -923,7 +942,8 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
           burn, stopReason: death ? death.message.slice(0, 200) : 'end_turn',
           summary: lastAssistantText(r?.result),
         });
-        if (death) return reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message });
+        if (death) return reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message,
+                                            code: r?.code ?? null, err: r?.err ?? '', result: r?.result ?? null });
         return row;
       // The failure handler is the SECOND argument of this `then`, not a `.catch` after it, and that
       // is load-bearing: a `.catch` would also catch anything the success handler above threw, and
@@ -954,7 +974,8 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
           burn: usageFrom(result),
           stopReason: `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
         }).catch(() => {});
-        if (death) reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message }).catch(() => {});
+        if (death) reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message,
+                                     code: dk?.code ?? null, err: dk?.err ?? '', result }).catch(() => {});
         // The caller may need to KNOW the message never arrived (a stale landing has no other way
         // to reach its zee). Best-effort by construction: this is already the failure path.
         try { onFail?.(e); } catch { /* a failing handler must not become an unhandled rejection */ }

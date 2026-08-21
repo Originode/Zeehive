@@ -551,12 +551,12 @@ router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
 // them — stale the first time one is renamed.
 router.get('/agent-doc-targets', (_req, res) => res.json(targetCatalogue()));
 router.get('/projects/:id/docs', async (req, res) => {
-  try { res.json(await listProjectDocs(req.params.id)); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try { res.json(await listProjectDocs(await resolveProjectParam(req.params.id))); }
+  catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
 });
 router.post('/projects/:id/docs', async (req, res) => {
-  try { res.json(await createProjectDoc(req.params.id, req.body || {})); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try { res.json(await createProjectDoc(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
 });
 router.put('/project-docs/:docId', async (req, res) => {
   try { res.json(await updateProjectDoc(req.params.docId, req.body || {})); }
@@ -573,7 +573,10 @@ router.delete('/project-docs/:docId', async (req, res) => {
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-router.get('/projects/:id/sites', async (req, res) => res.json(await listSites(req.params.id)));
+router.get('/projects/:id/sites', async (req, res) => {
+  try { res.json(await listSites(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
+});
 // ── WireGuard mesh — the human's door onto the ZEEHIVE network ───────────────────────────────
 // Decision 5.4 (docs/common-xell-network-plan.md): ZEEHIVE operates a WG server; a human (or
 // another machine) downloads a ready .conf and joins the tunnel. These are HUMAN surface routes
@@ -603,8 +606,8 @@ router.patch('/projects/:id/wireguard/endpoint', async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/projects/:id/sites', async (req, res) => {
-  try { res.json(await createSite(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await createSite(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.patch('/sites/:id', async (req, res) => {
   try { res.json(await updateSite(req.params.id, req.body || {})); }
@@ -635,8 +638,8 @@ router.post('/sites/:id/adopt', async (req, res) => {
 // one provider type (036): POST adds one, DELETE …/account/:accountId removes one; the PUT
 // keeps its legacy replace-in-place semantics for single-account types (github, scripts).
 router.get('/projects/:id/tokens', async (req, res) => {
-  try { res.json(await listProviderTokens(req.params.id)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await listProviderTokens(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 // HOW MUCH OF EACH PROVIDER ACCOUNT'S USAGE LIMIT IS STILL AVAILABLE — project-scoped,
 // account-grained, never per-xell. Same data as fleet.provider_limits; a dedicated route so
@@ -647,17 +650,18 @@ router.get('/projects/:id/provider-limits', async (req, res) => {
 });
 router.post('/projects/:id/tokens', async (req, res) => {
   try {
-    const out = await addProviderToken(req.params.id, req.body?.provider, req.body?.token, req.body?.label);
+    const projectId = await resolveProjectParam(req.params.id);
+    const out = await addProviderToken(projectId, req.body?.provider, req.body?.token, req.body?.label);
     // A human connected an account → if live cages for this provider predate the new key, raise a
     // rotation request for a human to approve (the queenzee performs the injection on approval).
-    await raiseRotationRequest({ projectId: req.params.id, provider: req.body?.provider })
+    await raiseRotationRequest({ projectId, provider: req.body?.provider })
       .catch(() => {});   // a failed trigger must never fail the token save
     res.json(out);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.delete('/projects/:id/tokens/account/:accountId', async (req, res) => {
-  try { res.json(await deleteProviderAccount(req.params.id, req.params.accountId)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await deleteProviderAccount(await resolveProjectParam(req.params.id), req.params.accountId)); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 // SET one provider's spend-alert threshold (migration 206) — a customizable USD amount per
 // provider, applied per xell by the fleet read model: when a xell's gateway-ledger spend on
@@ -674,9 +678,9 @@ router.put('/projects/:id/provider-alerts/:provider', async (req, res) => {
 // still be deleted. Same shape as the fleet/project/xell pause routes.
 router.post('/projects/:id/tokens/account/:accountId/pause', async (req, res) => {
   try {
-    res.json(await setProviderAccountPaused(req.params.id, req.params.accountId, true,
+    res.json(await setProviderAccountPaused(await resolveProjectParam(req.params.id), req.params.accountId, true,
       { by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.post('/projects/:id/tokens/account/:accountId/resume', async (req, res) => {
   try {
@@ -741,12 +745,12 @@ router.post('/xells/:id/env', async (req, res) => {
 // server through emitXellEnv (into a xell's own .zeehive.env) and the human export below. Mirrors
 // the provider-tokens + sites route shapes.
 router.get('/projects/:id/environments', async (req, res) => {
-  try { res.json(await listEnvironments(req.params.id)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await listEnvironments(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.post('/projects/:id/environments', async (req, res) => {
-  try { res.json(await createEnvironment(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await createEnvironment(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.get('/environments/diff', async (req, res) => {
   try { res.json(await diffEnvironments(req.query.a, req.query.b)); }
@@ -817,6 +821,13 @@ router.get('/xells/:id/env/export', async (req, res) => {
 async function resolveProjectParam(id) {
   return resolveProjectId({ project: id });
 }
+// A project NAME that matches nothing is a 404 — the caller addressed a project that does not
+// exist, and UnknownProject's message names which projects do — not the route's ordinary 400 for
+// a malformed body. The name-vs-uuid sweep routes use this so an unknown name is never a postgres
+// `invalid input syntax for type uuid` (that is the defect the sweep removes) and never a 500.
+function projectErrorStatus(err, fallback = 400) {
+  return err?.code === 'UNKNOWN_PROJECT' ? 404 : fallback;
+}
 router.get('/projects/:id/manifest', async (req, res) => {
   try { res.json(await getProjectManifest(await resolveProjectParam(req.params.id))); }
   catch (err) { res.status(404).json({ error: err.message }); }
@@ -879,8 +890,8 @@ router.post('/projects/:id/manifest/compose-apply', async (req, res) => {
 router.post('/projects/probe', (req, res) => res.json(probeRepo(req.body?.repo_root)));
 // The readiness checklist: which gates pass, can it provision, can it SHIP.
 router.get('/projects/:id/readiness', async (req, res) => {
-  try { res.json(await projectReadiness(req.params.id)); }
-  catch (err) { res.status(404).json({ error: err.message }); }
+  try { res.json(await projectReadiness(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err, 404)).json({ error: err.message }); }
 });
 // Machine × project BUILD-READINESS (ticket #173): for every machine of this project, can a
 // build actually work there? Read-only probe — same docker facts verifyRequires uses, plus the
@@ -905,16 +916,22 @@ router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // The dev spawn template: what a new xell gets by default (couplings, runtime, pool size).
-router.get('/projects/:id/pool-config', async (req, res) => res.json(await getPoolConfig(req.params.id)));
+router.get('/projects/:id/pool-config', async (req, res) => {
+  try { res.json(await getPoolConfig(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
+});
 router.patch('/projects/:id/pool-config', async (req, res) => {
-  try { res.json(await updatePoolConfig(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await updatePoolConfig(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 // Shared-container inventory (prod containers included — a ship needs at least one shippable).
-router.get('/projects/:id/containers', async (req, res) => res.json(await listSharedContainers(req.params.id)));
+router.get('/projects/:id/containers', async (req, res) => {
+  try { res.json(await listSharedContainers(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
+});
 router.post('/projects/:id/containers', async (req, res) => {
-  try { res.json(await createSharedContainer(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await createSharedContainer(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.patch('/containers/:id', async (req, res) => {
   try { res.json(await updateSharedContainer(req.params.id, req.body || {})); }

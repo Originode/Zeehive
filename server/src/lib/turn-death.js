@@ -12,9 +12,10 @@
 //
 // The two cohorts want opposite things, and that is the whole of this file:
 //
-//   • TRANSIENT (429 / 529 / a closed connection / another 5xx / a timeout) — the provider was busy
-//     or the pipe broke. The session is intact, the cage is intact, the work is intact. Resuming it
-//     a few minutes later is very likely to just work, and it costs nobody anything.
+//   • TRANSIENT (429 / 529 / a closed connection / another 5xx / a timeout / a SIGKILL) — the
+//     provider was busy or the pipe broke, or the OS killed the process (137 = OOM). The session is
+//     intact, the cage is intact, the work is intact. Resuming it a few minutes later is very likely
+//     to just work, and it costs nobody anything.
 //   • TERMINAL (401 / an invalid key / a disabled org / an unknown model / exhausted credit) — the
 //     credential or the dispatch is wrong. No number of retries fixes it, and every retry burns a
 //     turn and buries the one line a human needs. Raise a human, name the account, quote the error.
@@ -28,6 +29,13 @@
 // Anything that matches neither is UNKNOWN, and unknown is deliberately inert: the 7 zees whose
 // whole message was 'error' are exactly the population where a guess in either direction is worse
 // than doing nothing (a wrong revive costs a turn; a wrong tend teaches humans to skim their cards).
+//
+// AND SOME THINGS ARE NOT DEATHS AT ALL — a healthy 'end_turn', a prompt the queenzee itself sent
+// ('post-ship reflection'), a manager's nudge ('message from manager-…'), a manager's swap ('swapped
+// out by manager-…'). MEASURED live (2026-08-21): 16 of 65 'unknown' rows are exactly these — the
+// classifier being asked a question about rows that should never have reached it. They get the
+// 'none' kind and drop OUT of the death cohort (revive_class stays NULL) rather than inflating
+// 'unknown'.
 
 // The transient ladder: how long to wait before revive attempt 1, 2 and 3. Minutes, growing, so a
 // provider-wide incident is not hammered by the whole fleet at once — and so the third attempt is
@@ -47,11 +55,17 @@ const RULES = [
     // "incorrect api key provided" is xAI's wording for a bad key — and it arrives as HTTP 400, not
     // 401 (measured against api.x.ai, 2026-08-04), so nothing else in this rule would catch it and a
     // dead grok credential classified as UNKNOWN raises nobody at all. OpenAI uses the same sentence.
-    test: /\b401\b|unauthorized|unauthorised|authentication_error|invalid[_ ]api[_ ]key|incorrect api key|invalid bearer|missing bearer|invalid x-api-key|not logged in|oauth token (has )?expired|permission[_ ]error|\b403\b|forbidden/i },
+    // "Not signed in. To authenticate without a browser, run: grok login --device-code…" is grok's
+    // CLI when the cage has NO credential at all — MEASURED live 2026-08-21, 15 rows filed 'unknown'
+    // for exactly this sentence. Same fix-what-a-human-fixes class as a 401.
+    test: /\b401\b|unauthorized|unauthorised|authentication_error|invalid[_ ]api[_ ]key|incorrect api key|invalid bearer|missing bearer|invalid x-api-key|not logged in|not signed in|please sign in|sign in to continue|log in to continue|not authenticated|oauth token (has )?expired|permission[_ ]error|\b403\b|forbidden/i },
   { kind: 'terminal', signal: 'account',
     test: /organization (has been )?(disabled|deactivated|suspended)|account (has been )?(disabled|deactivated|suspended)|org(anization)?[_ ]disabled|access terminated/i },
   { kind: 'terminal', signal: 'model',
-    test: /unknown model|model[_ ]not[_ ]found|invalid model|model .{0,40}(does not exist|is not available|not found)|no access to model/i },
+    // "There's an issue with the selected model (deepseek-chat). It may not exist or you may not
+    // have access to the model." is DeepSeek's refusal — MEASURED live 2026-08-21, 17 rows. The
+    // provider's own wording, and retrying it can only fail.
+    test: /unknown model|model[_ ]not[_ ]found|invalid model|model .{0,60}(does not exist|may not exist|is not available|not found)|no access to model|issue with the selected model|may not have access to the model/i },
 
   // ── TRANSIENT: the provider or the pipe, not the account. ────────────────────────────────────
   { kind: 'transient', signal: '429',   test: /\b429\b|rate[_ ]?limit|too many requests|slow down/i },
@@ -61,7 +75,19 @@ const RULES = [
   { kind: 'transient', signal: 'timeout', test: /timed out|timeout|ETIMEDOUT|deadline exceeded|\b504\b|gateway time-?out/i },
   { kind: 'transient', signal: '5xx',
     test: /\b5(00|02|03|20|21|22|24|25|30)\b|internal server error|bad gateway|service unavailable|server error|upstream/i },
+  // A SIGKILL — the CLI process was killed by the OS (137 = 128 + SIGKILL, the OOM-killer's exit).
+  // MEASURED live 2026-08-21: 5 rows reading "cxell claude exited 137 with no result event". The
+  // process died but the cage, session and files all survived, exactly the host-restart shape — so
+  // it rides the same transient ladder rather than being guessed at from a bare string.
+  { kind: 'transient', signal: 'killed', test: /exited 137\b|\bSIGKILL\b|process (was )?killed/i },
 ];
+
+// A deliberate end the classifier was never meant to see (see the note at the top — the measured
+// 16). Anchored where the marker is a whole sentence, unanchored where it is a prefix a real reason
+// is built from. Matching these is what keeps a healthy finish or a manager's act from inflating
+// 'unknown'.
+const NON_DEATH_RE = /^(end_turn(\s*\(usage unreported\))?|post-ship reflection|message from manager-|swapped out by manager-)/i;
+export const NON_DEATH_SIGNAL = 'healthy';
 
 // A death nobody has to READ, because the queenzee WATCHED it happen: the machine (or its docker
 // daemon) went down under a live turn and every cxell came back EXITED. There is no provider
@@ -98,12 +124,44 @@ const TRANSIENT_CAUSE = {
 
 // Classify the sentence a dead turn left behind (zee.last_stop_reason, a CLI's final result text, a
 // docker exec's stderr). Never throws; an empty message is UNKNOWN, not an error.
-// → { kind: 'transient' | 'terminal' | 'unknown', signal, message }
+// → { kind: 'transient' | 'terminal' | 'unknown' | 'none', signal, message }
 export function classifyTurnDeath(text) {
   const message = String(text ?? '').trim();
   if (!message) return { kind: 'unknown', signal: null, message: '' };
+  if (NON_DEATH_RE.test(message)) return { kind: 'none', signal: NON_DEATH_SIGNAL, message };
   for (const r of RULES) if (r.test.test(message)) return { kind: r.kind, signal: r.signal, message };
   return { kind: 'unknown', signal: null, message };
+}
+
+// Classify a death that ALSO carries what the message alone cannot always: the process exit code,
+// the tail of stderr, and the vendor's structured error object. The card's honest case — "error"
+// with exit 137 beside it — is exactly the one the bare message throws away. Layered, most specific
+// first:
+//   1. the message rules above (a provider sentence beats every other signal);
+//   2. the structured error's own message/type (a result event whose `result` field is the bare word
+//      "error" while `error.message` carries the real sentence — the measured bare-'error' cohort);
+//   3. a recognised kill exit code (137 = SIGKILL, the OOM-killer's exit);
+//   4. the stderr tail, which may hold the provider sentence the message field lost.
+// Anything still unmatched stays UNKNOWN — the honest default, never a louder guess.
+// → { kind, signal, message }
+export function classifyTurnDeathEx({ message = '', code = null, err = '', result = null } = {}) {
+  const fromMessage = classifyTurnDeath(message);
+  if (fromMessage.kind !== 'unknown') return fromMessage;
+
+  const structured = String(result?.error?.message || result?.error?.type || result?.subtype || '');
+  if (structured) {
+    const fromStructured = classifyTurnDeath(structured);
+    if (fromStructured.kind !== 'unknown') return fromStructured;
+  }
+
+  if (Number.isInteger(code) && code === 137) {
+    return { kind: 'transient', signal: 'killed', message: String(message ?? '').trim() };
+  }
+
+  const fromErr = classifyTurnDeath(err);
+  if (fromErr.kind !== 'unknown') return fromErr;
+
+  return fromMessage;
 }
 
 // WHAT TO DO ABOUT IT — the whole revival policy, in one pure function, decided in this order:
@@ -137,6 +195,10 @@ export function decideRevive({ kind = 'unknown', attempts = 0, decommissioned = 
   if (kind === 'terminal') {
     return { action: 'tend', delayMinutes: null,
              reason: 'the turn died on a credential/dispatch error — retrying cannot fix it, so a human is raised instead' };
+  }
+  if (kind === 'none') {
+    return { action: 'none', delayMinutes: null,
+             reason: 'the turn did not die — it ended on a deliberate or healthy marker, so it is not a death at all' };
   }
   if (kind === 'unknown') {
     return { action: 'none', delayMinutes: null,

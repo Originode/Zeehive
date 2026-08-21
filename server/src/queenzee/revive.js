@@ -41,7 +41,7 @@ import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { recordEvent, setTend } from '../lib/status.js';
 import { xellPaused } from '../lib/fleet-pause.js';
-import { classifyTurnDeath, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MIN,
+import { classifyTurnDeath, classifyTurnDeathEx, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MIN,
          HOST_RESTART_DEATH, CAGE_RESTART_DEATH } from '../lib/turn-death.js';
 import { providerForRuntimeKey } from '../lib/cxell-runtimes.js';
 import { raiseAuthDeathRequest, injectedRevivePrompt, scrubSecrets } from '../lib/credential-inject.js';
@@ -83,7 +83,8 @@ const DIED_WHERE = {
 };
 
 export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', resumable = true,
-                                      source = 'turn', death: deathOverride = null } = {}) {
+                                      source = 'turn', death: deathOverride = null,
+                                      code = null, err = '', result = null } = {}) {
   try {
     if (!zeeId) return { classified: false };
     const zee = await one(
@@ -99,7 +100,9 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
 
     const death = deathOverride
       ? { kind: deathOverride.kind, signal: deathOverride.signal, message: String(reason || '') }
-      : classifyTurnDeath(reason);
+      : (code != null || err || result)
+        ? classifyTurnDeathEx({ message: reason, code, err, result })
+        : classifyTurnDeath(reason);
     const verdict = decideRevive({
       kind: death.kind,
       attempts: zee.revive_attempts || 0,
@@ -117,11 +120,22 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     // unrecognised is still worth being able to count later.
     // A new death RE-DECIDES the schedule outright, including clearing it: a zee that dies on a 401
     // while a transient revive is still pending must not be revived by that leftover schedule.
+    // A NON-DEATH ('none' — a healthy 'end_turn', a manager's nudge, a swap) drops OUT of the cohort
+    // entirely: revive_class stays NULL, so it cannot be counted as an unclassifiable death.
+    // The CAPTURE rides the same statement: the process exit code, a bounded tail of stderr and the
+    // vendor's structured error object (migration 213), all scrubbed before they touch the row.
+    const notADeath = death.kind === 'none';
+    const errTail = String(err || '').trim().split('\n').slice(-5).join('\n').slice(0, 500) || null;
+    const scrubbedResult = result ? JSON.parse(scrubSecrets(JSON.stringify(result))) : null;
     await q(`UPDATE zee SET revive_class = $2, revive_signal = $3,
                             revive_next_at = CASE WHEN $4::int IS NULL THEN NULL
-                                                  ELSE now() + ($4::int || ' minutes')::interval END
+                                                  ELSE now() + ($4::int || ' minutes')::interval END,
+                            last_death_code = $5, last_death_stderr = $6, last_death_error = $7
                WHERE id = $1`,
-            [zee.id, death.kind, death.signal, verdict.action === 'revive' ? verdict.delayMinutes : null]);
+            [zee.id, notADeath ? null : death.kind, notADeath ? null : death.signal,
+             verdict.action === 'revive' ? verdict.delayMinutes : null,
+             Number.isInteger(code) ? code : null,
+             errTail ? scrubSecrets(errTail) : null, scrubbedResult]);
     // A vendor error can ECHO THE KEY back ("your api key: sk-ant-… is invalid") — scrub token-
     // shaped substrings before the reason lands in the event log or the tend (finding [10]).
     const scrubbedReason = scrubSecrets(String(reason || ''));
@@ -147,6 +161,9 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
                         raw: { kind: death.kind, signal: death.signal, action: verdict.action,
                                attempts: zee.revive_attempts || 0, delay_minutes: verdict.delayMinutes,
                                source, message: scrubbedReason.slice(0, 1000),
+                               exit_code: Number.isInteger(code) ? code : null,
+                               stderr_tail: errTail ? scrubSecrets(errTail) : null,
+                               error: result?.error || null,
                                quarantined: !!quarantine.paused,
                                account_id: quarantine.accountId || zee.provider_token_id || null,
                                sibling_id: quarantine.siblingId || null,
