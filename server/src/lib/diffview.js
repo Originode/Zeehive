@@ -281,12 +281,15 @@ export async function xellPatch(xellId, { kind = 'source' } = {}) {
     if (p) {
       return { ...meta, ...payload({
         source: 'cxell',
-        base_ref: want === 'own' ? p.head || 'HEAD' : x.head_commit,
+        // p.base is the diff base actually used inside the cxell — the FORK POINT off the source
+        // (merge-base), not the recorded head_commit, which after a sync/land IS the merged HEAD and
+        // would read as the zee's own-commit diff.
+        base_ref: want === 'own' ? p.head || 'HEAD' : p.base || x.head_commit,
         head_ref: p.head || null,
         label: `${x.slug} · in its cxell${want === 'own' ? ' · uncommitted' : ''}`,
         text: p.text, capped: p.capped,
         note: want === 'source'
-          ? 'read from inside the cxell — this is the zee\'s work, committed and not, since it was spun up'
+          ? 'read from inside the cxell — the zee\'s work, committed and not, over its fork point off the source'
           : 'read from inside the cxell — work not yet checkpointed',
       }) };
     }

@@ -138,8 +138,9 @@ async function xellGate(row, branch) {
         ahead, dirty, diff }
     : { clean: true, ahead: 0, dirty: 0, diff: { files: 0, insertions: 0, deletions: 0 } };
   const parts = [];
-  // The source-diff shortstat is `git diff --shortstat <base>` (base = merge-base for the worktree
-  // path, the recorded head_commit for the live-cxell path): the work the branch adds that is NOT in
+  // The source-diff shortstat is measured against the branch's FORK POINT off the source — for the
+  // worktree path merge-base(ref, HEAD) (worktreeDiff), for the live-cxell path the same fork point
+  // computed inside the cage (cxellDiff, cxellSourceBase): the work the branch adds that is NOT in
   // master's content. Non-zero files/insertions/deletions = unlanded WORK — refuse.
   if (diff.files > 0) parts.push(`a non-empty diff against source (+${diff.insertions}/−${diff.deletions} in ${diff.files} file(s)) — that work has not landed`);
   if (dirty > 0) parts.push(`${dirty} dirty file(s)`);

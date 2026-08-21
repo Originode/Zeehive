@@ -553,11 +553,17 @@ export async function syncCxellWithXource({ ctx = 'default', slug, worktree, ref
 // exactly why the dashboard's diff hexagon showed 0/0 for every working cxell zee. Read the numbers
 // from the cxell instead.
 //
-// The cxell clone is a bundle of the branch only: it carries the branch history (including `base`,
-// the provisioning commit) but NOT the source ref (`master` isn't there). So "what would land" is
-// measured against `base` — everything the zee added since it was spun up, committed OR not (a plain
-// `git diff <base>` spans working tree vs base, so uncommitted work counts too). `behind` (how far
-// the source moved since the fork) isn't knowable in the cxell; the caller fills it in from the host.
+// The SOURCE diff is measured from the FORK POINT off the source — merge-base(origin/main, HEAD) once
+// a sync has delivered origin/main, else merge-base(base, HEAD) — NOT from the recorded `base`
+// (head_commit). A cxell clone is a bundle of the branch only, so before the first sync the fork
+// point IS the provisioning `base`; but once deliverXourceIntoCxell has fetched the source as
+// refs/remotes/origin/main and syncCxellWithXource has MERGED it into the branch, HEAD is a MERGE
+// commit that already contains the source and head_commit is updated to that merged HEAD. Diffing it
+// then reads only the uncommitted delta — the committed work vanishes and the "source diff" becomes
+// the zee's own-commit diff (the reported symptom). merge-base(source, HEAD) is where the branch left
+// the trunk, so diffing against it yields precisely what the branch adds — committed or not — i.e.
+// what would land, the same base the host worktreeDiff uses. `behind` (how far the source moved since
+// the fork) isn't knowable in the cxell; the caller fills it in from the host.
 //
 // One docker exec runs every git query and prints five newline-separated fields (echo "$(...)" keeps
 // an empty shortstat as a blank line, so the field positions never shift). Returns null if the cxell
@@ -603,32 +609,57 @@ export async function writeCxellEnvironment({ ctx = 'default', slug, text, timeo
   return { ok: r.verdict === 'WROTE', path: '/etc/environment' };
 }
 
-export async function cxellDiff({ ctx = 'default', slug, base }) {
-  if (!base) return null;
-  const b = String(base).replace(/[^0-9a-fA-F]/g, '');
-  if (!b) return null;
-  // "ahead" is the count of the zee's UNLANDED commits. Measure it against origin/main WHEN THAT REF
-  // EXISTS in the cxell (delivered by deliverXourceIntoCxell) — because commits the zee already landed
-  // are on main, so counting from the frozen provisioning base kept them showing as unlanded forever
-  // (six xells read ↑1–↑4 with every commit already on main). Fall back to the base only until the
-  // first sync delivers a live origin/main. The shortstat still measures the working diff vs base.
-  const script = [
-    'cd /work/repo || exit 3',
-    'echo "$(git rev-parse HEAD 2>/dev/null)"',
+// The shell fragment that computes $SRC — the base for a cxell's SOURCE diff (shortstat and patch).
+// The source diff must measure everything the xell adds over its FORK POINT off the source —
+// merge-base of the source ref and HEAD — NOT against the recorded head_commit: after a sync/land
+// head_commit IS the merged HEAD that already contains the source, so diffing it shows only the
+// uncommitted delta (the reported symptom "xell diffs show against the xell's own commit"). When
+// refs/remotes/origin/main exists (delivered by deliverXourceIntoCxell) the fork point is
+// merge-base(origin/main, HEAD) — the sync merged the source in, so that IS the source tip and the
+// diff excludes the source. Before the first sync there is no origin/main, so the fork point is
+// merge-base(base, HEAD), which is the provisioning base while the branch still descends from it.
+// $SRC is left as HEAD if git cannot resolve it, which reads as an empty source diff (nothing
+// measurable) rather than a wrong one. Exported (like syncMergeScript) so a test can run it against
+// a real throwaway repo without docker.
+export function cxellSourceBase(base) {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  return [
     'OM="$(git rev-parse --verify -q refs/remotes/origin/main || true)"',
+    `if [ -n "$OM" ]; then SRC="$(git merge-base refs/remotes/origin/main HEAD 2>/dev/null)"; `
+      + `else SRC="$(git merge-base ${b} HEAD 2>/dev/null)"; fi`,
+    'SRC="${SRC:-HEAD}"',
+  ].join('; ');
+}
+
+// The shell script cxellDiff runs INSIDE the cage. `repoDir` is the cxell's clone (default
+// /work/repo); `base` is the recorded head_commit (the provisioning base, or the merged HEAD after a
+// sync/land). Exported so a test can run the exact script against a real throwaway repo without
+// docker, and so the fork-point fix is pinned by a test rather than by a number.
+export function cxellDiffScript(base, repoDir = '/work/repo') {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  return [
+    `cd ${repoDir} || exit 3`,
+    'echo "$(git rev-parse HEAD 2>/dev/null)"',
+    cxellSourceBase(b),
+    // "ahead" is the count of the zee's UNLANDED commits. Measure it against origin/main WHEN THAT REF
+    // EXISTS in the cxell (delivered by deliverXourceIntoCxell) — because commits the zee already
+    // landed are on main, so counting from the frozen provisioning base kept them showing as unlanded
+    // forever (six xells read ↑1–↑4 with every commit already on main). Fall back to the base only
+    // until the first sync delivers a live origin/main. $OM is set by cxellSourceBase above.
     `if [ -n "$OM" ]; then echo "$(git rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null)"; `
       + `else echo "$(git rev-list --count ${b}..HEAD 2>/dev/null)"; fi`,
-    `echo "$(git diff --shortstat ${b} 2>/dev/null)"`,
+    // The source shortstat measures the WORKING TREE vs the fork point: everything the zee added,
+    // committed or not. `git diff <commit>` spans the tree, so uncommitted work counts too.
+    'echo "$(git diff --shortstat "$SRC" 2>/dev/null)"',
+    // The own diff is worktree vs HEAD — only what is not checkpointed yet.
     'echo "$(git diff --shortstat HEAD 2>/dev/null)"',
     'echo "$(git status --porcelain 2>/dev/null | wc -l)"',
   ].join('\n');
-  let out;
-  try {
-    const r = await dk(ctx, ['exec', cxellName(slug), 'bash', '-lc', script], { timeoutMs: 8000 });
-    out = r.out;
-  } catch {
-    return null;
-  }
+}
+
+// Parse cxellDiff's five newline-separated fields. Exported so a test can assert the numbers the
+// script produced against a real repo, without docker.
+export function parseCxellDiff(out) {
   const [head, ahead, src, own, dirty] = String(out).split('\n');
   const num = (s, re) => +((s || '').match(re)?.[1] || 0);
   return {
@@ -646,30 +677,68 @@ export async function cxellDiff({ ctx = 'default', slug, base }) {
   };
 }
 
+export async function cxellDiff({ ctx = 'default', slug, base }) {
+  if (!base) return null;
+  const b = String(base).replace(/[^0-9a-fA-F]/g, '');
+  if (!b) return null;
+  let out;
+  try {
+    const r = await dk(ctx, ['exec', cxellName(slug), 'bash', '-lc', cxellDiffScript(base)], { timeoutMs: 8000 });
+    out = r.out;
+  } catch {
+    return null;
+  }
+  return parseCxellDiff(out);
+}
+
+// The shell body cxellPatch runs INSIDE the cage. Echoes `BASE:<sha>` — the diff base actually used
+// (the fork point for 'source', HEAD for 'own') — as its FIRST line, then the patch, then any
+// untracked files. `repoDir` is a parameter (like syncMergeScript) so a test can run the real body
+// against a real throwaway repo without docker.
+export function cxellPatchBody(base, kind = 'source', repoDir = '/work/repo') {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  const untracked = "git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do "
+    + 'git --no-pager diff --no-color --no-index -- /dev/null "$f"; done';
+  if (kind === 'own') {
+    return [
+      `cd ${repoDir} || exit 3`,
+      'echo "BASE:$(git rev-parse HEAD 2>/dev/null)"',
+      'git --no-pager diff --no-color -M HEAD',
+      untracked,
+    ].join('; ');
+  }
+  return [
+    `cd ${repoDir} || exit 3`,
+    `${cxellSourceBase(b)}; echo "BASE:$SRC"`,
+    'git --no-pager diff --no-color -M "$SRC"',
+    untracked,
+  ].join('; ');
+}
+
 // The PATCH behind cxellDiff's numbers — the same read, one level deeper, for the console's diff
 // viewer. cxellDiff answers "how much", this answers "what": the actual lines, read from inside the
 // cage where a cxell zee's work lives until it lands.
 //
-//   kind 'source' → `git diff <base>`: everything the zee added since it was spun up, committed or
-//                   not (a plain diff against a commit spans the working tree, so uncommitted counts).
+//   kind 'source' → `git diff <fork point>`: everything the zee adds over its fork point off the
+//                   source, committed or not (a plain diff against a commit spans the working tree,
+//                   so uncommitted counts). The fork point is merge-base(origin/main, HEAD) once a
+//                   sync has delivered origin/main — NOT the recorded head_commit, which after a
+//                   sync IS the merged HEAD and would read only the uncommitted delta.
 //   kind 'own'    → `git diff HEAD`: only what is not checkpointed yet.
 //
 // Untracked files are appended as `--no-index` patches: `git diff` cannot see a file git has never
 // been told about, and a zee that has just written five new files and not committed is exactly when
 // a human opens this. The whole pipeline is capped with `head -c` INSIDE the container, so a runaway
 // diff never crosses the docker boundary; the cap is reported, not hidden. Returns null when the
-// cxell is unreachable (the caller then falls back to the host worktree), never throws.
+// cxell is unreachable (the caller then falls back to the host worktree), never throws. The return
+// carries `base` (the diff base actually used — the fork point for 'source', HEAD for 'own') so the
+// caller can report it truthfully.
 export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source', maxBytes = 4_000_000 }) {
+  if (kind !== 'own' && !base) return null;
   const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
-  const target = kind === 'own' ? 'HEAD' : b;
-  if (!target) return null;
+  if (kind !== 'own' && !b) return null;
   const name = cxellName(slug);
-  const body = [
-    'cd /work/repo || exit 3',
-    `git --no-pager diff --no-color -M ${target}`,
-    "git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do "
-      + 'git --no-pager diff --no-color --no-index -- /dev/null "$f"; done',
-  ].join('; ');
+  const body = cxellPatchBody(base, kind);
   let out, head = null;
   try {
     const r = await dk(ctx, ['exec', name, 'bash', '-lc',
@@ -682,7 +751,17 @@ export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source',
     return null;
   }
   const text = String(out || '');
-  return { text, head, capped: text.length >= (Number(maxBytes) || 4_000_000) };
+  // The first line is `BASE:<sha>` — the base the diff was actually measured against. Strip it
+  // before the caller parses the patch; the cap is judged on the WHOLE output, base line included.
+  let baseUsed = null;
+  let bodyText = text;
+  if (text.startsWith('BASE:')) {
+    const nl = text.indexOf('\n');
+    const line = nl >= 0 ? text.slice(0, nl) : text;
+    baseUsed = line.slice(5).trim() || null;
+    bodyText = nl >= 0 ? text.slice(nl + 1) : '';
+  }
+  return { text: bodyText, base: baseUsed, head, capped: text.length >= (Number(maxBytes) || 4_000_000) };
 }
 
 // Create (or recreate) the xell's cxell container on its own bridge network. Labeled so
