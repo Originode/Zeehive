@@ -62,6 +62,17 @@ try {
   git(repo, 'worktree', 'add', '-q', '-b', 'spinoff/hdbusy', wtBusy, 'master');
   const wtDirty = join(tmp, 'wt-dirty');
   git(repo, 'worktree', 'add', '-q', '-b', 'spinoff/hddirty', wtDirty, 'master');
+  // The LANDED worker (the manager's live counter-example): it committed work, LANDED it on master,
+  // and `zee land` HEALED by merging master back into the branch. The heal-merge commit is reachable
+  // from the branch and not from main, so `ahead` stays positive forever — but the tree is
+  // byte-identical to master, so the diff against source is EMPTY. The gate must close this one.
+  const wtLanded = join(tmp, 'wt-landed');
+  git(repo, 'worktree', 'add', '-q', '-b', 'spinoff/hdlanded', wtLanded, 'master');
+  writeFileSync(join(wtLanded, 'landed.txt'), 'landed work\n');
+  git(wtLanded, 'add', '-A'); git(wtLanded, 'commit', '-qm', "the zee's landed work");
+  git(repo, 'merge', '--no-ff', '-q', 'spinoff/hdlanded', '-m', 'merge landed work');   // it LANDED
+  const landedHead = git(repo, 'rev-parse', 'HEAD');                                    // = on master now
+  git(wtLanded, 'merge', '--no-ff', '-q', 'master', '-m', 'heal: merge master back');   // the heal merge
 
   await client.query(
     `INSERT INTO project (id, name, repo_root, main_branch, db_name, db_user)
@@ -187,9 +198,46 @@ try {
   const dirtyRow = await rowOf(dirtySug.suggestion.id);
   ok(dirtyRow.status === 'approved-held',
      'the row is STILL approved-held — the approval was NOT applied over unlanded work');
-  ok(dirtyRow.result?.gate?.clean === false && /unlanded commit/.test(dirtyRow.result?.gate?.reason || ''),
-     `…and the reason it stayed held is legible (unlanded commits): "${dirtyRow.result?.gate?.reason}"`);
+  ok(dirtyRow.result?.gate?.clean === false && /non-empty diff against source/.test(dirtyRow.result?.gate?.reason || ''),
+     `…and the reason it stayed held is legible (unlanded WORK): "${dirtyRow.result?.gate?.reason}"`);
   ok(await xellStatus(wDirty.id) !== 'retired', 'and the dirty xell is NOT retired');
+
+  // ── 5b. the gate's OTHER half: a LANDED worker whose branch is ahead (heal-merges)
+  //      but whose diff against source is EMPTY MUST close (the manager's 16:50 counter-example).
+  console.log('\n── landed + healed: the gate APPLIES ──');
+  // `zee land` heals by MERGING master into the branch, so `ahead` (rev-list count of main..HEAD)
+  // stays positive forever even after a perfectly successful landing — the branch's content is
+  // byte-identical to master, but the merge commits are reachable from the branch and not from main.
+  // Gating on `ahead` would hold this verifiably-finished worker FOREVER, legibly wrong. The gate
+  // keys on the DIFF AGAINST SOURCE: an empty shortstat means every change is in master's content.
+  const wLanded = await mkXell('hdlanded', { manager: mgr.id, worktree: wtLanded, head: landedHead });
+  await mkZee(wLanded, 'working');
+  await mkTask(wLanded);
+  // It LANDED on master — the ledger records the landed sha (head_commit also tracks it, like a real
+  // land gate).
+  await client.query(
+    `INSERT INTO land_request (project_id, xell_id, ref, status, new_sha, decided_at, decided_by, landed_at)
+       VALUES ($1,$2,'refs/heads/master','landed',$3,now(),'test@human',now())`, [PID, wLanded.id, landedHead]);
+  const landedSug = await suggestDone({ manager: mgr, target: wLanded, reason: 'landed, clean' });
+  await inboxFor(mgr.id);   // drain
+  const landedDecided = await decideDoneSuggestion(landedSug.suggestion.id, 'approved', 'test@human');
+  ok(landedDecided.refused === true && landedDecided.held === true,
+     'the human approves a MID-TURN xell → HELD');
+  await client.query(`UPDATE zee SET status='idle', last_stop_reason='end_turn' WHERE xell_id=$1`, [wLanded.id]);
+  // The trap, verified: the branch IS ahead of master (the heal-merge), while the diff is empty.
+  const aheadNow = +git(repo, 'rev-list', '--count', 'master..spinoff/hdlanded') || 0;
+  const landedDiff = git(repo, 'diff', '--shortstat', 'master', 'spinoff/hdlanded').trim();
+  ok(aheadNow > 0, `the landed branch is genuinely AHEAD of master (${aheadNow} heal-merge commit) — the old gate would refuse`);
+  ok(landedDiff === '', `…but its diff against source is EMPTY ("${landedDiff}") — every change is in master's content`);
+  const landedTick = await heldDoneTick();
+  ok(landedTick.scanned === 2 && landedTick.applied === 1,
+     `a sweep over BOTH held rows applies exactly the landed one (scanned=${landedTick.scanned}, applied=${landedTick.applied})`);
+  const landedRow = await rowOf(landedSug.suggestion.id);
+  ok(landedRow.status === 'approved' && landedRow.result?.ok === true,
+     'the landed worker is finalized approved — an empty diff against source meant the close was safe');
+  ok(await xellStatus(wLanded.id) === 'retired', 'the landed xell is actually retired');
+  ok((await rowOf(dirtySug.suggestion.id)).status === 'approved-held',
+     '…while the unlanded worker STAYS held (the gate distinguished them by the diff, not the count)');
 
   // ── 6. evidence captured AT APPROVAL TIME is on the held row ───────────────
   console.log('\n── approval-time evidence ──');
@@ -212,8 +260,8 @@ try {
      'the crew row for a held approval carries done_held:true (it is decided, not awaiting a human)');
   ok(/APPROVED and HELD/.test(dirtyCrew.waiting_on_human.join('; ')),
      '…and zee zees says "APPROVED and HELD" with the legible reason');
-  ok(/1 unlanded commit/.test(dirtyCrew.waiting_on_human.join('; ')),
-     '…naming exactly what it waits for (the unlanded commits)');
+  ok(/non-empty diff against source/.test(dirtyCrew.waiting_on_human.join('; ')),
+     '…naming exactly what it waits for (the unlanded WORK, not a commit count)');
   const doneHeldText = dirtyCrew.waiting_on_human.join('; ');
   ok(!/a human must confirm/.test(doneHeldText) && !/awaiting a human/.test(doneHeldText),
      '…and it does NOT say "a human must confirm" (the human already approved)');

@@ -98,21 +98,29 @@ async function crewDiff(row, branch) {
   return val;
 }
 
-// The unlanded/dirty GATE for executing a done approval (ticket #75). A held approval is applied
-// only when the xell is clean — no unlanded commits, no dirty files — because the thing actually
-// being protected is unlanded work: a zee with nothing uncommitted and nothing unlanded loses
-// nothing by being reaped; a zee holding a diff can lose everything. Same read as crewDiff (cxell
-// first, host worktree second) but FRESH — a gate must not decide from a 15s-old cache.
+// The SOURCE-DIFF GATE for executing a done approval (ticket #75). A held approval is applied only
+// when the xell is clean — an EMPTY DIFF AGAINST SOURCE and zero dirty files — because the thing
+// actually being protected is unlanded WORK: a zee whose every change is in master's content loses
+// nothing by being reaped; a zee holding a diff can lose everything.
+//
+// WHAT IT MEASURES — and deliberately NOT "unlanded commits". `ahead` (rev-list count of
+// main..HEAD) stays positive forever after a successful `zee land`, because landing heals by MERGING
+// master into the branch: those merge commits are reachable from the branch and not from main, so
+// the count never returns to zero even when the branch's content is byte-identical to master. A
+// worker that LANDED is verifiably finished but would read `ahead>0` for ever — gating on it turns a
+// discarded decision into a permanently stuck one. The DIFF AGAINST SOURCE tells the truth: an empty
+// shortstat (the working tree vs merge-base, which IS the source tip once the branch healed) means
+// every change in that branch is in master's content and a teardown loses nothing. Non-empty diff OR
+// dirty files → refuse. Unmeasurable-from-something-that-exists → refuse ("I could not read it" must
+// never mean yes). Unmeasurable with NOTHING to measure (no worktree, no live cxell — the simulate
+// shape every test uses) is clean: there is no work on disk to lose.
 //
 // Returns:
-//   { clean: true, ahead, dirty }           — provably nothing unlanded or uncommitted (the counts
-//                                             ride along for the approval-time evidence)
-//   { clean: false, reason, ahead, dirty }  — holds unlanded/dirty work (the legible reason), or the
-//                                             diff could not be read from something that exists
-//                                             (cxell unreachable, worktree read failed) — "cannot
-//                                             confirm clean" is not clean.
-// Unmeasurable with NOTHING to measure (no worktree on disk, no live cxell) is clean: there is no
-// work on disk to lose, and this is the simulate-mode shape every test uses.
+//   { clean: true, ahead, dirty, diff }            — provably empty diff + clean (the counts ride
+//                                                    along for the approval-time evidence)
+//   { clean: false, reason, ahead, dirty, diff }   — holds a non-empty diff or dirty files (the
+//                                                    legible reason), or the diff could not be read
+//                                                    from something that exists.
 async function xellGate(row, branch) {
   let d = null, existed = false;
   if (row.cxell_live && row.head_commit) {
@@ -123,16 +131,21 @@ async function xellGate(row, branch) {
     d = await worktreeDiff(row.worktree_path, branch).catch(() => null);
     existed = true;
   }
+  const ahead = d?.ahead || 0, dirty = d?.dirty || 0;
+  const diff = { files: d?.files || 0, insertions: d?.insertions || 0, deletions: d?.deletions || 0 };
   if (!d) return existed
-    ? { clean: false, reason: "the xell's work could not be measured — cannot confirm it is clean before tearing it down" }
-    : { clean: true, ahead: 0, dirty: 0 };
-  const ahead = d.ahead || 0, dirty = d.dirty || 0;
+    ? { clean: false, reason: "the xell's work could not be measured — cannot confirm it is clean before tearing it down",
+        ahead, dirty, diff }
+    : { clean: true, ahead: 0, dirty: 0, diff: { files: 0, insertions: 0, deletions: 0 } };
   const parts = [];
-  if (ahead > 0) parts.push(`${ahead} unlanded commit(s)`);
+  // The source-diff shortstat is `git diff --shortstat <base>` (base = merge-base for the worktree
+  // path, the recorded head_commit for the live-cxell path): the work the branch adds that is NOT in
+  // master's content. Non-zero files/insertions/deletions = unlanded WORK — refuse.
+  if (diff.files > 0) parts.push(`a non-empty diff against source (+${diff.insertions}/−${diff.deletions} in ${diff.files} file(s)) — that work has not landed`);
   if (dirty > 0) parts.push(`${dirty} dirty file(s)`);
   return parts.length
-    ? { clean: false, reason: `it holds ${parts.join(' and ')}`, ahead, dirty }
-    : { clean: true, ahead, dirty };
+    ? { clean: false, reason: `it holds ${parts.join(' and ')}`, ahead, dirty, diff }
+    : { clean: true, ahead, dirty, diff };
 }
 
 // Evidence captured AT APPROVAL TIME for a HELD decision (ticket #75): what was true when the
@@ -153,6 +166,7 @@ async function captureDoneEvidence(target) {
     clean: gate?.clean ?? null,
     ahead: gate?.ahead ?? null,
     dirty: gate?.dirty ?? null,
+    diff: gate?.diff ?? null,
     ...(gate?.reason ? { reason: gate.reason } : {}),
   };
 }
