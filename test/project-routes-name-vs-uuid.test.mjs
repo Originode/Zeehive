@@ -2,15 +2,15 @@
 //
 // The /projects/:id/{sites,pool-config,containers,readiness,docs,tokens,environments}
 // families fed req.params.id straight into a `WHERE project_id = $1` lookup, so a caller
-// addressing the project by NAME got `invalid input syntax for type uuid` — the same
-// name-vs-uuid 400 the /api/router/* handlers used to ship (lib/router.js) and the
-// manifest routes used to ship (test/project-manifest-refresh-name.test.mjs). This is the
-// sweep that resolves :id through resolveProjectId (lib/project-resolve.js) at the top of
-// each handler.
+// addressing the project by NAME got postgres error 22P02 `invalid input syntax for type
+// uuid` — the same name-vs-uuid 400 the /api/router/* handlers used to ship (lib/router.js)
+// and the manifest routes used to ship (test/project-manifest-refresh-name.test.mjs). This
+// is the sweep that resolves :id through resolveProjectId (lib/project-resolve.js) at the
+// top of each handler.
 //
 // This mounts the REAL routes router and drives the REAL HTTP verbs BY NAME — one
 // parameterized case per route, so the next route added is one line to cover. It asserts:
-//   1. every route resolves a project NAME (200, never a uuid syntax error);
+//   1. every route resolves a project NAME (200, never the 22P02 uuid error);
 //   2. an UNKNOWN project name gives a clean 404 naming the project (not 400, not 500);
 //   3. the UUID path still works (one GET by uuid).
 // It would FAIL the moment any route regresses to a bare uuid lookup.
