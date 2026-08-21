@@ -19,6 +19,8 @@ import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations, pendingBootMigrations } from './shipmigrate.js';
+import { runShipPreflight, noteShipPreflight } from './ship-preflight.js';
+import { classifyShipFailure } from '../lib/ship-failure.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { setShipRefusal, clearShipRefusal } from '../lib/status.js';
@@ -116,7 +118,11 @@ async function resolveShipCommit(project, shipSite, main) {
   // (ticket #12). Best-effort and never throws: an unreadable ledger becomes {ok:false} on the
   // card — "unknown", which is the honest answer — not a silent zero.
   const boot = await pendingBootMigrations(project, commit, shipSite);
-  return { commit, migrations: mig.pending || [], bootMigrations: boot };
+  // pendingMigrations() failing at request time used to become `migrations: []` and the card said
+  // "none" — the error is carried to the row now (migrations_error) so the card can say UNKNOWN,
+  // the same rule the boot-time set already followed (ticket #58).
+  return { commit, migrations: mig.pending || [], bootMigrations: boot,
+           migrationsError: mig.ok ? null : mig.error };
 }
 
 // Is the diff between what prod currently RUNS and this ship's candidate commit docs-only?
@@ -240,17 +246,17 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // whose integration truth is remote (ship_ref like 'origin/main') gets that remote fetched
   // FIRST so the human approves the sha that is actually current, not a stale mirror. What schema
   // rides along is decided NOW too, so the human approves code and migrations as one thing.
-  let commit, migrations, bootMigrations;
-  try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, shipSite, main)); }
+  let commit, migrations, bootMigrations, migrationsError;
+  try { ({ commit, migrations, bootMigrations, migrationsError } = await resolveShipCommit(project, shipSite, main)); }
   catch (e) { return refuse(e.message); }
   let row;
   try {
     row = await one(
       `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
-                                 skip_migrations, db_note, boot_migrations)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb) RETURNING *`,
+                                 skip_migrations, db_note, boot_migrations, migrations_error)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
       [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(migrations), shipSite?.id || null,
-       !!skipDb, dbNote, JSON.stringify(bootMigrations)]);
+       !!skipDb, dbNote, JSON.stringify(bootMigrations), migrationsError]);
   } catch (e) {
     // ship_request_open_uq (one open ship per xell) — two asks raced, or a row appeared between the
     // check above and here. The zee's ask IS satisfied by the winner, so hand that back rather than
@@ -264,6 +270,20 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   }
   // The ask is now a row a human can see, so any earlier refusal on this xell is history.
   await clearShipRefusal(xellId, { zeeId });
+
+  // PRE-FLIGHT (ticket #58) — the deploy's preconditions, checked and recorded at REQUEST time so
+  // the card shows "cannot ship, because X" BEFORE a human spends attention approving it. Runs the
+  // SAME guards the deploy path walks (shipmigrate's prod-db identity check, the build inventory,
+  // the docker contexts), READ-ONLY. Never blocks the ask: a probe that cannot run reports
+  // 'unknown' — a verdict, not a crash — and the row is created either way. Only a DEFINITE miss
+  // stops the auto-approve policy below (the whole point is to not deploy against a known-missing
+  // prerequisite); an 'unknown' pre-flight still rides the card, and the deploy's own guard remains
+  // the backstop.
+  const preflight = await runShipPreflight(project, shipSite, commit, t,
+    { skipDb: !!skipDb, mode: MODE });
+  try { await noteShipPreflight(row.id, preflight); } catch (e) { logline('ship', `preflight note failed for ${row.id}: ${e.message}`); }
+  row = await one(`SELECT * FROM ship_request WHERE id=$1`, [row.id]);
+
   broadcast('ship', row);
   // the honeycomb's xell→queenzee line: this xell raised a ship request
   activity('x2q', xellId, 'ship', project.id);
@@ -278,6 +298,17 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // would only restart the live orchestrator for nothing. The request stays pending; a human can
   // still ship it manually. The skip is said out loud in the note and the ship log, never silent.
   if (project.auto_approve_ship) {
+    if (preflight.status === 'missing') {
+      // A DEFINITE missing prerequisite is exactly what the pre-flight exists to catch — auto-
+      // approving would queue a deploy that the deploy path itself refuses (assertProdDbTarget /
+      // the empty build inventory). Hold it for a human who can read "cannot ship, because X".
+      logline('ship', `auto-ship HELD for ${xell.slug} @ ${String(commit).slice(0, 8)}`
+        + `${shipSite ? ` → site ${shipSite.key}` : ''} — pre-flight found a missing prerequisite: `
+        + preflight.error);
+      return { ok: true, request: row,
+        note: 'auto-ship held — the pre-flight found a missing prerequisite, so policy will not deploy '
+          + `it: ${preflight.error}. A human can still ship it manually once the reason is fixed.` };
+    }
     if (await docsOnlySinceDeployed(project, commit, { targets: t })) {
       logline('ship', `auto-ship SKIPPED for ${xell.slug} @ ${String(commit).slice(0, 8)}`
         + `${shipSite ? ` → site ${shipSite.key}` : ''} — the diff from the deployed build touches `
@@ -362,15 +393,15 @@ export async function resumeShip(id, by = 'human@console') {
     return { ok: false, reason: state.reason, request: deferred };
   }
 
-  let commit, migrations, bootMigrations;
-  try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, site, main)); }
+  let commit, migrations, bootMigrations, migrationsError;
+  try { ({ commit, migrations, bootMigrations, migrationsError } = await resolveShipCommit(project, site, main)); }
   catch (e) { return { ok: false, reason: e.message, request: deferred }; }
 
   const row = await one(
     `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, commit=$2, migrations=$3::jsonb, boot_migrations=$4::jsonb,
-            requested_at=now()
+            migrations_error=$5, requested_at=now()
        WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
-    [id, commit, JSON.stringify(migrations), JSON.stringify(bootMigrations)]);
+    [id, commit, JSON.stringify(migrations), JSON.stringify(bootMigrations), migrationsError]);
   if (!row) throw new Error('ship request changed underneath the resume — reload and try again');
   broadcast('ship', row);
   logline('ship', `RESUMED ship for ${xell?.slug || deferred.xell_id} by ${by} @ ${String(commit).slice(0, 8)}`
@@ -429,8 +460,8 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
     const site = landed[0].site_id
       ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [landed[0].site_id])
       : await resolveShipSite(projectId, null);
-    let commit, migrations, bootMigrations;
-    try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, site, main)); }
+    let commit, migrations, bootMigrations, migrationsError;
+    try { ({ commit, migrations, bootMigrations, migrationsError } = await resolveShipCommit(project, site, main)); }
     catch (e) { skipped.push({ slug: `site ${site?.key || 'default'}`, reason: e.message }); continue; }
 
     const [carrier, ...riders] = landed;
@@ -443,9 +474,10 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
     // xell's landed work, because they all resolve to this same main tip.
     const c = await one(
       `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, bundled_into=NULL,
-              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4, boot_migrations=$5::jsonb
+              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4, boot_migrations=$5::jsonb,
+              migrations_error=$6
          WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
-      [carrier.id, commit, JSON.stringify(migrations), reason, JSON.stringify(bootMigrations)]);
+      [carrier.id, commit, JSON.stringify(migrations), reason, JSON.stringify(bootMigrations), migrationsError]);
     if (!c) { skipped.push({ slug: carrier.xell_slug, reason: 'changed underneath the bundle' }); continue; }
     broadcast('ship', c);
 
@@ -478,18 +510,19 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
 // work is in the main tip the carrier built, so a shipped carrier ships them and a failed carrier
 // fails them — from the single real deploy, no rider ever builds on its own. Shared by the normal
 // success/fail path and the crash path so a carrier that dies mid-run still frees its riders.
-async function resolveBundleRiders(carrierId, ok, commit) {
+async function resolveBundleRiders(carrierId, ok, commit, classified = { cause: null, line: null }) {
   const riders = await q(
     `UPDATE ship_request
         SET status=$2, finished_at=now(), deferred_at=NULL, deferred_by=NULL,
             decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'bundle@queenzee'),
-            containers=$3::jsonb, error=$4
+            containers=$3::jsonb, error=$4, failure_cause=$5, failure_line=$6
       WHERE bundled_into=$1 AND status='pending' RETURNING *`,
     [carrierId, ok ? 'shipped' : 'failed',
       JSON.stringify([{ role: 'bundle', ok, method: 'bundled',
         log: `rode a bundled ship built from main @ ${String(commit).slice(0, 8)} — this xell's landed `
           + `work is included in that single deploy` }]),
-      ok ? null : `bundle carrier ${String(commit).slice(0, 8)} failed`]);
+      ok ? null : `bundle carrier ${String(commit).slice(0, 8)} failed`,
+      ok ? null : classified.cause, ok ? null : classified.line]);
   for (const r of riders) broadcast('ship', r);
   if (riders.length) {
     logline('ship', `bundle: ${riders.length} folded ship(s) resolved → ${ok ? 'shipped' : 'failed'}`
@@ -709,17 +742,20 @@ export async function runShip(shipId, { mode = MODE } = {}) {
     await runShipBody(ship, xell, project, site, lockKey, mode);
   } catch (e) {
     try {
+      const crashErr = `ship machinery crashed mid-run: ${String(e.message || e).slice(0, 1400)}`;
+      const classified = classifyShipFailure({ error: crashErr });
       const done = await one(
-        `UPDATE ship_request SET status='failed', finished_at=now(), error=$2
+        `UPDATE ship_request SET status='failed', finished_at=now(), error=$2,
+                                failure_cause=$3, failure_line=$4
            WHERE id=$1 AND status IN ('approved','shipping') RETURNING *`,
-        [ship.id, `ship machinery crashed mid-run: ${String(e.message || e).slice(0, 1400)}`]);
+        [ship.id, crashErr, classified.cause, classified.line]);
       if (done) broadcast('ship', done);
       await q(
         `UPDATE deploy_lock SET phase='failed', auto_release_at=COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
           WHERE ship_id=$1 AND held=false`, [ship.id, String(AUTO_RELEASE_SEC)]);
       broadcast('xell', { id: xell.id });
       // A crashed carrier fails its riders too — never leave them stranded pointing at a dead ship.
-      await resolveBundleRiders(ship.id, false, ship.commit).catch(() => {});
+      await resolveBundleRiders(ship.id, false, ship.commit, classified).catch(() => {});
       logline('ship', `ship ${String(ship.commit).slice(0, 8)} CRASHED mid-run — marked failed, ${lockKey} countdown started: ${e.message}`);
     } catch { /* the DB is what failed — the tick() stranded sweep is the backstop */ }
   } finally {
@@ -890,18 +926,24 @@ export async function runShipBody(ship, xell, project, site, lockKey, mode = MOD
   // Build logs are arbitrary bytes and ride along in `results`; postgres jsonb REJECTS the
   // escaped-NUL sequence (backslash-u-0000), so one NUL anywhere in a build's output would throw
   // HERE — at the exact statement whose failure used to strand the ship at 'shipping'.
+  // The raw log is never replaced; a failure ALSO gets a classified cause + the one identifying
+  // line (ticket #58) so the card can say WHY instead of handing out a 400-character tail to scroll.
+  const failErr = ok ? null : (results.find((r) => !r.ok)?.error || 'ship failed').slice(0, 1500);
+  const classified = ok ? { cause: null, line: null }
+    : classifyShipFailure({ error: failErr, containers: results });
   const done = await one(
-    `UPDATE ship_request SET status=$2, finished_at=now(), containers=$3::jsonb, error=$4
+    `UPDATE ship_request SET status=$2, finished_at=now(), containers=$3::jsonb, error=$4,
+                            failure_cause=$5, failure_line=$6
        WHERE id=$1 RETURNING *`,
     [ship.id, ok ? 'shipped' : 'failed', JSON.stringify(results).replaceAll('\\u0000', ''),
-      ok ? null : (results.find((r) => !r.ok)?.error || 'ship failed').slice(0, 1500)]);
+      failErr, classified.cause, classified.line]);
   broadcast('ship', done);
   logline('ship', ok
     ? `SHIPPED ${String(ship.commit).slice(0, 8)} to prod from ${xell.slug} (${mode})`
     : `ship FAILED for ${xell.slug}: ${done.error}`);
 
   // If this ship was a BUNDLE carrier, resolve its riders now — one deploy, one verdict for all.
-  await resolveBundleRiders(ship.id, ok, ship.commit);
+  await resolveBundleRiders(ship.id, ok, ship.commit, classified);
 
   // Countdown starts either way: a failed ship must not sit on prod forever either.
   const lock = await one(
@@ -1089,17 +1131,19 @@ async function recoverStrandedShip(ship, why) {
   }
   // COALESCE the decider fields: a normally-approved ship already has them, but the
   // ship_decided_has_decider CHECK requires them on any terminal status, so recovery must
-  // never produce a row that cannot land.
+  // never produce a row that cannot land. A recovered FAILURE also gets the classified cause
+  // (a stranded ship failed its health probe → health-check), same contract as runShipBody.
+  const failErr = allUp ? null : `${why}; targets not verifiably up — re-request`;
+  const classified = allUp ? { cause: null, line: null } : classifyShipFailure({ error: failErr });
   const done = await one(
-    `UPDATE ship_request SET status=$2, finished_at=now(), error=$3,
+    `UPDATE ship_request SET status=$2, finished_at=now(), error=$3, failure_cause=$4, failure_line=$5,
             decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'recovery@queenzee')
       WHERE id=$1 AND status='shipping' RETURNING *`,
-    [ship.id, allUp ? 'shipped' : 'failed',
-      allUp ? null : `${why}; targets not verifiably up — re-request`]);
+    [ship.id, allUp ? 'shipped' : 'failed', failErr, classified.cause, classified.line]);
   if (!done) return;   // someone else landed it between our SELECT and now — nothing to recover
   broadcast('ship', done);
   // A recovered carrier resolves its riders to the same verdict — they never outlive their carrier.
-  await resolveBundleRiders(ship.id, done.status === 'shipped', ship.commit).catch(() => {});
+  await resolveBundleRiders(ship.id, done.status === 'shipped', ship.commit, classified).catch(() => {});
   logline('ship', `recovered stranded ship ${String(ship.commit).slice(0, 8)} → ${done.status}`
     + (allUp ? ' (health check passed — the self-ship pattern)' : ` (${done.error})`));
   // start the countdown on its lock if the dying process never did

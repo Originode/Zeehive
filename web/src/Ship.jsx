@@ -126,12 +126,21 @@ function LiveBuildLog({ lines }) {
 // unknown, and saying "none" there is exactly the bug this fixes.
 export function ShipSchema({ req }) {
   const deploy = Array.isArray(req?.migrations) ? req.migrations : [];
+  const deployErr = req?.migrations_error || null;
   const boot = req?.boot_migrations && typeof req.boot_migrations === 'object' ? req.boot_migrations : null;
   const bootOn = !!boot?.applicable;
+  // A pendingMigrations() failure at request time makes the DEPLOY-time count unknown — "no
+  // migrations ride this ship" would be a lie. Same rule the boot-time set already followed (075).
   if (!deploy.length && !bootOn) {
     return (
       <div className="ship-schema" data-testid="ship-schema">
-        <span className="k">schema:</span> <span className="ship-schema-none">no migrations ride this ship</span>
+        <span className="k">schema:</span>{' '}
+        {deployErr
+          ? <b className="ship-schema-unknown" data-testid="ship-schema-deploy-unknown">UNKNOWN</b>
+          : <span className="ship-schema-none">no migrations ride this ship</span>}
+        {deployErr && (
+          <span className="ship-schema-when"> — the deploy-time migration set could not be read: {deployErr}</span>
+        )}
       </div>
     );
   }
@@ -146,7 +155,12 @@ export function ShipSchema({ req }) {
         <span className="k">at deploy:</span>{' '}
         {deploy.length
           ? <b>{deploy.length} migration(s)</b>
-          : <span className="ship-schema-none">none</span>}
+          : deployErr
+            ? <b className="ship-schema-unknown" data-testid="ship-schema-deploy-unknown">UNKNOWN</b>
+            : <span className="ship-schema-none">none</span>}
+        {deployErr && !deploy.length && (
+          <span className="ship-schema-when"> — the deploy-time migration set could not be read: {deployErr}</span>
+        )}
         <span className="ship-schema-when"> — the queenzee applies these to the production database before the containers build</span>
         {deploy.length > 0 && list(deploy)}
       </div>
@@ -170,6 +184,58 @@ export function ShipSchema({ req }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// THE DEPLOY'S PRECONDITIONS, as probed when the ship was raised (ticket #58). The queenzee runs
+// READ-ONLY checks at request time — the migration target db is addressable and inspectable, the
+// build targets have build scripts, the docker contexts answer — and this renders the verdict so a
+// failing precondition turns the card into "cannot ship, because X" BEFORE a human spends attention
+// approving it. The stored checks are rendered as-is (the card never reclassifies), so the record
+// and the card cannot disagree.
+export function ShipPreflight({ req }) {
+  const checks = Array.isArray(req?.preflight) && req.preflight.length ? req.preflight : null;
+  if (!checks) return null;
+  const failed = checks.filter((c) => !c.ok && !c.unknown && !c.skipped);
+  const unknown = checks.filter((c) => c.unknown);
+  const passed = checks.filter((c) => c.ok && !c.skipped);
+  const skipped = checks.filter((c) => c.skipped);
+
+  if (failed.length) {
+    return (
+      <div className="ship-preflight bad" data-testid="ship-preflight">
+        <div className="ship-preflight-head" data-testid="ship-preflight-bad">⛔ cannot ship, because:</div>
+        {failed.map((c) => (
+          <div className="ship-preflight-fail" key={c.check} data-testid="ship-preflight-fail">
+            <b>{c.check}:</b> {c.detail}
+          </div>
+        ))}
+        {unknown.length > 0 && (
+          <div className="ship-preflight-unknown" data-testid="ship-preflight-partial">
+            …plus {unknown.length} check{unknown.length === 1 ? '' : 's'} that could not be verified:
+            {' '}{unknown.map((c) => c.check).join(', ')}
+          </div>
+        )}
+        {req.preflight_error && (
+          <div className="ship-preflight-err" data-testid="ship-preflight-error">{req.preflight_error}</div>
+        )}
+      </div>
+    );
+  }
+  if (unknown.length) {
+    return (
+      <div className="ship-preflight unknown" data-testid="ship-preflight">
+        <span className="k">pre-flight:</span> could not verify everything —{' '}
+        {unknown.map((c) => `${c.check}: ${c.detail}`).join(' · ')}
+      </div>
+    );
+  }
+  return (
+    <div className="ship-preflight ok" data-testid="ship-preflight">
+      <span className="k">pre-flight:</span> ready —
+      {' '}{passed.length} precondition{passed.length === 1 ? '' : 's'} verified
+      {skipped.length ? ` · ${skipped.length} skipped` : ''}
     </div>
   );
 }
@@ -312,6 +378,11 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
           applying five to the live meta-DB, two of which rewrote the manual every zee reads. The
           gate is only as good as what it tells the human. */}
       <ShipSchema req={req} />
+      {/* THE DEPLOY'S PRECONDITIONS, probed at request time (ticket #58). A failing precondition
+          turns the card into "cannot ship, because X" BEFORE the human spends attention approving.
+          The deploy's own guards re-check at deploy time, so an approve after the reason is fixed
+          is safe; an approve before it is fixed fails with the SAME named reason on the result. */}
+      <ShipPreflight req={req} />
       {/* DB scope + the zee's drift assessment — the human approves the SCOPE and the REASONING,
           not a bare green tick. A code-only ship says what it deliberately will not run. */}
       {req.skip_migrations && (
@@ -357,7 +428,19 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
       {req.status === 'shipping' && <LiveBuildLog lines={live} />}
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
       {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
-      {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
+      {req.status === 'failed' && (
+        <>
+          {/* The classified cause rides beside the raw log — the card says WHY it failed instead of
+              handing out a 400-character tail to scroll (ticket #58). */}
+          {req.failure_cause && (
+            <div className="ship-cause" data-testid="ship-cause">
+              ✗ {req.failure_cause.replaceAll('-', ' ')}
+              {req.failure_line && <span className="ship-cause-line" data-testid="ship-cause-line"> — {req.failure_line}</span>}
+            </div>
+          )}
+          <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>
+        </>
+      )}
       {/* A ship built by the queenzee and failed — hand the zee the exact build output so it can
           fix and re-ship, instead of the operator copy-pasting logs into the message composer by
           hand. Opens the same 📨 composer, pre-filled with the failure report; the human can add a

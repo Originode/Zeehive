@@ -860,6 +860,21 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-schema-err { color: #ffcf9e; margin-top: 2px; }
 .ship-schema-files { margin: 3px 0 0; padding-left: 18px; color: var(--text); }
 .ship-schema-files code { font-size: 11px; }
+/* the deploy's pre-conditions as probed at request time (ticket #58) */
+.ship-preflight { margin: 5px 0 0; font-size: 12px; }
+.ship-preflight .k { color: var(--muted); }
+.ship-preflight.ok { color: var(--ready, #7bc86c); }
+.ship-preflight.unknown { color: #ffcf9e; }
+.ship-preflight.bad { color: #ffb4a2; background: rgba(217,85,59,.12);
+  border: 1px solid rgba(217,85,59,.4); border-radius: 5px; padding: 5px 7px; }
+.ship-preflight-head { font-weight: 600; margin-bottom: 2px; }
+.ship-preflight-fail { margin-top: 2px; }
+.ship-preflight-fail b { color: #ffb4a2; }
+.ship-preflight-unknown { margin-top: 3px; color: #ffcf9e; font-size: 11px; }
+.ship-preflight-err { margin-top: 4px; color: var(--muted); font-size: 11px; }
+/* the classified cause beside a failed ship's raw log (ticket #58) */
+.ship-cause { margin: 5px 0 0; font-size: 12.5px; color: var(--error); font-weight: 600; }
+.ship-cause-line { font-weight: 400; color: #ffb4a2; }
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
 /* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */
