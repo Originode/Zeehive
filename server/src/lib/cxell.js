@@ -618,16 +618,29 @@ export async function writeCxellEnvironment({ ctx = 'default', slug, text, timeo
 // merge-base(origin/main, HEAD) — the sync merged the source in, so that IS the source tip and the
 // diff excludes the source. Before the first sync there is no origin/main, so the fork point is
 // merge-base(base, HEAD), which is the provisioning base while the branch still descends from it.
-// $SRC is left as HEAD if git cannot resolve it, which reads as an empty source diff (nothing
-// measurable) rather than a wrong one. Exported (like syncMergeScript) so a test can run it against
-// a real throwaway repo without docker.
+//
+// If git cannot resolve a base, $SRC falls back to HEAD — and the empty source diff that reads is
+// NOT interchangeable with "resolved and empty": for a gate like xellGate, an unresolvable base is
+// "I could not read it", which must refuse, never approve. So the script RECORDS the decision: an
+// EMPTY $SRC means merge-base FAILED (the recorded base was rewritten away, or the source ref was
+// never delivered) — the caller must know that HEAD was a fallback, not the fork point. Exported
+// (like syncMergeScript) so a test can run it against a real throwaway repo without docker.
 export function cxellSourceBase(base) {
   const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
   return [
     'OM="$(git rev-parse --verify -q refs/remotes/origin/main || true)"',
     `if [ -n "$OM" ]; then SRC="$(git merge-base refs/remotes/origin/main HEAD 2>/dev/null)"; `
       + `else SRC="$(git merge-base ${b} HEAD 2>/dev/null)"; fi`,
-    'SRC="${SRC:-HEAD}"',
+    // Did the fork point actually resolve? An empty $SRC means merge-base FAILED (the recorded base
+    // was rewritten away, or the source ref was never delivered) — $SRC then falls back to HEAD, and
+    // the empty source diff that reads is "could not be measured", NOT "resolved and empty": a gate
+    // must refuse on it, never approve. So this fragment records SRC_OK=yes/no as a variable; the
+    // CALL SITE encodes it (cxellDiffScript prints a field, cxellPatchBody picks BASE:unresolved),
+    // because an echo here would shift cxellDiffScript's newline-separated field positions. SRC_OK is
+    // `yes` whenever a REAL fork point exists — a brand-new branch still descends from its base, so
+    // merge-base(base, HEAD) resolves and the diff correctly reads empty. (This is why the check is
+    // "did merge-base succeed", not "is $SRC a valid object": after the HEAD fallback, HEAD IS valid.)
+    'if [ -z "$SRC" ]; then SRC=HEAD; SRC_OK=no; else SRC_OK=yes; fi',
   ].join('; ');
 }
 
@@ -654,13 +667,22 @@ export function cxellDiffScript(base, repoDir = '/work/repo') {
     // The own diff is worktree vs HEAD — only what is not checkpointed yet.
     'echo "$(git diff --shortstat HEAD 2>/dev/null)"',
     'echo "$(git status --porcelain 2>/dev/null | wc -l)"',
+    // SRC_OK = did the fork point really resolve (yes) or did $SRC fall back to HEAD (no).
+    'echo "$SRC_OK"',
   ].join('\n');
 }
 
-// Parse cxellDiff's five newline-separated fields. Exported so a test can assert the numbers the
+// Parse cxellDiff's six newline-separated fields. Exported so a test can assert the numbers the
 // script produced against a real repo, without docker.
+//
+// `unresolved` is the sixth field: whether the fork point could not be resolved ($SRC_OK=no — the
+// recorded base was rewritten away, or the source ref was never delivered) and $SRC fell back to
+// HEAD. The diff numbers read 0 files in that case — which is NOT "resolved and empty". A consumer
+// like xellGate must treat `unresolved` as "could not be measured" and refuse, never approve. A
+// missing sixth field (legacy output) defaults to resolved → `unresolved:false`, so an old 5-line
+// read still parses as before.
 export function parseCxellDiff(out) {
-  const [head, ahead, src, own, dirty] = String(out).split('\n');
+  const [head, ahead, src, own, dirty, srcOk] = String(out).split('\n');
   const num = (s, re) => +((s || '').match(re)?.[1] || 0);
   return {
     head: head?.trim() || null,
@@ -669,6 +691,7 @@ export function parseCxellDiff(out) {
     insertions: num(src, /(\d+) insertions?/),
     deletions: num(src, /(\d+) deletions?/),
     dirty: +String(dirty || '').trim() || 0,
+    unresolved: String(srcOk).trim() === 'no',
     own: {
       files: num(own, /(\d+) files? changed/),
       insertions: num(own, /(\d+) insertions?/),
@@ -709,7 +732,12 @@ export function cxellPatchBody(base, kind = 'source', repoDir = '/work/repo') {
   }
   return [
     `cd ${repoDir} || exit 3`,
-    `${cxellSourceBase(b)}; echo "BASE:$SRC"`,
+    // `BASE:<sha>` names the base actually used — but when the fork point could not be resolved
+    // ($SRC_OK=no — the recorded base was rewritten away, or the source ref was never delivered),
+    // name it `BASE:unresolved` instead of lying with a HEAD sha that reads as a real fork point. A
+    // consumer must never mistake a failed resolution for "resolved and empty".
+    `${cxellSourceBase(b)}; if [ "$SRC_OK" = yes ]; then echo "BASE:$SRC"; `
+      + 'else echo "BASE:unresolved"; fi',
     'git --no-pager diff --no-color -M "$SRC"',
     untracked,
   ].join('; ');

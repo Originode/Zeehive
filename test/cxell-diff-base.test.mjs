@@ -33,6 +33,11 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 
 const { cxellDiffScript, cxellPatchBody, cxellSourceBase, parseCxellDiff } =
   await import('../server/src/lib/cxell.js');
+// The GATE that consumes cxellDiff's numbers at done-approval time. Its DECISION is pure once the
+// diff is in hand (xellGateDecision) — imported here so the mirror case (an unresolvable base must
+// REFUSE, never read clean) is pinned end-to-end: real script output with a bogus base → parse →
+// gate.
+const { xellGateDecision } = await import('../server/src/lib/managers.js');
 
 // ── a real repo in the shape of a SYNCED cxell ──────────────────────────────────────────────────
 //   master:  B0 (base) → M1 (main moves after the zee forks)
@@ -123,6 +128,68 @@ try {
      'and falls back to merge-base(<base>, HEAD) before the first sync');
   ok(!/git diff --shortstat \$\{?b\}?/.test(cxellDiffScript(B0, repo)),
      'the shortstat is measured against $SRC, never the recorded head_commit directly');
+
+  console.log('\n── the MIRROR case: an unresolvable base must REFUSE, never read clean ──');
+  // A SECOND repo, in the exact state the manager's repro needs: the zee's recorded base was
+  // REWRITTEN AWAY (a sha that is no longer an object) BEFORE the first sync delivered origin/main.
+  // The cxell clone is a bundle of the branch only — there is NO refs/remotes/origin/main yet, so
+  // cxellSourceBase falls to the `else` branch and merge-base(<bogus>, HEAD) FAILS → $SRC falls back
+  // to HEAD → the source shortstat reads 0 files EVEN THOUGH the branch holds a committed-unlanded
+  // commit. Before this change that read "clean"; a done-approval gate would have deleted real work.
+  const mirrorRepo = mkdtempSync(join(tmpdir(), 'zeehive-cxellmirror-'));
+  // The outer `g` is bound to `repo`; the mirror repo needs its own.
+  const gm = (...args) => {
+    const r = execFileSync('git', ['-C', mirrorRepo, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return String(r).trim();
+  };
+  try {
+    gm('init', '-q', '-b', 'master');
+    gm('config', 'user.email', 'test@zeehive'); gm('config', 'user.name', 'zeehive test');
+    writeFileSync(join(mirrorRepo, 'README.md'), '# base\n');
+    gm('add', '-A'); gm('commit', '-qm', 'base');
+    const M0 = gm('rev-parse', 'HEAD');
+    gm('branch', 'spinoff/zee');
+    gm('checkout', '-q', 'spinoff/zee');
+    writeFileSync(join(mirrorRepo, 'work.txt'), 'real committed-unlanded work\n');
+    gm('add', '-A'); gm('commit', '-qm', 'zee adds real work');
+    // No refs/remotes/origin/main — the recorded base (a rewritten-away sha) is all there is.
+    const bogus = 'f'.repeat(40);
+    const mirrored = parseCxellDiff(execFileSync('bash', ['-lc', cxellDiffScript(bogus, mirrorRepo)], { encoding: 'utf8' }));
+    ok(mirrored.unresolved === true,
+       `the fork point could not be resolved and is reported (unresolved=${mirrored.unresolved})`);
+    ok(mirrored.files === 0,
+       `and the source shortstat reads 0 files — the committed-unlanded work is invisible (files=${mirrored.files})`);
+    ok(mirrored.ahead === 0, `and 'ahead' is 0 too (ahead=${mirrored.ahead})`);
+    const gateOnMirror = xellGateDecision(mirrored, true);
+    ok(gateOnMirror.clean === false,
+       'the GATE refuses on an unresolvable base — unmeasurable-from-something-that-exists must never mean yes');
+    ok(/could not be resolved/.test(gateOnMirror.reason),
+       `and says why (${gateOnMirror.reason.slice(0, 60)}…)`);
+    // The mirror of the mirror: the SAME empty numbers, but with a RESOLVED base, approve — "same
+    // number, opposite meaning" is exactly the distinction the manager asked to make visible.
+    const cleanResolved = xellGateDecision({ files: 0, dirty: 0, unresolved: false }, true);
+    ok(cleanResolved.clean === true,
+       'an empty but RESOLVED read still approves — 0 files means clean only when the base was real');
+    // Control: the same committed-unlanded work with a resolvable base must show the diff (and refuse,
+    // but for the RIGHT reason — a non-empty diff, not a broken base).
+    const control = parseCxellDiff(execFileSync('bash', ['-lc', cxellDiffScript(M0, mirrorRepo)], { encoding: 'utf8' }));
+    ok(control.unresolved === false && control.files === 1,
+       `control: a resolvable base shows the committed work (unresolved=${control.unresolved} files=${control.files})`);
+    ok(xellGateDecision(control, true).clean === false &&
+       /non-empty diff/.test(xellGateDecision(control, true).reason),
+       'and the gate refuses on it for the real reason (a non-empty diff against source)');
+    // The patch path names the failure too — `BASE:unresolved`, not a HEAD sha that reads as a fork
+    // point.
+    const mirrPatch = splitBase(execFileSync('bash', ['-lc', `{ ${cxellPatchBody(bogus, 'source', mirrorRepo)}; } 2>/dev/null`],
+      { encoding: 'utf8' }));
+    ok(mirrPatch.base === 'BASE:unresolved',
+       'the source patch names the failure (BASE:unresolved), not a plausible-looking HEAD sha');
+    // Structural: the sixth field exists in the script, so the signal cannot silently drop.
+    ok(cxellDiffScript(B0, repo).split('\n').includes('echo "$SRC_OK"'),
+       'the resolved/unresolved signal is a real sixth field in the script, not an accident of parsing');
+  } finally {
+    rmSync(mirrorRepo, { recursive: true, force: true });
+  }
 } catch (e) {
   console.error('\n✗ FAIL (threw):', e?.stack || e?.message || e);
   fail++;

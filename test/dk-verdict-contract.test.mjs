@@ -549,6 +549,12 @@ try {
     // decision is made from it on any path. Asserted by test/cxell-diff-base.test.mjs, which runs the
     // real body and checks the BASE line names the fork point.
     BASE: 'a data prefix parsed by cxellPatch, not a verdict — stripped before the patch is read',
+    // A SHELL VARIABLE, not a marker: `echo "$SRC_OK"` prints its VALUE (`yes`/`no` — lowercase, no
+    // `_`-token), and the six field positions of cxellDiff's output are parsed positionally by
+    // parseCxellDiff, never read as a verdict off an exit code. The regex catches the `$SRC_OK`
+    // expansion; the same pattern already exempted `$SRC`/`$OM`. Asserted by test/cxell-diff-base
+    // .test.mjs (the mirror case), which checks the signal is a real sixth field.
+    SRC_OK: 'a shell variable echoed for a positional field, not a verdict marker — its value is yes/no',
     __ZEE_TALK_QUEUED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_TALK_FAILED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_KEYS_SENT__: 'not run by dk at all — sshExecInCxell (asserted below)',

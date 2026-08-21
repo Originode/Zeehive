@@ -131,12 +131,32 @@ async function xellGate(row, branch) {
     d = await worktreeDiff(row.worktree_path, branch).catch(() => null);
     existed = true;
   }
+  // The DECISION is pure once `d` is in hand — extracted so test/cxell-diff-base.test.mjs can pin
+  // "an unresolvable base must refuse" without docker (it feeds the parsed output of a real script
+  // run with a bogus base into this).
+  return xellGateDecision(d, existed);
+}
+
+// The pure half of xellGate, extracted so it is testable without docker. `d` is a cxellDiff / cxell
+// worktreeDiff result (or null when nothing on disk could answer); `existed` is whether anything
+// (a live cxell or a worktree) WAS present to ask. The rule: unmeasurable-from-something-that-exists
+// must never mean yes.
+export function xellGateDecision(d, existed) {
   const ahead = d?.ahead || 0, dirty = d?.dirty || 0;
   const diff = { files: d?.files || 0, insertions: d?.insertions || 0, deletions: d?.deletions || 0 };
   if (!d) return existed
     ? { clean: false, reason: "the xell's work could not be measured — cannot confirm it is clean before tearing it down",
         ahead, dirty, diff }
     : { clean: true, ahead: 0, dirty: 0, diff: { files: 0, insertions: 0, deletions: 0 } };
+  // The diff's BASE was never resolved — $SRC fell back to HEAD inside the cage (cxellDiff.unresolved,
+  // from cxellSourceBase's SRC="${SRC:-HEAD}"), so the empty source shortstat is NOT "resolved and
+  // empty", it is "could not be measured against the source": the recorded base was likely rewritten
+  // away before the first sync. Committed-but-unlanded work is INVISIBLE to this read. Same family
+  // as `!d` above — unmeasurable-from-something-that-exists must never mean yes. The mirror of the
+  // clean-approval case: an empty source diff is affirmative only when the base was a REAL fork point.
+  if (d.unresolved) return { clean: false,
+    reason: "the xell's diff base could not be resolved in its cxell (the recorded commit was likely rewritten away) — cannot confirm it is clean before tearing it down",
+    ahead, dirty, diff };
   const parts = [];
   // The source-diff shortstat is measured against the branch's FORK POINT off the source — for the
   // worktree path merge-base(ref, HEAD) (worktreeDiff), for the live-cxell path the same fork point
