@@ -225,9 +225,10 @@ export const updateHarness = (key, body) => fetch(`/api/harnesses/${key}`, { met
 export const deleteHarness = (key) => fetch(`/api/harnesses/${key}`, { method: 'DELETE' }).then((r) => r.json());
 
 // Dispatch a human-composed prompt EXACTLY like a /xell dispatch: the queenzee claims a ready xell
-// for this project and spawns a zee into its worktree with the task (and any pasted images).
-// `images` is [{ name, data }] where data is a base64 data URL. Throws with the server's message
-// (e.g. "no ready xell available") so the composer can surface it without losing the prompt.
+// for this project and spawns a zee into its worktree with the task (and any pasted files).
+// `images` is [{ name, data }] where data is a base64 data URL — a legacy field name that carries
+// any file attachment. Throws with the server's message (e.g. "no ready xell available") so the
+// composer can surface it without losing the prompt.
 // IS SOMEBODY ALREADY IN THIS WORK? (#33) A read-only preflight the dispatch dialog calls as the prompt
 // is written, so the answer is in front of you BEFORE the button rather than in the receipt after it.
 // Advisory: it never refuses a dispatch, and a failure answers "no warnings" rather than throwing.
@@ -398,6 +399,11 @@ export const pauseProviderAccount = (projectId, accountId, reason) =>
     { reason: reason || undefined });
 export const resumeProviderAccount = (projectId, accountId) =>
   siteCall(`/api/projects/${projectId}/tokens/account/${accountId}/resume`, 'POST');
+// Per-provider spend-alert threshold (migration 206) — a USD amount per provider; a xell whose
+// gateway-ledger spend on that provider exceeds it gets an over-budget hexagon indicator.
+export const setProviderAlertAmount = (projectId, provider, amount) =>
+  siteCall(`/api/projects/${projectId}/provider-alerts/${provider}`, 'PUT',
+    { amount: amount === '' || amount == null ? null : amount });
 // ── project API keys — the credential a DEPLOYED project presents to /api/ext/v1 (migration 190).
 // The plaintext key comes back ONCE, on create; every later read carries key_hint alone, so the
 // console must show it at mint time or never (lib/project-api-keys.js). ─────────
@@ -457,6 +463,11 @@ export const setXellEnvironment = (xellId, environmentId) =>
 // A xell's message history — the manager⇄worker conversation (directives a manager sent, reports a
 // worker sent back). Human-facing audit: marks NOTHING read (only the agent's own `zee inbox` does).
 export const getXellMessages = (xellId) => siteCall(`/api/xells/${xellId}/messages`, 'GET');
+// A xell's CAPTURED CONVERSATION — the actual text the zee's model produced during its turns
+// (assistant events classified by the observability feed into conversation vs thinking). The mobile
+// chat renders this, so a zee's speech surfaces WITHOUT the zee calling any tool.
+export const getXellConversation = (xellId, { limit = 100 } = {}) =>
+  siteCall(`/api/xells/${xellId}/conversation?limit=${limit}`, 'GET');
 // Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
 // full .env text — the "pull out what this xell is running with" reveal.
 export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');
@@ -507,6 +518,17 @@ export const squashOffer = (r, branch = 'main') =>
   + `${branch}, on top of the remote base. The review diff is identical, the intermediate commits are not pushed, and `
   + `nothing local is rewritten.`;
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
+// Machine × project build-readiness (ticket #173): per-machine verdict {ok|unknown|missing}
+// with the failing check named, rendered in the container matrix where the pool knobs are set.
+export const getBuildReadiness = (projectId) => fetch(`/api/projects/${projectId}/build-readiness`).then((r) => r.json());
+// Machine × project build-bootstrap (ticket #173 follow-on): the one-click action that CREATES
+// the dev prerequisites the probe names as missing. dryRun (default) returns the plan and performs
+// nothing — the console shows it before a human commits; dryRun:false performs each step
+// idempotently and re-runs the probe. QUEENZEE-performed; a prod tier/container/stack is refused.
+export const planBuildBootstrap = (projectId, machineId) =>
+  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: true });
+export const performBuildBootstrap = (projectId, machineId, actor) =>
+  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: false, by: actor });
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
 export const getSharedContainers = (projectId) => fetch(`/api/projects/${projectId}/containers`).then((r) => r.json());
@@ -949,6 +971,18 @@ export async function setBackupConfig(body) {
   return data;
 }
 
+// Pause/resume this project's backups — the stop-switch for a retry storm. While paused, the
+// scheduler starts no new backup (policy OR retry) and "Back up now" is refused, until a human
+// flips it back. An in-flight backup is not interrupted (that's Cancel); restore/delete are untouched.
+export async function setBackupPaused(paused, projectId) {
+  const r = await fetch('/api/backups/pause', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paused, project: projectId }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `pause failed (${r.status})`);
+  return data;
+}
+
 // Trigger a backup right now (used by the "Back up now" button in the modal).
 export async function runBackup(projectId) {
   const r = await fetch('/api/backups/run', {
@@ -1156,8 +1190,27 @@ export const prXell = (id, note) => xellVerb(id, 'pr', { note });
 // means there was no live cxell zee to reach.
 export const nudgeXell = (id) => xellVerb(id, 'nudge');
 
-// Send a composed operator message — long text and/or image attachments ([{ name, type, data }],
-// data being a base64 / data-URL string) — to the xell's live cxell zee. Images and long text are
+// ── the cage itself ──────────────────────────────────────────────────────────
+// What is this xell's cxell container doing right now? One `docker inspect`, read-only, asked
+// on demand (never on a dashboard render) so the restart confirm can be TRUE about what it is
+// about to end. Resolves { ok, state, missing, mid_turn, zee_status, name, mode }.
+export async function cxellStatus(id) {
+  const r = await fetch(`/api/xells/${id}/cxell`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || 'could not read the cxell state');
+  return data;
+}
+
+// Restart the cage: the queenzee stops it (only with force), starts it, re-opens its ssh door,
+// RE-SEALS its egress firewall and resumes the zee's session. `force` is required for a container
+// docker still calls running — that is the wedged case, and stopping it ends the live turn.
+// Resolves { ok, verdict, … } for every outcome, including the refusals ('running' without force,
+// 'missing', 'unsealed', 'no-cxell'): they are answers, not errors.
+export const restartXellCxell = (id, { force = false } = {}) =>
+  xellVerb(id, 'cxell/restart', { force });
+
+// Send a composed operator message — long text and/or FILE attachments ([{ name, type, data }],
+// data being a base64 / data-URL string) — to the xell's live cxell zee. Files and long text are
 // handed over as files in the cxell's .zee-inbox with a pointer typed into the live session; short
 // text is typed inline. Resolves { sent, attachments?, reason? } — sent:false (not a throw) means
 // there was no live cxell zee to reach.

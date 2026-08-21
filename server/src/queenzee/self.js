@@ -16,6 +16,7 @@ import { logline } from '../lib/logbus.js';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
+import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
 // about the branch it just walked into (see branchHandover).
@@ -35,7 +36,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 // the guard at the head of selfLand.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
-import { attachXellDb } from '../lib/xell-db.js';
+import { attachXellDb, projectProdIsManagingMeta, managingMetaWritableRefusal } from '../lib/xell-db.js';
 import { probeRoleUpstream } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
@@ -61,6 +62,11 @@ import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, 
 import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateHarness,
          deleteHarnessUnlessWorn, liveHarnessWearers, wearerList } from '../lib/harness.js';
 import { uploadConversationArchive, conversationsForManager, harnessArchivalSettings } from '../lib/conversations.js';
+// The A2A outbound send (`zee a2a <card-url> --message "…"`, phase 4) — queenzee-mediated, recorded.
+import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
+// The A2A MEET group-chat rooms (`zee meet`, docs/zee-meet-plan.md) — the DB half lives here so
+// the self verbs below are thin. Any live zee of a project may create/attend a room by code.
+import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '../lib/a2a-meet.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -833,6 +839,12 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
 // Records a REQUEST only. It does NOT bind: binding grants prod DATA, a human's call (HANDOFF). The
 // human confirms in the console (decideProdBind), and ONLY then does the queenzee attachProdStack
 // AND re-seal the cxell firewall to allow the prod db. Until confirmed the cxell cannot reach prod.
+//
+// Two structural refusals fire BEFORE a row is written, so a human is never shown a BIND button
+// that cannot succeed:
+//   • manager → already holds SELECT-only; escalation is not a zee-ask (see below).
+//   • project's prod IS the managing meta-DB (ZEEHIVE self-hosting) → a writable bind would hand
+//     a nested queenzee the live fleet database. The write path for that case is `zee seed`.
 export async function selfProdRequest(xell, { reason = null } = {}) {
   // A MANAGER already holds production — READ-ONLY, through its own SELECT-only postgres role. A
   // full bind would be a WRITE escalation, and escalating your own access is not a thing an agent
@@ -845,6 +857,18 @@ export async function selfProdRequest(xell, { reason = null } = {}) {
       + 'freely. If rows must CHANGE in production, that is `zee seed` — a landed file a human reads '
       + 'and the queenzee runs — or a human\'s own decision. If you believe this job genuinely needs '
       + 'write access, raise it with `zee tend --reason "…"` and let a human decide.' };
+  }
+  // Self-hosting: the project's production database IS this queenzee's meta-DB. Attach would refuse
+  // (§6.2); refuse the ASK too so nothing pending lands on a human, and name the seed path.
+  const meta = await projectProdIsManagingMeta(xell.project_id);
+  if (meta.isMeta) {
+    const error = managingMetaWritableRefusal(xell.slug, meta.dsn);
+    logline('xell-prod', `${xell.slug} prod-bind REFUSED (managing meta-DB): use zee seed for prod data writes`);
+    return { ok: false, status: 'refused', error,
+      path: 'zee seed',
+      note: 'This project\'s production database is the orchestrator\'s own meta-DB. A writable bind '
+        + 'is structurally unsafe. Modify prod data via `zee seed` (landed SQL, human-approved, '
+        + 'queenzee-run); read prod via a MANAGER (db-prod-readonly).' };
   }
   const existing = await one(
     `SELECT * FROM prod_bind_request WHERE xell_id=$1 AND status='pending'`, [xell.id]);
@@ -1031,8 +1055,24 @@ export async function listProdBindRequests(projectId, { open = true } = {}) {
 // The human decides. On CONFIRM: bind the prod stack (attachProdStack — the same call /xell-prod
 // makes) AND re-seal the cxell firewall so the cxell can now reach the prod db host:port. Rejection is
 // a plain status flip; nothing is bound and the cxell stays sealed.
+//
+// Preflight BEFORE flipping status: if this project's prod IS the managing meta-DB, attach would
+// throw after the row was already 'confirmed', leaving a half-decided ask with no bind. Refuse the
+// confirm with the seed path named; the request stays pending so the human can Reject it cleanly
+// (selfProdRequest no longer creates these for new asks — this is the backstop for leftovers).
 export async function decideProdBind(id, decision, by = 'human@console') {
   if (!['confirmed', 'rejected'].includes(decision)) throw new Error(`bad decision: ${decision}`);
+  const pending = await one(
+    `SELECT pbr.*, x.slug AS xell_slug FROM prod_bind_request pbr
+       LEFT JOIN xell x ON x.id = pbr.xell_id
+      WHERE pbr.id=$1 AND pbr.status='pending'`, [id]);
+  if (!pending) throw new Error('no such pending prod-bind request (already decided?)');
+  if (decision === 'confirmed') {
+    const meta = await projectProdIsManagingMeta(pending.project_id);
+    if (meta.isMeta) {
+      throw new Error(managingMetaWritableRefusal(pending.xell_slug || pending.xell_id, meta.dsn));
+    }
+  }
   const row = await one(
     `UPDATE prod_bind_request SET status=$2, decided_at=now(), decided_by=$3
        WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by]);
@@ -1063,20 +1103,16 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 // project's — that one is now reachable, which is the whole point of the bind. Mirrors spawnCxell's
 // block-list logic (default-allow egress, drop only prod DBs).
 //
-// ⚠ Same host:port-only caveat as spawnCxell's copy, and the SAME two conditions keep it harmless:
-// an ALIAS-ONLY prod db is absent from this list because (a) it publishes no host port, so there is
-// nothing for an iptables rule to drop, AND (b) the only cage on its docker network is the
-// prod-read-only manager's, joined deliberately by connectCxellToProdNetwork(). Break either — add a
-// host_port to an alias-registered row, or join anything else to that network — and both copies of
-// this query have to change together. Read the long note in intake.js spawnCxell before touching it.
+// ⚠ The host:port-only caveat that governs WHICH pairs come back — and the two conditions that keep
+// an ALIAS-ONLY prod db harmless despite being absent from the list — are stated ONCE, in
+// lib/cxell-seal.js, which is now the single query behind all three seals (spawn, this re-seal, and
+// the re-seal of a cage restarted after a host reboot). Read it before touching any of them.
 async function resealCxellForStack(xellId) {
   const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
-  const prodDbs = await q(
-    `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
-      WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
-  const blockTcp = prodDbs
-    .filter((r) => r.project_id !== xell.project_id) // this xell's prod DB is now allowed
-    .map((r) => `${r.host}:${r.host_port}`);
+  // prodBound: true — the bind has just been granted, so this xell's OWN prod db is now allowed (the
+  // xell row this reads was written before the grant, so its coupling cannot say so yet). The query
+  // itself, and the alias-only caveat above, live in lib/cxell-seal.js with the spawn seal's copy.
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, prodBound: true });
   const sealed = await sealCxell({ ctx: 'default', name: cxellName(xell.slug), blockTcp });
   return { blockTcp, tail: sealed[sealed.length - 1] || null };
 }
@@ -1745,6 +1781,9 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   try {
     out = await dispatchXell({
       task: brief, project: xell.project_id, title: title || null,
+      // A manager deploy is always FOR a card (itemless `zee dispatch` is refused above), and the
+      // assignment is deployWorkItem's — the prompt→work_node auto-cut must not double the card.
+      work_item_id: work_item_id || null,
       ...(provisioned?.id ? { xell_id: provisioned.id } : {}),
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
@@ -2343,6 +2382,72 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
     message: deliveryReceipt(r.delivery?.delivery, worker.slug,
                              r.delivery?.reason || r.delivery?.error || null),
   };
+}
+
+// POST /api/xell/self/a2a — a zee sends an A2A SendMessage to an EXTERNAL agent card URL
+// (`zee a2a <card-url> --message "…"`, plan §6 P4, DR-2/DR-7). The zee never dials the external
+// server: the queenzee makes the HTTP call on its behalf and RECORDS it at the transport layer
+// (lib/a2a-outbound.js → a2a_outbound_request, migration 201). The sender resolves from the xell
+// token, never from a payload — this is a verb, not a wire hole.
+export async function selfA2ASend(xell, { card_url = null, message = null } = {}) {
+  const out = await sendExternalA2AMessage({ xell, cardUrl: card_url, message });
+  return out.ok ? { ok: true, ...out } : { ok: false, error: out.error };
+}
+
+// ── A2A MEET — group chat rooms (`zee meet`, docs/zee-meet-plan.md) ────────────
+// The human directive: "i want agents to be able to talk to each other via some sort of peer to
+// peer a2a chat session like a group chat via a zee meet verb… zees can join and talk." These four
+// verbs are the self half of that surface (the CLI + routes are thin wrappers). Any live zee of a
+// project may create a room (create), attend a room by the code a founder printed (attend), post to
+// a room it is a member of (say), and list/read its rooms (list/transcript). The design decisions
+// are recorded in docs/zee-meet-decision-record.md — the short version: a room is a first-class
+// store (DR-1), attendance is self-serve and recorded (DR-2), and a post is one transcript row plus
+// a best-effort delivery fan-out (DR-3).
+export async function selfMeetCreate(xell, { title = null } = {}) {
+  const r = await createMeet({ xell, title });
+  if (!r.ok) return { ok: false, error: r.error };
+  return {
+    ok: true, meet_id: r.room.id, code: r.code, title: r.room.title,
+    members: [{ slug: xell.slug, role: 'founder' }],
+    message: `Created meet "${r.room.title}". Hand this code to the zees you want in: \`zee meet attend ${r.code}\``,
+  };
+}
+
+export async function selfMeetAttend(xell, { code = null } = {}) {
+  const r = await attendMeet({ xell, code });
+  if (!r.ok) return { ok: false, error: r.error };
+  return {
+    ok: true, meet_id: r.meet_id, code: r.code, title: r.title, members: r.members,
+    joined: r.joined,
+    message: r.joined
+      ? `You joined "${r.title}" (${r.code}). Read what you missed: \`zee meet --transcript ${r.code}\`, then \`zee meet say ${r.code} --message "…"\`.`
+      : `You are already a member of "${r.title}" (${r.code}).`,
+  };
+}
+
+export async function selfMeetSay(xell, { code = null, message = null } = {}) {
+  const r = await sayToMeet({ xell, code, message });
+  if (!r.ok) return { ok: false, error: r.error };
+  return {
+    ok: true, posted: r.posted, code: r.code, meet_id: r.meet_id, message: r.message,
+    deliveries: r.deliveries,
+    message_text: `Posted to ${r.code}. ${r.deliveries.length} live member(s) notified; the rest catch up with \`zee meet --transcript\`.`,
+  };
+}
+
+// GET /api/xell/self/meet — the caller's rooms, or one room's transcript when ?code= is given.
+export async function selfMeet(xell, { code = null } = {}) {
+  if (code) {
+    const t = await transcriptFor(xell, code);
+    if (!t.ok) return { ok: false, error: t.error };
+    return { ok: true, meet: { code: t.code, title: t.title, members: t.members },
+             messages: t.messages, count: t.messages.length,
+             message: `${t.messages.length} message(s) in "${t.title}" — now marked read.` };
+  }
+  const meets = await listMeetsFor(xell);
+  return { ok: true, count: meets.length, meets,
+           message: meets.length ? `${meets.length} meet(s) — \`zee meet --transcript <code>\` to read one.`
+                                 : 'You are in no meets yet. Create one: `zee meet create --title "…"`.' };
 }
 
 // POST /api/xell/self/report — a WORKER's note to its manager (`zee report`), and the vehicle for

@@ -1,6 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.jsx';
+import MobileChat from './MobileChat.jsx';
 import { DialogHost } from './Dialog.jsx';
 import { DiffViewerHost } from './DiffViewer.jsx';
 import { FileViewerHost } from './FileViewer.jsx';
@@ -22,11 +23,23 @@ window.fetch = (input, init) =>
 // held landing, PR) opens the viewer with showDiff(...), from wherever it is rendered.
 // FileViewerHost is the same shape again: the terminal's file explorer opens a file with
 // showFileViewer(...), which the root-mounted host routes by file type to the right viewer.
+//
+// The MOBILE CHAT UI lives at /m (http://<webapp>:<port>/m?project=<name>). It is a phone-first
+// sibling of the console: one box per xell, a prompt button to deploy zees, and a per-xell detail
+// screen with observability + chat + a deep-linked terminal. It is a pure pathname split — the
+// server already SPA-falls-back every non-asset path to index.html (nginx try_files / vite), so no
+// server route is needed and the console keeps every other path.
+const isMobileChat = (() => {
+  try { return /^\/m(?:\/|$)/.test(window.location.pathname); } catch { return false; }
+})();
+
 createRoot(document.getElementById('root')).render(
-  <React.Fragment>
-    <App />
-    <DialogHost />
-    <DiffViewerHost />
-    <FileViewerHost />
-  </React.Fragment>,
+  isMobileChat
+    ? <MobileChat />
+    : <React.Fragment>
+        <App />
+        <DialogHost />
+        <DiffViewerHost />
+        <FileViewerHost />
+      </React.Fragment>,
 );

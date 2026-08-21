@@ -591,6 +591,26 @@ a.cbox:hover { border-color: var(--accent); }
 .burn { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted); }
 .statusline .fleetburn { color: var(--muted); font-size: 14px; }
 .statusline .fleetburn b { color: var(--fg, inherit); font-family: 'Cascadia Code', monospace; font-size: 12px; }
+/* Per-provider SPEND on the fleet-burn chip. Limits (remaining %) live on .providerlimits. */
+.statusline .fleetburn-prov-name { color: var(--muted); font-size: 12px; }
+/* PROVIDER LIMITS — remaining quota per provider account. Green when healthy, amber under 40%,
+   red under 20%. "X% free" is available_pct, never used%. */
+.statusline .providerlimits { color: var(--muted); font-size: 14px; }
+.statusline .providerlimits b {
+  font-family: 'Cascadia Code', monospace; font-size: 12px;
+  color: var(--ok, #3d9a5f);
+}
+.statusline .providerlimits-prov.is-warn b { color: var(--amber, #d4a017); }
+.statusline .providerlimits-prov.is-tight b { color: var(--danger, #c44); }
+.statusline .providerlimits-name { color: var(--muted); font-size: 12px; }
+/* Project setup: remaining limit next to each provider account. */
+.token-usage-limit {
+  font-family: 'Cascadia Code', monospace; font-size: 11px;
+  color: var(--ok, #3d9a5f); margin-left: 6px;
+}
+.token-usage-limit.is-warn { color: var(--amber, #d4a017); }
+.token-usage-limit.is-tight { color: var(--danger, #c44); }
+.token-usage-limit.is-empty { color: var(--muted); font-style: italic; }
 
 /* production card */
 .card.prod { border-top-color: var(--down); background: linear-gradient(180deg, rgba(229,85,78,.06), transparent); }
@@ -804,6 +824,23 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-conn.ok:hover:not(:disabled) { color: var(--up); border-color: var(--up); }
 .mx-conn.fail { color: var(--down); border-color: rgba(229,85,78,.5); }
 .mx-conn.fail:hover:not(:disabled) { color: var(--down); border-color: var(--down); }
+/* the per-(machine, project) BUILD-READINESS badge (ticket #173) — same shape as mx-conn: the
+   button IS the verdict. ok=green, unknown=amber, missing=red, un-checked=idle. */
+.mx-br { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
+  cursor: pointer; font-size: 9px; padding: 0 4px; white-space: nowrap; }
+.mx-br:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-br.ok { color: var(--up); border-color: rgba(53,196,107,.5); }
+.mx-br.ok:hover:not(:disabled) { color: var(--up); border-color: var(--up); }
+.mx-br.unk { color: #e0a53b; border-color: rgba(224,165,59,.5); }
+.mx-br.unk:hover:not(:disabled) { color: #e0a53b; border-color: #e0a53b; }
+.mx-br.miss { color: var(--down); border-color: rgba(229,85,78,.5); }
+.mx-br.miss:hover:not(:disabled) { color: var(--down); border-color: var(--down); }
+/* the one-click BUILD BOOTSTRAP (ticket #173 follow-on) — shown only when the readiness badge says
+   something is missing; amber like the "missing" verdict it fixes. */
+.mx-bs { background: none; border: 1px solid rgba(229,85,78,.5); border-radius: 4px; color: var(--down);
+  cursor: pointer; font-size: 9px; padding: 0 4px; white-space: nowrap; }
+.mx-bs:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-bs:disabled { opacity: .7; cursor: default; }
 .mx-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 10px; padding: 0 2px; }
 .mx-del:hover { color: #d9553b; }
 .mx-prod { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
@@ -1008,6 +1045,12 @@ a.cbox:hover { border-color: var(--accent); }
   background: none; border: 1px solid transparent; color: var(--muted); cursor: pointer;
   font-size: 15px; line-height: 1; padding: 2px 7px; border-radius: 6px; margin-right: 6px;
 }
+.cs-mobile {
+  color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 600;
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin-right: 6px;
+  white-space: nowrap;
+}
+.cs-mobile:hover { color: var(--accent); border-color: var(--accent); background: var(--panel2); }
 .cs-gear:hover { color: var(--text); border-color: var(--line); background: var(--panel2); }
 .console-settings {
   width: min(440px, 92vw); background: var(--panel); border: 1px solid var(--line);
@@ -1068,9 +1111,20 @@ a.cbox:hover { border-color: var(--accent); }
   font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
 .bkstale { color: #d9a441; border: 1px solid #d9a441; border-radius: 6px; padding: 1px 7px;
   font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
+/* A PAUSED backup: the stop-switch is ON, so the "retry in 8 min" sentence below is replaced by
+   "paused — no backups will start". Blue like the pause state, not amber: nothing is failing, a
+   human deliberately stopped NEW backups. */
+.bkpaused { color: #7fb8e6; border: 1px solid #7fb8e6; border-radius: 6px; padding: 1px 7px;
+  font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
+.bknext.bk-paused-note { color: #7fb8e6; border-color: #7fb8e6; }
 .bkcog { margin-left: auto; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   width: 30px; height: 30px; border-radius: 8px; font-size: 15px; cursor: pointer; line-height: 1; }
 .bkcog:hover { color: var(--text); border-color: var(--accent); }
+.bkpausebtn { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  width: 30px; height: 30px; border-radius: 8px; font-size: 14px; cursor: pointer; line-height: 1; }
+.bkpausebtn:hover { color: var(--text); border-color: var(--accent); }
+.bkpausebtn.paused { color: #7fb8e6; border-color: #7fb8e6; }
+.bkpausebtn:disabled { opacity: .5; cursor: default; }
 
 /* all-backups modal (reuses the .term-overlay backdrop) */
 .bkmodal { width: min(860px, 94vw); max-height: 80vh; background: #0a0d12; border: 1px solid var(--line);
@@ -1492,6 +1546,12 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 50%; background: rgba(0,0,0,.65); color: #fff; cursor: pointer; font-size: 11px;
   line-height: 1; display: flex; align-items: center; justify-content: center; }
 .disp-img-x:hover { background: var(--down); }
+.disp-filechip { position: relative; display: flex; align-items: center; gap: 6px; max-width: 260px;
+  padding: 6px 26px 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+  font-size: 12px; }
+.disp-filechip .disp-file-icon { font-size: 15px; }
+.disp-filechip .disp-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disp-filechip .disp-img-x { position: absolute; top: 4px; right: 4px; }
 .disp-imgnote { color: var(--muted); font-size: 11px; }
 
 .disp-controls { display: flex; flex-wrap: wrap; gap: 16px; }
@@ -1503,6 +1563,8 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-seg b { color: var(--text); font-weight: 700; }
 /* a segment that carries a provider coin lays it out beside its words */
 .disp-seg:has(.zav) { display: inline-flex; align-items: center; gap: 6px; }
+/* Remaining usage limit next to a model/account segment in the prompt window. */
+.disp-limit { color: var(--ok, #3d9a5f); font-size: 11px; font-family: 'Cascadia Code', monospace; opacity: 0.95; }
 .disp-seg:hover { border-color: var(--accent); }
 .disp-seg.on { border-color: var(--accent); color: var(--text); background: rgba(91,140,255,.14); }
 .disp-hint { color: var(--muted); font-size: 11px; max-width: 320px; }
@@ -1793,6 +1855,24 @@ a.cbox:hover { border-color: var(--accent); }
    the honeycomb on anything wider than a laptop). The panels pane still scrolls, so it loses
    nothing but width. */
 .hive-pane.honey  { flex: 3 1 0; position: relative; }
+/* ── the honeycomb LEVEL breadcrumb (the work-node hierarchy) ─────────────────
+   Floats over the canvas' top-left corner: where in the tree this honeycomb is, and the way back
+   up. The active (last) crumb is the CONTEXT every new prompt is cut under. */
+.hive-crumbs {
+  position: absolute; top: 8px; left: 10px; z-index: 5;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap; max-width: calc(100% - 20px);
+  pointer-events: none;   /* the strip itself must never eat a canvas drag… */
+}
+.hive-crumbs .hive-crumb {
+  pointer-events: auto;   /* …but its buttons stay clickable */
+  background: rgba(22, 27, 36, 0.88); color: #8b97a8;
+  border: 1px solid #2a3242; border-radius: 12px;
+  font: 600 11px 'Segoe UI', sans-serif; padding: 3px 10px; cursor: pointer;
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hive-crumbs .hive-crumb:hover { color: #e6ebf2; border-color: #7f95c2; }
+.hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
+.hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
 .hive-pane.panels { flex: 2 1 0; overflow: auto; }
 
 /* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
@@ -2215,6 +2295,22 @@ a.cbox:hover { border-color: var(--accent); }
 .term-x.talk.on { border-color: var(--accent); color: var(--accent); }
 .term-x.talk.urge { border-color: #e0a53b; color: #f0c46a; background: rgba(224,165,59,.12); }
 
+/* ── ⟳ cage: restart the container this terminal could not reach ──
+   Same shape as 💬 talk (a word, in the header, next to the doors that are failing), and MUTED
+   until it is the answer: `.urge` fires only when the socket errored or closed, which is when an
+   operator is looking at a dead pane wondering what they are allowed to do about it. It is a
+   destructive-ish action, so it never LOOKS like the primary one — the confirm dialog carries the
+   warning, not the button. */
+.term-x.cage { font-size: 11.5px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px;
+  margin-right: 6px; background: var(--panel2); color: var(--muted); white-space: nowrap; }
+.term-x.cage:hover { border-color: var(--error); color: var(--text); }
+.term-x.cage.urge { border-color: var(--error); color: #f0a09a; background: rgba(229,85,78,.12); }
+
+/* The same verb on the xell card, beside ⌨ terminal: a .termbtn, dimmed, because the card is a
+   place you READ and this is the one control on it that stops something. */
+.termbtn.cagebtn { color: var(--muted); }
+.termbtn.cagebtn:hover { border-color: var(--error); color: var(--text); }
+
 /* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
    These first shipped as bare .term-chips and came straight back as "it's too difficult to see if
    the buttons are pressed or not" — correct: .term-chip carries no COLOUR (the queenzee-log chips
@@ -2258,8 +2354,11 @@ a.cbox:hover { border-color: var(--accent); }
 .tstat.t-live { color: #35c46b; } .tstat.t-connecting { color: #e0a53b; }
 .tstat.t-closed, .tstat.t-error { color: #e5554e; }
 
-/* ── message composer (long text + images → a xell's live cxell zee) ─────────── */
-.msg-back { position: absolute; inset: 0; z-index: 22; display: flex; align-items: center;
+/* ── message composer (long text + files → a xell's live cxell zee) ────────────
+   Portalled to <body>, so it is FIXED to the viewport regardless of where it opened
+   (hexagon OR the terminal's 💬 talk). z-index 60 sits above the terminal overlay
+   (50) and below toasts (80) / dialogs (90) — see the header comment in MessageComposer. */
+.msg-back { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center;
   justify-content: center; background: rgba(6,8,12,.6); backdrop-filter: blur(3px); }
 .msg-modal { width: min(560px, 92%); background: var(--panel); border: 1px solid var(--line);
   border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.6); display: flex;
@@ -2283,6 +2382,12 @@ a.cbox:hover { border-color: var(--accent); }
 .msg-thumb-x { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%;
   border: none; background: rgba(6,8,12,.75); color: #fff; cursor: pointer; font-size: 10px; line-height: 1; }
 .msg-thumb-x:hover { background: var(--down, #e5554e); }
+.msg-filechip { position: relative; display: flex; align-items: center; gap: 6px; max-width: 240px;
+  padding: 6px 26px 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel2);
+  font-size: 12px; }
+.msg-filechip .msg-file-icon { font-size: 15px; }
+.msg-filechip .msg-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-filechip .msg-thumb-x { position: absolute; top: 4px; right: 4px; }
 .msg-err { font-size: 12px; color: var(--down, #e5554e); }
 .msg-foot { display: flex; align-items: center; gap: 12px; }
 .msg-attach { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; color: var(--text);
@@ -3088,6 +3193,16 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   display: grid; place-items: center; border: 1.5px solid var(--line); z-index: 1; }
 .zav-coin img { width: 76%; height: 76%; object-fit: contain; display: block; user-select: none; }
 .zav-mono { font-size: calc(var(--zav-size, 26px) * 0.22); line-height: 1; color: var(--text); }
+/* HP bar across the middle of the provider coin: green = remaining limit, red = used.
+   Clipped by the coin's border-radius so it reads as a slice through the badge. */
+.zav-hp {
+  position: absolute; left: 0; right: 0; top: 50%; height: 18%;
+  transform: translateY(-50%); display: flex; flex-direction: row;
+  pointer-events: none; z-index: 2;
+  box-shadow: 0 0 0 0.5px rgba(0,0,0,.35);
+}
+.zav-hp-used { background: rgba(196, 68, 68, 0.92); height: 100%; flex: none; }
+.zav-hp-free { background: rgba(61, 154, 95, 0.92); height: 100%; flex: 1 1 auto; }
 /* the costume: unit-space SVG over the whole box — behind the coin (wings) and in front of it
    (the tool on the belt, the glasses on the face). pointer-events off: it is paint, not a target. */
 .zav-gear { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible;
@@ -3331,3 +3446,212 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .ob-gw-body-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .ob-gw-body { margin: 0; padding: 6px 8px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; max-height: 220px; overflow-y: auto; }
 .ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }
+
+/* ════════════════════════════════════════════════════════════════════════════════
+   MOBILE CHAT UI (/m?project=…) — web/src/MobileChat.jsx
+   A phone-first sibling of the console. Every class is prefixed .mob- so it can never
+   collide with the console's classes. It owns the FULL screen: no width cap, no centering —
+   a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with
+   100dvh as the refinement, so webviews that predate dvh still fill the viewport.
+   ════════════════════════════════════════════════════════════════════════════════ */
+/* MobileChat.jsx adds `mob-page` to <html>/<body> on mount; these rules therefore apply ONLY
+   at /m and never leak into the console. Height chain + overflow-x so a phone never renders a
+   desktop-width page scaled down (the "shrunk UI" failure), and text-size-adjust so iOS keeps
+   the authored font sizes instead of inflating them. */
+html.mob-page, html.mob-page body { height: 100%; }
+html.mob-page body { margin: 0; overflow-x: hidden; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+.mob { width: 100%; max-width: none; margin: 0; min-height: 100vh; min-height: 100dvh;
+  display: flex; flex-direction: column; overflow-x: hidden;
+  background: var(--bg); color: var(--text); }
+.mob-list { display: flex; flex-direction: column; flex: 1; padding: 0 12px calc(16px + env(safe-area-inset-bottom)); }
+
+/* header */
+.mob-top { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 14px 2px 10px; position: sticky; top: 0; z-index: 5; background: var(--bg); }
+.mob-top-l { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mob-logo { font-size: 22px; color: var(--accent); }
+.mob-top-txt { min-width: 0; }
+.mob-title { font-size: 16px; font-weight: 700; letter-spacing: .02em; }
+.mob-proj { appearance: none; -webkit-appearance: none; background: var(--panel2); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 7px; padding: 3px 20px 3px 8px; font-size: 12px;
+  max-width: 180px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='6'%3E%3Cpath d='M1 1l3 3 3-3' stroke='%238b97a8' fill='none' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 7px center; }
+.mob-proj-static { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 200px; }
+.mob-new { display: flex; align-items: center; gap: 5px; background: var(--accent); color: #fff;
+  border: none; border-radius: 10px; padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.mob-new:active { opacity: .8; }
+.mob-new-ic { font-size: 15px; line-height: 1; }
+.mob-new-lbl { font-size: 12px; }
+
+/* prompt composer */
+.mob-prompt { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px; margin: 4px 0 8px; display: flex; flex-direction: column; gap: 8px; }
+.mob-prompt-ta { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 10px; font-size: 14px; font-family: inherit; resize: vertical; }
+.mob-prompt-ta:focus { outline: none; border-color: var(--accent); }
+.mob-prompt-actions { display: flex; justify-content: flex-end; }
+.mob-btn { background: var(--accent); color: #fff; border: none; border-radius: 8px;
+  padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.mob-btn:disabled { opacity: .5; cursor: not-allowed; }
+.mob-btn.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+
+/* status / notices */
+.mob-count { color: var(--muted); font-size: 12px; padding: 2px 4px 8px; }
+.mob-notice { background: color-mix(in srgb, var(--up) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--up) 40%, var(--line)); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px; margin: 2px 0 8px; cursor: pointer; }
+.mob-err { background: color-mix(in srgb, var(--down) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--down) 40%, var(--line)); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px; margin: 2px 0 8px; cursor: pointer; word-break: break-word; }
+.mob-x { color: var(--muted); float: right; margin-left: 6px; }
+.mob-empty { color: var(--muted); text-align: center; padding: 40px 16px; font-size: 13px; }
+.mob-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
+
+/* xell boxes */
+.mob-boxes { display: flex; flex-direction: column; gap: 8px; }
+.mob-box { display: flex; flex-direction: column; gap: 4px; text-align: left; width: 100%;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 11px 12px; color: var(--text); cursor: pointer; font: inherit; }
+.mob-box:active { border-color: var(--accent); background: var(--panel2); }
+.mob-box-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mob-box-name { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.mob-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 9px;
+  font-size: 11px; font-weight: 700; line-height: 1.5; white-space: nowrap; text-transform: capitalize; }
+.mob-box-task { font-size: 13px; color: var(--muted); overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.mob-box-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-top: 2px; font-size: 11px; color: var(--muted); }
+.mob-branch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46%; }
+.mob-box-meta { white-space: nowrap; }
+
+/* detail header */
+.mob-detail { display: flex; flex-direction: column; flex: 1; width: 100%; min-height: 100vh; min-height: 100dvh; }
+.mob-dtop { display: flex; align-items: center; gap: 8px; padding: 12px 10px 8px;
+  border-bottom: 1px solid var(--line); }
+.mob-back { background: none; border: none; color: var(--text); font-size: 22px; cursor: pointer;
+  padding: 4px 8px 4px 2px; }
+.mob-dtop-mid { flex: 1; min-width: 0; }
+.mob-dname { font-weight: 700; font-size: 15px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.mob-dsub { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 12px; }
+.mob-dbranch { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-dactions { display: flex; align-items: center; gap: 6px; }
+.mob-term { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 9px; width: 38px; height: 38px; font-size: 18px; cursor: pointer; }
+.mob-term:active { border-color: var(--accent); }
+.mob-menu-btn { font-size: 20px; line-height: 1; }
+
+/* tabs */
+.mob-tabs { display: flex; gap: 4px; padding: 8px 10px 4px; }
+.mob-tab { flex: 1; background: none; border: 1px solid var(--line); color: var(--muted);
+  padding: 7px 0; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.mob-tab.on { color: var(--accent); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel2)); }
+
+/* observability (activity) */
+.mob-obs { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px 16px; overflow-y: auto; }
+.mob-turn { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  overflow: hidden; }
+.mob-turn.open { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.mob-turn-h { display: flex; align-items: flex-start; gap: 8px; width: 100%; text-align: left;
+  background: none; border: none; color: var(--text); padding: 9px 10px; cursor: pointer; font: inherit; }
+.mob-turn-ic { font-size: 15px; line-height: 1.4; }
+.mob-turn-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.mob-turn-model { font-size: 13px; font-weight: 600; }
+.mob-turn-sum { font-size: 12px; color: var(--muted);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.mob-turn-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.mob-turn-status { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 999px;
+  background: var(--panel2); border: 1px solid var(--line); white-space: nowrap; }
+.mob-turn-status.ended { color: var(--up); border-color: color-mix(in srgb, var(--up) 45%, var(--line)); }
+.mob-turn-status.errored { color: var(--down); border-color: color-mix(in srgb, var(--down) 45%, var(--line)); }
+.mob-turn-status.started { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.mob-turn-chev { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.mob-turn-body { border-top: 1px solid var(--line); padding: 8px 10px; display: flex;
+  flex-direction: column; gap: 5px; background: var(--panel); }
+.mob-ev { display: flex; gap: 8px; font-size: 12px; line-height: 1.45; }
+.mob-ev-ts { color: var(--muted); font-size: 10px; white-space: nowrap; padding-top: 2px; }
+.mob-ev-text { color: var(--text); word-break: break-word; }
+.mob-ev-tools { color: #e0a53b; word-break: break-word; }
+.mob-ev code { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 4px; font-size: 11px; color: var(--muted); word-break: break-all; }
+
+/* chat */
+.mob-chat { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.mob-msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; }
+.mob-msg { display: flex; }
+.mob-msg.mine { justify-content: flex-end; }
+.mob-msg.theirs { justify-content: flex-start; }
+.mob-msg-bubble { max-width: 82%; display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 11px; border-radius: 14px; font-size: 14px; line-height: 1.4; word-break: break-word;
+  white-space: pre-wrap; }
+.mob-msg.mine .mob-msg-bubble { background: var(--accent); color: #fff;
+  border-bottom-right-radius: 4px; }
+.mob-msg.theirs .mob-msg-bubble { background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+.mob-msg-meta { font-size: 10px; opacity: .7; }
+.mob-msg.mine .mob-msg-meta { text-align: right; }
+/* The zee's CAPTURED speech (feed-captured conversation, no tool call): a slightly-dashed
+   bubble so the operator can tell "the zee actually said this while working" from a door
+   message the zee deliberately sent. */
+.mob-msg.theirs.captured .mob-msg-bubble { border-style: dashed; border-color: var(--accent); }
+.mob-msg.captured .mob-msg-meta { opacity: .6; }
+/* The THINKING stream — kept out of the talk, shown as a dimmed italic aside. */
+.mob-msg.think { justify-content: flex-start; }
+.mob-think-bubble { max-width: 88%; display: flex; flex-direction: column; gap: 2px;
+  padding: 7px 12px; border-radius: 12px; font-size: 12px; line-height: 1.45;
+  word-break: break-word; background: transparent; color: var(--muted);
+  border: 1px solid var(--line); opacity: .75; font-style: italic; }
+.mob-msg.think .mob-msg-meta { font-style: normal; }
+
+/* composer */
+.mob-composer { border-top: 1px solid var(--line); padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  background: var(--bg); display: flex; flex-direction: column; gap: 6px; }
+.mob-composer-row { display: flex; align-items: flex-end; gap: 8px; }
+.mob-in { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 18px; padding: 9px 13px; font-size: 14px; font-family: inherit; resize: none;
+  max-height: 100px; }
+.mob-in:focus { outline: none; border-color: var(--accent); }
+.mob-send { background: var(--accent); color: #fff; border: none; border-radius: 50%;
+  width: 36px; height: 36px; font-size: 15px; cursor: pointer; flex-shrink: 0; }
+.mob-send:disabled { opacity: .45; cursor: not-allowed; }
+
+/* terminal sheet */
+.mob-sheet-back { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 40;
+  display: flex; align-items: flex-end; justify-content: center; }
+.mob-sheet { width: 100%; max-width: none; background: var(--panel); border-top: 1px solid var(--line);
+  border-radius: 16px 16px 0 0; padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; gap: 10px; }
+.mob-sheet-title { font-weight: 700; font-size: 15px; }
+.mob-sheet-body { display: flex; flex-direction: column; gap: 8px; }
+.mob-sheet-hint { color: var(--muted); font-size: 12px; margin: 0; line-height: 1.5; }
+.mob-sheet-url { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  word-break: break-all; color: var(--text); }
+.mob-sheet-actions { display: flex; gap: 8px; }
+.mob-sheet-close { background: none; border: none; color: var(--muted); font-size: 13px;
+  cursor: pointer; padding: 4px; align-self: center; }
+
+/* the ⋮ context-actions sheet */
+.mob-menu-sub { color: var(--muted); font-size: 12px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-menu-msg { font-size: 13px; padding: 8px 10px; border-radius: 8px; }
+.mob-menu-msg.ok { background: color-mix(in srgb, var(--up) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--up) 40%, var(--line)); }
+.mob-menu-msg.err { background: color-mix(in srgb, var(--down) 12%, var(--panel)); color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--down) 40%, var(--line)); word-break: break-word; }
+.mob-menu-items { display: flex; flex-direction: column; }
+.mob-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: none; border: none; border-top: 1px solid var(--line); color: var(--text);
+  padding: 13px 4px; font-size: 14px; font-weight: 600; text-align: left; cursor: pointer; width: 100%; }
+.mob-menu-item:disabled { opacity: .5; cursor: default; }
+.mob-menu-item.danger { color: var(--down); }
+.mob-menu-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-menu-busy { color: var(--muted); font-size: 13px; }
+.mob-directive-text { font-size: 14px; line-height: 1.55; color: var(--text);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow-y: auto; }

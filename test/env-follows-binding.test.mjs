@@ -201,24 +201,48 @@ try {
   ok(nod.vars.DATABASE_URL !== SHARED_PROD,
      `no owner DSN leaked to a reader (${nod.vars.DATABASE_URL ?? '(none)'})`);
 
-  // ── 4b. the §6.2 refusal survives the new precedence ────────────────────────────────────────
+  // ── 4b. the §6.2 refusal fires at ATTACH time, not just at EMIT time ─────────────────────────
   // Following the binding must never become a way to be HANDED a database. When ZEEHIVE
   // orchestrates itself the production db IS the managing instance's own meta-DB, and a full
   // (writable) bind to it is exactly what §6.2 refuses — two reconcilers on one meta-DB reap each
-  // other's xells. The refusal must still fire now that the prod container is preferred, and it
-  // must not leave a HALF-DONE binding: the re-emit is best-effort, so the coupling change stands
-  // and the file is simply not rewritten (loudly logged), rather than the attach throwing.
+  // other's xells. The OLD behaviour let the attach succeed and the EMIT fail, leaving the xell
+  // coupled to prod with no DATABASE_URL and a permanently-failing reconcile. The refusal now
+  // fires UP FRONT in attachXellDb: the bind throws, nothing is half-done, and the xell keeps its
+  // previous coupling + file.
   console.log('§6.2: preferring the prod container never smuggles in the managing meta-DB');
   const { config } = await import('../server/src/config.js');
   const g = await mkXell('guard');
   const guardBefore = projection(g.wt).text;
   await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
           [pid, config.databaseUrl]);
-  const attached = await attachXellDb(g.id, { coupling: 'db-shared-prod' });
-  ok(attached.coupling === 'db-shared-prod', 'the binding change itself still succeeds');
-  ok(/REFUSING to emit/.test(attached.env_error || ''),
-     `and the projection is REFUSED, not written [${(attached.env_error || 'no error').slice(0, 48)}]`);
+  let guardErr = null;
+  try { await attachXellDb(g.id, { coupling: 'db-shared-prod' }); }
+  catch (e) { guardErr = e.message; }
+  ok(/REFUSING to bind/.test(guardErr || ''),
+     `a writable bind to the managing meta-DB is REFUSED at attach [${(guardErr || 'no error').slice(0, 60)}]`);
+  ok(/zee seed/.test(guardErr || ''),
+     'the refusal names `zee seed` as the prod-data WRITE path (not only manager/readonly)');
   ok(projection(g.wt).text === guardBefore, 'the file on disk is untouched — never the meta-DB');
+  const guardRow = await one(`SELECT db_coupling FROM xell WHERE id=$1`, [g.id]);
+  ok(guardRow.db_coupling === 'db-isolated',
+     `and the xell keeps its previous coupling, not a half-done prod bind [${guardRow.db_coupling}]`);
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, SHARED_PROD]);
+
+  // …and the CONTAINER-named path (attachXellDb by container id) refuses the same way.
+  const g2 = await mkXell('guard2');
+  const g2Before = projection(g2.wt).text;
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, config.databaseUrl]);
+  const prodRow = await one(`SELECT id FROM container WHERE project_id=$1 AND role='db' AND tier='prod'`, [pid]);
+  let g2Err = null;
+  try { await attachXellDb(g2.id, { container: prodRow.id }); }
+  catch (e) { g2Err = e.message; }
+  ok(/REFUSING to bind/.test(g2Err || ''),
+     `naming the meta-DB container explicitly is refused too [${(g2Err || 'no error').slice(0, 60)}]`);
+  ok(/zee seed/.test(g2Err || ''),
+     'container-named refusal also names the seed path');
+  ok(projection(g2.wt).text === g2Before, 'and the second xell\'s file is untouched as well');
   await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
           [pid, SHARED_PROD]);
 

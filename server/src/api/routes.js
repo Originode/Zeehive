@@ -22,13 +22,15 @@ import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
          previewProjectDoc } from '../lib/project-docs.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
-import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
+import { backupProd, refreshStaleXellDbs, setBackupConfig, setBackupPaused, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { diffOneContainerAgainstProd, diffCandidates } from '../queenzee/proddiff.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
+import { buildReadinessForProject } from '../lib/build-readiness.js';
+import { performBuildBootstrap } from '../lib/build-bootstrap.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
@@ -49,8 +51,8 @@ import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { resolveProjectId } from '../lib/project-resolve.js';
-import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderToken,
-         deleteProviderAccount, setProviderAccountPaused } from '../lib/provider-tokens.js';
+import { listProviderTokens, providerLimits, setProviderToken, addProviderToken, deleteProviderToken,
+         deleteProviderAccount, setProviderAccountPaused, setProviderAlertAmount } from '../lib/provider-tokens.js';
 import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
          listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
          resolvedEnvView, setXellEnvironment, extractXellEnv } from '../lib/environments.js';
@@ -62,6 +64,7 @@ import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, lan
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
+import { restartXellCxell, probeXellCxell } from '../queenzee/cxell-recover.js';
 import { pauseFleet, resumeFleet, pauseProject, resumeProject,
          pauseXell, resumeXell } from '../queenzee/pause.js';
 import { pauseState, projectPauseState } from '../lib/fleet-pause.js';
@@ -79,14 +82,15 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
-         selfSay, selfReport, selfInbox,
+         selfSay, selfReport, selfInbox, selfA2ASend,
+         selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
          selfProviderEnv } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
-import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask,
+import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask, externalCaller,
          dispatchA2A, agentCardFor, directoryFor } from '../lib/a2a-read.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
@@ -427,7 +431,8 @@ router.get('/fleet/xells-stream', async (req, res) => {
 
 // Fleet burn: per-xell token + $ consumption and a project-cumulative total, summed across every
 // zee. Same 503-not-throw contract as /fleet (a read model must never take the queenzee down).
-// NB: FLEET-OWN consumption only — Anthropic's account-wide %/limits are NOT surfaced here.
+// Fleet-own zee burn + gateway by_provider + current rate-limit headers (lib/fleet.js getFleetBurn).
+// Account-wide Admin /usage still needs separate admin keys the fleet does not hold.
 router.get('/fleet/burn', async (req, res) => {
   try {
     const burn = await getFleetBurn(req.query.project || null);
@@ -633,6 +638,13 @@ router.get('/projects/:id/tokens', async (req, res) => {
   try { res.json(await listProviderTokens(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// HOW MUCH OF EACH PROVIDER ACCOUNT'S USAGE LIMIT IS STILL AVAILABLE — project-scoped,
+// account-grained, never per-xell. Same data as fleet.provider_limits; a dedicated route so
+// Project setup can refresh without re-pulling the whole fleet snapshot.
+router.get('/projects/:id/provider-limits', async (req, res) => {
+  try { res.json({ ok: true, project_id: req.params.id, providers: await providerLimits(req.params.id) }); }
+  catch (err) { res.status(503).json({ error: `provider limits unavailable: ${err.message}` }); }
+});
 router.post('/projects/:id/tokens', async (req, res) => {
   try {
     const out = await addProviderToken(req.params.id, req.body?.provider, req.body?.token, req.body?.label);
@@ -647,6 +659,16 @@ router.delete('/projects/:id/tokens/account/:accountId', async (req, res) => {
   try { res.json(await deleteProviderAccount(req.params.id, req.params.accountId)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// SET one provider's spend-alert threshold (migration 206) — a customizable USD amount per
+// provider, applied per xell by the fleet read model: when a xell's gateway-ledger spend on
+// that provider exceeds the amount, its hexagon shows an over-budget indicator. Body: { amount }
+// (number, or null/'' to clear).
+router.put('/projects/:id/provider-alerts/:provider', async (req, res) => {
+  try {
+    res.json(await setProviderAlertAmount(req.params.id, req.params.provider, req.body?.amount));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // PAUSE / RESUME a provider account (migration 104): disabling it for every dispatch surface
 // without disconnecting the token. Pausing is reversible (resume), and a paused account can
 // still be deleted. Same shape as the fleet/project/xell pause routes.
@@ -859,6 +881,28 @@ router.post('/projects/probe', (req, res) => res.json(probeRepo(req.body?.repo_r
 router.get('/projects/:id/readiness', async (req, res) => {
   try { res.json(await projectReadiness(req.params.id)); }
   catch (err) { res.status(404).json({ error: err.message }); }
+});
+// Machine × project BUILD-READINESS (ticket #173): for every machine of this project, can a
+// build actually work there? Read-only probe — same docker facts verifyRequires uses, plus the
+// meta-DB facts a placement needs. Verdict per machine: ok | unknown | missing, with the
+// failing check NAMED. Rendered in the container matrix where the pool knobs are set.
+router.get('/projects/:id/build-readiness', async (req, res) => {
+  try { res.json(await buildReadinessForProject(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Machine × project BUILD BOOTSTRAP (ticket #173 follow-on): the one-click action that turns the
+// probe's "missing" answer into created DEV prerequisites. PLAN FIRST — dry_run (the default)
+// returns the ordered plan and performs nothing, so the console can show it before a human
+// commits; dry_run:false performs each step idempotently, re-runs the probe, and records the
+// action (build_bootstrap_action). QUEENZEE-performed; the dev-only guard in
+// lib/build-bootstrap.js refuses a prod tier/container/stack.
+router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res) => {
+  try {
+    const dryRun = req.body?.dry_run !== false;
+    res.json(await performBuildBootstrap(req.params.id, req.params.machineId, {
+      dryRun, actor: req.body?.by || 'human@console',
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // The dev spawn template: what a new xell gets by default (couplings, runtime, pool size).
 router.get('/projects/:id/pool-config', async (req, res) => res.json(await getPoolConfig(req.params.id)));
@@ -1085,7 +1129,7 @@ router.post('/harness-bridge/:slug/message', async (req, res) => {
     if (!gate.allowed) return res.status(403).json({ sent: false, reason: gate.reason });
     const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     if (auth !== process.env.HARNESS_BRIDGE_TOKEN) return res.status(401).json({ sent: false, reason: 'bad bridge token' });
-    res.json(await sendMessageToXell(b.xellId, { text: req.body?.text || '', images: req.body?.images || [], by: `hermes:${req.body?.by || 'web-ui'}` }));
+    res.json(await sendMessageToXell(b.xellId, { text: req.body?.text || '', attachments: req.body?.images || [], by: `hermes:${req.body?.by || 'web-ui'}` }));
   } catch (err) { res.status(500).json({ sent: false, error: err.message }); }
 });
 // Apply the xell's pending server/sql/migrations + ops files (at ITS branch head) to ITS OWN
@@ -1517,6 +1561,27 @@ router.post('/xells/:id/pr', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── RESTART THIS XELL'S CAGE, because a human said it is wedged ──────────────────────────────────
+// The console's only cure for the failure the recovery loop cannot see: a cxell docker still calls
+// running, with a dead terminal and a silent agent inside it. GET reports what the cage is doing
+// right now (so the confirm dialog can be TRUE about whether a live turn is about to be killed);
+// POST runs the queenzee's own restart sequence — stop (only with `force`) → start → sshd → SEAL →
+// resume the session. Loop-owned work, so an API-only instance must refuse it rather than act
+// without the single-queenzee lock. Both answer 200 with a verdict, including their refusals
+// ('running', 'missing', 'unsealed', 'no-cxell'): each of those is something an operator needs to
+// read, not a 500 to guess at.
+router.get('/xells/:id/cxell', requireQueenzeeLoops, async (req, res) => {
+  try { res.json(await probeXellCxell(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.post('/xells/:id/cxell/restart', requireQueenzeeLoops, async (req, res) => {
+  try {
+    res.json(await restartXellCxell(req.params.id, {
+      by: req.body?.by || 'human@console', force: !!req.body?.force }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // Nudge the xell's live cxell zee for a STATUS UPDATE — the flower's "nudge" button. Best-effort:
 // returns { nudged:false, reason } (200) when there is no live zee to reach, so the UI can say so.
 router.post('/xells/:id/nudge', async (req, res) => {
@@ -1524,14 +1589,43 @@ router.post('/xells/:id/nudge', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// Send a COMPOSED message — long text and/or image attachments — to this xell's live cxell zee, for
-// when the raw terminal is too clumsy. Images and long/multi-line text are handed to the zee as real
+// Send a COMPOSED message — long text and/or FILE attachments — to this xell's live cxell zee, for
+// when the raw terminal is too clumsy. Files and long/multi-line text are handed to the zee as real
 // files under its .zee-inbox and a pointer is typed into the live session; short text is typed inline.
-// Body: { text, images: [{ name, type, data }], by }. Returns { sent, attachments?, reason?/error? }.
+// Body: { text, images: [{ name, type, data }], by }. `images` is a legacy name — it carries any file
+// attachment. Returns { sent, attachments?, reason?/error? }.
+//
+// The 📨 window and 💬 talk deliver into the zee's session but used to write NO durable record — the
+// console's conversation view (GET /xells/:id/messages) reads zee_message, so a sent operator
+// message vanished from the audit: the human saw "Sent" and then nothing anywhere as received. So
+// record it here the same way a router's routing request is recorded (lib/router.js): one zee_message
+// row, its id handed to sendMessageToXell so the existing delivery-correction machinery works, then
+// stamp delivered from the actual verdict. The same guard as router.js/managers.js — a correction
+// written by messageUndelivered (the resume died) is never clobbered by this later stamp.
 router.post('/xells/:id/message', async (req, res) => {
-  try { res.json(await sendMessageToXell(req.params.id, {
-    text: req.body?.text || '', images: req.body?.images || [], by: req.body?.by || 'human@console' })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try {
+    const xellId = req.params.id;
+    const by = req.body?.by || 'human@console';
+    const text = String(req.body?.text || '').trim();
+    const attachments = Array.isArray(req.body?.images) ? req.body.images : [];
+    if (!text && !attachments.length) {
+      return res.json({ sent: false, delivery: 'none', reason: 'empty message (no text or attachments)' });
+    }
+    const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
+    if (!xell) return res.status(404).json({ error: 'no such xell' });
+    const [row] = await q(
+      `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+       VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
+      [xell.project_id, by, xellId, xell.slug,
+       text || `(${attachments.length} file attachment${attachments.length === 1 ? '' : 's'})`,
+       JSON.stringify({ by, operator: true, attachments: attachments.length })]);
+    const delivery = await sendMessageToXell(xellId, { text, attachments, by, messageId: row.id });
+    await q(
+      `UPDATE zee_message SET delivered=$2, delivery=$3::jsonb
+        WHERE id=$1 AND NOT COALESCE((delivery->>'undelivered')::boolean, false)`,
+      [row.id, !!delivery.sent, JSON.stringify(delivery)]);
+    res.json(delivery);
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // Accepting happens on the XOURCE's card — the side being asked to take the code.
@@ -1818,6 +1912,37 @@ router.post('/xell/self/report', async (req, res) => {
     res.json(await selfReport(x, { message: req.body?.message, kind: req.body?.kind || 'report' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// `zee a2a <card-url> --message "…"` — send an A2A SendMessage to an EXTERNAL agent card URL,
+// queenzee-mediated and recorded (phase 4, plan §6). The sender is the calling xell, never a payload.
+router.post('/xell/self/a2a', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfA2ASend(x, { card_url: req.body?.card_url, message: req.body?.message })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// `zee meet` — peer-to-peer GROUP CHAT rooms (docs/zee-meet-plan.md). The human directive: agents
+// talk to each other in a group chat via a zee meet verb — create shows a code, another zee
+// attends with it, and they talk. Token-scoped exactly like the other self verbs; any live zee may
+// create/attend/post (DR-2), and the room's membership set is the visibility boundary.
+router.post('/xell/self/meet/create', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMeetCreate(x, { title: req.body?.title })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/meet/attend', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMeetAttend(x, { code: req.body?.code })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/meet/say', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMeetSay(x, { code: req.body?.code, message: req.body?.message })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.get('/xell/self/meet', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMeet(x, { code: req.query.code || null })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
 router.get('/xell/self/inbox', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfInbox(x, { all: req.query.all === '1' })); }
@@ -1961,6 +2086,21 @@ router.get('/turns/:id/events', async (req, res) => {
     if (!t) return res.status(404).json({ error: 'no such turn' });
     const { eventsForTurn } = await import('../lib/turn-ledger.js');
     res.json({ ok: true, turn_id: req.params.id, events: await eventsForTurn(req.params.id) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// THE ZEE'S CAPTURED CONVERSATION — the actual text the zee's model produced during its turns,
+// from the observability feed (assistant events classified at capture time by lib/turn-ledger.js
+// into conversation vs thinking). The mobile chat's Chat tab renders this, so a zee's speech
+// surfaces WITHOUT the zee calling any tool. Newest-first; `limit` caps the count (default 100).
+// Read-only, same 503-not-throw contract as the other read models.
+router.get('/xells/:id/conversation', async (req, res) => {
+  try {
+    const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    const { conversationForXell } = await import('../lib/turn-ledger.js');
+    const items = await conversationForXell(req.params.id, { limit: req.query.limit || 100 });
+    res.json({ ok: true, xell_id: req.params.id, items });
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -2828,7 +2968,7 @@ router.post('/maintenance/refresh', async (req, res) => {
 router.get('/backups', async (req, res) => {
   const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
   const cfg = await one(
-    `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables, backup_plugins FROM pool_config WHERE project_id=$1`, [proj]);
+    `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables, backup_plugins, backup_paused FROM pool_config WHERE project_id=$1`, [proj]);
   // tables = this dump's scoped selection (null = full db). toc_summary->tables = every table the
   // archive contains, so the restore picker offers exactly what can be restored out of THIS backup.
   const rows = await q(
@@ -2865,6 +3005,13 @@ router.get('/backups', async (req, res) => {
 });
 router.post('/backups/config', async (req, res) => {
   try { res.json(await setBackupConfig(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Pause/resume this project's backups — the stop-switch for a retry storm (a failed backup that
+// keeps re-doing itself). While paused, the scheduler starts no new backup and a manual
+// "Back up now" is refused; an in-flight one is not interrupted (Cancel does that).
+router.post('/backups/pause', async (req, res) => {
+  try { res.json(await setBackupPaused(req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/backups/run', async (req, res) => {
@@ -2931,13 +3078,14 @@ router.get('/stream', async (req, res) => {
 // path preserved. New URLs are minted as direct ports and never come here.
 router.use('/xell-web/:slug', webappRedirect);
 
-// ── A2A READ + WRITE SIDE (P2 + P3) — docs/a2a-protocol-plan.md §3, DR-2/DR-5 ──
+// ── A2A READ + WRITE SIDE (P2 + P3 + P4) — docs/a2a-protocol-plan.md §3, DR-2/DR-5/DR-6 ──
 // The fleet speaks A2A v1.0 at ONE place — this router, mounted at the ORIGIN ROOT in index.js
 // (NOT under /api), because the well-known card is RFC 8615 origin-root and the /a2a/v1 paths are
-// the wire contract. P2 read + P3 write are internal-only: every authenticated route resolves the
-// caller from its xell token exactly like /api/xell/self/* (resolveSelf above), and crew scoping
-// is unchanged — a worker may address its manager, a manager its crew. External zhk_ keys are
-// PHASE 4.
+// the wire contract. P2 read + P3 write authenticate the INTERNAL caller from its xell token
+// exactly like /api/xell/self/* (resolveSelf), and crew scoping is unchanged — a worker may
+// address its manager, a manager its crew. P4 (external interop) adds the EXTERNAL caller: a
+// project API key (`Bearer zhk_…`, or X-Zeehive-Api-Key for parity) with the `a2a` scope, which
+// may see and address only the agents its project owns (plan §3.4, DR-6).
 //
 // The read/write-model half (task projection, cards, SendMessage/CancelTask) lives in
 // lib/a2a-read.js; the pure shapes live in lib/a2a.js. This router is the HTTP surface only:
@@ -2948,6 +3096,42 @@ function a2aBase(req) {
   // The base a card points at is wherever the caller reached us — a card must be usable by the
   // client that asked for it, not baked to a host the caller may not be able to see.
   return `${req.protocol}://${req.get('host')}`;
+}
+
+// The A2A auth gate — TWO credentials, exactly the two that already exist (DR-6, "A2A grants no
+// new reach"). An INTERNAL caller (a zee through its verbs) presents the xell token and resolves
+// like /api/xell/self/*; an EXTERNAL caller (a deployed project's server) presents a project API
+// key with the `a2a` scope. A body naming a project is REFUSED rather than ignored — the project
+// comes from the KEY, the same construction as the ticketing API's extAuth above, and silence
+// would let a caller believe the field did something.
+async function resolveA2ACaller(req, res) {
+  const m = /^Bearer\s+(.+)$/i.exec((req.get('authorization') || '').trim());
+  const bearer = m ? m[1].trim() : '';
+  const keyHeader = (req.get('x-zeehive-api-key') || '').trim();
+  if (bearer.startsWith('zhk_') || keyHeader) {
+    const presented = bearer.startsWith('zhk_') ? bearer : keyHeader;
+    let out;
+    try {
+      out = await authenticateApiKey(presented, { scope: 'a2a', ip: req.ip || req.socket?.remoteAddress || null });
+    } catch (err) {
+      // The gate itself failed (the meta-DB is unreachable, say). That is OURS, not the caller's,
+      // and it must be a 503 rather than a 401 — an integration told "unknown key" would revoke a
+      // perfectly good credential and re-mint it.
+      res.status(503).json({ ok: false,
+        error: `the A2A API could not check your key right now: ${String(err?.message || err)}. Your key is fine — retry.` });
+      return null;
+    }
+    if (!out.ok) { res.status(out.status || 401).json({ ok: false, error: out.reason }); return null; }
+    if (req.body && (req.body.project || req.body.project_id)) {
+      res.status(400).json({ ok: false,
+        error: 'do not send a project — an A2A key acts for its OWN project, and naming one here '
+          + `would be ignored. This key acts for "${out.project.name}".` });
+      return null;
+    }
+    return externalCaller(out);
+  }
+  // Internal xell token — resolveSelf writes its own 401/409 for a missing/unknown/retired token.
+  return resolveSelf(req, res);
 }
 
 function rpcResult(res, id, result) {
@@ -2966,7 +3150,7 @@ a2aRouter.get('/.well-known/agent-card.json', async (req, res) => {
 // ── the directory — live agents the caller's credential may see, each with its card URL ──
 a2aRouter.get('/a2a/v1/agents', async (req, res) => {
   try {
-    const caller = await resolveSelf(req, res); if (!caller) return;
+    const caller = await resolveA2ACaller(req, res); if (!caller) return;
     res.json(await directoryFor(caller, a2aBase(req)));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2975,7 +3159,7 @@ a2aRouter.get('/a2a/v1/agents', async (req, res) => {
 // 404 for a slug the caller may not see or that names no live xell — never confirm existence.
 a2aRouter.get('/a2a/v1/agents/:slug/card', async (req, res) => {
   try {
-    const caller = await resolveSelf(req, res); if (!caller) return;
+    const caller = await resolveA2ACaller(req, res); if (!caller) return;
     const visible = await cardVisibleXellIds(caller);
     const agent = await one(`SELECT * FROM xell WHERE slug=$1 AND status <> 'retired'`, [req.params.slug]);
     if (!agent || !visible.has(agent.id)) { res.status(404).json({ error: `no agent card for "${req.params.slug}"` }); return; }
@@ -2990,7 +3174,7 @@ a2aRouter.get('/a2a/v1/agents/:slug/card', async (req, res) => {
 // -32009 for wrong/missing — checked BEFORE method dispatch, per DR-5 "implemented from day one").
 a2aRouter.post('/a2a/v1/agents/:slug', async (req, res) => {
   try {
-    const caller = await resolveSelf(req, res); if (!caller) return;
+    const caller = await resolveA2ACaller(req, res); if (!caller) return;
     // The :slug is the agent being ADDRESSED; the caller must be able to read its card. Task data
     // is scoped separately by the caller's own conversation visibility (taskVisibleXellIds).
     const cardVisible = await cardVisibleXellIds(caller);

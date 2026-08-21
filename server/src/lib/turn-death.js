@@ -63,6 +63,39 @@ const RULES = [
     test: /\b5(00|02|03|20|21|22|24|25|30)\b|internal server error|bad gateway|service unavailable|server error|upstream/i },
 ];
 
+// A death nobody has to READ, because the queenzee WATCHED it happen: the machine (or its docker
+// daemon) went down under a live turn and every cxell came back EXITED. There is no provider
+// sentence to classify — the turn left no message at all, and an empty message is UNKNOWN, which is
+// deliberately inert (see the note at the top), so a host restart classified the normal way would
+// resume nobody. The caller that KNOWS what happened (queenzee/cxell-recover.js, which just
+// restarted the cage itself) passes this classification in instead of a string to guess from.
+//
+// TRANSIENT is the honest kind: the session, the cage's filesystem, the branch and the database all
+// survived the reboot — only the process did — which is the same "resume it in a few minutes" shape
+// a 529 has, on the same three-attempt ladder with the same human at the end of it.
+export const HOST_RESTART_DEATH = Object.freeze({ kind: 'transient', signal: 'host-restart' });
+
+// The same death, caused ON PURPOSE by a human: the console's "restart cage" button (the route
+// behind it is queenzee/cxell-recover.js restartXellCxell). A wedged cage — sshd gone, the runtime
+// hung, a turn that has stopped speaking without dying — is the case the automatic sweep cannot see,
+// because from docker's side the container is RUNNING and nothing is wrong with it. So a human
+// stops it, the queenzee brings it back through the same start → door → seal order, and the turn
+// that was live inside it died exactly the way a reboot kills one.
+//
+// It is a SEPARATE signal from host-restart for one reason: everything downstream SAYS what happened
+// — the revive prompt the zee reads, the tend a spent ladder raises, the `revive_signal` column
+// somebody groups by later. "The zeehive machine restarted" is a lie when what happened is "a human
+// pressed restart on your cage", and it sends both the agent and the operator to the wrong logs.
+// The POLICY is deliberately identical (transient, same 5/15/45 ladder, same human at the end).
+export const CAGE_RESTART_DEATH = Object.freeze({ kind: 'transient', signal: 'cage-restart' });
+
+// What to CALL a transient death in the one sentence a human reads. Provider errors are the default
+// because they are almost all of them; the two the queenzee causes itself name themselves.
+const TRANSIENT_CAUSE = {
+  [HOST_RESTART_DEATH.signal]: 'the zeehive machine restarted under this turn',
+  [CAGE_RESTART_DEATH.signal]: 'a human restarted this zee\'s cxell under this turn',
+};
+
 // Classify the sentence a dead turn left behind (zee.last_stop_reason, a CLI's final result text, a
 // docker exec's stderr). Never throws; an empty message is UNKNOWN, not an error.
 // → { kind: 'transient' | 'terminal' | 'unknown', signal, message }
@@ -88,9 +121,15 @@ export function classifyTurnDeath(text) {
 //      provider any more, and the fourth retry is the one that would hide it.
 //
 // `attempts` is how many revives this zee has ALREADY been given (zee.revive_attempts).
+// `signal` is only used to SAY THE RIGHT THING: every transient death used to be a provider error,
+// and since HOST_RESTART_DEATH and CAGE_RESTART_DEATH ride the same ladder
+// (queenzee/cxell-recover.js) that sentence would be a lie in the one place a human reads to find
+// out what happened. The POLICY does not branch on it — a rebooted machine, a cage a human bounced
+// and a 529 are all "wait and resume", which is why they share a ladder — only the wording does.
 // → { action: 'revive' | 'tend' | 'none', delayMinutes, reason }
 export function decideRevive({ kind = 'unknown', attempts = 0, decommissioned = false,
-                              xellStatus = null, resumable = true } = {}) {
+                              xellStatus = null, resumable = true, signal = null } = {}) {
+  const cause = TRANSIENT_CAUSE[signal] || 'a transient provider error';
   if (decommissioned) return { action: 'none', delayMinutes: null, reason: 'the zee has been decommissioned — there is no session to revive' };
   if (xellStatus === 'retired' || xellStatus === 'tearing-down') {
     return { action: 'none', delayMinutes: null, reason: `the xell is ${xellStatus} — its cxell is gone` };
@@ -105,14 +144,14 @@ export function decideRevive({ kind = 'unknown', attempts = 0, decommissioned = 
   }
   if (!resumable) {
     return { action: 'none', delayMinutes: null,
-             reason: 'a transient provider error, but this turn died before it had a session to resume (the cage was never built or was removed)' };
+             reason: `${cause}, but this turn died before it had a session to resume (the cage was never built or was removed)` };
   }
   if (attempts >= MAX_REVIVE_ATTEMPTS) {
     return { action: 'tend', delayMinutes: null,
-             reason: `the queenzee has already revived this zee ${attempts} time(s) and it keeps dying on the provider — a human is raised instead of a fourth retry` };
+             reason: `the queenzee has already revived this zee ${attempts} time(s) and the turn keeps dying — a human is raised instead of a fourth retry` };
   }
   return { action: 'revive', delayMinutes: REVIVE_BACKOFF_MIN[attempts],
-           reason: `a transient provider error — revive attempt ${attempts + 1} of ${MAX_REVIVE_ATTEMPTS}, in ${REVIVE_BACKOFF_MIN[attempts]} minute(s)` };
+           reason: `${cause} — revive attempt ${attempts + 1} of ${MAX_REVIVE_ATTEMPTS}, in ${REVIVE_BACKOFF_MIN[attempts]} minute(s)` };
 }
 
 // DID THIS RESUMED TURN DIE THE SAME WAY A SPAWNED ONE DOES?

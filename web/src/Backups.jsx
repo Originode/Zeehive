@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { getBackups, setBackupConfig, runBackup, revealBackup, restoreBackup, deleteBackup, cancelBackup, subscribe } from './api.js';
+import { getBackups, setBackupConfig, setBackupPaused, runBackup, revealBackup, restoreBackup, deleteBackup, cancelBackup, subscribe } from './api.js';
 import { showConfirm, showPrompt, showAlert } from './Dialog.jsx';
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -154,6 +154,7 @@ export function rowsTitle(b) {
 export function nextAttemptLine(backup) {
   const n = backup?.next;
   if (!n || backup?.running) return null;
+  if (n.kind === 'paused') return 'paused — no backups will start';
   if (n.kind === 'running') return null;
   if (n.kind === 'retry') {
     return n.due ? 'retrying now' : `retry in ${Math.max(1, Math.ceil((n.waitSec || 0) / 60))} min`;
@@ -168,9 +169,23 @@ export default function BackupsPanel({ backup, projectId }) {
   const [showCfg, setShowCfg] = useState(false);
   const last = backup?.last;
   const running = !!backup?.running;   // a backup job is in flight
+  const paused = !!backup?.config?.backup_paused;   // a human stopped NEW backups (the retry-storm stop-switch)
   const fresh = backupFreshness(backup);
   const stale = !running && (fresh.state === 'overdue' || fresh.failedSince);
   const nextAttempt = nextAttemptLine(backup);
+
+  // Pause/resume. No confirm: it is one reversible flag, and the person hitting it is usually
+  // watching a failing backup re-run itself every ten minutes — the fastest thing they can reach
+  // wins. While paused the scheduler starts no new backup and "Back up now" is refused.
+  // The project id is EXPLICIT here: the server defaults a missing project to the FIRST project
+  // in the DB (usually Zeehive itself), so omitting it would pause the wrong project's backups.
+  const [togglingPause, setTogglingPause] = useState(false);
+  const togglePause = async () => {
+    setTogglingPause(true);
+    try { await setBackupPaused(!paused, projectId); }
+    catch (e) { showAlert(e.message || 'Pause failed', { variant: 'error' }); }
+    setTogglingPause(false);
+  };
 
   // Cancel the in-flight backup right from the panel — the same verb as the modal's running-row
   // Cancel. The confirm is the same wording, because the outcome is the same: the dump is killed,
@@ -222,15 +237,27 @@ export default function BackupsPanel({ backup, projectId }) {
           ⚠ last attempt failed
         </span>
       )}
+      {paused && !running && (
+        <span className="bkpaused" data-testid="backup-paused"
+              title={'A human paused backups — no new backup will start (scheduled or manual) until it is resumed. '
+                + 'Existing backups are untouched; an in-flight one finishes. Fix the destination, then resume with ▶.'}>
+          ⏸ backups paused
+        </span>
+      )}
       {/* …and what the queenzee will DO about it. A failed attempt schedules a RETRY (10 min, doubling,
           capped at the policy interval) instead of waiting out the whole window — so the mark above is
-          never the end of the sentence. #26. */}
+          never the end of the sentence. #26. When a human has PAUSED backups, that sentence is "nothing
+          will start" until they flip the toggle back. */}
       {nextAttempt && (
-        <span className="bknext" data-testid="backup-next"
+        <span className={`bknext ${paused ? 'bk-paused-note' : ''}`} data-testid="backup-next"
               title={backup?.next?.reason
-                ? `${backup.next.reason}.\n\nA failed attempt shortens the next window instead of consuming it: `
-                  + 'the retry interval starts at 10 minutes and doubles per consecutive failure, capped at '
-                  + 'the policy interval — so it is always sooner than the schedule alone, and never a storm.'
+                ? paused
+                  ? `${backup.next.reason}\n\nWhile paused, no scheduled or manual backup will start, so a `
+                    + 'broken destination stops triggering the same failing dump over and over. Existing '
+                    + 'backups are untouched; fix the destination, then resume with the ▶ button.'
+                  : `${backup.next.reason}.\n\nA failed attempt shortens the next window instead of consuming it: `
+                    + 'the retry interval starts at 10 minutes and doubles per consecutive failure, capped at '
+                    + 'the policy interval — so it is always sooner than the schedule alone, and never a storm.'
                 : 'when the next attempt is due'}>
           {nextAttempt}
         </span>
@@ -250,6 +277,15 @@ export default function BackupsPanel({ backup, projectId }) {
         </>
       )}
       {backup?.count > 0 && <span className="bkcount">{backup.count} stored</span>}
+      {/* Pause/resume — the stop-switch for a retry storm. While paused the scheduler starts no new
+          backup and "Back up now" is refused; an in-flight one finishes (Cancel is the stop). */}
+      <button className={`bkpausebtn ${paused ? 'paused' : ''}`} onClick={togglePause} disabled={togglingPause}
+              title={paused
+                ? 'Backups are PAUSED — resume so the schedule can run again'
+                : 'Pause backups — stops the schedule AND "Back up now" until resumed (e.g. a broken backup destination that keeps retrying)'}
+              aria-label={paused ? 'Resume backups' : 'Pause backups'} data-testid="backup-pause-toggle">
+        {paused ? '▶' : '⏸'}
+      </button>
       <button className="bkcog" onClick={() => setShowCfg(true)}
               title="Backup settings" aria-label="Backup settings" data-testid="backup-cog">⚙</button>
 

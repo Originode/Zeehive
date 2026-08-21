@@ -29,7 +29,17 @@ export async function createTask({ prompt, mode, source, req_db_coupling, req_so
       `UPDATE task SET status='assigned', xell_id=$2, zee_id=$3, assigned_at=now() WHERE id=$1 RETURNING *`,
       [task.id, spawned.xell_id, spawned.zee_id]);
     broadcast('task', linked);
-    return { task: linked, spawned };
+    // ANY NEW PROMPT IS A WORK_NODE — same rule as dispatchXell (lib/prompt-work-node.js): the
+    // spawned worker gets a card (and therefore a work_node) with the xell assigned, unless the
+    // xell already carries an open one. Non-fatal: the zee is already running.
+    let workItem = null;
+    try {
+      const { ensurePromptWorkItem } = await import('../lib/prompt-work-node.js');
+      workItem = await ensurePromptWorkItem({ projectId, xellId: spawned.xell_id, prompt });
+    } catch (e) {
+      logline('intake', `no work_node could be cut for this task (spawn unaffected): ${e.message}`);
+    }
+    return { task: linked, spawned, ...(workItem ? { work_item: workItem } : {}) };
   }
   return task;
 }

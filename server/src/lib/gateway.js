@@ -155,6 +155,119 @@ export function modelFromStream(text = '') {
   return m ? m[1] : null;
 }
 
+// Classify a response body into the CONVERSATION text vs the THINKING stream — the observability
+// gateway is the one place every model's output crosses, so this is where "which thinking stream,
+// which actual conversation text" is answered PER ROW. The result is stored on the ledger row in
+// meta.speech (the gateway's completeRequest) and the mobile chat renders the conversation WITHOUT
+// the zee needing to call a tool. `kind` is the same dialect the usage parser uses:
+//   'messages'          — Anthropic dialect (text/thinking/redacted_thinking content blocks, SSE
+//                         content_block_delta events) PLUS the xAI Responses API (grok routes
+//                         through /responses; output_text.delta / reasoning_summary.delta) which
+//                         is dispatched as kind 'messages'.
+//   'chat-completions'  — OpenAI dialect (choices[].delta.content / choices[].message.content,
+//                         deepseek-reasoner's delta.reasoning_content thinking stream).
+// Pure so the classification is testable without an upstream (test/gateway.test.mjs).
+export function classifyResponseText(text = '', kind = 'messages') {
+  const out = { conversation: [], thinking: [] };
+  if (!text) return out;
+
+  const push = (arr, v) => {
+    if (v == null) return;
+    const s = typeof v === 'string' ? v : (v?.text ?? v?.content ?? '');
+    if (String(s).trim()) arr.push(String(s));
+  };
+  const eachBlock = (blocks, fn) => {
+    if (Array.isArray(blocks)) blocks.forEach(fn);
+  };
+
+  // Anthropic SSE delivers a thinking block's FULL text TWICE: content_block_start carries it AND
+  // the thinking_delta repeats it (unlike text, whose deltas are incremental). Track the indexes
+  // whose start block already emitted the whole stream so the delta does not duplicate it.
+  const thinkingEmitted = new Set();
+
+  const parseData = (j) => {
+    if (!j || typeof j !== 'object') return;
+    // OpenAI dialect: choices[] with delta/message content (a string or an array of text parts)
+    // and deepseek-reasoner's reasoning_content thinking stream.
+    if (Array.isArray(j.choices)) {
+      for (const c of j.choices) {
+        const m = c?.message || c?.delta || {};
+        push(out.conversation, m.content);
+        push(out.thinking, m.reasoning_content);
+        eachBlock(m.content, (b) => {
+          if (b && typeof b === 'object' && (b.type === 'text' || b.type === 'output_text')) push(out.conversation, b.text);
+        });
+      }
+      return;
+    }
+    // xAI Responses API SSE: output_text deltas (conversation) and reasoning_summary (thinking).
+    if (j.type === 'response.output_text.delta') push(out.conversation, j.delta);
+    if (j.type === 'response.output_text.done') push(out.conversation, j.text);
+    if (j.type === 'response.reasoning_summary.delta') push(out.thinking, j.delta);
+    if (j.type === 'response.reasoning_summary.done') push(out.thinking, j.text);
+    // Anthropic non-streaming message content + xAI non-streaming output[].
+    if (Array.isArray(j.content)) {
+      eachBlock(j.content, (b) => {
+        if (!b || typeof b !== 'object') return;
+        if (b.type === 'text' || b.type === 'output_text' || b.type === 'input_text') push(out.conversation, b.text);
+        if (b.type === 'thinking') push(out.thinking, b.thinking ?? b.data ?? b.text);
+        if (b.type === 'redacted_thinking') push(out.thinking, b.data ?? b.thinking ?? b.text);
+        if (b.type === 'reasoning') push(out.thinking, b.summary ?? b.text ?? b.data);
+      });
+    }
+    if (Array.isArray(j.output)) {
+      eachBlock(j.output, (item) => {
+        if (!item || typeof item !== 'object') return;
+        if (item.type === 'message') {
+          eachBlock(item.content, (b) => {
+            if (!b || typeof b !== 'object') return;
+            if (b.type === 'output_text' || b.type === 'input_text') push(out.conversation, b.text);
+            if (b.type === 'reasoning') push(out.thinking, b.summary ?? b.text ?? b.data);
+          });
+        }
+        if (item.type === 'reasoning') push(out.thinking, item.summary ?? item.text ?? item.data);
+      });
+    }
+    // Anthropic SSE streaming: content_block_start carries the full first block; content_block_delta
+    // carries text_delta / thinking_delta / redacted_thinking_delta. Thinking is emitted ONCE: the
+    // start block has the whole stream and the delta repeats it, so the index set skips the repeat.
+    if (j.type === 'content_block_start') {
+      const b = j.content_block || {};
+      if (b.type === 'text') push(out.conversation, b.text);
+      if (b.type === 'thinking' && String(b.thinking ?? b.text ?? '').trim()) {
+        push(out.thinking, b.thinking ?? b.text);
+        thinkingEmitted.add(j.index);
+      }
+      if (b.type === 'redacted_thinking' && String(b.data ?? b.text ?? '').trim()) {
+        push(out.thinking, b.data ?? b.text);
+        thinkingEmitted.add(j.index);
+      }
+    }
+    if (j.type === 'content_block_delta') {
+      const d = j.delta || {};
+      if (d.type === 'text_delta') push(out.conversation, d.text);
+      if (d.type === 'thinking_delta' && !thinkingEmitted.has(j.index)) {
+        push(out.thinking, d.thinking ?? d.text);
+        thinkingEmitted.add(j.index);
+      }
+      if (d.type === 'redacted_thinking_delta' && !thinkingEmitted.has(j.index)) {
+        push(out.thinking, d.data ?? d.text);
+        thinkingEmitted.add(j.index);
+      }
+    }
+    // A bare JSON body with a string content (rare, non-SSE, no choices wrapper).
+    if (typeof j.content === 'string') push(out.conversation, j.content);
+  };
+
+  for (const m of text.matchAll(/data: (\{.*\})/g)) {
+    try { parseData(JSON.parse(m[1])); } catch { /* partial event at a chunk boundary */ }
+  }
+  if (!text.includes('data: {')) {
+    try { parseData(JSON.parse(text)); } catch { /* not JSON (or a partial chunk) */ }
+  }
+  return out;
+}
+
 // Look up a model's $/1M token prices from ai_model_spec (migration 163). The ledger records the
 // WIRE id the CLI sent (claude-opus-5); the spec row is keyed by the SHORT alias (opus) and lists
 // its known wire ids in wire_ids (migration 164 — GROUND TRUTH, an explicit per-id alias, never a
@@ -195,6 +308,246 @@ export function costOf({ upstreamCost = null, price = null, usage = null } = {})
   const cacheRead = (Number(usage.cacheRead) || 0) * (price.cacheReadPerMtok ?? 0);
   const cacheWrite = (Number(usage.cacheWrite) || 0) * (price.cacheWritePerMtok ?? 0);
   return (input + output + cacheRead + cacheWrite) / 1e6 || 0;
+}
+
+// RATE / USAGE-LIMIT HEADERS — how much of THIS provider ACCOUNT's limit is still available.
+//
+// Two header families ride ordinary API responses (no Admin key needed):
+//
+//   1. Claude Code / OAuth SEAT windows (the answer a human on Pro/Max actually wants):
+//        anthropic-ratelimit-unified-5h-utilization   0.0–1.0 used fraction of the 5-hour window
+//        anthropic-ratelimit-unified-7d-utilization   same for the weekly cap
+//        anthropic-ratelimit-unified-*-status         allowed | exceeded | rate_limited
+//        anthropic-ratelimit-unified-*-reset          unix epoch when that window resets
+//        anthropic-ratelimit-unified-status           overall
+//        anthropic-ratelimit-unified-representative-claim  five_hour | seven_day | …
+//      Measured on live Claude Code traffic (claude-meter / Anthropic client source): the client
+//      already reads these for its /usage bar; the gateway was throwing them away.
+//
+//   2. API RPM/TPM (pay-as-you-go + every vendor that publishes them):
+//        anthropic-ratelimit-{tokens,requests}-{limit,remaining,reset}
+//        x-ratelimit-{limit,remaining}-{tokens,requests}  (OpenAI-compatible)
+//
+// The number a human wants is AVAILABLE, not used: available_pct = 100 − used%. Pure so the
+// extraction is unit-testable without a proxy. Returns null when no limit header is present.
+export function extractRateLimit(headers = {}) {
+  if (!headers || typeof headers !== 'object') return null;
+  const h = {};
+  for (const [k, v] of Object.entries(headers)) {
+    // node http lowercases; express/undici may not. Array values take the first entry.
+    h[String(k).toLowerCase()] = Array.isArray(v) ? v[0] : v;
+  }
+  const num = (k) => {
+    const v = h[k];
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const str = (k) => {
+    const v = h[k];
+    return v == null || v === '' ? null : String(v);
+  };
+  // available% from remaining/limit (API TPM/RPM). Null when either side is missing.
+  const availFromRemLim = (rem, lim) => {
+    if (rem == null || lim == null || !(lim > 0)) return null;
+    return Math.round((rem / lim) * 1000) / 10;
+  };
+  // available% from a 0.0–1.0 utilization fraction (unified seat windows).
+  const availFromUtil = (u) => {
+    if (u == null || !Number.isFinite(u)) return null;
+    return Math.round((1 - Math.min(1, Math.max(0, u))) * 1000) / 10;
+  };
+  // unix epoch seconds (or ms) → ISO; leave non-numeric strings alone.
+  const resetAt = (raw) => {
+    if (raw == null || raw === '') return null;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 1e9) {
+      // seconds if < 1e12, else already ms
+      const ms = n < 1e12 ? n * 1000 : n;
+      try { return new Date(ms).toISOString(); } catch { return String(raw); }
+    }
+    return String(raw);
+  };
+
+  // ── Claude Code / OAuth unified windows ──────────────────────────────────────────────────
+  const windows = {};
+  for (const win of ['5h', '7d', '7d_sonnet', '7d_opus']) {
+    const util = num(`anthropic-ratelimit-unified-${win}-utilization`);
+    const status = str(`anthropic-ratelimit-unified-${win}-status`);
+    const reset = resetAt(str(`anthropic-ratelimit-unified-${win}-reset`));
+    if (util == null && !status) continue;
+    windows[win] = {
+      status: status || null,
+      utilization: util,
+      available_pct: availFromUtil(util),
+      reset_at: reset,
+    };
+  }
+  const unifiedStatus = str('anthropic-ratelimit-unified-status');
+  // representative_claim: five_hour | seven_day | seven_day_sonnet | … — normalize to window key
+  const claimRaw = str('anthropic-ratelimit-unified-representative-claim');
+  const claimToWin = {
+    five_hour: '5h', fivehour: '5h', '5h': '5h',
+    seven_day: '7d', sevenday: '7d', '7d': '7d',
+    seven_day_sonnet: '7d_sonnet', seven_day_opus: '7d_opus',
+  };
+  const representative = claimRaw
+    ? (claimToWin[claimRaw.toLowerCase().replace(/-/g, '_')] || claimRaw)
+    : null;
+
+  // ── API TPM / RPM ────────────────────────────────────────────────────────────────────────
+  const tokens_remaining = num('anthropic-ratelimit-tokens-remaining')
+    ?? num('x-ratelimit-remaining-tokens');
+  const tokens_limit = num('anthropic-ratelimit-tokens-limit')
+    ?? num('x-ratelimit-limit-tokens');
+  const requests_remaining = num('anthropic-ratelimit-requests-remaining')
+    ?? num('x-ratelimit-remaining-requests');
+  const requests_limit = num('anthropic-ratelimit-requests-limit')
+    ?? num('x-ratelimit-limit-requests');
+  const tokens_reset = str('anthropic-ratelimit-tokens-reset')
+    || str('x-ratelimit-reset-tokens');
+  const requests_reset = str('anthropic-ratelimit-requests-reset')
+    || str('x-ratelimit-reset-requests');
+
+  const hasUnified = Object.keys(windows).length > 0 || !!unifiedStatus;
+  const hasApi = tokens_remaining != null || tokens_limit != null
+    || requests_remaining != null || requests_limit != null;
+  if (!hasUnified && !hasApi) return null;
+
+  // PRIMARY available_pct: the binding unified window first (what a seat user hits), else TPM, else RPM.
+  let available_pct = null;
+  if (representative && windows[representative]?.available_pct != null) {
+    available_pct = windows[representative].available_pct;
+  } else if (windows['5h']?.available_pct != null) {
+    available_pct = windows['5h'].available_pct;
+  } else if (windows['7d']?.available_pct != null) {
+    available_pct = windows['7d'].available_pct;
+  } else {
+    available_pct = availFromRemLim(tokens_remaining, tokens_limit)
+      ?? availFromRemLim(requests_remaining, requests_limit);
+  }
+
+  // Keep the legacy used% fields so older readers of meta.rate_limit still work; the primary
+  // field for the console is available_pct.
+  const usedFromAvail = (a) => (a == null ? null : Math.round((100 - a) * 10) / 10);
+
+  return {
+    source: 'headers',
+    status: unifiedStatus || null,
+    representative,
+    available_pct,
+    windows: hasUnified ? windows : undefined,
+    tokens: hasApi ? {
+      remaining: tokens_remaining, limit: tokens_limit, reset: tokens_reset,
+      available_pct: availFromRemLim(tokens_remaining, tokens_limit),
+    } : undefined,
+    requests: hasApi ? {
+      remaining: requests_remaining, limit: requests_limit, reset: requests_reset,
+      available_pct: availFromRemLim(requests_remaining, requests_limit),
+    } : undefined,
+    // legacy (used% for meta.rate_limit consumers written before available_pct)
+    tokens_remaining, tokens_limit, tokens_reset,
+    tokens_used_pct: usedFromAvail(availFromRemLim(tokens_remaining, tokens_limit)),
+    requests_remaining, requests_limit, requests_reset,
+    requests_used_pct: usedFromAvail(availFromRemLim(requests_remaining, requests_limit)),
+  };
+}
+
+// DEEPSEEK BALANCE — the ONE quota signal DeepSeek offers.
+//
+// DeepSeek's API returns NO rate-limit response headers at all (verified live on 2026-08-13 with a
+// real key: a 200 from api.deepseek.com/anthropic/v1/messages carries only content-type/date/etc).
+// So extractRateLimit() above returns null for every deepseek call and provider_token.usage_limit
+// was never written — the console showed "limit: —" for deepseek while claude had its 5h/7d
+// windows. What DeepSeek DOES offer is its account balance endpoint:
+//
+//   GET https://api.deepseek.com/user/balance   (Authorization: Bearer <key>)
+//   → { "is_available": true,
+//       "balance_infos": [ { "currency": "USD", "total_balance": "56.40",
+//                            "granted_balance": "0.00", "topped_up_balance": "56.40" } ] }
+//
+// A dollar balance is not a "percent of a window remaining", so this snapshot deliberately does NOT
+// invent an available_pct. It carries the balance FACTS (source 'balance', currency, total,
+// granted, topped-up, is_available) and the console renders "— $56.40 balance" for deepseek
+// instead of a "% free" chip. The one number a human actually cares about ("is there money left?")
+// is is_available, plus the total. Pure so it is unit-testable without a network.
+export function extractDeepseekBalance(body = null) {
+  if (!body || typeof body !== 'object') return null;
+  if (typeof body.is_available !== 'boolean') return null;
+  const infos = Array.isArray(body.balance_infos) ? body.balance_infos : [];
+  const rows = infos
+    .map((b) => ({
+      currency: b?.currency || null,
+      total_balance: b?.total_balance != null ? String(b.total_balance) : null,
+      granted_balance: b?.granted_balance != null ? String(b.granted_balance) : null,
+      topped_up_balance: b?.topped_up_balance != null ? String(b.topped_up_balance) : null,
+    }))
+    .filter((b) => b.total_balance != null);
+  if (!rows.length) return null;
+  return {
+    source: 'balance',
+    is_available: body.is_available,
+    available_pct: null,          // a dollar balance is not a % of a window — no invented number
+    representative: 'balance',
+    balance: rows,
+    // legacy no-op fields so consumers that expect the header shape keep working
+    status: body.is_available ? 'allowed' : null,
+  };
+}
+
+// Persist a rate/usage-limit snapshot onto the provider_token ACCOUNT that authenticated the
+// call. MERGES with the previous snapshot so provider-wide updates AND by_model entries accumulate
+// (an opus call must not wipe the sonnet / gpt-5.6 row). Best-effort, never throws.
+export async function recordAccountUsageLimit(accountId, rateLimit, { model = null, provider = null } = {}) {
+  if (!accountId || !rateLimit) return;
+  try {
+    const { mergeUsageLimit } = await import('./usage-limits.js');
+    const prev = await one(`SELECT usage_limit FROM provider_token WHERE id = $1`, [accountId]);
+    const merged = mergeUsageLimit(prev?.usage_limit, rateLimit, { model, provider });
+    await q(
+      `UPDATE provider_token
+          SET usage_limit = $2::jsonb, usage_limit_at = now()
+        WHERE id = $1`,
+      [accountId, JSON.stringify(merged)]);
+  } catch (e) {
+    // Column absent (migration 203 not applied yet) or row gone — log once-ish, never throw.
+    logline('gateway', `could not store usage_limit on account ${String(accountId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
+  }
+}
+
+// ── the DeepSeek balance probe ─────────────────────────────────────────────────────────────────
+// Fired best-effort from the gateway on each completed deepseek call. DeepSeek sends no
+// rate-limit headers, so the ONLY quota signal is the /user/balance endpoint; the probe fills
+// the gap (the "deepseek shows no limit" report). Bounded (hard timeout), silent on failure
+// (observability must never sink or slow an AI response), and it never touches the response
+// stream — it runs in the background after the response is handed through.
+const BALANCE_TIMEOUT_MS = 5000;
+
+export async function probeDeepseekBalance({ accountId = null, upstreamUrl = null, token = null } = {}) {
+  if (!accountId || !token) return null;
+  try {
+    // The balance endpoint lives at the API ROOT (https://api.deepseek.com/user/balance), NOT under
+    // the /anthropic path the messages endpoint rides (that path 404s — verified live). So derive
+    // the origin from the upstream URL and hit /user/balance there.
+    let origin = 'https://api.deepseek.com';
+    try { origin = new URL(String(upstreamUrl || providerUpstreamUrl('deepseek'))).origin; } catch { /* default */ }
+    const url = `${origin}/user/balance`;
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), BALANCE_TIMEOUT_MS);
+    let out = null;
+    try {
+      const res = await fetch(url, {
+        headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        signal: ctl.signal,
+      });
+      if (res.ok) {
+        const snap = extractDeepseekBalance(await res.json().catch(() => null));
+        if (snap) { await recordAccountUsageLimit(accountId, snap); out = snap; }
+      }
+    } catch { /* timeout / network — no snapshot, never an error */ }
+    finally { clearTimeout(t); }
+    return out;
+  } catch { return null; }
 }
 
 // ── the recorder ──────────────────────────────────────────────────────────────────────────────
@@ -302,9 +655,13 @@ export function gatewayHello(_req, res) {
   return res.status(200).json({ ok: true, service: 'zeehive-llm-gateway' });
 }
 
-// Resolve the upstream for a request: which provider URL + credential. `path` is the gateway
-// path (/v1/messages or /v1/chat/completions). Returns { provider, upstreamUrl, token, kind }
-// or null when the caller is not a known xell / the project has no account for the provider.
+// Resolve the upstream for a request: which provider URL + credential. Returns
+// { provider, upstreamUrl, token, kind, accountId, accountLabel } or null when the caller is
+// not a known xell / the project has no account for the provider.
+//
+// Account selection: prefer the account this xell was GRANTED at spawn (xell_provider_grant) so
+// the usage-limit snapshot lands on the same row the cage is actually holding — the freshest
+// project account can differ after a rotation. Fall back to tokenForSpawn's freshest ACTIVE.
 async function resolveUpstream(xell, kind, providerKey) {
   // The provider comes from the PATH (/x/<token>/<provider>/...) — the gateway's own URL, so it is
   // authoritative. claude + deepseek speak the Anthropic dialect (/v1/messages); openai + kimi the
@@ -313,14 +670,24 @@ async function resolveUpstream(xell, kind, providerKey) {
   // with no dispatch runtime is refused.
   const p = PROVIDERS[providerKey];
   if (!p || !p.dispatch) return null;
-  const acct = await tokenForSpawn(xell.project_id, p.key).catch(() => null);
+  let tokenId = null;
+  try {
+    const grant = await one(
+      `SELECT provider_token_id FROM xell_provider_grant
+        WHERE xell_id = $1 AND provider = $2`, [xell.id, p.key]);
+    tokenId = grant?.provider_token_id || null;
+  } catch { /* grant table missing in ancient DBs — fall through */ }
+  const acct = await tokenForSpawn(xell.project_id, p.key, { tokenId }).catch(() => null);
   if (!acct) {
     logline('gateway', `xell ${xell.slug}: no ${p.label} account — refusing to forward`);
     return null;
   }
   // The upstream URL per provider (the same base the adapter would have used directly).
   const upstreamUrl = providerUpstreamUrl(p.key);
-  return { provider: p.key, upstreamUrl, token: acct.token, kind };
+  return {
+    provider: p.key, upstreamUrl, token: acct.token, kind,
+    accountId: acct.id || null, accountLabel: acct.label || null,
+  };
 }
 
 // The provider's real API base, by provider key — the value the cxell adapters inject today.
@@ -541,6 +908,47 @@ export async function gatewayProxy(req, res) {
         logUnpriced(upstream.provider, m);
         metaPatch = { unpriced: { provider: upstream.provider, model: m } };
       }
+      // HOW MUCH OF THIS ACCOUNT'S LIMIT IS STILL AVAILABLE — the upstream's own headers.
+      // Stored on the ledger row (meta.rate_limit) AND on the provider_token account
+      // (usage_limit — migration 203) so the console can answer per PROVIDER, not per xell.
+      const rateLimit = extractRateLimit(proxyRes.headers);
+      if (rateLimit) {
+        metaPatch = {
+          ...(metaPatch || {}),
+          rate_limit: rateLimit,
+          provider_token_id: upstream.accountId || null,
+        };
+        // Persist onto the account (provider-wide + by_model merge) for prompt pickers + badge HP.
+        if (upstream.accountId) {
+          recordAccountUsageLimit(upstream.accountId, rateLimit, {
+            model: m || model || null,
+            provider: upstream.provider,
+          });
+        }
+      }
+      // DEEPSEEK: no rate-limit headers exist, so a response header snapshot is never captured
+      // (verified live — api.deepseek.com returns none). The only quota signal is the account
+      // balance endpoint; probe it in the BACKGROUND (bounded, never blocks the stream) so the
+      // deepseek account gets a usage_limit snapshot like claude does.
+      if (upstream.provider === 'deepseek' && upstream.accountId) {
+        void probeDeepseekBalance({
+          accountId: upstream.accountId,
+          upstreamUrl: upstream.upstreamUrl,
+          token: upstream.token,
+        });
+      }
+      // THE CONVERSATION vs THE THINKING STREAM — the gateway is the one place every model's
+      // output crosses, so each row captures what the model SAID (meta.speech.conversation) and
+      // what it THOUGHT (meta.speech.thinking), classified from the reassembled response body.
+      // The mobile chat's Chat tab reads this, so a zee's speech surfaces WITHOUT the zee making
+      // any tool call. Only when capture is on (the per-project body-capture switch) — same gate
+      // as persistBodies below, so no row is held to a higher cost than the project chose.
+      if (captureOn && respText) {
+        const speech = classifyResponseText(respText, upstream.kind);
+        if (speech.conversation.length || speech.thinking.length) {
+          metaPatch = { ...(metaPatch || {}), speech };
+        }
+      }
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
         cost: costOf({ upstreamCost, price, usage: u }),
@@ -617,6 +1025,9 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
+                 classifyResponseText,
+                 extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
+                 probeDeepseekBalance,
                  providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
                  completeRequest, gatewayEnv, zeeTurnForXell };
 
@@ -660,6 +1071,13 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 // account. The grok CLI (Grok Build) reads GROK_XAI_API_BASE_URL for its endpoint — EMPIRICALLY
 // verified on grok 0.2.118 (XAI_API_BASE_URL is ignored; GROK_XAI_API_BASE_URL redirects to a mock;
 // the CLI then speaks /responses, not /v1/messages).
+//
+// KNOWN GAP, stated rather than hidden: that redirect was measured on the API-KEY path
+// (api.x.ai/v1/responses). A cage authenticated with a SuperGrok / Business SEAT session — the
+// device-auth credential, see lib/cxell-runtimes.js grokSessionCredential — talks to the vendor's
+// own cli-chat-proxy.grok.com instead, so its turns are NOT observed to pass through this gateway
+// and may not be metered here. The seat is billed by the weekly pool rather than per call, so
+// nothing is spent unseen; what is missing is the RECORD. Measure it before claiming either way.
 export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
   if (config.gatewayPort === config.port) return {};
   const base = gatewayBaseUrl();

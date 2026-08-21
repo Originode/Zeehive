@@ -15,6 +15,7 @@ import XellEnvironment from './XellEnvironment.jsx';
 import Directives from './Directives.jsx';
 import XellObservability from './XellObservability.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
+import { restartXellCage } from './cage.js';
 import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
@@ -53,6 +54,8 @@ import ZeeAvatar from './ZeeAvatar.jsx';
 import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
 import WorkConsole from './work/WorkConsole.jsx';
+// the honeycomb's WORK-NODE hierarchy reads the same plan the board does
+import { listWorkItems, deployWorkItem } from './work/workApi.js';
 import DeliveryTelemetry from './DeliveryTelemetry.jsx';
 import Toasts from './Toasts.jsx';
 
@@ -109,7 +112,8 @@ const fmtAgo = (ts) => {
 
 // FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
 // dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
-// consumption; account-wide %/limits are NOT available (only Anthropic's /usage shows those).
+// consumption. Per-provider breakdown and "current" rate-limit % come from the gateway ledger
+// (getFleetBurn.by_provider / .current) — not Admin /usage, which needs keys the fleet does not hold.
 const fmtTok = (n) => {
   const v = Number(n || 0);
   if (v >= 1e9) return (v / 1e9).toFixed(v >= 1e10 ? 0 : 1).replace(/\.0$/, '') + 'B';
@@ -121,6 +125,31 @@ const fmtUsd = (n) => {
   const v = Number(n || 0);
   return '$' + (v >= 100 ? v.toFixed(0) : v.toFixed(2));
 };
+
+// Tooltip for the whole fleet-burn chip: total + spend per provider. Limits (remaining %) live
+// on a SEPARATE chip — this one is spend only, so a human never confuses the two questions.
+function fleetBurnTitle(burn) {
+  if (!burn?.fleet) return '';
+  const lines = [
+    `Every run across this project consumed ${Number(burn.fleet.tokens).toLocaleString()} tokens `
+      + `for ${fmtUsd(burn.fleet.cost)}, over ${burn.fleet.zees} zee run(s).`,
+  ];
+  for (const p of burn.by_provider || []) {
+    lines.push(`${p.provider}: ${Number(p.tokens).toLocaleString()} tok · ${fmtUsd(p.cost)}`
+      + ` over ${p.requests} gateway call(s)`);
+  }
+  lines.push('Fleet-own spend only. Remaining provider quotas live on the "limits" chip.');
+  return lines.join('\n');
+}
+
+// Tooltip for one provider's SPEND segment of the burn chip.
+function providerBurnTitle(p) {
+  return `${p.provider}: ${Number(p.tokens).toLocaleString()} tokens · ${fmtUsd(p.cost)}`
+    + ` · ${p.requests} gateway call(s)\n`
+    + `input ${fmtTok(p.input)} · output ${fmtTok(p.output)}`
+    + ` · cache R ${fmtTok(p.cache_read)} · W ${fmtTok(p.cache_write)}`;
+}
+
 
 
 // Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
@@ -237,6 +266,15 @@ export default function App() {
   // without flipping the truthy check.)
   const [showDispatch, setShowDispatch] = useState(false);
   const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
+  // ── the honeycomb's WORK-NODE hierarchy (hive levels) ─────────────────────────
+  // 'projects' = the TOP level: every hexagon is a project (its root work_node) — what the console
+  // opens on. 'nodes' = inside a project: the level named by nodePath (empty = the project root's
+  // children), where a child work_node is a hexagon — the assigned xell when it has one, a vacant
+  // dashed seat when it does not — and drilling into a node makes IT the context every new prompt
+  // is cut under (parent_work_item on the dispatch).
+  const [hiveMode, setHiveMode] = useState('projects');
+  const [nodePath, setNodePath] = useState([]);      // [{id,title}] from the project root downward
+  const [workItems, setWorkItems] = useState([]);    // the selected project's plan (flat, from /work-items)
   const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
@@ -379,6 +417,19 @@ export default function App() {
     return ps;
   }, []);
 
+  // The selected project's PLAN — the flat work-item list the honeycomb's node levels are computed
+  // from. `pid` is explicit because the default project's id is only known from the fleet snapshot.
+  const loadWorkItemsFor = useCallback(async (pid) => {
+    if (!pid) return;
+    try {
+      const items = await listWorkItems(pid);
+      // stale-guard, same rule as loadAll: never paint the previous project's plan
+      if (!projectIdRef.current || projectIdRef.current === pid) {
+        setWorkItems(Array.isArray(items) ? items : []);
+      }
+    } catch { /* keep last */ }
+  }, []);
+
   // Load EVERYTHING for the selected project: the fleet snapshot, the git graph and the diffs.
   // This is the full-resolve path — a project switch, or a landing/ship (which moves main, so the
   // graph and diffs all change at once). Live churn routes through the cheaper streamChange below,
@@ -397,9 +448,10 @@ export default function App() {
       if (d) setDiffs(d);
       syncXells(f?.xells || []);    // adopt the snapshot's decorated xells — no extra NDJSON stream
       loadProjects();               // keep the switcher's xell counts fresh
+      loadWorkItemsFor(pid || f?.project?.id);   // …and the plan the honeycomb's node levels read
       setVersion((v) => v + 1);
     } catch { /* keep last */ }
-  }, [projectId, loadProjects, applyFleet, syncXells]);
+  }, [projectId, loadProjects, applyFleet, syncXells, loadWorkItemsFor]);
 
   // An EXPLICIT re-read (the caller just acted — dispatch, build, pause, a gate decision…): full.
   const refresh = useCallback(async () => {
@@ -430,11 +482,12 @@ export default function App() {
         getTimeline(pid).then((t) => { if (projectIdRef.current === pid && t) { setTimeline(t); setVersion((v) => v + 1); } });
         getDiffs(pid).then((d) => { if (projectIdRef.current === pid && d) setDiffs(d); });
       }
+      if (type === 'work') loadWorkItemsFor(pid);   // a plan change moves the honeycomb's node levels
       f.catch(() => {});
       loadProjects();
     };
     refreshTimer.current = setTimeout(work, git ? 120 : 400);
-  }, [applyFleet, syncXells, loadProjects]);
+  }, [applyFleet, syncXells, loadProjects, loadWorkItemsFor]);
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
@@ -508,12 +561,12 @@ export default function App() {
   }, [appendToastLine]);
 
   // Fire-and-forget dispatch. The composer hands us the whole payload and closes IMMEDIATELY; the
-  // slow bits (uploading a pasted image, renaming the worktree, spawning + awaiting the zee) run
-  // here and report through a toast. A failure keeps the payload in a Retry closure, so "no ready
-  // xell available" et al. never lose the composed prompt even though the modal is already gone.
+  // slow bits (uploading pasted attachments, renaming the worktree, spawning + awaiting the zee)
+  // run here and report through a toast. A failure keeps the payload in a Retry closure, so "no
+  // ready xell available" et al. never lose the composed prompt even though the modal is already gone.
   const runDispatch = useCallback(async (payload) => {
     const id = `disp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const nImg = payload.images?.length || 0;
+    const nAtt = payload.images?.length || 0;   // `images` is the wire field's legacy name — any file
     // THE ROUTER PAYLOADS (139) ride the same fire-and-forget toast machinery: the composer closed
     // already, so progress/failure/Retry live here whichever door the payload goes through.
     //   via_router      → hand the RAW prompt to the live router (POST /api/router/route)
@@ -528,8 +581,8 @@ export default function App() {
       body: routerVerb === 'route'
         ? 'Handing the raw prompt to the router zee — it recomposes and dispatches.'
         : routerVerb ? 'Claiming a xell and spawning the router (prod read-only, no land/ship)…'
-        : nImg
-        ? `Uploading ${nImg} image${nImg === 1 ? '' : 's'}, claiming a xell and spawning…`
+        : nAtt
+        ? `Uploading ${nAtt} attachment${nAtt === 1 ? '' : 's'}, claiming a xell and spawning…`
         : 'Claiming a ready xell and spawning…' });
     // YIELD before the network call. dispatchTask() runs synchronously up to its first await —
     // JSON.stringify()-ing a multi-MB base64 screenshot blocks the main thread for that whole
@@ -707,6 +760,10 @@ export default function App() {
     setProjectId(id);
     localStorage.setItem(PROJECT_KEY, id);
     writeProjectParam(projectsRef.current.find((p) => p.id === id));
+    // a project switch lands at ITS root level — the previous project's node path means nothing here
+    setHiveMode('nodes');
+    setNodePath([]);
+    setWorkItems([]);
   }, []);
 
   const handleCreate = useCallback(async (body) => {
@@ -841,6 +898,90 @@ export default function App() {
   const xells = [...gridXells].sort((a, b) =>
     (rank(a) - rank(b)) || ((order[a.id] ?? 9999) - (order[b.id] ?? 9999)));
 
+  // ── the honeycomb's WORK-NODE hierarchy: what THIS level's hexagons are ───────
+  // Top level ('projects'): one hexagon per project — the root work_nodes. Inside a project
+  // ('nodes'): the children of the context node (nodePath's tail, or the project root), each drawn
+  // as its live xell when one is assigned, or as a vacant work-node seat when not; PLUS, at the
+  // root level only, every xell carrying no open card (the provisioned pool, managers, the router,
+  // production). A xell assigned to a deeper node shows at ITS level, not here. The cards pane, the
+  // git graph and the wires keep reading the FULL xell list — only the honeycomb is levelled.
+  const TERMINAL_WORK = ['done', 'cancelled'];
+  const openItems = (workItems || []).filter((i) => i.kind !== 'project' && !TERMINAL_WORK.includes(i.status));
+  const rootWorkItem = (workItems || []).find((i) => i.kind === 'project') || null;
+  const workItemById = new Map((workItems || []).map((i) => [i.id, i]));
+  const nodeChildCount = new Map();
+  for (const i of openItems) if (i.parent_id) nodeChildCount.set(i.parent_id, (nodeChildCount.get(i.parent_id) || 0) + 1);
+  const ctxItemId = hiveMode === 'nodes'
+    ? (nodePath.length ? nodePath[nodePath.length - 1].id : rootWorkItem?.id || null) : null;
+  let hiveCells;
+  if (hiveMode === 'projects') {
+    hiveCells = (projects || []).map((p) => ({ id: `proj:${p.id}`, hex_kind: 'project', slug: p.name, project: p }));
+  } else {
+    const xellById = new Map(xells.map((x) => [x.id, x]));
+    const openXellItem = new Set(openItems.map((i) => i.xell_id).filter(Boolean));
+    const level = ctxItemId ? openItems.filter((i) => i.parent_id === ctxItemId) : [];
+    const seen = new Set();
+    hiveCells = [];
+    // the opened node's OWN xell first — clicking a work node opens its flower, so its zee leads the level
+    if (nodePath.length && ctxItemId) {
+      const ctxItem = workItemById.get(ctxItemId);
+      const zx = ctxItem?.xell_id ? xellById.get(ctxItem.xell_id) : null;
+      if (zx) { seen.add(zx.id); hiveCells.push({ ...zx, work_item: ctxItem, work_children: nodeChildCount.get(ctxItem.id) || 0 }); }
+    }
+    for (const it of level) {
+      const zx = it.xell_id ? xellById.get(it.xell_id) : null;
+      if (zx && !seen.has(zx.id)) {
+        seen.add(zx.id);
+        hiveCells.push({ ...zx, work_item: it, work_children: nodeChildCount.get(it.id) || 0 });
+      } else if (!zx) {
+        hiveCells.push({ id: `wn:${it.id}`, hex_kind: 'worknode', slug: it.title, work_item: it,
+                         work_children: nodeChildCount.get(it.id) || 0, project_id: it.project_id });
+      }
+    }
+    if (!nodePath.length) {
+      for (const x of xells) if (!openXellItem.has(x.id) && !seen.has(x.id)) hiveCells.push(x);
+    }
+  }
+
+  // drill into a project: select it and land at its root level
+  const openProjectLevel = (p) => {
+    if (!p?.id) return;
+    if (p.id !== projectId) selectProject(p.id);
+    else { setHiveMode('nodes'); setNodePath([]); }
+    setExpandedId(null);
+  };
+  // drill into a work node: it becomes the context (new prompts are cut under it); its own live
+  // xell — if it has one — opens as the flower at the new level
+  const openNodeLevel = (item) => {
+    if (!item?.id) return;
+    setHiveMode('nodes');
+    setNodePath((path) => {
+      const at = path.findIndex((n) => n.id === item.id);
+      return at >= 0 ? path.slice(0, at + 1) : [...path, { id: item.id, title: item.title }];
+    });
+    const zx = item.xell_id ? xells.find((x) => x.id === item.xell_id) : null;
+    setExpandedId(zx ? zx.id : null);
+  };
+  // the vacant seat's "assign zee" chip → deploy a fresh worker onto the card (the board's verb)
+  const assignNodeZee = async (item) => {
+    if (!item?.id) return;
+    if (!(await showConfirm(`Deploy a zee onto “${item.title}”?\n\nSpawns a real worker, briefed from the card itself, `
+      + 'and assigns it — the same deploy the board runs.', { okLabel: 'Deploy' }))) return;
+    const id = `deploy-${item.id}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: `Deploying a zee onto “${item.title}”…`,
+      body: 'Claiming a ready xell and spawning — briefed from the card itself.' });
+    try {
+      const r = await deployWorkItem(item.id, {});
+      updateToast(id, { kind: 'success', title: 'Zee deployed', onRetry: null,
+        body: r?.xell?.slug ? `Running in ${r.xell.slug}.` : 'The zee is on it.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 7000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', title: 'Deploy failed', body: e?.message || String(e),
+        onRetry: () => { dismissToast(id); assignNodeZee(item); } });
+    }
+  };
+
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
   // The manager↔crew relation for the DOM surfaces (hive/crew.js — the SAME grouping the honeycomb, the
@@ -877,7 +1018,11 @@ export default function App() {
     if (x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
-    if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
+    // ⟳ CAGE — restart the cxell container. The SAME handler the xell card and the terminal modal
+    // call (web/src/cage.js): it probes the live cage first and owns every confirm and refusal, so
+    // the three surfaces cannot drift into three different policies.
+    if (kind === 'cage') { restartXellCage(x, refresh); return; }
+    if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/file composer
     if (kind === 'directives') { setDirectivesXell(x); return; } // read the manager⇄worker conversation
     if (kind === 'env') {
       // Opens the ENVIRONMENT panel (ticket #20): which environment this xell resolved to and why,
@@ -1022,7 +1167,28 @@ export default function App() {
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey" style={split != null ? { flex: `${split} 1 0` } : undefined}>
-        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
+        {/* the LEVEL breadcrumb: where in the work-node tree this honeycomb is, and the way back up.
+            Every new prompt is cut under the level you are standing on (parent_work_item). */}
+        <div className="hive-crumbs">
+          <button className={`hive-crumb${hiveMode === 'projects' ? ' on' : ''}`}
+                  onClick={() => { setHiveMode('projects'); setExpandedId(null); }}>⬢ projects</button>
+          {hiveMode === 'nodes' && (
+            <>
+              <span className="hive-crumb-sep">›</span>
+              <button className={`hive-crumb${!nodePath.length ? ' on' : ''}`}
+                      onClick={() => { setNodePath([]); setExpandedId(null); }}>{project.name || '…'}</button>
+              {nodePath.map((n, i) => (
+                <React.Fragment key={n.id}>
+                  <span className="hive-crumb-sep">›</span>
+                  <button className={`hive-crumb${i === nodePath.length - 1 ? ' on' : ''}`}
+                          onClick={() => { setNodePath(nodePath.slice(0, i + 1)); setExpandedId(null); }}>
+                    {n.title}</button>
+                </React.Fragment>
+              ))}
+            </>
+          )}
+        </div>
+        <HiveCanvas xells={hiveCells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
                     expandedId={expandedId} onExpand={setExpandedId}
@@ -1031,6 +1197,7 @@ export default function App() {
                     showHarness={showHarness} redrawKey={version}
                     queenzeeActivity={qzActivity}
                     shipping={fleet.shipping || []}
+                    onOpenProject={openProjectLevel} onOpenNode={openNodeLevel} onNodeAssign={assignNodeZee}
                     onQueenzeeTerminal={openQueenzeeTerminal}
                     onQueenzeeLogs={() => setShowTerm(true)} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
@@ -1197,6 +1364,9 @@ export default function App() {
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided in the composer
               (or by the router on a router-gated fleet), opened from the single "+ prompt" button. */}
+          {/* The phone-first mobile chat UI (/m) — a same-tab switch, preserving the project. */}
+          <a className="cs-mobile" href={`./m?project=${encodeURIComponent(project.name)}`}
+             title="Open the phone-first mobile chat UI">📱 Mobile</a>
           {/* Console settings (browser-local): terminal engine xterm↔wterm, etc. Not project setup. */}
           <button type="button" className="cs-gear" data-testid="console-settings-btn"
                   title="Console settings — terminal engine and other browser-local preferences"
@@ -1217,16 +1387,27 @@ export default function App() {
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
-        {/* FLEET-CUMULATIVE BURN — every run across the project, tokens + $. Fleet-own consumption
-            only; account-wide %/limits are NOT available (Anthropic's /usage alone shows those). */}
-        {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0) && (
+        {/* FLEET-CUMULATIVE BURN — spend only (tokens + $). Remaining provider quotas are the
+            SEPARATE "limits" chip below — deliberately not mixed, so the two questions stay clear. */}
+        {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0
+            || (fleet.fleet_burn.by_provider || []).length > 0) && (
           <span className="fleetburn" data-testid="fleet-burn"
-                title={`Every run across this project consumed ${Number(fleet.fleet_burn.fleet.tokens).toLocaleString()} tokens `
-                  + `for ${fmtUsd(fleet.fleet_burn.fleet.cost)}, over ${fleet.fleet_burn.fleet.zees} zee run(s).\n`
-                  + 'Fleet-own consumption only — not your Anthropic account %/limits.'}>
+                title={fleetBurnTitle(fleet.fleet_burn)}>
             {' · '}fleet burn: <b>{fmtTok(fleet.fleet_burn.fleet.tokens)} tok · {fmtUsd(fleet.fleet_burn.fleet.cost)}</b>
+            {(fleet.fleet_burn.by_provider || []).length > 0 && (
+              <span className="fleetburn-by-provider" data-testid="fleet-burn-by-provider">
+                {(fleet.fleet_burn.by_provider || []).map((p) => (
+                  <span key={p.provider} className="fleetburn-prov" data-provider={p.provider}
+                        title={providerBurnTitle(p)}>
+                    {' · '}<span className="fleetburn-prov-name">{p.provider}</span>
+                    {' '}<b>{fmtTok(p.tokens)}/{fmtUsd(p.cost)}</b>
+                  </span>
+                ))}
+              </span>
+            )}
           </span>
         )}
+
         {/* The prewarmed-pool knob, right here in the status line so it never hides in project
             settings. Per-machine pool sizes (matrix column headers) replace this project-wide
             target ONLY when a machine is explicitly configured for the project — EITHER knob
@@ -1377,7 +1558,14 @@ export default function App() {
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
                   onClose={() => setShowDispatch(false)}
-                  onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
+                  onDispatch={(payload) => {
+                    setShowDispatch(false);
+                    // the prompt is cut under the honeycomb level it was written from: the new
+                    // work_node becomes a child of the opened node (server default: project root)
+                    runDispatch({ ...payload,
+                      ...(hiveMode === 'nodes' && nodePath.length
+                        ? { parent_work_item: nodePath[nodePath.length - 1].id } : {}) });
+                  }} />
       )}
       {showSetup && (
         <ProjectSetup project={project} onClose={() => setShowSetup(false)} onChanged={refresh} />
@@ -1777,6 +1965,15 @@ function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing
               <button className="termbtn" title="Open a live terminal into this cxell zee"
                       onClick={(e) => { e.stopPropagation(); setTermOpen(true); }}>⌨ terminal</button>
             )}
+            {/* …and when that terminal will not attach, the cure. Restarting the CAGE (not the xell,
+                not the stack) is the only operator move for a cxell whose sshd or agent has died
+                inside a container docker still reports as running — the recovery loop only acts on
+                cages that are EXITED. It probes and confirms before it touches anything. */}
+            {cxell && (
+              <button className="termbtn cagebtn" data-testid="restart-cage"
+                      title="Restart this zee's cxell container (stop → start → ssh → re-seal → resume the session)"
+                      onClick={(e) => { e.stopPropagation(); restartXellCage(x, onDone); }}>⟳ cage</button>
+            )}
           </div>
         )}
         {cxell && termOpen && (
@@ -1910,6 +2107,17 @@ function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing
                   title={`This xell's zees consumed ${Number(x.burn.tokens).toLocaleString()} tokens for ${fmtUsd(x.burn.cost)}.\n`
                     + 'Fleet-own consumption only — not your Anthropic account %/limits.'}>
               Σ {fmtTok(x.burn.tokens)} tok · {fmtUsd(x.burn.cost)}
+            </span>
+          </div>
+        )}
+        {/* OVER-BUDGET SPEND-ALERT (migration 206) — this xell's cumulative spend on a provider
+            exceeded the project's per-provider alert amount set in Project setup → Agent providers.
+            Shown right under the burn it explains. */}
+        {!isProd && x.burn_alert?.open && (
+          <div className="row"><span className="rk">alert</span>
+            <span className="envalert" data-testid="xell-burn-alert"
+                  title={`This xell has spent ${fmtUsd(x.burn_alert.cost)} on ${x.burn_alert.provider} — over the ${fmtUsd(x.burn_alert.limit)} alert you set for that provider.\n\nSet / clear it in Project setup → Agent providers.`}>
+              ⚠ over budget: {fmtUsd(x.burn_alert.cost)} on {x.burn_alert.provider} (limit {fmtUsd(x.burn_alert.limit)})
             </span>
           </div>
         )}

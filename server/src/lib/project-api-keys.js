@@ -24,6 +24,10 @@ export const KEY_PREFIX = 'zhk_';
 export const SCOPES = {
   'tickets:read':  'list and read the tickets of this project, their comments and their attachments',
   'tickets:write': 'file tickets, update them, comment on them and attach evidence',
+  // plan §3.4: "an A2A-scoped key sees and may address only agents its project owns" — the scope
+  // is a code constant, not DDL: the scopes column already exists (migration 190) and a key is
+  // minted with it via the same createProjectApiKey call as any other scope.
+  'a2a': 'call the A2A API — see, read the tasks of, and send messages to the agents this project owns',
 };
 export const SCOPE_KEYS = Object.keys(SCOPES);
 const DEFAULT_SCOPES = ['tickets:read', 'tickets:write'];

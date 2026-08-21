@@ -10,7 +10,7 @@ import {
   getComposeOnboardingPlan, applyComposeOnboarding,
   getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
-  pauseProviderAccount, resumeProviderAccount, getReposHome, listFsDirs,
+  pauseProviderAccount, resumeProviderAccount, setProviderAlertAmount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
@@ -2358,21 +2358,78 @@ function DiscoverPanel({ project, sites, busy, onAdopted }) {
   );
 }
 
+// Remaining usage limit for ONE provider account. Source: provider_token.usage_limit (migration
+// 203), written by the LLM gateway from the provider's own response headers. Never per-xell.
+// "X% free" is available_pct — how much of the binding window is still AVAILABLE.
+function AccountUsageLimit({ account }) {
+  const pct = account?.available_pct;
+  const rl = account?.usage_limit || {};
+  const win = rl.windows || {};
+  if (pct == null && !account?.usage_limit) {
+    return (
+      <span className="token-usage-limit is-empty" data-testid="account-usage-limit-empty"
+            title="No limit snapshot yet — it appears after a zee call authenticates with this account through the gateway">
+        limit: —
+      </span>
+    );
+  }
+  const bits = [];
+  if (win['5h']?.available_pct != null) bits.push(`5h ${win['5h'].available_pct}%`);
+  if (win['7d']?.available_pct != null) bits.push(`7d ${win['7d'].available_pct}%`);
+  if (rl.tokens?.available_pct != null && !bits.length) {
+    bits.push(`TPM ${rl.tokens.available_pct}%`);
+  }
+  // A BALANCE snapshot (deepseek: no % window exists, the quota IS a dollar balance). The
+  // first balance row is the account's money; is_available says whether calls still work.
+  const balanceRow = (Array.isArray(rl.balance) ? rl.balance[0] : null) || null;
+  const balanceText = balanceRow?.total_balance
+    ? `${balanceRow.currency || ''} ${balanceRow.total_balance}`.trim()
+    : null;
+  const title = [
+    pct != null ? `${pct}% of the binding window still available` : 'limit snapshot present',
+    bits.length ? bits.join(' · ') : null,
+    rl.representative ? `binding: ${rl.representative}` : null,
+    balanceText ? `balance: ${balanceText}` : null,
+    account.usage_limit_at ? `as of ${new Date(account.usage_limit_at).toLocaleString()}` : null,
+  ].filter(Boolean).join('\n');
+  const cls = pct != null && pct < 20 ? ' is-tight' : pct != null && pct < 40 ? ' is-warn' : '';
+  return (
+    <span className={`token-usage-limit${cls}`} data-testid="account-usage-limit" title={title}>
+      {pct != null ? `${pct}% free` : balanceText ? `limit: ${balanceText}` : 'limit: ok'}
+      {bits.length ? ` (${bits.join(', ')})` : ''}
+    </span>
+  );
+}
+
 // ── agent providers: the per-project credential a CXELLD zee runs on ───────────
 // Provider ACCOUNTS, stored in the meta-DB. A project can hold several accounts of one provider
 // type — e.g. two Claude subscriptions — each with its own label, its own prompt button in the
 // header, and its own last-used date. The human does the OAuth: copy the command, run it in a
 // terminal, authorize in the browser, paste the token back (plus an optional label naming the
 // account). The server only ever returns a masked hint — a connected token cannot be read back.
+// Remaining usage limit is per ACCOUNT (usage_limit), not per xell.
 function TokensSection({ project, run, busy }) {
   const [tokens, setTokens] = useState(null);
   const [open, setOpen] = useState(null);     // provider key whose add-account panel is open
   const [paste, setPaste] = useState('');
   const [label, setLabel] = useState('');
   const [copied, setCopied] = useState(false);
+  // Per-provider spend-alert input draft (migration 206): keyed by provider, undefined until the
+  // human edits. Kept separate from the loaded row so typing does not fight a refresh — on save the
+  // draft is cleared and the row re-reads the saved value.
+  const [alertDraft, setAlertDraft] = useState({});
   const load = useCallback(() => getProviderTokens(project.id).then(setTokens).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  // Save ONE provider's spend-alert amount (USD). Empty / invalid clears it. The draft is cleared
+  // after save so the input re-binds to the server value (null → placeholder).
+  const saveAlert = (p) => {
+    const raw = alertDraft[p.provider];
+    const v = String(raw ?? '').trim();
+    wrapped(() => setProviderAlertAmount(project.id, p.provider, v === '' ? null : v))
+      .then(() => setAlertDraft((d) => ({ ...d, [p.provider]: undefined })))
+      .catch(() => {});
+  };
 
   const copy = async (cmd) => {
     try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); }
@@ -2402,12 +2459,36 @@ function TokensSection({ project, run, busy }) {
 
   return (
     <div className="setup-sec">
-      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back. Several accounts of one provider are fine: each gets its own prompt button)</span></h3>
+      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back. Several accounts of one provider are fine: each gets its own prompt button. Remaining usage limit is per ACCOUNT, refreshed from the provider's own response headers whenever a call crosses the gateway.)</span></h3>
       {(tokens || []).map((p) => (
         <div key={p.provider} className="siteed">
           <div className="setup-row">
             <span className="sitekey">{p.label}</span>
             {!p.connected && <span className="gate g-warn">△ not connected</span>}
+            {p.available_pct != null && (
+              <span className={`token-usage-limit${p.available_pct < 20 ? ' is-tight' : p.available_pct < 40 ? ' is-warn' : ''}`}
+                    data-testid={`provider-limit-${p.provider}`}
+                    title="Worst remaining quota across this provider's active accounts">
+                {p.available_pct}% free
+              </span>
+            )}
+            {/* PER-PROVIDER SPEND-ALERT (migration 206): a USD amount — when a xell's gateway-ledger
+                spend on this provider exceeds it, that xell's hexagon shows an over-budget indicator.
+                Empty clears the alert. Saves on blur / Enter. */}
+            <span className="pc" title="When a xell's spend on this provider exceeds this amount (USD), its hexagon shows an over-budget alert.">
+              alert $
+            </span>
+            <input
+              className="mono"
+              style={{ width: 72 }}
+              type="number" min="0" step="0.01"
+              placeholder="no alert"
+              value={alertDraft[p.provider] ?? p.alert_amount ?? ''}
+              onChange={(e) => setAlertDraft((d) => ({ ...d, [p.provider]: e.target.value }))}
+              onBlur={() => saveAlert(p)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } }}
+              data-testid={`provider-alert-${p.provider}`}
+            />
             <button type="button" className="ghost"
                     onClick={() => { setOpen(open === p.provider ? null : p.provider); setPaste(''); setLabel(''); }}>
               {open === p.provider ? '▾ cancel' : p.connected ? '＋ add another account' : '＋ connect'}
@@ -2428,6 +2509,9 @@ function TokensSection({ project, run, busy }) {
                   {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
                 </span>
               )}
+              {/* Remaining usage limit for THIS account (Claude 5h/7d seat, API TPM/RPM). Null
+                  until the gateway has authenticated one call with this key. */}
+              <AccountUsageLimit account={a} />
               <button type="button" className="projpop-del" disabled={busy}
                       title={a.paused ? `Resume this ${p.label} account` : `Pause this ${p.label} account — no dispatch can use it while paused`}
                       onClick={() => pauseToggle(p, a)}>{a.paused ? '▶' : '⏸'}</button>
@@ -2446,7 +2530,10 @@ function TokensSection({ project, run, busy }) {
               <span className="pc">2 · {p.steps}</span>
               <label>3 · Paste the token{p.connected ? ' (a new account — existing ones stay)' : ''}
                 <span className="setup-row">
-                  <input type="password" autoComplete="off" value={paste} placeholder="sk-ant-oat01-…"
+                  {/* the SHAPE to paste comes from the provider registry (server-side copy), so a
+                      vendor with a different-looking credential — a Grok seat session is a JSON
+                      object, not an sk-… string — never shows claude's example */}
+                  <input type="password" autoComplete="off" value={paste} placeholder={p.placeholder || 'paste it here'}
                          onChange={(e) => setPaste(e.target.value)}
                          onKeyDown={(e) => { if (e.key === 'Enter' && paste.trim()) { e.preventDefault(); save(p); } }} />
                   <input value={label} placeholder="label (optional) — e.g. work / personal"

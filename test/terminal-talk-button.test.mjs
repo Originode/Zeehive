@@ -8,7 +8,7 @@
 //
 // So the header carries 💬 talk, and this pins what it must keep being:
 //   • present only on the ZEE door (a container shell has no zee to converse with);
-//   • the SAME composer 📨 opens — one delivery path, one set of rules for long text and images;
+//   • the SAME composer 📨 opens — one delivery path, one set of rules for long text and any files;
 //   • loud (`urge`) exactly while a live feed owns the pane — the one state in which typing into
 //     the terminal does nothing;
 //   • and a receipt that says which of the two things happened, in words, into the pane.
@@ -44,7 +44,7 @@ console.log('\n── it opens the SAME composer the hexagon 📨 button does �
 ok(/import MessageComposer from '\.\/MessageComposer\.jsx'/.test(src), 'it imports MessageComposer');
 ok(/<MessageComposer xell=\{xell\}/.test(src), 'and renders it against this xell');
 ok(!/sendXellMessage|fetch\(/.test(src),
-   'the terminal does NOT grow its own delivery path — one door, one set of rules about long text and images');
+   'the terminal does NOT grow its own delivery path — one door, one set of rules about long text and any files');
 
 console.log('\n── the receipt tells the truth about delivery ──');
 const receipt = src.slice(src.indexOf('const talkReceipt'), src.indexOf('const toggleExplorer'));

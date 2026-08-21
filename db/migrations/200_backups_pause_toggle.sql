@@ -1,0 +1,16 @@
+-- PAUSE PROD BACKUPS — a human stop-switch for the retry storm (omnibiz: a dead remote
+-- destination kept re-doing the backup).
+--
+-- The scheduler's retry loop is deliberate (#26): a failed attempt brings the next one FORWARD
+-- (10 min, doubling, capped at the policy interval) instead of consuming the window — but a
+-- destination that is genuinely broken (a dead NAS context, an unmountable volume) stays broken,
+-- and every retry re-runs the same failing dump. With the execPipe fix, each attempt now fails
+-- FAST instead of hanging for 30 minutes, so the loop tightens into a storm. This flag is the
+-- escape hatch: while it is set, the scheduler starts NO new backup (policy OR retry), and a
+-- manual "Back up now" is refused too — the operator fixes the destination, then flips it back.
+--
+-- backup_paused   false → backups run on their normal schedule. true → no new backups start,
+--                 automatic or manual, until a human clears it. An in-flight backup is NOT
+--                 interrupted (that is the existing Cancel button); restore/delete/duplicate are
+--                 untouched (they read existing backups, they do not create new dumps of prod).
+ALTER TABLE pool_config ADD COLUMN IF NOT EXISTS backup_paused boolean NOT NULL DEFAULT false;

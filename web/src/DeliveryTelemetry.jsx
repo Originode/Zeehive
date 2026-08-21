@@ -217,6 +217,27 @@ export function DeliveryTelemetryScreen({ data: d }) {
                 ))}
               </Card>
 
+              {/* 3b ── USAGE PER PROVIDER (gateway ledger) */}
+              <Card title="3b · Usage per provider"
+                    why={'Tokens and $ the LLM gateway recorded for each provider in the window. '
+                      + 'The gateway is the only door that attributes a call to a provider key '
+                      + '(claude / openai / kimi / deepseek / grok). Empty means no call crossed '
+                      + 'the gateway in this window — not "free". Sample size is the request count.'}>
+                {!(d.usage_by_provider || []).length && (
+                  <div className="dt-empty">no gateway calls in this window <N n={0} /></div>
+                )}
+                <ul className="dt-list" data-testid="usage-by-provider">
+                  {(d.usage_by_provider || []).map((r) => (
+                    <li key={r.provider}>
+                      <span className="mono">{r.provider}</span>
+                      <b>{fmtUsd(r.cost)}</b>
+                      <N n={r.requests} unit="calls" />
+                      <span className="dt-sub">{Number(r.tokens).toLocaleString()} tok</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+
               {/* 4 ── ERROR RATE BY MODEL */}
               <Card title="4 · Error rate by model"
                     why={'Zees that ended in `errored`, over every zee of that model in the window. '

@@ -35,7 +35,8 @@ import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
          requestsForXell, gatewayHello, usageFromStream, modelFromStream, providerUpstreamUrl,
-         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf } from '../server/src/lib/gateway.js';
+         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf, extractRateLimit,
+         classifyResponseText } from '../server/src/lib/gateway.js';
 
 // providerUpstreamUrl reads these from the PROCESS env (the queenzee's own operator overrides).
 // This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
@@ -67,6 +68,49 @@ eq(a.cacheRead, 20, 'anthropic cache read'); eq(a.cacheWrite, 5, 'anthropic cach
 const o = normalizeUsage({ prompt_tokens: 100, completion_tokens: 50 }, 'chat-completions');
 eq(o.input, 100, 'openai prompt'); eq(o.output, 50, 'openai completion');
 eq(o.cacheRead, 0, 'openai has no cache read'); eq(o.cacheWrite, 0, 'openai has no cache write');
+
+// ── B2. extractRateLimit — AVAILABLE % of the provider account's limit (pure) ────────────────
+// Claude Code seat windows (unified) + API TPM/RPM. Primary field is available_pct (remaining).
+console.log('\n── B2. extractRateLimit — Anthropic + OpenAI + unified seat headers ──');
+const antRl = extractRateLimit({
+  'anthropic-ratelimit-tokens-limit': '100000',
+  'anthropic-ratelimit-tokens-remaining': '40000',
+  'anthropic-ratelimit-tokens-reset': '2026-08-13T12:00:00Z',
+  'anthropic-ratelimit-requests-limit': '50',
+  'anthropic-ratelimit-requests-remaining': '10',
+});
+eq(antRl?.tokens_limit, 100000, 'anthropic tokens limit');
+eq(antRl?.tokens_remaining, 40000, 'anthropic tokens remaining');
+eq(antRl?.available_pct, 40, 'AVAILABLE = remaining/limit = 40% (the number a human wants)');
+eq(antRl?.tokens_used_pct, 60, 'legacy used% still present for older meta readers');
+eq(antRl?.tokens_reset, '2026-08-13T12:00:00Z', 'anthropic tokens reset timestamp');
+const oaiRl = extractRateLimit({
+  'x-ratelimit-limit-tokens': '20000',
+  'x-ratelimit-remaining-tokens': '5000',
+  'x-ratelimit-limit-requests': '60',
+  'x-ratelimit-remaining-requests': '60',
+});
+eq(oaiRl?.available_pct, 25, 'openai available = 5000/20000 = 25%');
+eq(oaiRl?.requests?.available_pct, 100, 'openai RPM fully free when remaining=limit');
+// Claude Code unified seat windows (5h/7d) — utilization 0.0–1.0.
+const seat = extractRateLimit({
+  'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+  'anthropic-ratelimit-unified-5h-utilization': '0.07',
+  'anthropic-ratelimit-unified-5h-status': 'allowed',
+  'anthropic-ratelimit-unified-7d-utilization': '0.53',
+});
+eq(seat?.representative, '5h', 'five_hour → 5h');
+eq(seat?.available_pct, 93, 'seat available follows binding 5h window: 100−7=93');
+eq(seat?.windows?.['7d']?.available_pct, 47, '7d available = 100−53=47');
+// Case-insensitive + array-valued headers (node/express variance).
+const mixed = extractRateLimit({
+  'Anthropic-Ratelimit-Tokens-Limit': ['1000'],
+  'Anthropic-Ratelimit-Tokens-Remaining': ['250'],
+});
+eq(mixed?.available_pct, 25, 'header names are case-insensitive; array values take [0]');
+eq(extractRateLimit({}), null, 'no rate-limit headers → null (not a zero-filled object)');
+eq(extractRateLimit(null), null, 'null headers → null');
+eq(extractRateLimit({ 'content-type': 'application/json' }), null, 'unrelated headers → null');
 
 // ── D. gatewayEnv — the base URLs cxells get ─────────────────────────────────────────────────
 console.log('\n── D. gatewayEnv — the base URLs cxells get ──');
@@ -206,6 +250,53 @@ const grokStream = 'event: response.created\ndata: {"type":"response.created","r
 eq(usageFromStream(grokStream, 'messages')?.input_tokens, 12, 'xAI nested response.usage → input tokens');
 eq(usageFromStream(grokStream, 'messages')?.output_tokens, 7, 'xAI nested response.usage → output tokens');
 
+// ── F2. classifyResponseText — the conversation vs thinking classifier ───────────────────────
+console.log('\n── F2. classifyResponseText — which is talk, which is thinking ──');
+// Anthropic SSE streaming: text_delta → conversation, thinking_delta → thinking, tool_use → neither.
+const antSse = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"plan the steps"}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan the steps"}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I will implement"}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" the feature."}}\n\n';
+const antSpeech = classifyResponseText(antSse, 'messages');
+eq(antSpeech.conversation.join(''), 'I will implement the feature.', 'anthropic SSE: text_delta text is the conversation');
+eq(antSpeech.thinking.join(''), 'plan the steps', 'anthropic SSE: thinking_delta is the thinking stream');
+// Anthropic non-streaming message body: content blocks carry text and thinking in one JSON.
+const antBody = JSON.stringify({ type: 'message', content: [
+  { type: 'thinking', thinking: 'internal reasoning' },
+  { type: 'redacted_thinking', data: '[redacted reasoning]' },
+  { type: 'text', text: 'Here is the answer.' },
+  { type: 'tool_use', name: 'Bash', input: { command: 'ls' } },
+] });
+const antBodySpeech = classifyResponseText(antBody, 'messages');
+eq(antBodySpeech.conversation.length, 1, 'non-streaming: one conversation text block');
+eq(antBodySpeech.conversation[0], 'Here is the answer.', 'non-streaming: the text block is the conversation');
+eq(antBodySpeech.thinking.length, 2, 'non-streaming: thinking + redacted_thinking both counted');
+ok(antBodySpeech.thinking[1].includes('redacted'), 'non-streaming: redacted thinking captured');
+// OpenAI SSE: delta.content (string) is conversation; deepseek-reasoner's reasoning_content is thinking.
+const oaiSse = 'data: {"choices":[{"delta":{"reasoning_content":"mull it over","content":""}}]}\n\n'
+  + 'data: {"choices":[{"delta":{"content":"The result is 4."}}]}\n\n'
+  + 'data: [DONE]\n\n';
+const oaiSpeech = classifyResponseText(oaiSse, 'chat-completions');
+eq(oaiSpeech.conversation.join(''), 'The result is 4.', 'openai SSE: delta.content is the conversation');
+eq(oaiSpeech.thinking.join(''), 'mull it over', 'openai SSE: delta.reasoning_content is the thinking stream');
+// OpenAI non-streaming message body.
+const oaiBody = JSON.stringify({ choices: [{ message: { content: 'Final answer', reasoning_content: 'deep thought' } }] });
+const oaiBodySpeech = classifyResponseText(oaiBody, 'chat-completions');
+eq(oaiBodySpeech.conversation[0], 'Final answer', 'openai body: message.content is the conversation');
+eq(oaiBodySpeech.thinking[0], 'deep thought', 'openai body: message.reasoning_content is the thinking stream');
+// xAI Responses API (grok, dispatched as kind 'messages'): output_text deltas vs reasoning_summary.
+const grokSpeechSse = 'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
+  + 'data: {"type":"response.output_text.delta","delta":" there"}\n\n'
+  + 'data: {"type":"response.reasoning_summary.delta","delta":"hmm"}\n\n'
+  + 'data: {"type":"response.completed","response":{}}\n\n';
+const grokSpeech = classifyResponseText(grokSpeechSse, 'messages');
+eq(grokSpeech.conversation.join(''), 'Hello there', 'xAI SSE: output_text.delta is the conversation');
+eq(grokSpeech.thinking.join(''), 'hmm', 'xAI SSE: reasoning_summary.delta is the thinking stream');
+// Empty / null / not-JSON all degrade to empty buckets (never throw).
+eq(JSON.stringify(classifyResponseText('')), '{"conversation":[],"thinking":[]}', 'empty text → empty buckets');
+eq(JSON.stringify(classifyResponseText('not json at all')), '{"conversation":[],"thinking":[]}', 'non-JSON → empty buckets');
+eq(JSON.stringify(classifyResponseText(null)), '{"conversation":[],"thinking":[]}', 'null → empty buckets');
+
 // ── C. the round-trip ────────────────────────────────────────────────────────────────────────
 console.log('\n── C. record → complete → read ──');
 let projectId = null, xourceId = null, xellId = null, zeeId = null, rid = null, autoRid = null;
@@ -283,7 +374,12 @@ try {
   await completeRequest(rid, { status: 200, input: 1, output: 1, cost: 0, meta: { unpriced: { provider: 'deepseek', model: 'no-such-model' } } });
   const metaRow = await one(`SELECT meta FROM llm_gateway_request WHERE id=$1`, [rid]);
   eq(metaRow?.meta?.unpriced?.model, 'no-such-model', 'the meta note lands on the row (an unpriced model says WHY it is 0)');
-  await completeRequest(rid, { status: 200, input: 6, output: 9, cost: 0 });
+  // The gateway's conversation-vs-thinking classification ALSO merges into meta.speech (the same
+  // merge the proxy's finish() uses), so the mobile chat can read it off the row.
+  await completeRequest(rid, { status: 200, input: 6, output: 9, cost: 0, meta: { speech: classifyResponseText(antBody, 'messages') } });
+  const speechRow = await one(`SELECT meta FROM llm_gateway_request WHERE id=$1`, [rid]);
+  eq(speechRow?.meta?.speech?.conversation?.[0], 'Here is the answer.', 'meta.speech.conversation lands on the row');
+  eq(speechRow?.meta?.speech?.thinking?.length, 2, 'meta.speech.thinking lands on the row');
 
   // ── G. zee/turn linkage — a request is attributed to the live zee + open turn ──────────────
   console.log('\n── G. zee/turn linkage — zee_id + turn_id at record time ──');

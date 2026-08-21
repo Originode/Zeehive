@@ -233,9 +233,9 @@ ok(/CXELL_IMAGE_REQUIRED/.test(read('docs/deploy-topology-spec.md')),
 // ── (c) usage text vs implemented cases, inside scripts/zee ───────────────────────────────────
 console.log('\n── scripts/zee: every advertised verb is implemented, and vice versa ──');
 const usageBlock = cli.slice(cli.indexOf('function usage()'), cli.indexOf('switch (cmd)'));
-const advertised = new Set([...usageBlock.matchAll(/^\s{2,}zee ([a-z][a-z-]*)/gm)].map((m) => m[1]));
-const implemented = new Set([...cli.matchAll(/^\s*(?:case '[a-z-]+':\s*)*case '([a-z-]+)':/gm)].map((m) => m[1]));
-for (const m of cli.matchAll(/case '([a-z-]+)':/g)) implemented.add(m[1]);
+const advertised = new Set([...usageBlock.matchAll(/^\s{2,}zee ([a-z][a-z0-9-]*)/gm)].map((m) => m[1]));
+const implemented = new Set([...cli.matchAll(/^\s*(?:case '[a-z0-9-]+':\s*)*case '([a-z0-9-]+)':/gm)].map((m) => m[1]));
+for (const m of cli.matchAll(/case '([a-z0-9-]+)':/g)) implemented.add(m[1]);
 implemented.delete('help');   // documented in the usage BODY, not as a verb line
 ok(advertised.size >= 15, `usage advertises the full verb set (${advertised.size} verbs)`);
 const unimplemented = [...advertised].filter((v) => !implemented.has(v));
@@ -359,7 +359,7 @@ try {
     // Backticked mentions, plus the verb lines inside a fenced block — NOT bare "zee …" in prose,
     // which wraps into sentences like "zee is executing" and would invent a verb to complain about.
     const fenced = [...text.matchAll(/```[\s\S]*?```/g)].map((m) => m[0]).join('\n');
-    const named = [...new Set([...text.matchAll(/`zee ([a-z][a-z-]*)/g), ...fenced.matchAll(/^zee ([a-z][a-z-]*)/gm)]
+    const named = [...new Set([...text.matchAll(/`zee ([a-z][a-z0-9-]*)/g), ...fenced.matchAll(/^zee ([a-z][a-z0-9-]*)/gm)]
       .map((m) => m[1]))];
     const ghosts = named.filter((v) => !implemented.has(v));
     ok(!ghosts.length, `and names no verb the CLI does not implement (${ghosts.join(', ') || 'none'})`);

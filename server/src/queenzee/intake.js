@@ -43,6 +43,7 @@ import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.
 import { projectDocFiles } from '../lib/project-docs.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
+import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
@@ -236,14 +237,14 @@ function titleFromTask(task) {
   return null;
 }
 
-// Pasted images ride the dispatch body as base64 data URLs (the dashboard "+" composer lets a
-// human paste a screenshot into the prompt). Decode them into the TARGET worktree so the spawned
+// Pasted files ride the dispatch body as base64 data URLs (the dashboard "+" composer lets a human
+// paste a screenshot or a log into the prompt). Decode them into the TARGET worktree so the spawned
 // zee can Read them by a path relative to its cwd — the same way a human would hand it a file.
-// Returns the worktree-relative paths saved (drops any that fail; never throws — a bad image must
-// not sink the dispatch). The folder gets a `.gitignore` of `*` so pasted screenshots never show
+// Returns the worktree-relative paths saved (drops any that fail; never throws — a bad attachment
+// must not sink the dispatch). The folder gets a `.gitignore` of `*` so pasted files never show
 // up as dirty files or get accidentally committed by the zee.
-function saveDispatchImages(worktreePath, images) {
-  if (!worktreePath || !existsSync(worktreePath) || !Array.isArray(images) || !images.length) return [];
+function saveDispatchAttachments(worktreePath, attachments) {
+  if (!worktreePath || !existsSync(worktreePath) || !Array.isArray(attachments) || !attachments.length) return [];
   const dir = resolve(worktreePath, '.zeehive', 'prompt-attachments');
   try {
     mkdirSync(dir, { recursive: true });
@@ -251,20 +252,24 @@ function saveDispatchImages(worktreePath, images) {
   } catch (e) { logline('intake', `could not prepare attachments dir: ${e.message}`); return []; }
   const stamp = Date.now();
   const saved = [];
-  images.forEach((img, i) => {
-    const data = typeof img === 'string' ? img : img?.data;
+  attachments.forEach((att, i) => {
+    const data = typeof att === 'string' ? att : att?.data;
     if (!data) return;
     const m = /^data:([^;,]+)?(?:;base64)?,(.*)$/s.exec(data);
-    const mime = (m && m[1]) || 'image/png';
+    const mime = (m && m[1]) || 'application/octet-stream';
     const b64 = m ? m[2] : data;
-    const ext = (mime.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'png';
-    const raw = (typeof img === 'object' && img?.name) ? String(img.name) : '';
+    // The extension is only a hint for a file with no name; an unknown/octet-stream type degrades to
+    // `.bin` rather than inventing a misleading image extension.
+    const ext = (mime === 'application/octet-stream'
+      ? 'bin'
+      : (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 8)) || 'bin';
+    const raw = (typeof att === 'object' && att?.name) ? String(att.name) : '';
     const base = raw.replace(/\.[^.]*$/, '').replace(/[^a-z0-9._-]/gi, '_').slice(0, 40) || `pasted-${i + 1}`;
     const rel = `.zeehive/prompt-attachments/${stamp}-${i + 1}-${base}.${ext}`;
     try {
       writeFileSync(resolve(worktreePath, rel), Buffer.from(b64, 'base64'));
       saved.push(rel);
-    } catch (e) { logline('intake', `could not save pasted image #${i + 1}: ${e.message}`); }
+    } catch (e) { logline('intake', `could not save pasted file #${i + 1}: ${e.message}`); }
   });
   return saved;
 }
@@ -292,6 +297,13 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
                                      // said worker" are different inputs, and the old default made
                                      // them indistinguishable. See the effective-type block below.
                                      zee_type = null, manager_xell_id = null,
+                                     // THE PROMPT'S WORK_NODE (lib/prompt-work-node.js). work_item_id
+                                     // = this dispatch is already FOR a card (deployWorkItem /
+                                     // `zee assign`) — the caller assigns it, no card is cut here.
+                                     // parent_work_item = the honeycomb context the prompt was
+                                     // written under; the auto-cut card hangs beneath it (advisory —
+                                     // unknown/foreign falls back to the project root).
+                                     work_item_id = null, parent_work_item = null,
                                      // PER-XELL VISUAL VERIFICATION (opt-in at dispatch time): the human
                                      // asked this xell's zee to build the webapp and OFFER the live link
                                      // in the console. Stored on the xell so the binding and briefing can
@@ -496,15 +508,16 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
       }
     }
 
-    // Pasted images: save them into the (possibly just-renamed) target worktree and append a
+    // Pasted files: save them into the (possibly just-renamed) target worktree and append a
     // reference block so the zee is handed PATHS to Read, not a base64 blob in its prompt. Done
     // AFTER the rename above, which moves the worktree folder — so we re-read the current path.
+    // `images` is the wire field's legacy name — it carries any file attachment now.
     if (targetId && Array.isArray(images) && images.length) {
       const wt = (await one(`SELECT worktree_path FROM xell WHERE id=$1`, [targetId]))?.worktree_path;
-      const saved = saveDispatchImages(wt, images);
+      const saved = saveDispatchAttachments(wt, images);
       if (saved.length) {
-        taskText += `\n\n## Attached images\n`
-          + `The human pasted ${saved.length} image(s) into this prompt. They are saved in your `
+        taskText += `\n\n## Attached files\n`
+          + `The human pasted ${saved.length} file(s) into this prompt. They are saved in your `
           + `worktree — open and read them (paths are relative to your worktree root):\n`
           + saved.map((p) => `- ${p}`).join('\n');
       }
@@ -560,9 +573,29 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
      VALUES ($1,$2,'dispatch','assigned',$3,$4, now())`,
     [projectId, taskText, spawned.xell_id, spawned.zee_id]);
 
+  // ── ANY NEW PROMPT IS A WORK_NODE (the honeycomb's work tree) ────────────────
+  // Every worker dispatch guarantees a card: the caller's own (work_item_id — the caller assigns it
+  // after this returns), the open card the target xell already carries (a swap/re-dispatch), or a
+  // fresh task item cut under parent_work_item — the honeycomb context the prompt was written from,
+  // default the project root. The item's dual-write is what creates the work_node, so the model and
+  // the annex stay in step. A MANAGER takes no card (it runs a crew; it is not a unit of work), and
+  // the cut is NON-FATAL by design: the zee is already running, so a card that could not be cut
+  // must never read back as a dispatch that failed.
+  let workItem = null;
+  if (effectiveType !== 'manager') {
+    try {
+      const { ensurePromptWorkItem } = await import('../lib/prompt-work-node.js');
+      workItem = await ensurePromptWorkItem({ projectId, xellId: spawned.xell_id,
+        workItemId: work_item_id, parentWorkItem: parent_work_item, title: from, prompt: task });
+    } catch (e) {
+      logline('intake', `no work_node could be cut for this prompt (dispatch unaffected): ${e.message}`);
+    }
+  }
+
   logline('intake', `dispatched a zee into ${xell?.slug} — confirmed working (${runtime || 'default runtime'}, mode ${m.key})`);
   return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path,
-           mode: m.key, mode_label: m.label, ...spawned };
+           mode: m.key, mode_label: m.label, ...spawned,
+           ...(workItem ? { work_item: workItem } : {}) };
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
@@ -1498,25 +1531,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // which Docker's bridge NAT would otherwise expose on the LAN. A xell bound to prod
   // (db-shared-prod) keeps its OWN prod DB reachable — that binding is a human's call.
   //
-  // ⚠ THIS LIST IS host:port PAIRS ONLY, so a prod db registered ALIAS-ONLY (no host/host_port,
-  // reachable only by its docker network name — see lib/prod-readonly.js decideReaderAddress) is
-  // NOT in it. That is currently harmless, but only because TWO conditions hold together:
-  //   (a) an alias-only row publishes no host port, so there is no bridge-NAT path for a rule to
-  //       block in the first place — the thing this list exists to close does not exist for it; AND
-  //   (b) the ONLY container joined to that db's docker network is the prod-read-only MANAGER's
-  //       cage, joined deliberately by connectCxellToProdNetwork() and only for db-prod-readonly.
-  // If EITHER stops holding — a host_port is added to an alias-registered row, or anything else is
-  // joined to that network — the row belongs in blockTcp for every project except its own
-  // prod-bound one, and this query must stop filtering on host/host_port to find it.
-  const prodDbs = await q(
-    `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
-      WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
+  // WHICH host:port pairs, and the alias-only caveat that governs the query, live in ONE place now
+  // (lib/cxell-seal.js) — this seal, the re-seal after a prod bind (queenzee/self.js) and the
+  // re-seal of a cage restarted after a host reboot (queenzee/cxell-recover.js) must never drift.
   // A manager holds prod READ-ONLY ('db-prod-readonly') — it must reach the prod db host:port too,
-  // or the SELECT-only role it was given is unusable and the whole binding is theatre.
-  const prodBound = ['db-shared-prod', 'db-prod-readonly'].includes(xell.db_coupling);
-  const blockTcp = prodDbs
-    .filter((r) => !(prodBound && r.project_id === xell.project_id))
-    .map((r) => `${r.host}:${r.host_port}`);
+  // or the SELECT-only role it was given is unusable and the whole binding is theatre; both that
+  // coupling and the human grant are in PROD_REACHING_COUPLINGS.
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, dbCoupling: xell.db_coupling });
 
   // RECORD THE MODEL THE CAGE WILL ACTUALLY RUN. A claude alias means nothing to a non-claude CLI,
   // so the adapter drops it and runs the vendor's own — which left production holding deepseek-cxell

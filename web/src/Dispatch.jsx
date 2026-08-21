@@ -4,23 +4,61 @@ import { createPortal } from 'react-dom';
 import { getDispatchOptions, getHarnesses, getRouterStatus } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
 import ZeeAvatar from './ZeeAvatar.jsx';
+import { providerWide, modelWide, formatLimitChip } from './usageLimits.js';
 
-// Same ceiling as the 📨 MessageComposer: pasted images ride the dispatch JSON body as base64 data
-// URLs, and base64 inflates ~33% — so keep the total image payload well under the server's 30mb
+// MODEL-WIDE only — empty when no model-specific pool is known (do not fall back to provider-wide
+// on the model button; that number lives on the provider button).
+function modelLimitLabel(provider, modelKey, modelRow, account) {
+  if (account?.usage_limit) {
+    const lim = modelWide(account.usage_limit, { provider, model: modelKey });
+    if (lim.available_pct != null) return formatLimitChip(lim);
+  }
+  // Server already attaches model-wide only (null when unknown).
+  if (modelRow?.available_pct != null && modelRow.limit_source === 'model') {
+    return formatLimitChip({
+      available_pct: modelRow.available_pct,
+      window: modelRow.limit_window,
+      source: 'model',
+    });
+  }
+  if (modelRow?.available_pct != null && modelRow.limit_source == null && modelRow.limit_window) {
+    // older shape: treat non-null as model when window is a model tier
+    return formatLimitChip({
+      available_pct: modelRow.available_pct,
+      window: modelRow.limit_window,
+      source: 'model',
+    });
+  }
+  return '';
+}
+
+// PROVIDER-WIDE chip for a provider button.
+function providerLimitLabel(providerRow, account) {
+  if (account?.usage_limit) {
+    return formatLimitChip(providerWide(account.usage_limit));
+  }
+  if (providerRow?.available_pct != null) {
+    return formatLimitChip({ available_pct: providerRow.available_pct, source: 'provider' });
+  }
+  return '';
+}
+
+// Same ceiling as the 📨 MessageComposer: pasted files ride the dispatch JSON body as base64 data
+// URLs, and base64 inflates ~33% — so keep the total file payload well under the server's 30mb
 // json limit (server/src/index.js) and the webapp nginx's client_max_body_size (nginx-web.conf).
 const MAX_BYTES = 20 * 1024 * 1024;
 
-// The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
-// the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
+// The "+" composer. A human writes a prompt (rich text, paste-friendly, attachments welcome) and
+// picks the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
 // dispatch: the queenzee claims a ready xell for this project and spawns a zee into its worktree
-// with the task text (+ any pasted images). This is not a parallel one-off mechanism; it POSTs the
+// with the task text (+ any pasted files). This is not a parallel one-off mechanism; it POSTs the
 // same /api/xell/dispatch the CLI dispatch does, so the new xell shows up like any other.
 //
 // The overlay deliberately does NOT close on an outside click — a half-written prompt is real work,
 // and losing it to a stray click is worse than one extra button press. Close is ✕ / Cancel only.
 //
 // SUBMIT IS FIRE-AND-FORGET: dispatching a zee is slow (it uploads any pasted screenshot, renames
-// the worktree, then spawns and AWAITS the real zee start), and an attached image made the old
+// the worktree, then spawns and AWAITS the real zee start), and an attached file made the old
 // blocking "Dispatching…" button freeze the modal for seconds. So submit now just validates, hands
 // the whole payload up to the parent and closes at once — the parent runs the dispatch and reports
 // progress through a toast (including a Retry that reuses this exact payload if it fails).
@@ -58,8 +96,8 @@ const MAX_BYTES = 20 * 1024 * 1024;
 //     not a switch a human flips here (stated as a note instead of a control that lies);
 //   • the brief MAY be left blank — the server then hands it DEFAULT_MANAGER_BRIEF (study the
 //     project, propose a plan, ask before starting a crew), which is a real answer, not an empty one.
-// Everything else — the editor, images, model, mode, supervision, account — is shared, because a
-// manager's prompt deserves at least what a worker's gets.
+// Everything else — the editor, attachments, model, mode, supervision, account — is shared, because
+// a manager's prompt deserves at least what a worker's gets.
 export default function Dispatch({ projectId, projectName,
                                    // WHICH PERSONA this composer is for. Three-state, and the same
                                    // three states the dispatch payload carries: undefined = the
@@ -89,7 +127,7 @@ export default function Dispatch({ projectId, projectName,
   const [headless, setHeadless] = useState(true); // default headless (fire-and-forget)
   const [prodDb, setProdDb] = useState(false);    // OFF by default — LIVE production data, opt-in only
   const [visualVerify, setVisualVerify] = useState(false); // OFF by default — per-xell VISUAL VERIFICATION (build the webapp, offer the link to a human)
-  const [images, setImages] = useState([]);       // [{ id, name, data(dataURL), size }]
+  const [attachments, setAttachments] = useState([]);   // [{ id, name, type, data(dataURL), size }]
   const [err, setErr] = useState(null);
   const [empty, setEmpty] = useState(true);       // drives the placeholder + submit-disabled state
   // ONE SUBMIT PER DOOR (150). submit() is fire-and-forget — it hands the payload up and the
@@ -340,21 +378,21 @@ export default function Dispatch({ projectId, projectName,
   // Esc closes only when nothing is composed — so it can't silently discard a written prompt.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === 'Escape' && empty && !images.length) onClose();
+      if (e.key === 'Escape' && empty && !attachments.length) onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [empty, images.length, onClose]);
+  }, [empty, attachments.length, onClose]);
 
-  // Same per-attachment ceiling as the 📨 MessageComposer (MAX_BYTES there): a pasted screenshot is
-  // sent as base64 INSIDE the JSON body, so an oversized image fails the whole dispatch with an
+  // Same per-attachment ceiling as the 📨 MessageComposer (MAX_BYTES there): a pasted file is
+  // sent as base64 INSIDE the JSON body, so an oversized attachment fails the whole dispatch with an
   // opaque 413. Say so here, before the POST. Base64 inflates ~33%, and the server's json limit is
-  // 30mb — 20mb of images stays comfortably under it. The ceiling is enforced in the functional
-  // updater (not from the render closure) so two images pasted in the same tick are summed against
+  // 30mb — 20mb of files stays comfortably under it. The ceiling is enforced in the functional
+  // updater (not from the render closure) so two files pasted in the same tick are summed against
   // it correctly — the same shape MessageComposer's addFiles uses.
-  const addImage = (img) =>
-    setImages((prev) => {
-      const next = [...prev, { id: `${Date.now()}-${prev.length}`, ...img }];
+  const addFile = (att) =>
+    setAttachments((prev) => {
+      const next = [...prev, { id: `${Date.now()}-${prev.length}`, ...att }];
       const total = next.reduce((n, im) => n + (im.size || 0), 0);
       if (total > MAX_BYTES) {
         setErr(`Attachments exceed 20 MB — remove one before dispatching (${(total / (1024 * 1024)).toFixed(1)} MB).`);
@@ -363,7 +401,7 @@ export default function Dispatch({ projectId, projectName,
       setErr(null);
       return next;
     });
-  const removeImage = (id) => { setErr(null); setImages((prev) => prev.filter((im) => im.id !== id)); };
+  const removeFile = (id) => { setErr(null); setAttachments((prev) => prev.filter((im) => im.id !== id)); };
 
   const syncEmpty = () => {
     setEmpty(!(editorRef.current?.innerText || '').trim());
@@ -384,22 +422,24 @@ export default function Dispatch({ projectId, projectName,
   };
   useEffect(() => () => clearTimeout(overlapTimer.current), []);
 
-  // Paste: capture image FILES (a pasted screenshot) as attachments rather than letting the browser
-  // dump a giant base64 blob into the editor; let text/HTML paste through so formatted text lands
-  // sensibly. If the clipboard has both an image and text, we keep the text and grab the image.
+  // Paste: capture FILE attachments (a pasted screenshot, a copied log) rather than letting the
+  // browser dump a giant base64 blob into the editor; let text/HTML paste through so formatted text
+  // lands sensibly. If the clipboard has both a file and text, we keep the text and grab the file.
   const onPaste = (e) => {
     const items = Array.from(e.clipboardData?.items || []);
-    const imgItems = items.filter((it) => it.kind === 'file' && it.type.startsWith('image/'));
-    if (!imgItems.length) return; // plain/rich text paste — default behaviour is fine
+    const fileItems = items.filter((it) => it.kind === 'file');
+    if (!fileItems.length) return; // plain/rich text paste — default behaviour is fine
     e.preventDefault();
     const text = e.clipboardData.getData('text/plain');
     if (text) { document.execCommand('insertText', false, text); syncEmpty(); }
-    imgItems.forEach((it, i) => {
+    fileItems.forEach((it, i) => {
       const file = it.getAsFile();
       if (!file) return;
+      const ext = (file.type?.split('/')[1] || '').replace(/[^a-z0-9]/gi, '').slice(0, 8);
       const reader = new FileReader();
-      reader.onload = () => addImage({
-        name: file.name || `pasted-${Date.now()}-${i + 1}.${(file.type.split('/')[1] || 'png')}`,
+      reader.onload = () => addFile({
+        name: file.name || `pasted-${Date.now()}-${i + 1}${ext ? `.${ext}` : '.bin'}`,
+        type: file.type || 'application/octet-stream',
         data: reader.result,
         size: file.size,
       });
@@ -433,7 +473,8 @@ export default function Dispatch({ projectId, projectName,
     // the project default / the router). undefined → omit (project default); '' → core only
     // (null); a key → that harness.
     ...(h !== undefined ? { harness: h || null } : {}),
-    images: images.map(({ name, data }) => ({ name, data })),
+    // `images` is the wire field's legacy name — it carries any file attachment now.
+    images: attachments.map(({ name, data }) => ({ name, data })),
   });
 
   // INSTANT DEPLOY — skip the router zee, dispatch with the custom pins now. Unpinned fields use
@@ -443,7 +484,7 @@ export default function Dispatch({ projectId, projectName,
   // resolved provider is blocked, so the refusal is not waiting for the spawn.
   const instantDeploy = () => {
     const task = (editorRef.current?.innerText || '').trim();
-    if (!task) { setErr('Write a prompt first (an image alone is not enough — the zee needs a task).'); return; }
+    if (!task) { setErr('Write a prompt first (an attachment alone is not enough — the zee needs a task).'); return; }
     const r = resolveInstantDeployment({
       cProv, cModel, cMode, cHarness, cAcctId, harness, options: cOptions,
     });
@@ -478,9 +519,9 @@ export default function Dispatch({ projectId, projectName,
     // A WORKER with no task is nothing to do. A MANAGER with no task is a defined thing: the server
     // hands it DEFAULT_MANAGER_BRIEF (study the project, propose a programme, ask before starting a
     // crew), which is exactly what the old one-line box allowed by leaving it blank. Keep that.
-    if (!task && !manager) { setErr('Write a prompt first (an image alone is not enough — the zee needs a task).'); return; }
+    if (!task && !manager) { setErr('Write a prompt first (an attachment alone is not enough — the zee needs a task).'); return; }
     // ROUTE VIA ROUTER: the prompt goes RAW to the live router, which recomposes it and decides
-    // the dispatch — so none of the controls below ride along, only the words and the images. The
+    // the dispatch — so none of the controls below ride along, only the words and the attachments. The
     // persona the button chose travels as a HINT (the router decides the harness, but the human's
     // click is a signal worth carrying). Cmd/Ctrl+Enter always takes this door when a router is
     // live — Instant deploy is the explicit second button only.
@@ -508,7 +549,8 @@ export default function Dispatch({ projectId, projectName,
         // (provider/model/mode/harness), only the fields actually pinned. Omitted entirely when the
         // panel was never touched, so the routing request is exactly what it was before.
         ...(customCount ? { custom } : {}),
-        images: images.map(({ name, data }) => ({ name, data })),
+        // `images` is the wire field's legacy name — it carries any file attachment now.
+        images: attachments.map(({ name, data }) => ({ name, data })),
       });
       return;
     }
@@ -530,7 +572,7 @@ export default function Dispatch({ projectId, projectName,
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); submit(); }
   };
 
-  const totalMb = images.reduce((n, im) => n + (im.size || 0), 0) / (1024 * 1024);
+  const totalMb = attachments.reduce((n, im) => n + (im.size || 0), 0) / (1024 * 1024);
 
   // What the persona RESTRICTS, in one line — rendered next to its name so the rule is visible at
   // the moment of the decision rather than in the refusal afterwards.
@@ -721,16 +763,18 @@ export default function Dispatch({ projectId, projectName,
             </div>
           )}
 
-          {images.length > 0 && !routerMode && (
-            <div className="disp-imgs" data-testid="dispatch-images">
-              {images.map((im) => (
-                <div className="disp-img" key={im.id} title={im.name}>
-                  <img src={im.data} alt={im.name} />
-                  <button className="disp-img-x" onClick={() => removeImage(im.id)}
-                          title="Remove this image" aria-label="Remove image">✕</button>
+          {attachments.length > 0 && !routerMode && (
+            <div className="disp-imgs" data-testid="dispatch-attachments">
+              {attachments.map((att) => (
+                <div className={att.type?.startsWith('image/') ? 'disp-img' : 'disp-filechip'} key={att.id} title={att.name}>
+                  {att.type?.startsWith('image/')
+                    ? <img src={att.data} alt={att.name} />
+                    : <><span className="disp-file-icon">📎</span><span className="disp-file-name">{att.name}</span></>}
+                  <button className="disp-img-x" onClick={() => removeFile(att.id)}
+                          title="Remove this attachment" aria-label="Remove attachment">✕</button>
                 </div>
               ))}
-              <span className="disp-imgnote">{images.length} image{images.length === 1 ? '' : 's'} · {totalMb.toFixed(1)} MB — handed to the zee as files in its worktree</span>
+              <span className="disp-imgnote">{attachments.length} attachment{attachments.length === 1 ? '' : 's'} · {totalMb.toFixed(1)} MB — handed to the zee as files in its worktree</span>
             </div>
           )}
 
@@ -794,18 +838,27 @@ export default function Dispatch({ projectId, projectName,
                               data-testid="custom-provider-router"
                               title="Leave the provider to the router (its policy weights and schedule decide)."
                               onClick={() => setCProv(null)}>router decides</button>
-                      {cProviderRows.map((p) => (
+                      {cProviderRows.map((p) => {
+                        const pAcct = (p.accounts || []).find((a) => !a.paused && a.usage_limit)
+                          || (p.accounts || []).find((a) => !a.paused) || null;
+                        const pLim = providerLimitLabel(p, pAcct);
+                        return (
                         <button key={p.provider} className={`disp-seg ${cProv === p.provider ? 'on' : ''} ${p.blocked_reason ? 'seg-hollow' : ''}`}
                                 data-testid={`custom-provider-${p.provider}`}
                                 disabled={!!p.blocked_reason}
                                 title={p.blocked_reason
                                   ? `${p.label}: ${p.blocked_reason}`
-                                  : `Pin this dispatch to ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`}
+                                  : `Pin this dispatch to ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`
+                                    + (pLim ? `\nprovider-wide: ${pLim}` : '')}
                                 onClick={() => setCProv(p.provider)}>
-                          <ZeeAvatar provider={p.provider} size={18} />
+                          <ZeeAvatar provider={p.provider} size={18}
+                                     availablePct={p.available_pct
+                                       ?? providerWide(pAcct?.usage_limit).available_pct} />
                           {p.label}
+                          {pLim ? <span className="disp-limit" data-testid={`custom-provider-limit-${p.provider}`}> · {pLim}</span> : null}
                         </button>
-                      ))}
+                        );
+                      })}
                       {!cProviderRows.length && (
                         <span className="disp-hint" data-testid="custom-no-providers">
                           {optsErr ? `could not read this project's providers: ${optsErr}` : 'loading…'}
@@ -851,17 +904,23 @@ export default function Dispatch({ projectId, projectName,
                                 data-testid="custom-model-router"
                                 title="Leave the model to the router (the persona's policy resolves it)."
                                 onClick={() => setCModel(null)}>router decides</button>
-                        {cModels.map((m) => (
+                        {cModels.map((m) => {
+                          const cAcc = cAcctId ? cAccounts.find((a) => a.id === cAcctId) : cAccounts[0];
+                          const lim = modelLimitLabel(cProv, m.key, m, cAcc);
+                          return (
                           <button key={m.key} className={`disp-seg ${cModel === m.key ? 'on' : ''}`}
                                   data-testid={`custom-model-${m.key}`}
                                   title={[m.note || m.label,
+                                          lim ? `model limit: ${lim}` : null,
                                           m.context_window ? `context ${Number(m.context_window).toLocaleString()} tokens` : null,
                                           m.parameters ? `${m.parameters}B parameters` : null,
                                           m.priority > 1 ? `deployment priority ${m.priority}` : null].filter(Boolean).join(' · ')}
                                   onClick={() => setCModel(m.key)}>
                             {m.label}{m.key === cActive?.default_model ? ' ·default' : ''}
+                            {lim ? <span className="disp-limit" data-testid={`model-limit-${m.key}`}> · {lim}</span> : null}
                           </button>
-                        ))}
+                          );
+                        })}
                         {!cModels.length && (
                           <span className="disp-hint" data-testid="custom-no-models">
                             this persona's model policy allows no model on {cActive?.label || 'this provider'}
@@ -952,21 +1011,30 @@ export default function Dispatch({ projectId, projectName,
             <div className="disp-field">
               <label className="disp-label">AI provider</label>
               <div className="disp-models" role="group" aria-label="AI provider">
-                {providerRows.map((p) => (
+                {providerRows.map((p) => {
+                  const pAcct = (p.accounts || []).find((a) => !a.paused && a.usage_limit)
+                    || (p.accounts || []).find((a) => !a.paused) || null;
+                  const pLim = providerLimitLabel(p, pAcct);
+                  return (
                   <button key={p.provider} className={`disp-seg ${prov === p.provider ? 'on' : ''} ${p.blocked_reason ? 'seg-hollow' : ''}`}
                           data-testid={`dispatch-provider-${p.provider}`}
                           disabled={!!p.blocked_reason}
                           title={p.blocked_reason
                             ? `${p.label}: ${p.blocked_reason}`
-                            : `Run this zee on ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`}
+                            : `Run this zee on ${p.label} — its own CLI inside the cxell (${p.runtime?.label || p.runtime?.key || 'runtime'})`
+                              + (pLim ? `\nprovider-wide limit: ${pLim}` : '')}
                           onClick={() => setProv(p.provider)}>
                     {/* the vendor's own coin — the badge the dispatched zee will WEAR in the
                         honeycomb (web/src/providerArt.js). Which AI is thinking is the identity,
                         so it is a picture here as well as on the hexagon. */}
-                    <ZeeAvatar provider={p.provider} size={18} />
+                    <ZeeAvatar provider={p.provider} size={18}
+                               availablePct={p.available_pct
+                                 ?? providerWide(pAcct?.usage_limit).available_pct} />
                     {p.label}
+                    {pLim ? <span className="disp-limit" data-testid={`provider-limit-${p.provider}`}> · {pLim}</span> : null}
                   </button>
-                ))}
+                  );
+                })}
                 {!providerRows.length && (
                   <span className="disp-hint" data-testid="dispatch-no-providers">
                     {optsErr ? `could not read this project's providers: ${optsErr}` : 'loading…'}
@@ -986,15 +1054,24 @@ export default function Dispatch({ projectId, projectName,
               <div className="disp-field">
                 <label className="disp-label">Account</label>
                 <div className="disp-models" role="group" aria-label="AI account">
-                  {accounts.map((a) => (
+                  {accounts.map((a) => {
+                    const pw = providerWide(a.usage_limit);
+                    const aPct = pw.available_pct ?? a.available_pct ?? null;
+                    const aLim = aPct != null
+                      ? formatLimitChip({ available_pct: aPct, source: 'provider' })
+                      : '';
+                    return (
                     <button key={a.id} className={`disp-seg ${acct?.id === a.id ? 'on' : ''}`}
                             data-testid={`dispatch-account-${a.id}`}
-                            title={`Run this zee on ${a.name} (${active?.label}) — its own CLI inside the cxell`}
+                            title={`Run this zee on ${a.name} (${active?.label}) — its own CLI inside the cxell`
+                              + (aLim ? `\nprovider-wide: ${aLim}` : '')}
                             onClick={() => setAcctId(a.id)}>
-                      <ZeeAvatar provider={active?.provider} size={18} />
+                      <ZeeAvatar provider={active?.provider} size={18} availablePct={aPct} />
                       {a.name}
+                      {aLim ? <span className="disp-limit"> · {aLim}</span> : null}
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1026,17 +1103,23 @@ export default function Dispatch({ projectId, projectName,
             <div className="disp-field">
               <label className="disp-label">Model</label>
               <div className="disp-models" role="group" aria-label="Model">
-                {models.map((m) => (
+                {models.map((m) => {
+                  const lim = modelLimitLabel(active?.provider || prov, m.key, m, acct);
+                  return (
                   <button key={m.key} className={`disp-seg ${model === m.key ? 'on' : ''}`}
                           data-testid={`dispatch-model-${m.key}`}
                           title={[m.note || m.label,
+                                  lim || null,
+                                  lim ? 'remaining usage limit for this model on the selected account' : null,
                                   m.context_window ? `context ${Number(m.context_window).toLocaleString()} tokens` : null,
                                   m.parameters ? `${m.parameters}B parameters` : null,
                                   m.priority > 1 ? `deployment priority ${m.priority}` : null].filter(Boolean).join(' · ')}
                           onClick={() => setModel(m.key)}>
                     {m.label}{(active ? m.key === active.default_model : m.default) ? ' ·default' : ''}
+                    {lim ? <span className="disp-limit" data-testid={`model-limit-${m.key}`}> · {lim}</span> : null}
                   </button>
-                ))}
+                  );
+                })}
                 {!models.length && (
                   <span className="disp-hint" data-testid="dispatch-no-models">
                     this persona's model policy allows no model on {active?.label || 'this provider'}
