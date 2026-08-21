@@ -41,6 +41,7 @@ import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harne
          resolveHarness, harnessFitsType, typeMismatchReason } from '../lib/harness.js';
 import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.js';
 import { projectDocFiles } from '../lib/project-docs.js';
+import { currentConditionsMarkdownForProject } from '../lib/current-conditions.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
@@ -1129,8 +1130,18 @@ export async function reinjectHarnessIntoXell(xellId) {
 // of running headless. Without this it gets a bare task string — it doesn't know it's a zee, what
 // it owns, how to build, or that nobody can answer a question, so it researches and then stalls
 // asking "want me to continue?" into a void.
-async function briefing(xellId, zee, task, { headless = true, cxell = false } = {}) {
+// Exported for test/current-conditions.test.mjs — the injection point is the seam the card's
+// judge looks at ("I can see it in a briefing"), so a test calls the REAL composer, not a mock.
+export async function briefing(xellId, zee, task, { headless = true, cxell = false } = {}) {
   const b = await bindingFor(xellId, zee, task, { cxell });
+  // CURRENT CONDITIONS (ticket #67) — the short, dated, per-PROJECT list of live impediments,
+  // injected here from the meta-DB (DATA, house rule 7). Deliberately NOT part of the manual or
+  // the project doc: those are TIMELESS, these lines are true NOW and should be false SOON. The
+  // render is null when the project has none, so a briefing for a healthy project is unchanged.
+  // Resolved live at briefing time so a line a manager added a minute ago is already in the very
+  // next briefing — there is no rebuild, no re-spawn, no cache to go stale.
+  const xellRow = await one(`SELECT project_id FROM xell WHERE id=$1`, [xellId]);
+  const conditions = await currentConditionsMarkdownForProject(xellRow?.project_id);
   // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +
   // "how you are running") and ABOVE the task — the fixed precedence in docs §4. core adds no new
   // TEXT (its content is the manual + rules, already here), so an unharnessed xell is unchanged.
@@ -1180,6 +1191,10 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
     '- Explore the codebase before designing: find the existing patterns and build on them.',
     '- When the job is done, stop. A human marks it done in the ZEEHIVE dashboard — never despawn',
     '  yourself, and never touch the xource (the read-only main repo).',
+    // CURRENT CONDITIONS — live impediments for THIS project, dated and visibly ephemeral, placed
+    // where they are read (above the persona and the task) rather than skimmed past. Null when the
+    // project has none — no empty section, no skim-past noise.
+    ...(conditions ? ['', conditions] : []),
     // HARNESS LAYER — the assigned persona/skills, below the law above and above the task below.
     ...(harnessBlock ? ['', harnessBlock] : []),
     '',

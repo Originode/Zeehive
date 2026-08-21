@@ -68,6 +68,10 @@ import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
 // The A2A MEET group-chat rooms (`zee meet`, docs/zee-meet-plan.md) — the DB half lives here so
 // the self verbs below are thin. Any live zee of a project may create/attend a room by code.
 import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '../lib/a2a-meet.js';
+// CURRENT CONDITIONS (ticket #67) — the short, dated, per-PROJECT list of live impediments
+// injected into every briefing. `zee conditions` is the read verb (every zee) and the manager's
+// write verb (--add / --remove). The lib owns the domain; this file adds the manager refusal.
+import { listProjectConditions, addProjectCondition, removeProjectConditionScoped } from '../lib/current-conditions.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -2719,6 +2723,27 @@ export async function selfTicketList(xell, { status = null, q: search = null } =
 // A MANAGER gets its project's plan in tree order (with each item's status, assignee and live zee);
 // a WORKER gets the item it is assigned to, with the ancestors/ticket/history it was briefed from.
 // `--item <id>` reads one item, scoped the same way.
+// CURRENT CONDITIONS — `zee conditions`. READ is every zee's: the short, dated, per-PROJECT list
+// of live impediments injected into every briefing (ticket #67). WRITE (--add / --remove) is a
+// MANAGER verb — the same `requireManager` wall as `zee work --new` — scoped to the caller's OWN
+// project by its token, opening no gate and touching nothing irreversible (it is a line of text in
+// the meta-DB that the next briefing renders).
+export async function selfConditions(xell, { action = null, body = null, id = null } = {}) {
+  if (!action) {
+    return { ok: true, conditions: await listProjectConditions(xell.project_id) };
+  }
+  const guard = requireManager(xell, 'conditions');
+  if (guard) return guard;
+  if (action === 'add') {
+    return addProjectCondition(xell.project_id, body, { actor: xell.slug });
+  }
+  if (action === 'remove') {
+    if (!id) return { ok: false, error: 'conditions --remove needs --id <condition-id>' };
+    return removeProjectConditionScoped(id, xell.project_id);
+  }
+  return { ok: false, error: `unknown conditions action "${action}" — use --add "…" or --remove <id>` };
+}
+
 export async function selfWork(xell, { board = false, item = null } = {}) {
   const { workItemTree, itemForXell } = await import('../lib/work-assign.js');
   const { getWorkItem } = await import('../lib/work-items.js');

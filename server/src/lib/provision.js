@@ -1018,7 +1018,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     await client.query('COMMIT');
     broadcast('xell', xell);
     // the honeycomb's queenzee→xell line: the queenzee just provisioned this xell
-    activity('q2x', xell.id, 'provision');
+    activity('q2x', xell.id, 'provision', projectId);
     // the harness-free projection rides every REAL provision; failure is logged, never fatal
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {

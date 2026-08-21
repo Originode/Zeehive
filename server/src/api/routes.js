@@ -10,7 +10,7 @@ import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
-import { bus, broadcast } from '../lib/events.js';
+import { bus, broadcast, activityFanout } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
@@ -20,6 +20,8 @@ import { dispatchOptions } from '../lib/dispatch-options.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
          previewProjectDoc } from '../lib/project-docs.js';
+import { listProjectConditions, addProjectCondition, updateProjectCondition,
+         removeProjectCondition } from '../lib/current-conditions.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, setBackupPaused, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -119,7 +121,7 @@ import { listCredentialInjectRequests, decideCredentialInject, dismissCredential
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
-         selfWorkItem } from '../queenzee/self.js';
+         selfWorkItem, selfConditions } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
@@ -572,6 +574,67 @@ router.get('/project-docs/:docId/preview', async (req, res) => {
 router.delete('/project-docs/:docId', async (req, res) => {
   try { res.json(await deleteProjectDoc(req.params.docId)); }
   catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── CURRENT CONDITIONS — the short, dated, per-PROJECT list of live impediments injected into
+// every briefing (ticket #67). The console is the HUMAN's authoring surface; a manager edits the
+// same list through `zee conditions --add/--remove` (see the /xell/self/conditions routes). Each
+// line is DATA (house rule 7): it lives here in the meta-DB, is resolved live at briefing time,
+// and is trivially deletable — there is deliberately no archive, because a condition that stops
+// being true should be GONE, not hidden. ──
+//
+// A WRITE to a condition reaches EVERY briefing in the project, so "who may write" is really "who
+// may edit every other zee's instructions" — that is a MANAGER wall, and it must hold on THIS
+// surface too, not just on the /xell/self route a zee's own CLI uses. The console sends NO token
+// (it is a human's dashboard), so a bare request passes; a MANAGER zee's token passes; a WORKER
+// zee's token is refused — closing the "call the console route straight from the cage" escape
+// from the self-route wall.
+async function refuseWorkerZeeToken(req) {
+  const auth = req.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
+  if (!token) return null;                 // the dashboard / human tooling — not a zee, not refused
+  const xell = await xellForToken(token);  // a real xell token, resolved server-side from the DB
+  if (!xell) return null;                  // an API-key/other auth path — not this wall's business
+  if (xell.zee_type !== 'manager') {
+    return { ok: false, status: 'refused',
+      error: 'writing a current condition is MANAGER-only (it reaches every briefing in the '
+        + 'project). A zee edits the list with `zee conditions` — which enforces the same wall '
+        + 'server-side — or a human edits it in the console.' };
+  }
+  return null;
+}
+router.get('/projects/:id/conditions', async (req, res) => {
+  try { res.json(await listProjectConditions(await resolveProjectParam(req.params.id))); }
+  catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
+});
+router.post('/projects/:id/conditions', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const r = await addProjectCondition(await resolveProjectParam(req.params.id),
+      req.body?.body || null, { actor: req.body?.actor || 'human' });
+    if (!r.ok) return res.status(400).json(r);
+    res.status(201).json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.put('/project-conditions/:condId', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const r = await updateProjectCondition(req.params.condId, req.body?.body || null,
+      { actor: req.body?.actor || 'human' });
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.delete('/project-conditions/:condId', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const r = await removeProjectCondition(req.params.condId);
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 router.get('/projects/:id/sites', async (req, res) => {
@@ -2891,6 +2954,24 @@ router.get('/work-items/:id/candidates', async (req, res) => {
   catch (err) { assignErr(res, err); }
 });
 
+// ── CURRENT CONDITIONS (`zee conditions`) — the short, dated, per-PROJECT list of live
+// impediments injected into every briefing (ticket #67). READ is every zee's; WRITE (--add /
+// --remove) is MANAGER-only, scoped to the caller's own project by its token — the same wall as
+// `zee work --new`. A worker that tries to write is told what it is, not 404'd.
+router.get('/xell/self/conditions', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfConditions(x, {})); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/conditions', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const r = await selfConditions(x, { action: b.action || null, body: b.body || null, id: b.id || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
 // ── WORK TRACKER: the cxell verbs (`zee work` · `zee assign` · `zee item`) ────
 // Token-scoped, exactly like every other /xell/self/ verb: a MANAGER sees and moves its own project's
 // plan, a WORKER sees and reports on the ONE item it is assigned to. The scope is resolved in the
@@ -3096,10 +3177,13 @@ router.get('/stream', async (req, res) => {
     res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
   }
 
-  const onEvent = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
+  const send = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
+  // Project-scope + cap the queenzee-activity fan-out per connection (activityFanout); every
+  // other event type rides through unchanged.
+  const { onEvent, close } = activityFanout(req.query.project || null, send);
   bus.on('event', onEvent);
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);
-  req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
+  req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); close(); });
 });
 
 // ── XELL WEBAPP REVIEW — /xell-web/<slug>/* (compatibility redirect) ──────────────────────────

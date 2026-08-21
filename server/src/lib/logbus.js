@@ -7,9 +7,16 @@ import { broadcast } from './events.js';
 // touched, in a shape the canvas can animate. Emitted only at the moments a human wants to SEE —
 // provisioning/housekeeping/reaping are queenzee→xell, and a zee's land/push/ship-request is
 // xell→queenzee — and capped client-side so a busy fleet does not clutter the honeycomb.
-export function activity(dir, xellId, kind) {
+//
+// project_id is carried AT THE SOURCE so a multi-project console can scope the fan-out before
+// the write (see activityFanout in events.js): the callers of activity() already hold the
+// project (they resolved the xell row or the project row to do their job), so passing it here
+// costs no DB round trip on the hot path — the alternative, resolving xell→project per event,
+// would add a query to every emit. A scoped connection drops an event whose project_id is
+// missing or different, so an un-stamped event never leaks to a browser it does not belong to.
+export function activity(dir, xellId, kind, projectId) {
   if (!xellId) return null;
-  const line = { dir, xell_id: xellId, kind, ts: Date.now() };
+  const line = { dir, xell_id: xellId, kind, ts: Date.now(), project_id: projectId || null };
   broadcast('queenzee-activity', line);
   return line;
 }

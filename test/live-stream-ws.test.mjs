@@ -10,6 +10,10 @@
 //   3. an unknown path is left alone (it is not a stream upgrade — no 400 from this handler, and
 //      the socket stays unclaimed by the bridge, like any other upgrade on the server);
 //   4. a bad project resolves to an `error` frame, never a dropped connection.
+//   5. the queenzee-activity fan-out is scoped AT THE SOURCE: a project-A connection never
+//      receives a project-B activity event, while an unscoped connection still gets both;
+//   6. a burst of activity events is capped server-side (≤ ACTIVITY_MAX_PENDING frames), and
+//   7. a single event in a quiet system arrives promptly and un-coalesced (exactly one frame).
 //
 // Nothing here is mocked where it could be run: a real http server, the real attachStreamWebSocket,
 // the real `ws` client (the same package the browser-independent side of the terminal bridge uses),
@@ -29,12 +33,14 @@ const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { attachStreamWebSocket } = await import('../server/src/lib/stream.js');
-const { broadcast } = await import('../server/src/lib/events.js');
+const { broadcast, ACTIVITY_MAX_PENDING, ACTIVITY_FLUSH_MS } = await import('../server/src/lib/events.js');
+const { activity } = await import('../server/src/lib/logbus.js');
 
 const db = new pg.Client({ connectionString: url });
 await db.connect();
 const tag = `zt-ws-${Date.now()}`;
 let projId = null;
+let projB = null;
 let httpSrv = null;
 let wsClient = null;
 
@@ -109,6 +115,69 @@ try {
   ok(c2.ws.readyState === 1, 'the connection is still open after the error frame');
   c2.ws.close();
 
+  // ── queenzee-activity fan-out bounds (project scoping + burst cap) ──────────────
+  // The card: "scope and cap the queenzee-activity SSE fan-out". These assertions prove the
+  // server-side bounds that live in activityFanout (events.js), through the REAL websocket:
+  // a project-scoped console never receives another project's arrows, a burst is capped at
+  // ACTIVITY_MAX_PENDING, and a lone event arrives promptly and un-coalesced.
+  projB = (await db.query(
+    `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'master') RETURNING id`,
+    [`${tag}-b`, `/tmp/${tag}-b`])).rows[0].id;
+  const act = (frames) => frames.filter((f) => f.type === 'queenzee-activity');
+
+  console.log('\n── the queenzee-activity feed is project-scoped at the source ──');
+  const c3 = await connect(`/api/stream/ws?project=${projId}`);
+  wsClient = c3.ws;
+  await until(c3.frames, (fs) => fs.some((f) => f.type === 'snapshot'));
+  activity('q2x', 'xell-b-1', 'provision', projB);   // a project-B arrow
+  activity('q2x', 'xell-a-1', 'provision', projId);  // a project-A arrow
+  ok(await until(c3.frames, (fs) => act(fs).some((f) => f.payload?.xell_id === 'xell-a-1')),
+     'a project-A console receives the project-A arrow');
+  await sleep(ACTIVITY_FLUSH_MS * 4);   // give a wrongly-routed project-B arrow time to arrive
+  ok(act(c3.frames).some((f) => f.payload?.xell_id === 'xell-a-1' && f.payload?.project_id === projId),
+     'the received arrow carries the project_id at the source');
+  ok(!act(c3.frames).some((f) => f.payload?.xell_id === 'xell-b-1'),
+     '…and NEVER receives a project-B arrow (the filter bites before the wire)');
+
+  console.log('\n── an unscoped connection still sees every project ──');
+  const c4 = await connect('/api/stream/ws');   // no ?project → whole-fleet view
+  wsClient = c4.ws;
+  await until(c4.frames, (fs) => fs.some((f) => f.type === 'snapshot'));
+  activity('q2x', 'xell-b-2', 'provision', projB);
+  ok(await until(c4.frames, (fs) => act(fs).some((f) => f.payload?.xell_id === 'xell-b-2')),
+     'an unscoped (whole-fleet) console still receives a project-B arrow');
+  c4.ws.close();
+
+  console.log('\n── a burst of queenzee-activity events is capped server-side ──');
+  const c5 = await connect(`/api/stream/ws?project=${projId}`);
+  wsClient = c5.ws;
+  await until(c5.frames, (fs) => fs.some((f) => f.type === 'snapshot'));
+  const beforeBurst = act(c5.frames).length;
+  for (let i = 0; i < 100; i++) activity('q2x', `xell-burst-${i}`, 'provision', projId);  // same tick
+  await until(c5.frames, (fs) => act(fs).length > beforeBurst);   // the flush lands
+  await sleep(ACTIVITY_FLUSH_MS * 4);                              // let the flush window close
+  const burstCount = act(c5.frames).length - beforeBurst;
+  ok(burstCount > 0 && burstCount <= ACTIVITY_MAX_PENDING,
+     `a 100-xell burst reaches the client as ≤ ${ACTIVITY_MAX_PENDING} frames (got ${burstCount})`);
+  c5.ws.close();
+
+  console.log('\n── a lone event in a quiet system arrives promptly, un-coalesced ──');
+  const c6 = await connect(`/api/stream/ws?project=${projId}`);
+  wsClient = c6.ws;
+  await until(c6.frames, (fs) => fs.some((f) => f.type === 'snapshot'));
+  const beforeLone = act(c6.frames).length;
+  const t0 = Date.now();
+  activity('q2x', 'xell-lone', 'provision', projId);
+  ok(await until(c6.frames, (fs) => act(fs).some((f) => f.payload?.xell_id === 'xell-lone'), 2000),
+     'the lone event arrives');
+  ok(Date.now() - t0 < 500, `…promptly (${Date.now() - t0}ms — the ${ACTIVITY_FLUSH_MS}ms flush, not a coalescing delay)`);
+  await sleep(ACTIVITY_FLUSH_MS * 4);
+  const lone = act(c6.frames).slice(beforeLone);
+  ok(lone.length === 1 && lone[0].payload?.kind === 'provision' && lone[0].payload?.xell_id === 'xell-lone',
+     `…and un-coalesced: exactly one frame carries it (got ${lone.length})`);
+  c6.ws.close();
+  c3.ws.close();
+
   wsClient = null;
   c1.ws.close();
 } catch (e) {
@@ -118,6 +187,7 @@ try {
   try { wsClient?.close(); } catch { /* */ }
   try { await new Promise((r) => httpSrv.close(r)); } catch { /* */ }
   await db.query(`DELETE FROM project WHERE id=$1`, [projId]).catch(() => {});
+  await db.query(`DELETE FROM project WHERE id=$1`, [projB]).catch(() => {});
   await db.end().catch(() => {});
 }
 

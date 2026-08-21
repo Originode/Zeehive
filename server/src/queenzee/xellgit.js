@@ -15,6 +15,7 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline, activity } from '../lib/logbus.js';
 import { cleanGitEnv, worktreeBound, doorFromEmail } from '../lib/git.js';
+import { clearStaleIndexLock } from '../lib/index-lock.js';
 
 // The catch-up creates COMMITS in the host worktree — a stash of stray worktree noise, and the
 // merge of the xource tip into the zee's branch. Those need a committer identity, and the queenzee
@@ -133,16 +134,39 @@ const dirtyCount = (wt) => {
 //                      MERGE, not a rebase, so the branch survives as its own lane on the graph.
 //   'conflict'       — the merge hit a real conflict; ABORTED, the worktree left exactly as it was.
 //   'no-ref'/'no-head' — the ref or HEAD could not be read (nothing to do safely).
-export function catchUpWorktree(worktree, ref) {
-  const tipR = git(worktree, ['rev-parse', ref]);
+export function catchUpWorktree(worktree, ref, { slug } = {}) {
+  // SELF-HEAL (TKT-86-B3B2 follow-up): a STALE index.lock in the worktree admin dir makes every
+  // index-touching git op below die with "Unable to create '.../index.lock': File exists" — and on
+  // the CATCH-UP path for a HOST xell that lock lives on the host, where a caged zee can neither see
+  // nor delete it, taking the zee out of service exactly as the collect path used to (every `zee
+  // build`/`zee land` failed at collect). On a failed git op, resolve the admin dir
+  // (`git rev-parse --absolute-git-dir` — for a linked worktree that is <repo>/.git/worktrees/<name>)
+  // and clear a STALE lock (present + mtime older than the threshold — no live op), then retry the op
+  // ONCE. A FRESH lock is never deleted — a live git process may be holding it; then we fail exactly
+  // as today, with the original error naming the file.
+  const gitH = (args, timeout = 60000) => {
+    const r = git(worktree, args, timeout);
+    if (r.ok) return r;
+    let admin = null;
+    try {
+      const a = git(worktree, ['rev-parse', '--absolute-git-dir'], 15000);
+      if (a.ok) admin = a.out;
+    } catch { /* keep the original failure */ }
+    if (admin && clearStaleIndexLock(admin, slug, { tag: 'landgate', reason: 'the catch-up could retry' })) {
+      return git(worktree, args, timeout);
+    }
+    return r;
+  };
+
+  const tipR = gitH(['rev-parse', ref]);
   if (!tipR.ok) return { state: 'no-ref', ref };
   const tip = tipR.out;
-  const headR = git(worktree, ['rev-parse', 'HEAD']);
+  const headR = gitH(['rev-parse', 'HEAD']);
   if (!headR.ok) return { state: 'no-head', ref, base: tip };
   const head = headR.out;
 
   // Our HEAD already contains the tip → at or ahead of the xource; a push is already a ff.
-  if (git(worktree, ['merge-base', '--is-ancestor', tip, head]).ok) {
+  if (gitH(['merge-base', '--is-ancestor', tip, head]).ok) {
     return { state: 'up-to-date', head, ref, base: tip };
   }
 
@@ -154,10 +178,10 @@ export function catchUpWorktree(worktree, ref) {
   // vanish without a stash. Then, for any REAL remaining dirt: a cxell zee's work arrives as COMMITS
   // collected from the cxell, so ANY uncommitted change in the host worktree is local noise — park it
   // in a labelled stash and carry on unattended (recoverable via `git stash list`, never lost).
-  git(worktree, ['config', 'core.fileMode', 'false']);
+  gitH(['config', 'core.fileMode', 'false']);
   let stashed = false;
   if (dirtyCount(worktree) > 0) {
-    const s = git(worktree, ['stash', 'push', '--include-untracked', '-m',
+    const s = gitH(['stash', 'push', '--include-untracked', '-m',
       'zee-land: stray host-worktree changes parked before catch-up']);
     stashed = s.ok;
     if (!s.ok) {
@@ -169,12 +193,12 @@ export function catchUpWorktree(worktree, ref) {
   }
 
   // Our HEAD is an ancestor of the tip → we added nothing of our own; just fast-forward to it.
-  if (git(worktree, ['merge-base', '--is-ancestor', head, tip]).ok) {
-    const m = git(worktree, ['merge', '--ff-only', ref]);
+  if (gitH(['merge-base', '--is-ancestor', head, tip]).ok) {
+    const m = gitH(['merge', '--ff-only', ref]);
     // a ff-only merge that fails is an operational error (we already proved it's a fast-forward), not
     // a content conflict — classify it as such so the caller doesn't tell the zee to "resolve" nothing.
     if (!m.ok) return { ...mergeFailure(m), ref, base: tip, stashed };
-    const h = git(worktree, ['rev-parse', 'HEAD']);
+    const h = gitH(['rev-parse', 'HEAD']);
     return { state: 'fast-forwarded', head: h.out, ref, base: tip, stashed };
   }
   // Diverged → MERGE the xource tip INTO our branch (NOT rebase). This is the accountability choice:
@@ -183,13 +207,13 @@ export function catchUpWorktree(worktree, ref) {
   // replay our commits onto the tip and FLATTEN the lane into the trunk, erasing that. On conflict,
   // ABORT and report — never leave a half-merge behind or fabricate a resolution nobody reviewed.
   // (Any dirty tree was parked in the stash above, so the merge starts clean.)
-  const branchName = git(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']).out || 'work';
-  const mg = git(worktree, ['merge', '--no-ff', '--no-edit', ref, '-m', `Merge ${ref} into ${branchName}`], 180000);
+  const branchName = gitH(['rev-parse', '--abbrev-ref', 'HEAD']).out || 'work';
+  const mg = gitH(['merge', '--no-ff', '--no-edit', ref, '-m', `Merge ${ref} into ${branchName}`], 180000);
   if (!mg.ok) {
-    git(worktree, ['merge', '--abort']);
+    gitH(['merge', '--abort']);
     return { ...mergeFailure(mg), ref, base: tip, stashed };
   }
-  const h = git(worktree, ['rev-parse', 'HEAD']);
+  const h = gitH(['rev-parse', 'HEAD']);
   return { state: 'merged', head: h.out, ref, base: tip, stashed };
 }
 
@@ -213,7 +237,7 @@ function mergeFailure(m) {
 // binding/guard as every other verb here (a de-registered worktree is refused before any git runs).
 export async function catchUpToXource(xellId) {
   const { x, ref } = await ctx(xellId);
-  const res = catchUpWorktree(x.worktree_path, ref);
+  const res = catchUpWorktree(x.worktree_path, ref, { slug: x.slug });
   if (res.state === 'rebased' || res.state === 'fast-forwarded' || res.state === 'merged') {
     logline('landgate', `${x.slug} caught up to ${ref} (${res.state} → ${String(res.head).slice(0, 8)})`);
   } else if (res.state === 'conflict') {
@@ -236,7 +260,7 @@ export async function pushToXource(xellId, by = 'human@console', { mode = PROVIS
 
   logline('landgate', `${by} pushed ${x.slug} → ${ref}`);
   // the honeycomb's xell→queenzee line: this xell pushed to the xource
-  activity('x2q', x.id, 'push');
+  activity('x2q', x.id, 'push', x.project_id);
   // ASYNC push (see gitAsyncPush): this is the call whose `update` hook curls back into this server,
   // so a synchronous push self-deadlocks and the gate raises nothing.
   const r = await gitAsyncPush(x.worktree_path, ['push', '.', `HEAD:${fullRef}`]);
