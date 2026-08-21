@@ -20,6 +20,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
@@ -38,6 +39,7 @@ const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
 const root = mkdtempSync(join(tmpdir(), `conditions-${tag}-`));
 const slug = `conditions-${tag}`;
 let pid = null, xid = null, pid2 = null;
+let srv = null;
 
 try {
   // ── a real project + xell in the meta-DB (worker, db-isolated) ─────────────
@@ -120,7 +122,72 @@ try {
   const scoped = await removeProjectConditionScoped(addOther.condition.id, pid);
   ok(scoped.ok === false, 'the scoped delete refuses a row that is not in the caller project');
   await removeProjectCondition(addOther.condition.id);
+
+  // ── the CONSOLE write routes enforce the same manager wall (a bypass test) ──
+  // The /xell/self wall only protects the route a zee's OWN CLI uses. A caged worker that can reach
+  // the queenzee API at all could call the console's /projects/:id/conditions POST straight — so the
+  // console WRITE routes refuse a WORKER zee's token server-side (403), while a bare request (the
+  // dashboard, which sends no token) and a MANAGER zee's token still pass. This is the exact
+  // "anyone who can reach the API bypasses it" hole the manager asked about, closed and tested.
+  console.log('\n── the console write routes refuse a WORKER zee token (no bypass) ──');
+  const { router } = await import('../server/src/api/routes.js');
+  const { mintXellToken } = await import('../server/src/lib/xell-token.js');
+  const express = (await import('express')).default;
+  const app = express();
+  app.use(express.json());
+  app.use('/api', router);
+  srv = createServer(app);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const BASE = `http://127.0.0.1:${srv.address().port}/api`;
+  const workerToken = await mintXellToken(xid);
+
+  const post = (path, body, token) => fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body || {}),
+  });
+  const asWorker = await post(`/projects/${pid}/conditions`, { body: 'a worker tries the console route' }, workerToken);
+  const workerBody = await asWorker.json().catch(() => ({}));
+  ok(asWorker.status === 403 && workerBody.status === 'refused',
+     'POST /projects/:id/conditions with a WORKER token → 403 refused (server-side, from the token-resolved xell)');
+
+  // a bare request (the human dashboard sends no token) still works
+  const asHuman = await post(`/projects/${pid}/conditions`, { body: 'a human writes from the console' });
+  const human = await asHuman.json().catch(() => ({}));
+  ok(asHuman.status === 201 && human.ok === true,
+     'the same route with NO token (the dashboard) still passes → 201');
+
+  // a MANAGER zee's token passes the console write route too
+  await q(`UPDATE xell SET zee_type='manager' WHERE id=$1`, [xid]);
+  const asMgrHttp = await post(`/projects/${pid}/conditions`, { body: 'a manager writes from the console' });
+  const mgrBody = await asMgrHttp.json().catch(() => ({}));
+  ok(asMgrHttp.status === 201 && mgrBody.ok === true,
+     'a MANAGER zee token passes the same console route → 201');
+
+  // PUT + DELETE refuse the worker token the same way (now that the xell is a manager we re-token a
+  // worker xell to prove the deny-path on the remaining two verbs)
+  await q(`UPDATE xell SET zee_type='worker' WHERE id=$1`, [xid]);
+  const put = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${workerToken}` },
+    body: JSON.stringify({ body: 'a worker edits' }),
+  });
+  const putBody = await put.json().catch(() => ({}));
+  ok(put.status === 403 && putBody.status === 'refused',
+     'PUT /project-conditions/:id with a WORKER token → 403 refused');
+  const del = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
+    method: 'DELETE',
+    headers: { authorization: `Bearer ${workerToken}` },
+  });
+  const delBody = await del.json().catch(() => ({}));
+  ok(del.status === 403 && delBody.status === 'refused',
+     'DELETE /project-conditions/:id with a WORKER token → 403 refused');
+  // the human who created it can still delete it (bare request)
+  const delHuman = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, { method: 'DELETE' });
+  ok(delHuman.status === 200, 'a bare DELETE (no token) still works — the human who wrote it can remove it');
+  await removeProjectCondition(mgrBody.condition?.id).catch(() => {});
 } finally {
+  if (srv) srv.close();
   // clean up everything this test created, in a finally, whatever happened
   try { await q(`DELETE FROM xell WHERE id=$1`, [xid]); } catch { }
   try { await q(`DELETE FROM xource WHERE project_id IN ($1,$2)`, [pid, pid2 ?? '00000000-0000-0000-0000-000000000000']); } catch { }

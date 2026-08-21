@@ -580,12 +580,36 @@ router.delete('/project-docs/:docId', async (req, res) => {
 // line is DATA (house rule 7): it lives here in the meta-DB, is resolved live at briefing time,
 // and is trivially deletable — there is deliberately no archive, because a condition that stops
 // being true should be GONE, not hidden. ──
+//
+// A WRITE to a condition reaches EVERY briefing in the project, so "who may write" is really "who
+// may edit every other zee's instructions" — that is a MANAGER wall, and it must hold on THIS
+// surface too, not just on the /xell/self route a zee's own CLI uses. The console sends NO token
+// (it is a human's dashboard), so a bare request passes; a MANAGER zee's token passes; a WORKER
+// zee's token is refused — closing the "call the console route straight from the cage" escape
+// from the self-route wall.
+async function refuseWorkerZeeToken(req) {
+  const auth = req.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
+  if (!token) return null;                 // the dashboard / human tooling — not a zee, not refused
+  const xell = await xellForToken(token);  // a real xell token, resolved server-side from the DB
+  if (!xell) return null;                  // an API-key/other auth path — not this wall's business
+  if (xell.zee_type !== 'manager') {
+    return { ok: false, status: 'refused',
+      error: 'writing a current condition is MANAGER-only (it reaches every briefing in the '
+        + 'project). A zee edits the list with `zee conditions` — which enforces the same wall '
+        + 'server-side — or a human edits it in the console.' };
+  }
+  return null;
+}
 router.get('/projects/:id/conditions', async (req, res) => {
   try { res.json(await listProjectConditions(await resolveProjectParam(req.params.id))); }
   catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
 });
 router.post('/projects/:id/conditions', async (req, res) => {
   try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
     const r = await addProjectCondition(await resolveProjectParam(req.params.id),
       req.body?.body || null, { actor: req.body?.actor || 'human' });
     if (!r.ok) return res.status(400).json(r);
@@ -594,6 +618,8 @@ router.post('/projects/:id/conditions', async (req, res) => {
 });
 router.put('/project-conditions/:condId', async (req, res) => {
   try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
     const r = await updateProjectCondition(req.params.condId, req.body?.body || null,
       { actor: req.body?.actor || 'human' });
     if (!r.ok) return res.status(400).json(r);
@@ -602,6 +628,8 @@ router.put('/project-conditions/:condId', async (req, res) => {
 });
 router.delete('/project-conditions/:condId', async (req, res) => {
   try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
     const r = await removeProjectCondition(req.params.condId);
     if (!r.ok) return res.status(400).json(r);
     res.json(r);
