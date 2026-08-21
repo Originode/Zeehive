@@ -727,7 +727,9 @@ export async function runShip(shipId, { mode = MODE } = {}) {
   }
 }
 
-async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
+// Exported for the ship-withdraw race test — the rest of the codebase calls runShip only, and
+// nothing else should call runShipBody directly; it expects runShip to have taken the lock already.
+export async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   // The flip to 'shipping' is ATOMIC on status='approved' (221/222 — `zee ship --withdraw`): runShip
   // read the row as approved and took the lock, but the zee may have withdrawn it in that window. If
   // so this UPDATE matches nothing and the deploy MUST NOT proceed — release the lock and leave the
