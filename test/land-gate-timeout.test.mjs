@@ -196,12 +196,30 @@ console.log('\n── D. land-approvals lib + landgate wiring (no live DB requir
   // clients, so decideLandRequest is not exercised live here. The hook path above is the
   // load-bearing proof; this section proves the receipt helper and that landgate.js wires it.
   const { writeLandApproval, readLandApproval, clearLandApproval, landApprovalPath,
-          landApprovalsDir } = await import('../server/src/lib/land-approvals.js');
+          landApprovalsDir, refreshLandGateHookIfStale, installedLandGatePath } =
+    await import('../server/src/lib/land-approvals.js');
 
   const { src, sha } = mkRepo('lib');
   const dir = landApprovalsDir(src);
   ok(!!dir && dir.endsWith('zeehive-land-approvals'),
     `landApprovalsDir → …/zeehive-land-approvals (${dir})`);
+
+  // Stale-hook refresh: a pre-fix installed hook (ours, but no fail-open) gets rewritten.
+  const hookPath = installedLandGatePath(src);
+  ok(!!hookPath && existsSync(hookPath), `installedLandGatePath finds the update hook (${hookPath})`);
+  // Strip the new marker so the refresher treats it as stale, keep the ZEEHIVE marker.
+  const staleBody = readFileSync(hookPath, 'utf8')
+    .replaceAll('fail-open-with-audit', 'FAIL_OPEN_PLACEHOLDER');
+  ok(/ZEEHIVE LANDING GATE/.test(staleBody) && !/fail-open-with-audit/.test(staleBody),
+    'fixture hook is ours but stale');
+  writeFileSync(hookPath, staleBody);
+  const refreshed = refreshLandGateHookIfStale(src, { projectId: PROJECT_ID, mainBranch: 'main', apiBase: API });
+  ok(refreshed.refreshed === true, `refreshLandGateHookIfStale rewrote the stale hook (${refreshed.reason || 'ok'})`);
+  ok(/fail-open-with-audit/.test(readFileSync(hookPath, 'utf8')),
+    'installed hook now carries fail-open-with-audit again');
+  const again = refreshLandGateHookIfStale(src, { projectId: PROJECT_ID, mainBranch: 'main', apiBase: API });
+  ok(again.refreshed === false && again.reason === 'already-current',
+    'second call is a no-op (already-current)');
 
   const path = writeLandApproval(src, {
     projectId: PROJECT_ID,
@@ -225,10 +243,12 @@ console.log('\n── D. land-approvals lib + landgate wiring (no live DB requir
   // "the hook reads ZEEHIVE_API".) If someone removes the call, A–C still pass against a
   // hand-written receipt and the approve path silently stops protecting re-pushes under load.
   const landgateSrc = readFileSync(join(REPO_ROOT, 'server/src/queenzee/landgate.js'), 'utf8');
-  ok(/import \{ writeLandApproval, clearLandApproval \}/.test(landgateSrc),
-    'landgate.js imports writeLandApproval + clearLandApproval');
+  ok(/import \{ writeLandApproval, clearLandApproval, refreshLandGateHookIfStale \}/.test(landgateSrc),
+    'landgate.js imports writeLandApproval + clearLandApproval + refreshLandGateHookIfStale');
   ok(/writeLandApproval\(project\.repo_root/.test(landgateSrc),
     'decideLandRequest writes the receipt on approve');
+  ok(/refreshLandGateHookIfStale\(project\.repo_root/.test(landgateSrc),
+    'decideLandRequest refreshes a stale installed hook before writing the receipt');
   ok(/clearLandApproval\(project\.repo_root, newSha\)/.test(landgateSrc),
     'checkPush clears the receipt when spending an approval');
   ok(/clearApprovalReceipt\(stale\)/.test(landgateSrc),

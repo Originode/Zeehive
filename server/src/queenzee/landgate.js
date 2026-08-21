@@ -17,7 +17,7 @@ import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway
          nudgeXellForLostClearance, tendForSilentClearance } from './nudge.js';
 import { shouldProcessNow, processPad, RECEIPT_MIN } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
-import { writeLandApproval, clearLandApproval } from '../lib/land-approvals.js';
+import { writeLandApproval, clearLandApproval, refreshLandGateHookIfStale } from '../lib/land-approvals.js';
 
 // Clear the local approval receipt for a row (best-effort). The hook reads that receipt when the
 // API is unreachable so a human approval is never undone by load; once the approval is spent,
@@ -741,8 +741,15 @@ export async function decideLandRequest(id, decision, by = 'human') {
   // Write the local approval receipt BEFORE we try to land. The hook fails open on this file when
   // /api/land/check times out — so a human approval can never be silently undone by load, even if
   // landApproved is still waiting on the merge lock or the zee re-pushes under a busy API.
-  const project = await one(`SELECT repo_root FROM project WHERE id=$1`, [row.project_id]);
+  // Also refresh a stale installed hook (predates fail-open-with-audit) so shipping this server
+  // actually arms the live gate — the template in the repo is not the copy git runs.
+  const project = await one(
+    `SELECT repo_root, main_branch FROM project WHERE id=$1`, [row.project_id]);
   if (project?.repo_root) {
+    refreshLandGateHookIfStale(project.repo_root, {
+      projectId: row.project_id,
+      mainBranch: project.main_branch || 'main',
+    });
     writeLandApproval(project.repo_root, {
       projectId: row.project_id,
       ref: row.ref,
