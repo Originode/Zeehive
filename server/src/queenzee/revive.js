@@ -46,6 +46,7 @@ import { classifyTurnDeath, classifyTurnDeathEx, decideRevive, MAX_REVIVE_ATTEMP
 import { providerForRuntimeKey } from '../lib/cxell-runtimes.js';
 import { raiseAuthDeathRequest, injectedRevivePrompt, scrubSecrets } from '../lib/credential-inject.js';
 import { quarantineOnAuthDeath } from '../lib/account-quarantine.js';
+import { bumpXellConsecutiveDeaths, resetXellConsecutiveDeaths } from '../lib/xell-quarantine.js';
 import { nudgeXellForTurnDeath } from './nudge.js';
 
 // Same switch every other real-side-effect module reads. A revive resumes an agent's session in a
@@ -142,6 +143,20 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     // shaped substrings before the reason lands in the event log or the tend (finding [10]).
     const scrubbedReason = scrubSecrets(String(reason || ''));
 
+    // THE CONSECUTIVE-DEATH STREAK (ticket #81) — the counter belongs to the CAGE, so it lives on
+    // the xell row, and every death path funnels through this one choke point. A REAL death bumps
+    // the streak (and, at the threshold, quarantines the xell — bump raises the tend with the
+    // unlanded-work brief, so the quarantine is never silent). A 'none' — a turn the classifier
+    // filed as NOT a death (a healthy end_turn, a post-ship reflection, a manager nudge, a swap) —
+    // RESETS the streak: the cage demonstrably did not kill this agent, so the run is honestly
+    // broken. (In production a healthy end_turn reaches intake.js, not here, and intake resets it
+    // there; this branch exists for the callers that DO file a 'none' — the classifier's decision
+    // is the same either way.)
+    const xellQ = notADeath
+      ? await resetXellConsecutiveDeaths(zee.xell_id)
+      : await bumpXellConsecutiveDeaths({ xellId: zee.xell_id, zeeId: zee.id, death, reason: scrubbedReason, source });
+    const xellQuarantined = !!xellQ?.quarantined;
+
     // AUTH-TERMINAL → quarantine the account this zee ran on (ticket #50). Happens BEFORE the tend
     // so the tend can say whether a healthy sibling remains, and so the spawn path can fail over
     // once without the dead account still being the freshest pick. Best-effort; never throws.
@@ -167,6 +182,7 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
                                stderr_tail: errTail ? scrubSecrets(errTail) : null,
                                error: result?.error || null,
                                quarantined: !!quarantine.paused,
+                               xell_quarantined: xellQuarantined,
                                account_id: quarantine.accountId || zee.provider_token_id || null,
                                sibling_id: quarantine.siblingId || null,
                                no_sibling: !!quarantine.noSibling } });
@@ -175,16 +191,23 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
       logline('revive', `${name}: turn died on ${death.signal} (TRANSIENT) — ${verdict.reason}`);
       broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
       return { classified: true, kind: death.kind, signal: death.signal, scheduled: true,
-               in_minutes: verdict.delayMinutes };
+               in_minutes: verdict.delayMinutes,
+               xell_quarantined: xellQuarantined };
     }
 
     if (verdict.action === 'tend') {
       // SPAWN + a healthy sibling: the intake catch will fail the dispatch over once. Do NOT raise
       // a tend on this xell yet — a successful failover would leave "needs you" lit on a working
-      // zee, and a failed failover files a second death that tends with "no sibling remains".
-      const deferTendForFailover = source === 'spawn' && !!quarantine.siblingId;
+      // zee, and a failed failover files a second death that tends with "no sibling remains". A
+      // quarantined xell NEVER fails over: bump already refused every further agent into the cage.
+      const deferTendForFailover = source === 'spawn' && !!quarantine.siblingId && !xellQuarantined;
 
       if (!deferTendForFailover) {
+        // A xell this death JUST quarantined already has its tend — bump raised it, naming the count,
+        // the last death and the unlanded work, and it is the card a human must see FIRST. Overwriting
+        // it with the account sentence would hide the quarantine. (An ALREADY-quarantined xell keeps
+        // its quarantine card the same way; a late death's detail is on the turn-death event log.)
+        const quarantineTendIsUp = xellQuarantined;
         const account = await accountFor(zee.project_id, zee.runtime_key, zee.provider_token_id);
         let why;
         if (death.kind === 'terminal') {
@@ -213,9 +236,12 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
             + 'with its work — its commits are on its branch — but it needs a human to decide whether to send it '
             + 'again (📨 a message resumes it) or mark it done.';
         }
-        await setTend(zee.xell_id, true, { reason: why, zeeId: zee.id, source: 'queenzee' });
+        if (!quarantineTendIsUp) {
+          await setTend(zee.xell_id, true, { reason: why, zeeId: zee.id, source: 'queenzee' });
+        }
         logline('revive', `${name}: turn died on ${death.signal} (${death.kind.toUpperCase()}) — raised a tend for a human`
-          + (quarantine.noSibling ? ' (no healthy sibling remains)' : ''));
+          + (quarantine.noSibling ? ' (no healthy sibling remains)' : '')
+          + (quarantineTendIsUp ? ' (QUARANTINE card supersedes it)' : ''));
       } else {
         logline('revive', `${name}: turn died on ${death.signal} (TERMINAL) — quarantined `
           + `${quarantine.accountLabel ? `"${quarantine.accountLabel}"` : 'the account'}; `
@@ -237,7 +263,8 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
       }
       return {
         classified: true, kind: death.kind, signal: death.signal,
-        tended: !deferTendForFailover,
+        tended: !deferTendForFailover && !xellQuarantined,
+        xell_quarantined: xellQuarantined,
         quarantined: !!quarantine.paused,
         siblingId: quarantine.siblingId || null,
         siblingLabel: quarantine.siblingLabel || null,
@@ -251,6 +278,7 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
       + (death.signal ? ` (${death.signal})` : ''));
     return { classified: true, kind: death.kind, signal: death.signal, scheduled: false,
              quarantined: !!quarantine.paused,
+             xell_quarantined: xellQuarantined,
              siblingId: quarantine.siblingId || null,
              noSibling: !!quarantine.noSibling };
   } catch (e) {
@@ -371,7 +399,7 @@ const reportedPaused = new Set();
 export async function reviveTick() {
   const due = await q(
     `SELECT z.id, z.xell_id, z.revive_attempts, z.revive_signal, z.last_stop_reason, z.revive_next_at,
-            x.slug, x.status AS xell_status, x.project_id
+            x.slug, x.status AS xell_status, x.project_id, x.quarantined_at
        FROM zee z JOIN xell x ON x.id = z.xell_id
       WHERE z.revive_next_at IS NOT NULL AND z.revive_next_at <= now()
         AND z.decommissioned_at IS NULL
@@ -381,6 +409,15 @@ export async function reviveTick() {
       LIMIT 10`);
   let revived = 0;
   for (const row of due) {
+    // A QUARANTINED cage is not revived (ticket #81): a revive is a TURN, and the quarantine's whole
+    // point is that no recovery path starts another turn in the cage until a human decides. The
+    // schedule stays on the row (clearing it would look like the death was forgotten), and the
+    // human's unquarantine clears the xell — the ladder then finds the schedule again, which is the
+    // "rescue the branch" arm working as intended.
+    if (row.quarantined_at) {
+      logline('revive', `${row.slug}: revive is DUE but the xell is QUARANTINED — held until a human clears the quarantine`);
+      continue;
+    }
     // A REVIVE IS A TURN, so every level of the pause switch refuses it — and it is HELD rather than
     // dropped: the schedule stays on the row and the zee is revived when a human presses play.
     if (await xellPaused({ id: row.xell_id, project_id: row.project_id })) {

@@ -49,6 +49,7 @@ import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { noteTurnDeath } from './revive.js';
+import { resetXellConsecutiveDeaths, xellQuarantineRefusal } from '../lib/xell-quarantine.js';
 import { SPIN_STOP_REASON } from '../lib/spin-detector.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
@@ -104,6 +105,7 @@ async function readyXells(projectId, { zeeType = null } = {}) {
        LEFT JOIN machine m ON m.docker_ctx = sc.docker_ctx AND m.enabled
        LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = x.project_id
       WHERE x.project_id = $1 AND x.status = 'ready'
+        AND x.quarantined_at IS NULL
         AND ($2::text IS DISTINCT FROM 'worker' OR COALESCE(x.zee_type, 'worker') <> 'manager')
       ORDER BY COALESCE(mp.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
     [projectId, zeeType]);
@@ -181,6 +183,24 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   const xell = readyXellForCwd(ready, cwd); // the worktree the caller is STANDING IN, or null
 
   if (!xell) {
+    // A QUARANTINED xell is excluded from the ready list (ticket #81), so standing in one would
+    // otherwise read as "not in a worktree" and point the caller at a DIFFERENT xell while the cage
+    // they are actually in waits for a human. Name it: the caller is told the cage is quarantined
+    // and what a human must decide, not sent off to dispatch somewhere else.
+    const quarantinedHere = cwd ? await one(
+      `SELECT slug, quarantined_at, quarantine_deaths, quarantine_reason FROM xell
+        WHERE project_id=$1 AND quarantined_at IS NOT NULL AND worktree_path = $2`,
+      [projectId, norm(cwd)]).catch(() => null) : null;
+    if (quarantinedHere) {
+      throw new NeedsWorktree({
+        needs_worktree: true,
+        can_dispatch: false,
+        project: { id: projectId, name: null, repo_root: null },
+        your_cwd: cwd || null,
+        message: xellQuarantineRefusal(quarantinedHere)
+          || `${quarantinedHere.slug} is quarantined — no agent will be claimed into it until a human decides.`,
+      });
+    }
     // Not in a worktree → cannot claim. Make sure a ready worktree EXISTS to open (provision
     // on demand if the pool is dry), then tell the caller to open it and re-run /xell there.
     let open = ready[0];
@@ -400,7 +420,14 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   if (xell_id && !claimed) {
     // Not fatal by itself — the xell is very often legitimately claimed already. It IS fatal when
     // the xell is on its way out, and that is precisely the case a dispatch used to walk into.
-    const state = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xell_id]);
+    const state = await one(`SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`, [xell_id]);
+    // A QUARANTINED cage is the one "already claimed" case a dispatch must NEVER walk into: the whole
+    // point of the quarantine (ticket #81) is that no recovery path feeds it another agent until a
+    // human decides. The claim above refused it (claimReadyXell), so we land here with the row in
+    // hand — say WHY, loudly, instead of letting the caller read the failure as "someone else claimed it".
+    if (state?.quarantined_at) {
+      throw new Error(xellQuarantineRefusal(state) || `${state.slug || xell_id} is quarantined`);
+    }
     if (!state || state.status === 'tearing-down' || state.status === 'retired') {
       throw new Error(
         `xell ${state?.slug || xell_id} is ${state?.status || 'gone'} — it is being decommissioned, so `
@@ -1240,6 +1267,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
     : await claimFirstReady(await readyXells(pid, { zeeType }));
   if (!xell) throw new Error('no ready xell available for headless spawn');
   if (!task) throw new Error('task (prompt) required for headless spawn');
+  // A QUARANTINED cage gets no new agent, whatever the surface that asked (ticket #81). This is the
+  // funnel every spawn passes through, so the refusal here is the one that actually holds; the
+  // explicit-id callers (a re-dispatch, the task poller, a swap) all land here and all get told why.
+  const quarantineRefusal = xellQuarantineRefusal(xell);
+  if (quarantineRefusal) throw new Error(quarantineRefusal);
 
   // A stale xell_id is the whole ballgame here. An explicit id resolved in an earlier turn can
   // point at a xell the reaper has since RETIRED — and a retired xell's worktree is deleted. We
@@ -1567,6 +1599,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
                             // catch below retries ONCE on a healthy sibling. This flag stops a
                             // second 401 from looping — one failover, then the human notice.
                             authFailoverAttempted = false } = {}) {
+  // A QUARANTINED cage gets no new agent, and this is the last door: spawnHeadless already refused,
+  // but the auth-failover retry (ticket #50) calls spawnCxell DIRECTLY from its own catch — and a
+  // failover after the SECOND death would otherwise feed the exact third agent the quarantine exists
+  // to stop. Refuse here, before anything is claimed or a container built (ticket #81).
+  const quarantineRefusal = xellQuarantineRefusal(xell);
+  if (quarantineRefusal) throw new Error(quarantineRefusal);
+
   // Which vendor CLI runs inside the cxell — claude, codex, or kimi (see lib/cxell-runtimes.js).
   // Resolved before anything is claimed so an unknown runtime fails the dispatch cleanly.
   const adapter = adapterFor(rt?.key);
@@ -2010,6 +2049,15 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
                                         reason: String(err.message),
                                         code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
                                         resumable: false, source: 'spawn' });
+    // A death that CROSSED the quarantine threshold stops the failover too (ticket #81): the cage
+    // has now killed two agents in a row, and a third — even on a healthy sibling account — is the
+    // exact burn the quarantine exists to stop. The quarantine card tells the human what to do.
+    if (filed?.xell_quarantined) {
+      await releaseXell(xell.id);
+      return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason,
+               xell_quarantined: true, quarantined: !!filed?.quarantined,
+               no_sibling: !!filed?.noSibling };
+    }
     if (filed?.kind === 'terminal' && filed?.signal === 'auth'
         && filed.siblingId && !authFailoverAttempted) {
       logline('intake', `${xell.slug}: auth-terminal on `
@@ -2076,6 +2124,10 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
           [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, SPIN_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (repetition without progress)`);
+        // A spin end is a DELIBERATE non-death — the detector chose to stop the turn (repetition
+        // without progress), the zee row goes idle, the turn row says 'ended'. The cage demonstrably
+        // did not kill the agent, so the consecutive-death streak is honestly broken (ticket #81).
+        await resetXellConsecutiveDeaths(xell.id);
         return;
       }
       const errored = result?.is_error;
@@ -2101,11 +2153,15 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       logline('intake', `cxell zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})${b.metered ? '' : ' [usage unreported]'}`);
       // A turn that ended on a PROVIDER error did not end on a decision of this zee's, and until now
       // that was where the story stopped. The reviver classifies it: transient → resumed on a
-      // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js).
+      // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js). A
+      // HEALTHY end resets the xell's consecutive-death streak (ticket #81) — the cage demonstrably
+      // carried this agent through a full turn, so the run of deaths is honestly over.
       if (errored) {
         await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
                               reason: String(result?.result || 'error'),
                               code, err, result, source: 'turn' });
+      } else {
+        await resetXellConsecutiveDeaths(xell.id);
       }
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
@@ -2137,6 +2193,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, SPIN_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (its exec died)`);
+        await resetXellConsecutiveDeaths(xell.id);
         return;
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
