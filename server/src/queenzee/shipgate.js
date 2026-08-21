@@ -498,6 +498,55 @@ async function resolveBundleRiders(carrierId, ok, commit) {
   return riders.length;
 }
 
+// ── the ZEE's own retraction — `zee ship --withdraw` ───────────────────────────
+// The symmetric half of `zee land --withdraw`: a zee that raises a ship and immediately learns the
+// deploy is bigger than described (it would carry other xells' migrations, prod is fragile, the ask
+// was wrong anyway) can UN-ASK it before the deploy starts. It deploys nothing, reverts nothing,
+// rejects nothing — the card leaves the human's screen and the row records who un-asked it and why.
+//
+// PENDING and APPROVED are both withdrawable, and that second one is deliberate: a ship approval
+// only QUEUES the deploy (the landing pad FIFO / the prod lock can hold an approved ship for a long
+// while), and an auto-approve project flips a fresh ask to 'approved' within milliseconds — the
+// very shape of "immediately learned it was wrong". The human's approval stays on the row; the zee
+// retracting its own ask before anything starts is not a decision the zee is overturning. SHIPPING
+// is the IN-FLIGHT state (started_at set, the build running) — that is the "deploy has started"
+// boundary, and a withdraw racing it is exactly the failure this verb exists to avoid.
+//
+// The check is ATOMIC in the UPDATE: `WHERE status IN ('pending','approved') AND NOT EXISTS
+// (deploy_lock …)` refuses the moment the queenzee has grabbed the prod lock for this ship, and
+// runShipBody's flip to 'shipping' is itself conditional on status='approved', so a withdraw that
+// lands between runShip's read and its lock-acquire stops the deploy before it starts rather than
+// racing it. Terminal rows (shipped/failed/rejected) are history and history is not editable.
+export async function withdrawShipRequest(id, by = 'zee', reason = null) {
+  const row = await one(`SELECT * FROM ship_request WHERE id=$1`, [id]);
+  if (!row) throw new Error('no such ship request');
+  // The deploy has STARTED when either the row is 'shipping' (the build is running) or the
+  // queenzee has taken this ship's prod lock (the window between lock-acquire and the status flip).
+  const started = row.status === 'shipping'
+    || !!(await one(`SELECT 1 FROM deploy_lock WHERE ship_id=$1 AND phase='shipping'`, [id]));
+  if (started) {
+    throw new Error(`that ship has already STARTED — the deploy is running (${row.status === 'shipping'
+      ? `status='shipping' since ${row.started_at}` : 'the prod lock is taken'}). Withdraw is refused; `
+      + 'if it must be stopped, `zee tend --reason "…"` now so a human sees prod is mid-deploy');
+  }
+  if (row.status !== 'pending' && row.status !== 'approved') {
+    throw new Error(`that ship is '${row.status}', not pending or approved — there is nothing open to withdraw`);
+  }
+  const out = await one(
+    `UPDATE ship_request SET status='withdrawn', withdrawn_at=now(), withdrawn_by=$2, withdraw_reason=$3
+       WHERE id=$1 AND status IN ('pending','approved')
+         AND NOT EXISTS (SELECT 1 FROM deploy_lock WHERE ship_id=$1 AND phase='shipping')
+       RETURNING *`,
+    [id, by, reason ? String(reason).slice(0, 2000) : null]);
+  if (!out) throw new Error('no such pending/approved ship request (the deploy started or the row changed underneath you)');
+  broadcast('ship', out);
+  logline('shipgate',
+    `WITHDRAWN ship ${String(out.commit || '').slice(0, 8) || '(no commit)'} by ${by}`
+    + `${reason ? ` — ${String(reason).slice(0, 120)}` : ''} (the zee un-asked it; no human decision was made)`
+    + (row.status === 'approved' ? ' — it had been APPROVED, but the deploy had not started' : ''));
+  return out;
+}
+
 export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
   return q(
@@ -671,8 +720,23 @@ export async function runShip(shipId, { mode = MODE } = {}) {
 }
 
 async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
+  // The flip to 'shipping' is ATOMIC on status='approved' (221/222 — `zee ship --withdraw`): runShip
+  // read the row as approved and took the lock, but the zee may have withdrawn it in that window. If
+  // so this UPDATE matches nothing and the deploy MUST NOT proceed — release the lock and leave the
+  // withdrawn row exactly as the zee left it. A withdraw that races a running deploy is the exact
+  // failure the withdraw verb exists to avoid, and without this guard runShipBody would flip a
+  // withdrawn row straight to 'shipping' and deploy a ship the zee just un-asked.
   const shipping = await one(
-    `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
+    `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 AND status='approved' RETURNING *`, [ship.id]);
+  if (!shipping) {
+    const cur = await one(`SELECT status FROM ship_request WHERE id=$1`, [ship.id]).catch(() => null);
+    await q(
+      `UPDATE deploy_lock SET phase='released', auto_release_at=now() WHERE ship_id=$1 AND held=false`, [ship.id]);
+    broadcast('xell', { id: xell.id });
+    logline('ship', `ship ${String(ship.commit || '').slice(0, 8)} NOT deployed — it was withdrawn before it started`
+      + ` (status=${cur?.status || 'gone'}); ${lockKey} lock released`);
+    return;
+  }
   broadcast('ship', shipping);
 
   // Honeycomb: queenzee → PRODUCTION while the deploy runs. The ask was xell→queenzee (x2q at

@@ -78,7 +78,7 @@ import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrat
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
-import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
+import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdrawShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
          selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
@@ -1822,6 +1822,15 @@ router.post('/xell/self/migration-number', async (req, res) => {
 router.post('/xell/self/ship', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfShip(x, { targets: req.body?.targets || null, reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// UN-ASK a held ship (`zee ship --withdraw`): the zee lowers its OWN pending/approved ship request
+// before the deploy starts. The symmetric verb to `zee land --withdraw` — nothing ships, nothing is
+// rejected, nothing is reverted; the card leaves the human's screen and the row records the
+// withdrawal in the ship ledger. REFUSED once the deploy has started (status='shipping').
+router.post('/xell/self/ship/withdraw', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWithdrawShip(x, { reason: req.body?.reason || null, request: req.body?.request || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // ASK to bind this xell to the prod stack — recorded only; a human confirms, then the queenzee binds.

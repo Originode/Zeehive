@@ -511,6 +511,7 @@ function usage() {
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
+  zee ship --withdraw [--reason "..."]   UN-ASK a held ship request before the deploy starts: the card leaves the human's screen, nothing ships, nothing is rejected. REFUSED once the deploy has started — that is \`zee tend\`
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
@@ -832,6 +833,15 @@ switch (cmd) {
     break;
   }
   case 'ship': {
+    // --withdraw (--clear is the same thing, for symmetry with land/tend/hint/done) UN-ASKS a held
+    // ship request before the deploy starts: the card leaves the human's screen, nothing ships,
+    // nothing is rejected and nothing is reverted. REFUSED once the deploy has started.
+    if (rest.includes('--withdraw') || rest.includes('--clear')) {
+      const r = await req('POST', '/api/xell/self/ship/withdraw', {
+        reason: flag('reason') || null, request: flag('request') || null });
+      console.log(JSON.stringify(r.json, null, 2));
+      process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    }
     const reason = flag('reason'); const targets = multi('targets');
     if (!reason) { console.error('ship needs --reason "what you are shipping"'); process.exit(1); }
     const r = await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) });

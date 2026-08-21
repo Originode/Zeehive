@@ -23,7 +23,7 @@ import { pushToXource, catchUpToXource } from './xellgit.js';
 import { cleanGitEnv, gitLog, worktreeDiff } from '../lib/git.js';
 import { existsSync } from 'node:fs';
 import { landStatus, openLandRequests, holdingRequests, withdrawLandRequest } from './landgate.js';
-import { requestShip, shipStatus } from './shipgate.js';
+import { requestShip, shipStatus, withdrawShipRequest } from './shipgate.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { requestXourceClean, xourceCleanStatusFor } from '../lib/xource-clean.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
@@ -250,6 +250,9 @@ export async function selfStatus(xell) {
           // dismissed: the request exists but a human took its card off their screen. It is NOT
           // something anyone is looking at, so a zee must never read it as "awaiting approval".
           dismissed: !!ship.dismissed_at,
+          // A zee's own retraction (`zee ship --withdraw`) — terminal, and NOT a human decision.
+          // Symmetric with the landing half: the card left the human's screen, nothing shipped.
+          withdrawn: ship.status === 'withdrawn',
           pending: ['pending', 'approved', 'shipping'].includes(ship.status)
             && !ship.deferred_at && !ship.dismissed_at }
       : null,
@@ -603,6 +606,79 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
       + 'branch exactly as they were. When the work really is ready, `zee land` raises ONE fresh request.'
       + (hadHint ? ' Your land? hint was lowered with it.' : '')
       + (approved.length ? ` (Note: ${approved.length} APPROVED landing(s) were left alone — a decision is not yours to retract.)` : ''),
+  };
+}
+
+// ── POST /api/xell/self/ship/withdraw — UN-ASK a held ship request ─────────────
+// The symmetric verb to selfWithdrawLand (above): a zee that raises a ship and immediately learns
+// the deploy is bigger than described can take the card off the human's screen WITHOUT deploying,
+// rejecting or reverting anything — the escape hatch for the ask that was wrong anyway. It is the
+// zee un-asking a question it should not have asked, and the row keeps the withdrawal in the ship
+// ledger exactly the way a landing withdrawal is kept.
+//
+// It withdraws THIS xell's pending/approved ship requests — normally exactly one (the open-ship
+// unique index enforces one per xell). `{ request: <id> }` targets a single one. Once the deploy has
+// STARTED (status='shipping', or the prod lock is taken) it is REFUSED — see withdrawShipRequest.
+export async function selfWithdrawShip(xell, { reason = null, request = null } = {}) {
+  const open = await q(
+    `SELECT * FROM ship_request WHERE xell_id=$1 AND status IN ('pending','approved') ORDER BY requested_at DESC`,
+    [xell.id]);
+  const targets = request ? open.filter((r) => r.id === request) : open;
+  if (request && !targets.length) {
+    const mine = await one(`SELECT * FROM ship_request WHERE id=$1 AND xell_id=$2`, [request, xell.id]);
+    return { ok: false, status: mine && mine.status === 'shipping' ? 'started' : 'not-found', withdrawn: [],
+      error: mine
+        ? (mine.status === 'shipping'
+            ? `ship_request ${String(request).slice(0, 8)} has already STARTED — the deploy is running. `
+              + 'Withdraw is refused; if it must be stopped, `zee tend --reason "…"` now so a human sees prod is mid-deploy.'
+            : `ship_request ${String(request).slice(0, 8)} is '${mine.status}', not pending or approved — there is nothing open to withdraw`)
+        : 'no such pending ship request for this xell',
+      message: mine
+        ? (mine.status === 'shipping'
+            ? 'The deploy has already started — this verb only un-asks a ship that has NOT begun.'
+            : 'That ship is history — it was decided or already finished. You can only withdraw a request that is still pending (or approved but not yet started).')
+        : 'You can only withdraw a ship YOUR xell raised, and only while it is still pending/approved.' };
+  }
+
+  if (!targets.length) {
+    const latest = await shipStatus(xell.id);
+    const started = latest?.status === 'shipping'
+      || !!(await one(`SELECT 1 FROM deploy_lock WHERE xell_id=$1 AND phase='shipping'`, [xell.id]));
+    if (started) {
+      return { ok: false, status: 'started', withdrawn: [], request: latest,
+        error: `your ship @ ${String(latest?.commit || '').slice(0, 8)} has already STARTED — the deploy is running. `
+          + 'Withdraw is refused; if it must be stopped, `zee tend --reason "…"` now so a human sees prod is mid-deploy.',
+        message: 'The deploy has already started — this verb only un-asks a ship that has NOT begun.' };
+    }
+    return {
+      ok: true, status: 'nothing-to-withdraw', withdrawn: [],
+      request: latest || null,
+      message: latest
+        ? `Nothing to withdraw — your latest ship request is '${latest.status}', not pending or approved.`
+        : 'Nothing to withdraw — this xell has never raised a ship request.',
+    };
+  }
+
+  const done = [];
+  for (const r of targets) {
+    const row = await withdrawShipRequest(r.id, `zee@${xell.slug}`, reason)
+      .catch((e) => ({ error: e.message, id: r.id }));
+    done.push(row.error ? { id: r.id, error: row.error } : { id: row.id, commit: row.commit, status: row.status });
+  }
+  const okCount = done.filter((d) => !d.error).length;
+  // A ship HINT is the same claim one notch quieter ("this looks ship-ready — a human should
+  // decide"). Un-asking the ship while leaving the hint up would light the ship? button for work
+  // the zee just said it does not want shipped, so the retraction lowers both. Best-effort.
+  const hadHint = await hintOpen(xell.id, 'ship').catch(() => false);
+  if (okCount && hadHint) await setHint(xell.id, 'ship', false, { reason: reason || 'ship withdrawn' }).catch(() => {});
+  logline('self', `${xell.slug} withdrew ${okCount} ship request(s)${reason ? ` — ${String(reason).slice(0, 120)}` : ''}`);
+  broadcast('xell', { id: xell.id });
+  return {
+    ok: okCount > 0, status: okCount ? 'withdrawn' : 'error', withdrawn: done,
+    message: `WITHDRAWN ${okCount} held ship request(s) — ${done.filter((d) => !d.error).map((d) => String(d.commit).slice(0, 8)).join(', ') || 'none'}. `
+      + 'The card is off the human\'s screen and nothing was deployed, decided or reverted: the ship simply did not '
+      + 'happen. When the work really is ready, `zee ship --reason "…"` raises ONE fresh request.'
+      + (hadHint ? ' Your ship? hint was lowered with it.' : ''),
   };
 }
 
