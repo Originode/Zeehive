@@ -167,6 +167,26 @@ try {
   ok(noted.status === 'ok', 'A8: runShipPreflightAndNote returns the verdict, never throws');
   await client.query(`DELETE FROM container WHERE id=$1`, [dbA6.rows[0].id]);
 
+  // A9. a probe that THROWS must degrade to 'unknown', NEVER propagate (the manager pin: the
+  // invariant "a ship request must not fail because a probe misbehaved" is enforced by the outer
+  // try/catch in runShipPreflight — a transient DB error in the inventory read or a throwing
+  // adapter rejects out of the check, and the verdict must absorb it, not the call site).
+  const dbA9 = await client.query(
+    `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, host_port)
+       VALUES ($1,'db','prod','shared','pf58_a9_db','default',15432) RETURNING id`, [PID]);
+  const throwOnInfo = async (ctx, args) => {
+    if (args[0] === 'info') throw new Error('fixture: daemon exploded mid-probe');
+    return { status: 0, stdout: '{"5432/tcp":[{"HostPort":"15432"}]}', stderr: '' };
+  };
+  const vA9 = await runShipPreflight(project, null, 'main', ['server', 'webapp'], { docker: throwOnInfo });
+  ok(vA9.status === 'unknown',
+     `A9: a probe that THROWS → '${vA9.status}' — a verdict, not a throw, not a failed request`);
+  ok(/preflight could not run: fixture: daemon exploded/.test(vA9.error || ''),
+     'A9: the degraded verdict NAMES the failure');
+  ok(Array.isArray(vA9.checks) && vA9.checks.length >= 2,
+     'A9: the checks that DID complete still ride the verdict');
+  await client.query(`DELETE FROM container WHERE id=$1`, [dbA9.rows[0].id]);
+
   // ── Part B: the REAL requestShip wires it (sandbox has no docker → deterministic) ──
   // This process runs SHIP_MODE=simulate, so requestShip's pre-flight skips db-migration-target
   // (runShipBody would record migrations as not-applied-simulate). The definite miss to exercise
@@ -208,6 +228,27 @@ try {
   ok(b2.rows[0].status === 'pending' && !b2.rows[0].decided_at, 'B2: the row is untouched — nothing decided');
   await client.query(`DELETE FROM ship_request WHERE id=$1`, [rB2.request.id]);
   await client.query(`UPDATE project SET auto_approve_ship=false WHERE id=$1`, [PID]);
+
+  // B3. a probe that THROWS must NOT prevent the ask — the manager pin through the REAL gate.
+  // requestShip forwards the pre-flight's docker adapter (preflightDocker), so a throwing adapter
+  // IS a throwing checks dependency; the outer try/catch in runShipPreflight absorbs it and the
+  // row is STILL created with 'unknown' — a pre-flight that informs the ask is never a new way
+  // for the ask to fail. A buildable container is needed so deploy-context actually reaches the
+  // docker call (with none, the check would skip before any probe ran).
+  const b3Web = await client.query(
+    `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, build_script)
+       VALUES ($1,'webapp','prod','shared','pf58_b3_web','default','scripts/ship-webapp.sh') RETURNING id`, [PID]);
+  const rB3 = await requestShip({ xellId: XELL, reason: 'ship despite probe trouble',
+                                  targets: ['server', 'webapp'], preflightDocker: throwOnInfo });
+  ok(rB3.ok === true && !!rB3.request?.id,
+     'B3: a throwing probe does not refuse the ask — a row is STILL created');
+  const b3 = await client.query(`SELECT * FROM ship_request WHERE id=$1`, [rB3.request.id]);
+  const rowB3 = b3.rows[0];
+  ok(rowB3.status === 'pending', `B3: the row is pending (${rowB3.status}) — the card is still raised`);
+  ok(rowB3.preflight_at && /preflight could not run: fixture: daemon exploded/.test(rowB3.preflight_error || ''),
+     'B3: the pre-flight degraded to UNKNOWN, with the reason on the record');
+  await client.query(`DELETE FROM ship_request WHERE id=$1`, [rB3.request.id]);
+  await client.query(`DELETE FROM container WHERE id=$1`, [b3Web.rows[0].id]);
 } finally {
   await cleanup();
   await client.end();

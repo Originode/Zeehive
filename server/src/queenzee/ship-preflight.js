@@ -180,19 +180,35 @@ async function checkDeployContext(project, site, targets, docker, db = null) {
 export async function runShipPreflight(project, site, commit, targets,
                                        { docker = dockerAdapter, skipDb = false, mode = 'real' } = {}) {
   const scope = { skipDb, mode };
+  const checks = [];
   // Resolve the prod db ONCE and share the handle: prodDb() does a blocking docker ps internally
   // (resolveRealDbContainer), so resolving it in every check would multiply the request-time probe
   // latency. Only a REAL ship that will run migrations needs the db at all — a code-only or
   // simulating ship skips the migration-target check before the handle is ever opened. A resolution
   // error rides on the handle ({ _error }) so the check can name it, never a throw.
-  let db = null;
-  if (!skipDb && mode === 'real') {
-    try { db = await prodDb(project, site); } catch (e) { db = { _error: e.message }; }
+  try {
+    let db = null;
+    if (!skipDb && mode === 'real') {
+      try { db = await prodDb(project, site); } catch (e) { db = { _error: e.message }; }
+    }
+    checks.push(await checkDbMigrationTarget(db, docker, scope));
+    checks.push(await checkBuildTargets(project, site, targets));
+    checks.push(await checkDeployContext(project, site, targets, docker, db));
+  } catch (e) {
+    // A READ-ONLY advisory probe must NEVER be the reason a ship cannot be raised: the whole point
+    // is to inform the ask, so a probe that misbehaves — a transient DB error in the inventory read
+    // (prodBuildableContainers), a throwing adapter, anything — degrades to 'unknown' and the card
+    // still gets raised; the deploy's own guards stay the backstop. Same rule as work-overlap.js's
+    // outer catch: "a coordination hint must never be the reason a sync does not happen or a land
+    // is refused." The checks that DID complete still ride the verdict, so nothing verified is lost.
+    return {
+      status: 'unknown',
+      error: `preflight could not run: ${e.message}`,
+      checks,
+      at: new Date().toISOString(),
+      commit,
+    };
   }
-  const checks = [];
-  checks.push(await checkDbMigrationTarget(db, docker, scope));
-  checks.push(await checkBuildTargets(project, site, targets));
-  checks.push(await checkDeployContext(project, site, targets, docker, db));
 
   const definite = checks.filter((c) => !c.ok && !c.unknown);
   const unknown = checks.filter((c) => c.unknown);

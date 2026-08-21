@@ -181,8 +181,10 @@ async function docsOnlySinceDeployed(project, commit, { targets = SHIPPABLE } = 
 // skipDb: the zee scoped this ship to CODE ONLY — runShip will NOT apply pending migration/ops
 // files (recorded on the row; the human approves the scope with the click, the results show the
 // skip). dbNote: the zee's drift diagnosis from the /ooney schema gate, shown on the card.
+// preflightDocker: DI seam for the pre-flight probes — the docker adapter the pre-flight uses
+// (defaults to the real one; tests inject a stub or a throwing adapter). null → the default.
 export async function requestShip({ xellId, zeeId = null, reason = null, targets = null, site = null,
-                                    skipDb = false, dbNote = null }) {
+                                    skipDb = false, dbNote = null, preflightDocker = null }) {
   // Which roles to rebuild — the zee names them (/ooney webapp|server|both). Silently dropping an
   // unknown role would ship less than the zee asked for and report success, so validate loudly.
   const t = (Array.isArray(targets) && targets.length ? targets : SHIPPABLE).map(String);
@@ -280,7 +282,7 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // prerequisite); an 'unknown' pre-flight still rides the card, and the deploy's own guard remains
   // the backstop.
   const preflight = await runShipPreflight(project, shipSite, commit, t,
-    { skipDb: !!skipDb, mode: MODE });
+    { docker: preflightDocker ?? undefined, skipDb: !!skipDb, mode: MODE });
   try { await noteShipPreflight(row.id, preflight); } catch (e) { logline('ship', `preflight note failed for ${row.id}: ${e.message}`); }
   row = await one(`SELECT * FROM ship_request WHERE id=$1`, [row.id]);
 
