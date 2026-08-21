@@ -131,6 +131,36 @@ class NeedsWorktree extends Error {
   constructor(detail) { super('not-in-worktree'); this.code = 'NEEDS_WORKTREE'; this.detail = detail; }
 }
 
+// THE SKILL-CLAIM TAKE: ready → claimed, in one statement — the claimXell twin of the dispatch
+// path's claimReadyXell (lib/xell-claim.js), and the same compare-and-set. The pool sweep takes a
+// pooled xell with an equally conditional ready → tearing-down (takeReadyXellForSweep), and Postgres
+// serialises concurrent updates of one row, so exactly ONE of the two statements can win. If the
+// sweep won, this returns null: the xell the session is standing in is being decommissioned, and
+// flipping it back to 'claimed' would resurrect a xell whose worktree/containers are mid-removal
+// (the skill-claim half of TKT-88-D6B4, which fixed only the dispatch half).
+//
+// Deliberately NO `AND NOT is_production` — unlike a dispatch, a /xell skill-claim of a production
+// xell is legitimate (the /xell-prod flow: a human standing in that worktree claims it), so this
+// claim must be able to transition a ready production xell. status='ready' is the whole guard.
+export async function claimReadyXellForSkill(xellId) {
+  if (!xellId) return null;
+  return one(
+    `UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 AND status='ready' RETURNING *`, [xellId]);
+}
+
+// The legible refusal when a skill-claim loses the race to a decommission. The session is bound to
+// the worktree it is physically standing in, so there is no "pick another" — the xell it was about
+// to claim is gone. Say exactly that, so the host session knows to open a fresh worktree and re-run
+// /xell there instead of retrying the same doomed one.
+export function skillClaimUnavailable(xellId, state) {
+  const err = new Error(
+    `xell ${state?.slug || xellId} is ${state?.status || 'gone'} — it was decommissioned while this `
+    + 'session was claiming it, so claiming it would resurrect a xell whose worktree is being removed. '
+    + 'A fresh ready xell will be provisioned; open its worktree and re-run /xell there.');
+  err.code = 'XELL_UNAVAILABLE';
+  return err;
+}
+
 // POST /api/xell/claim  { session_id, cwd, task, runtime?, project? }
 // The zee gets 'claimed' — and may begin work — ONLY when its session is physically inside a
 // ready xell's worktree. Anything else refuses: a session in the xource (main repo) or a
@@ -212,7 +242,22 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
      VALUES ($1,$2,'skill-claim',$3,$4,$5,'online',$6,$7, now()) RETURNING *`,
     [xell.id, session_id, rt?.id || null, viewer.url, viewer.kind, xell.worktree_path, session_id]);
 
-  const updatedXell = await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 RETURNING *`, [xell.id]);
+  // THE CLAIM IS CONDITIONAL (ready → claimed, one statement — claimReadyXellForSkill above). The
+  // readyXells SELECT above saw this xell 'ready', but the pool sweep may have taken it since: it
+  // claims with the SAME compare-and-set, so if the sweep won, this returns null — the xell the
+  // caller is standing in is being decommissioned. Flip it back and a zee starts working in a
+  // worktree the reaper is removing (TKT-88-D6B4's resurrection, which the dispatch fix closed and
+  // this is the skill-claim half of). Compensate the zee row this call already created and refuse
+  // legibly: the session is bound to THIS worktree, so "pick another" is not available to it.
+  const updatedXell = await claimReadyXellForSkill(xell.id);
+  if (!updatedXell) {
+    const state = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xell.id]).catch(() => null);
+    await q(`DELETE FROM zee WHERE id=$1`, [zee.id]).catch(() => {
+      logline('intake', `warn: could not compensate zee ${zee.id} for unclaimable xell ${xell.slug} — `
+        + `a zee row may be left pointing at a decommissioned xell`);
+    });
+    throw skillClaimUnavailable(xell.id, state);
+  }
   broadcast('zee', zee);
   broadcast('xell', updatedXell);
   logline('intake', `xell ${xell.slug} claimed (skill) by session ${String(session_id).slice(0, 8)} — in-worktree ✓`);
