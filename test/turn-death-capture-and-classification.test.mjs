@@ -124,6 +124,8 @@ try {
   ok(r1.last_death_code === 137, `the exit code is captured on the row (${r1.last_death_code})`);
   ok((r1.last_death_stderr || '').includes('Allocation failed'),
      `a bounded tail of stderr is captured (${JSON.stringify((r1.last_death_stderr || '').slice(0, 40))}…)`);
+  ok(r1.revive_class_source === 'live',
+     `a LIVE classification is stamped — decided at the moment of death, not by the backfill (${r1.revive_class_source})`);
 
   // a NON-DEATH drops out of the cohort entirely
   const x2 = await mkXell('capture-not-a-death');
@@ -135,6 +137,8 @@ try {
   const r2 = await row(z2.id);
   ok(r2.revive_class === null && r2.revive_signal === null && r2.revive_next_at === null,
      'and it leaves the cohort: revive_class stays NULL, so it cannot be counted as an unknown death');
+  ok(r2.revive_class_source === 'live',
+     "and it was EXAMINED (source 'live') — 'not a death' stays distinguishable from 'never processed'");
 
   // a bare 'error' WITH the exit code beside it classifies from the exit code
   const x3 = await mkXell('capture-error-with-code');
@@ -154,16 +158,22 @@ try {
   ok(noted4.kind === 'unknown' && r4.revive_class === 'unknown' && r4.last_death_code === null
      && r4.last_death_stderr === null && r4.last_death_error === null,
      "a bare 'error' with nothing beside it stays UNKNOWN and captures nothing — the honest default");
+  ok(r4.revive_class_source === 'live',
+     'and it was still EXAMINED at death time (source live) — the honest unknown is a decision, not an omission');
 
   // ── D. the BACKFILL re-classifies existing unknown rows from their last_stop_reason ───────────
   console.log('\n── D. the backfill patterns classify the measured unknown cohort ──');
   // The exact UPDATEs from migration 213, applied to seeded 'unknown' rows — proving the SQL
   // patterns read the same real messages the JS classifier now reads.
+  // A row the classifier filed as 'unknown' carries a turn-death event (noteTurnDeath always records
+  // one), and 213's backfill only touched 'unknown' rows — so the seeded 'unknown' rows that stand in
+  // for the 213 cohort need the event too, or migration 215's event guard would rightly skip them.
   const seed = async (slug, reason) => {
     const x = await mkXell(slug);
     const z = await mkZee(x.id, reason);
     // the backfill only touches rows the classifier already filed as 'unknown'
     await q(`UPDATE zee SET revive_class = 'unknown', revive_signal = NULL WHERE id=$1`, [z.id]);
+    await q(`INSERT INTO session_event (source, hook_event_name, zee_id) VALUES ('queenzee','turn-death',$1)`, [z.id]);
     return z;
   };
   const za = await seed('backfill-auth', 'Not signed in. To authenticate without a browser, run:\n  grok login --device-code');
@@ -172,7 +182,12 @@ try {
   const zn1 = await seed('backfill-end', 'end_turn');
   const zn2 = await seed('backfill-swap', 'swapped out by manager-zee-44019d → dev-reviewer');
   const ze = await seed('backfill-bare', 'error');
+  // a row that matches the non-death pattern but was NEVER examined — it has no turn-death event, so
+  // 215 must NOT claim it as a backfill decision (and 213 may or may not have NULLed it)
+  const xnever = await mkXell('backfill-never-processed');
+  const znever = await mkZee(xnever.id, 'end_turn');
 
+  // the EXACT 213 backfill, as applied to these seeded 'unknown' rows
   await q(`UPDATE zee SET revive_class = 'terminal', revive_signal = 'auth'
             WHERE revive_class = 'unknown' AND last_stop_reason ILIKE '%not signed in%'`);
   await q(`UPDATE zee SET revive_class = 'terminal', revive_signal = 'model'
@@ -196,6 +211,61 @@ try {
      "seeded non-death unknown rows (end_turn, swapped out) drop OUT of the cohort (16 measured rows)");
   ok((await row(ze.id)).revive_class === 'unknown',
      "a seeded bare 'error' row stays UNKNOWN — the 5 rows with no signal are left alone");
+
+  // ── E. the PROVENANCE — migration 215, marking who decided each row's class ────────────────────
+  console.log('\n── E. migration 215 stamps the backfill provenance (and distinguishes never-processed) ──');
+  // migration 215's exact SQL — a fresh additive column, then the reclassification markers
+  await q(`ALTER TABLE zee ADD COLUMN IF NOT EXISTS revive_class_source text`);
+  await q(`UPDATE zee SET revive_class_source = 'backfill-2026-08-21'
+            WHERE revive_class_source IS NULL
+              AND (   (revive_signal = 'auth'   AND last_stop_reason ILIKE '%not signed in%')
+                   OR (revive_signal = 'model'  AND last_stop_reason ILIKE '%issue with the selected model%')
+                   OR (revive_signal = 'killed' AND last_stop_reason ILIKE '%exited 137%')
+                   OR (revive_class = 'unknown' AND (   last_stop_reason ILIKE '%not signed in%'
+                                                     OR last_stop_reason ILIKE '%issue with the selected model%'
+                                                     OR last_stop_reason ILIKE '%exited 137%')))`);
+  await q(`UPDATE zee z SET revive_class_source = 'backfill-2026-08-21'
+            WHERE z.revive_class_source IS NULL
+              AND (z.revive_class IS NULL OR z.revive_class = 'unknown')
+              AND (   z.last_stop_reason LIKE 'end_turn%'
+                   OR z.last_stop_reason LIKE 'post-ship reflection%'
+                   OR z.last_stop_reason ILIKE 'message from manager-%'
+                   OR z.last_stop_reason ILIKE 'swapped out by manager-%')
+              AND EXISTS (SELECT 1 FROM session_event se
+                           WHERE se.zee_id = z.id AND se.hook_event_name = 'turn-death')`);
+  await q(`UPDATE zee z SET revive_class_source = 'live'
+            WHERE z.revive_class_source IS NULL
+              AND z.revive_class IS NOT NULL
+              AND EXISTS (SELECT 1 FROM session_event se
+                           WHERE se.zee_id = z.id AND se.hook_event_name = 'turn-death')`);
+
+  ok((await row(za.id)).revive_class_source === 'backfill-2026-08-21'
+     && (await row(zm.id)).revive_class_source === 'backfill-2026-08-21'
+     && (await row(zk.id)).revive_class_source === 'backfill-2026-08-21',
+     'the 213-reclassified groups are marked as a backfill decision (auth/model/killed)');
+  ok((await row(zn1.id)).revive_class_source === 'backfill-2026-08-21'
+     && (await row(zn2.id)).revive_class_source === 'backfill-2026-08-21',
+     "and the non-death NULL rows 213 touched are ALSO marked — 'examined and not a death' is not 'never processed'");
+  ok((await row(ze.id)).revive_class_source === 'live',
+     'a bare-unknown row is marked LIVE — it was examined at death time and honestly left unknown, '
+     + 'not rewritten by the backfill (the still-unknown cohort, provenance intact)');
+  ok((await row(znever.id)).revive_class_source === null,
+     "a row matching the non-death pattern but with NO turn-death event stays NULL source — "
+     + "it was never examined, and 215 does not pretend otherwise");
+
+  // a row live-classified BEFORE the provenance column existed (real class + turn-death event)
+  const xl = await mkXell('backfill-historical-live');
+  const zl = await mkZee(xl.id);
+  await q(`UPDATE zee SET revive_class='transient', revive_signal='429' WHERE id=$1`, [zl.id]);
+  await q(`INSERT INTO session_event (source, hook_event_name, zee_id) VALUES ('queenzee','turn-death',$1)`, [zl.id]);
+  await q(`UPDATE zee z SET revive_class_source = 'live'
+            WHERE z.revive_class_source IS NULL
+              AND z.revive_class IS NOT NULL
+              AND EXISTS (SELECT 1 FROM session_event se
+                           WHERE se.zee_id = z.id AND se.hook_event_name = 'turn-death')`);
+  ok((await row(zl.id)).revive_class_source === 'live',
+     'a pre-215 live classification (real class + turn-death event) is marked LIVE, so NULL source '
+     + 'means exactly one thing: never examined');
 
 } finally {
   await cleanup();
