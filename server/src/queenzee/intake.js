@@ -1948,6 +1948,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // ONCE onto it (ticket #50). Release the xell only when we are NOT about to retry.
     const filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
                                         reason: String(err.message),
+                                        code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
                                         resumable: false, source: 'spawn' });
     if (filed?.kind === 'terminal' && filed?.signal === 'auth'
         && filed.siblingId && !authFailoverAttempted) {
@@ -1978,7 +1979,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // Drive the rest in the background. The cxell container is KEPT after the turn (idle, sealed)
   // so its commits can be collected (lib/cxell.js exportCxellDiff) — the reaper owns teardown.
   handle.done
-    .then(async ({ result }) => {
+    .then(async ({ code, err, result }) => {
       // CXELLD is the priority for the burn tracker: capture the full usage object (tokens + $),
       // not just cost_usd. The cxell CLI's final result event carries usage.{input,output,
       // cache_read_input,cache_creation_input}_tokens alongside total_cost_usd.
@@ -2043,7 +2044,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js).
       if (errored) {
         await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                              reason: String(result?.result || 'error'), source: 'turn' });
+                              reason: String(result?.result || 'error'),
+                              code, err, result, source: 'turn' });
       }
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
@@ -2082,8 +2084,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
       // The other half of the same question (see the resolve path above): a run that died on the way
       // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
+      // runZee's reject carries the exit code and a bounded stderr tail (cxell.js), which rides here
+      // so the row captures what the CLI said even when it printed no result event.
       await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                            reason: String(err.message), source: 'turn' });
+                            reason: String(err.message),
+                            code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
+                            source: 'turn' });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,

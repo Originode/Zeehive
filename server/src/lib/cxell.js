@@ -1516,8 +1516,16 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
       // event instead of a bare transport error
       try { parser.close(code, err.trim().split('\n').slice(-3).join(' ').slice(0, 400)); }
       catch (e) { logline('cxell', `${adapter.key} parser close threw: ${e.message}`); }
-      if (result) resolve({ code, result });
-      else reject(new Error(`cxell ${adapter.bin} exited ${code} with no result event: ${err.slice(0, 400)}`));
+      // The bounded stderr tail rides the resolve so the death classifier and the zee row can see
+      // what the CLI said when the result event alone says nothing (the card's exit-code/stderr
+      // capture). The reject below does the same through `e.code` / `e.errTail`.
+      if (result) resolve({ code, result, err: err.slice(-2000) });
+      else {
+        const e = new Error(`cxell ${adapter.bin} exited ${code} with no result event: ${err.slice(0, 400)}`);
+        e.code = code;
+        e.errTail = err.slice(-2000);
+        reject(e);
+      }
     });
   });
   p.stdin.write(adapter.stdinPayload ? adapter.stdinPayload(prompt) : prompt);

@@ -812,10 +812,10 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
 // nudgeXellForTurnDeath above, and a static pair of imports would be a module cycle — the same
 // reason, and the same shape, as fleet-pause.js reaching status.js for recordEvent. Never throws:
 // this is already the failure path.
-async function reportTurnDeath({ zeeId, xellId, slug, reason }) {
+async function reportTurnDeath({ zeeId, xellId, slug, reason, code = null, err = '', result = null }) {
   try {
     const { noteTurnDeath } = await import('./revive.js');
-    await noteTurnDeath({ zeeId, xellId, slug, reason, source: 'resumed turn' });
+    await noteTurnDeath({ zeeId, xellId, slug, reason, code, err, result, source: 'resumed turn' });
   } catch (e) {
     logline('nudge', `${slug}: could not file the resumed turn's death (${String(e.message).slice(0, 120)})`);
   }
@@ -942,7 +942,8 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
           burn, stopReason: death ? death.message.slice(0, 200) : 'end_turn',
           summary: lastAssistantText(r?.result),
         });
-        if (death) return reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message });
+        if (death) return reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message,
+                                            code: r?.code ?? null, err: r?.err ?? '', result: r?.result ?? null });
         return row;
       // The failure handler is the SECOND argument of this `then`, not a `.catch` after it, and that
       // is load-bearing: a `.catch` would also catch anything the success handler above threw, and
@@ -973,7 +974,8 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
           burn: usageFrom(result),
           stopReason: `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
         }).catch(() => {});
-        if (death) reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message }).catch(() => {});
+        if (death) reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message,
+                                     code: dk?.code ?? null, err: dk?.err ?? '', result }).catch(() => {});
         // The caller may need to KNOW the message never arrived (a stale landing has no other way
         // to reach its zee). Best-effort by construction: this is already the failure path.
         try { onFail?.(e); } catch { /* a failing handler must not become an unhandled rejection */ }
