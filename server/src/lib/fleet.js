@@ -282,7 +282,8 @@ export function containerShellCmd(project, c) {
 async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false } = {}) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id, c.isolation,
-            c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
+            c.hot_build, c.last_build_commit, c.last_built_at, c.last_build_error,
+            c.busy_since, c.busy_op,
             c.docker_ctx, c.build_ctx, c.host, c.host_port, c.conn_ref,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
             (SELECT ox.worktree_path FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_worktree,
@@ -540,7 +541,7 @@ export async function getFleet(projectId) {
   // grouped container inventory
   const containers = await q(
     `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host, c.host_port, c.conn_ref, c.health,
-            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
+            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at, c.last_build_error,
             c.docker_ctx, c.build_ctx,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
             (SELECT ox.worktree_path FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_worktree,
