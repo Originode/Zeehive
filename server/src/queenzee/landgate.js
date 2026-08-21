@@ -17,6 +17,20 @@ import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway
          nudgeXellForLostClearance, tendForSilentClearance } from './nudge.js';
 import { shouldProcessNow, processPad, RECEIPT_MIN } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
+import { writeLandApproval, clearLandApproval } from '../lib/land-approvals.js';
+
+// Clear the local approval receipt for a row (best-effort). The hook reads that receipt when the
+// API is unreachable so a human approval is never undone by load; once the approval is spent,
+// stale, or otherwise finished, the receipt must not linger as a standing invitation.
+async function clearApprovalReceipt(row) {
+  if (!row?.project_id || !row?.new_sha) return;
+  try {
+    const project = await one(`SELECT repo_root FROM project WHERE id=$1`, [row.project_id]);
+    if (project?.repo_root) clearLandApproval(project.repo_root, row.new_sha);
+  } catch (e) {
+    logline('landgate', `could not clear approval receipt for ${String(row.new_sha).slice(0, 8)}: ${e.message}`);
+  }
+}
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
 // reaper, images, the .zeehive.env reconcile): 'real' touches machines, anything else models.
@@ -173,6 +187,9 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
     // The receive path is about to move the ref to newSha — keep the rollback baseline fresh so a
     // land does not leave head_commit stale (and later trip a false BACKWARD on pull).
     await recordLandedHead(project, newSha);
+    // Spend the local receipt too — the hook no longer needs it, and leaving it would let a
+    // later timeout fail-open on a sha whose approval has already been consumed.
+    clearLandApproval(project.repo_root, newSha);
     // The runway is free the moment this approval is spent — call whoever is holding for it.
     freeRunway(projectId, ref, `${newSha.slice(0, 8)} landed`);
     return { allow: true, reason: 'approved', request: row };
@@ -721,6 +738,20 @@ export async function decideLandRequest(id, decision, by = 'human') {
     freeRunway(row.project_id, row.ref, `${row.new_sha.slice(0, 8)} was rejected`);
     return row;
   }
+  // Write the local approval receipt BEFORE we try to land. The hook fails open on this file when
+  // /api/land/check times out — so a human approval can never be silently undone by load, even if
+  // landApproved is still waiting on the merge lock or the zee re-pushes under a busy API.
+  const project = await one(`SELECT repo_root FROM project WHERE id=$1`, [row.project_id]);
+  if (project?.repo_root) {
+    writeLandApproval(project.repo_root, {
+      projectId: row.project_id,
+      ref: row.ref,
+      newSha: row.new_sha,
+      decidedBy: by,
+      requestId: row.id,
+      decidedAt: row.decided_at,
+    });
+  }
   return landApproved(row, by);
 }
 
@@ -770,6 +801,8 @@ async function closeAsStale(row, { tip = null, from = 'approved' } = {}) {
             decided_by=COALESCE(decided_by, 'queenzee@stale')
       WHERE id=$1 AND status=$2 RETURNING *`, [row.id, from]);
   if (!stale) return null;                       // someone else decided it first — leave it alone
+  // A stale approval must not leave a fail-open receipt behind — the sha can never land.
+  await clearApprovalReceipt(stale);
   broadcast('land', stale);
   logline('landgate',
     `${from === 'pending' ? 'held request' : 'approval'} for ${short} is STALE — ${branch} has moved past it`
@@ -871,6 +904,7 @@ export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } 
       `UPDATE land_request SET status='landed', landed_at=COALESCE(landed_at, now())
          WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
+    clearLandApproval(project.repo_root, row.new_sha);
     // Its work is on the ref now — make the xell's stored position say so (level, not still-ahead).
     await syncXellAfterLand(row.xell_id, row.new_sha);
     logline('landgate', `${row.new_sha.slice(0, 8)} is already on ${row.ref.replace('refs/heads/', '')} — marking landed`);
@@ -908,13 +942,18 @@ export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } 
 
   // MOVE THE REF WITH update-ref, NOT `git push`. A push re-invokes the xource's `update` hook,
   // which curls back into THIS server — but the server is single-threaded and, having initiated
-  // the push, is blocked inside spawnSync waiting for it. The hook times out (curl rc=28), fails
-  // closed, and the push is declined. That self-deadlock is the actual cause of "I approved and
-  // nothing happened" — verified: /api/land/check answers in 57ms when the loop is free and times
-  // out during a server-initiated push. update-ref moves the ref with NO receive-pack hooks, so
-  // there is no re-entrancy; it still fires reference-transaction, whose non-ff guard is the
-  // backstop, and we only reach here on a proven fast-forward anyway. The old-value arg makes it a
-  // compare-and-swap: if the ref moved since ffState read it, this fails instead of clobbering.
+  // the push, is blocked inside spawnSync waiting for it. The hook times out (curl rc=28). That
+  // self-deadlock was the actual cause of "I approved and nothing happened" — verified:
+  // /api/land/check answers in 57ms when the loop is free and times out during a server-initiated
+  // push. update-ref moves the ref with NO receive-pack hooks, so there is no re-entrancy; it
+  // still fires reference-transaction, whose non-ff guard is the backstop, and we only reach here
+  // on a proven fast-forward anyway. The old-value arg makes it a compare-and-swap: if the ref
+  // moved since ffState read it, this fails instead of clobbering.
+  //
+  // The hook ALSO now retries and, when still unreachable, fails open on the local approval
+  // receipt this function's caller (decideLandRequest) wrote — so a human approval cannot be
+  // undone by load even if some other path still pushes through the hook. update-ref remains the
+  // primary land path; the receipt is the backstop for the re-push case.
   let u, now;
   try {
     u = spawnSync('git', ['-C', project.repo_root, 'update-ref', row.ref, row.new_sha, tip],
@@ -932,6 +971,7 @@ export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } 
     const landed = await one(
       `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
+    clearLandApproval(project.repo_root, row.new_sha);
     // The ref just moved to include this xell's work — sync its stored head/last-synced to the landed
     // sha so its diff reads level (0/0) instead of the frozen provisioning base it forked from.
     await syncXellAfterLand(row.xell_id, row.new_sha);

@@ -85,6 +85,6 @@ chmod +x "$HOOK"
 echo "installed landing gate → $HOOK"
 echo "  project : $PROJECT_ID"
 echo "  protects: $(tr '\n' ' ' < "$REFS_FILE")  (list: $REFS_FILE)"
-echo "  api     : $API_BASE  (FAILS CLOSED if unreachable)"
+echo "  api     : $API_BASE  (fails closed if unreachable UNLESS a local approval receipt matches the sha)"
 echo
 echo "Verify with:  $0 --status $REPO_ROOT"
