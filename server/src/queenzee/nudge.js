@@ -23,7 +23,7 @@ import { predecessorActionDigest } from '../lib/predecessor-digest.js';
 // is the TURN LOCK half of the same module: a resume must CLAIM the turn atomically (refusing if one
 // is already in flight) instead of blindly marking 'working' over a live session (TKT-114-B).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
-import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
+import { startTurn, endTurn, lastAssistantText, turnBudgetWarningMessage } from '../lib/turn-ledger.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
 import { broadcast } from '../lib/events.js';
@@ -690,6 +690,17 @@ export async function sendMessageToXell(xellId, { text = '', attachments = [], b
     logline('message', `message for xell ${String(xellId).slice(0, 8)} failed: ${String(e.message).slice(0, 160)}`);
     return { sent: false, delivery: 'none', error: e.message };
   }
+}
+
+// ── TURN-BUDGET WARNING — tell a zee its turn is approaching the vendor ceiling ─────────────────
+// The ONE message a zee gets when its turn's running token total crosses TURN_BUDGET_WARNING_TOKENS
+// (~12M, a named constant in lib/turn-ledger.js). Delivered through the SAME channel as every other
+// operator message (sendMessageToXell), which routes mid-turn to the talk queue — typed into the
+// zee's session the moment the turn ends — exactly the shape the card asks for (sendMessageToXell,
+// not nudgeCxell, which REFUSES a mid-turn zee by design). Best-effort by contract, and never ends
+// a turn: the vendor's ceiling does that, and this warning exists so a zee lands what it has first.
+export async function nudgeXellForTurnBudget(xellId, { tokens = 0, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  return sendMessageToXell(xellId, { text: turnBudgetWarningMessage(tokens), by, mode });
 }
 
 // A DELIVERY THAT FAILED MUST CORRECT ITS OWN RECORD (TKT-60) — the same rule staleNudgeUndelivered
