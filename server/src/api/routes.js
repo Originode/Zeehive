@@ -21,7 +21,7 @@ import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
          previewProjectDoc } from '../lib/project-docs.js';
 import { listProjectConditions, addProjectCondition, updateProjectConditionScoped,
-         removeProjectCondition } from '../lib/current-conditions.js';
+         removeProjectConditionScoped } from '../lib/current-conditions.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, setBackupPaused, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -119,7 +119,7 @@ import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
          raiseRotationRequest } from '../lib/credential-inject.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
-import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
+import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor, getWorkItemOverlap } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
          selfWorkItem, selfConditions } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
@@ -583,18 +583,24 @@ router.delete('/project-docs/:docId', async (req, res) => {
 // being true should be GONE, not hidden. ──
 //
 // A WRITE to a condition reaches EVERY briefing in the project, so "who may write" is really "who
-// may edit every other zee's instructions" — that is a MANAGER wall, and it must hold on THIS
-// surface too, not just on the /xell/self route a zee's own CLI uses. The console sends NO token
-// (it is a human's dashboard), so a bare request passes; a MANAGER zee's token passes; a WORKER
-// zee's token is refused — closing the "call the console route straight from the cage" escape
-// from the self-route wall.
+// may edit every other zee's instructions". The zee-facing wall is the /xell/self route (token →
+// requireManager). THIS surface is the console: /api has NO router-level authentication at all
+// (index.js mounts `app.use('/api', router)` bare), so a request that sends no token — or a token
+// that does not resolve to a xell — is NOT refused here. refuseWorkerZeeToken below is therefore a
+// PARTIAL wall: it refuses a worker zee that VOLUNTEERS its token, and nothing else. Closing the
+// unauthenticated write path is an authentication decision about the whole /api surface — an open
+// HUMAN card (492743d2), not this route's to settle. The honest contract is: this guard narrows the
+// reach of an identified worker; it does not make the console route safe.
 async function refuseWorkerZeeToken(req) {
   const auth = req.get('authorization') || '';
   const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
   const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
-  if (!token) return null;                 // the dashboard / human tooling — not a zee, not refused
-  const xell = await xellForToken(token);  // a real xell token, resolved server-side from the DB
-  if (!xell) return null;                  // an API-key/other auth path — not this wall's business
+  // PARTIAL WALL — see the block comment above. /api has no auth, so a request with NO token, or
+  // with a token that does not resolve, passes here. Card 492743d2 is the open human decision that
+  // would actually close the unauthenticated path; this guard only refuses an IDENTIFIED worker.
+  if (!token) return null;
+  const xell = await xellForToken(token);
+  if (!xell) return null;
   if (xell.zee_type !== 'manager') {
     return { ok: false, status: 'refused',
       error: 'writing a current condition is MANAGER-only (it reaches every briefing in the '
@@ -636,7 +642,11 @@ router.delete('/project-conditions/:condId', async (req, res) => {
   try {
     const g = await refuseWorkerZeeToken(req);
     if (g) return res.status(403).json(g);
-    const r = await removeProjectCondition(req.params.condId);
+    // Same scoping rule as PUT: the condition's own project is the scope, so the scoped remove
+    // refuses a foreign row by name (an id is not an authorisation).
+    const cond = await one(`SELECT project_id FROM project_condition WHERE id=$1`, [req.params.condId]);
+    if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
+    const r = await removeProjectConditionScoped(req.params.condId, cond.project_id);
     if (!r.ok) return res.status(400).json(r);
     res.json(r);
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -2951,6 +2961,20 @@ router.post('/work-items/:id/deploy', async (req, res) => {
       title: b.title || null, actor: b.actor || 'human@console',
       managerXellId: b.manager_xell_id || null }));
   } catch (err) { assignErr(res, err); }
+});
+// IS SOMEBODY ALREADY IN THIS WORK? — the board's DEPLOY preflight (the work-item mirror of
+// /xell/dispatch/overlap). Read-only, no side effects, and it exists so a human sees the answer
+// BEFORE they press "deploy a worker" rather than in the receipt afterwards. It builds the same
+// brief the deploy would and keys it on the item itself (the landed-warning half reads the tracker
+// link), and a failure inside it answers "no warnings" rather than an error — because a
+// coordination hint must never stand between a human and a dispatch.
+router.post('/work-items/:id/deploy/overlap', async (req, res) => {
+  try {
+    res.json(await getWorkItemOverlap(req.params.id, { task: req.body?.task || null }));
+  } catch (err) {
+    res.json({ warnings: [], note: null, checked: { xells: 0, paths: [], tickets: [], landings: 0 },
+              degraded: [`overlap check unavailable: ${err.message}`] });
+  }
 });
 // Which xells could take this item — so the console offers a picker instead of asking a human to
 // paste a uuid (the ready pool + live workers with no open item, in this project only).

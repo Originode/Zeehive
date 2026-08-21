@@ -137,13 +137,15 @@ try {
   ok(updMine.condition.updated_by === 'test', 'and stamps the actor who made the edit');
   await removeProjectCondition(mineUpd.condition.id);
 
-  // ── the CONSOLE write routes enforce the same manager wall (a bypass test) ──
+  // ── the CONSOLE write routes refuse an IDENTIFIED worker (and honestly say what they do not) ──
   // The /xell/self wall only protects the route a zee's OWN CLI uses. A caged worker that can reach
-  // the queenzee API at all could call the console's /projects/:id/conditions POST straight — so the
-  // console WRITE routes refuse a WORKER zee's token server-side (403), while a bare request (the
-  // dashboard, which sends no token) and a MANAGER zee's token still pass. This is the exact
-  // "anyone who can reach the API bypasses it" hole the manager asked about, closed and tested.
-  console.log('\n── the console write routes refuse a WORKER zee token (no bypass) ──');
+  // the queenzee API at all could call the console's /projects/:id/conditions POST straight, so the
+  // console WRITE routes run refuseWorkerZeeToken: a request carrying a resolvable WORKER token is
+  // refused (403). That is a PARTIAL wall — /api has NO router-level authentication, so a request
+  // with no token, or with a token that does not resolve, is NOT refused here. The assertions below
+  // call that out by name: the no-token writes SUCCEED, and that is the current /api reality (an
+  // open human card, 492743d2), not a feature we are claiming as a security boundary.
+  console.log('\n── the console write routes refuse an IDENTIFIED worker token (partial wall) ──');
   const { router } = await import('../server/src/api/routes.js');
   const { mintXellToken } = await import('../server/src/lib/xell-token.js');
   const express = (await import('express')).default;
@@ -163,13 +165,19 @@ try {
   const asWorker = await post(`/projects/${pid}/conditions`, { body: 'a worker tries the console route' }, workerToken);
   const workerBody = await asWorker.json().catch(() => ({}));
   ok(asWorker.status === 403 && workerBody.status === 'refused',
-     'POST /projects/:id/conditions with a WORKER token → 403 refused (server-side, from the token-resolved xell)');
+     'POST /projects/:id/conditions with a resolvable WORKER token → 403 refused (server-side, from the token-resolved xell)');
 
-  // a bare request (the human dashboard sends no token) still works
-  const asHuman = await post(`/projects/${pid}/conditions`, { body: 'a human writes from the console' });
-  const human = await asHuman.json().catch(() => ({}));
-  ok(asHuman.status === 201 && human.ok === true,
-     'the same route with NO token (the dashboard) still passes → 201');
+  // HONEST LIMIT — an unauthenticated write succeeds because /api has no auth (card 492743d2).
+  // This is the hole the manager proved from its own cage; it is asserted here as reality so nobody
+  // reading this test mistakes the partial wall for a closed one.
+  const noToken = await post(`/projects/${pid}/conditions`, { body: 'an UNAUTHENTICATED write succeeds today' });
+  const human = await noToken.json().catch(() => ({}));
+  ok(noToken.status === 201 && human.ok === true,
+     'POST with NO token → 201: an UNAUTHENTICATED write succeeds (no /api auth; card 492743d2)');
+  const garbage = await post(`/projects/${pid}/conditions`, { body: 'a garbage token also succeeds today' }, 'not-a-real-token');
+  const garbageBody = await garbage.json().catch(() => ({}));
+  ok(garbage.status === 201 && garbageBody.ok === true,
+     'POST with an UNRESOLVABLE token → 201: the guard does not fire (partial wall, by design)');
 
   // a MANAGER zee's token passes the console write route too
   await q(`UPDATE xell SET zee_type='manager' WHERE id=$1`, [xid]);
@@ -178,8 +186,8 @@ try {
   ok(asMgrHttp.status === 201 && mgrBody.ok === true,
      'a MANAGER zee token passes the same console route → 201');
 
-  // PUT + DELETE refuse the worker token the same way (now that the xell is a manager we re-token a
-  // worker xell to prove the deny-path on the remaining two verbs)
+  // PUT + DELETE refuse an identified worker token the same way, and the UNAUTHENTICATED write also
+  // succeeds there (the same partial wall, asserted as reality).
   await q(`UPDATE xell SET zee_type='worker' WHERE id=$1`, [xid]);
   const put = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
     method: 'PUT',
@@ -188,25 +196,24 @@ try {
   });
   const putBody = await put.json().catch(() => ({}));
   ok(put.status === 403 && putBody.status === 'refused',
-     'PUT /project-conditions/:id with a WORKER token → 403 refused');
-  const putHuman = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
+     'PUT /project-conditions/:id with a resolvable WORKER token → 403 refused');
+  const putNoAuth = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ body: 'a human edits (bare request)' }),
+    body: JSON.stringify({ body: 'an UNAUTHENTICATED edit succeeds today' }),
   });
-  const putHumanBody = await putHuman.json().catch(() => ({}));
-  ok(putHuman.status === 200 && putHumanBody.ok === true,
-     'a bare PUT (no token — the human editing in the console) still works');
+  const putNoAuthBody = await putNoAuth.json().catch(() => ({}));
+  ok(putNoAuth.status === 200 && putNoAuthBody.ok === true,
+     'PUT with NO token → 200: an UNAUTHENTICATED edit succeeds (no /api auth; card 492743d2)');
   const del = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, {
     method: 'DELETE',
     headers: { authorization: `Bearer ${workerToken}` },
   });
   const delBody = await del.json().catch(() => ({}));
   ok(del.status === 403 && delBody.status === 'refused',
-     'DELETE /project-conditions/:id with a WORKER token → 403 refused');
-  // the human who created it can still delete it (bare request)
-  const delHuman = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, { method: 'DELETE' });
-  ok(delHuman.status === 200, 'a bare DELETE (no token) still works — the human who wrote it can remove it');
+     'DELETE /project-conditions/:id with a resolvable WORKER token → 403 refused');
+  const delNoAuth = await fetch(`${BASE}/project-conditions/${human.condition?.id}`, { method: 'DELETE' });
+  ok(delNoAuth.status === 200, 'DELETE with NO token → 200: an UNAUTHENTICATED delete succeeds (card 492743d2)');
   await removeProjectCondition(mgrBody.condition?.id).catch(() => {});
 } finally {
   if (srv) srv.close();
