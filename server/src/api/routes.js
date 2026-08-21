@@ -20,7 +20,7 @@ import { dispatchOptions } from '../lib/dispatch-options.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
          previewProjectDoc } from '../lib/project-docs.js';
-import { listProjectConditions, addProjectCondition, updateProjectCondition,
+import { listProjectConditions, addProjectCondition, updateProjectConditionScoped,
          removeProjectCondition } from '../lib/current-conditions.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
@@ -621,8 +621,13 @@ router.put('/project-conditions/:condId', async (req, res) => {
   try {
     const g = await refuseWorkerZeeToken(req);
     if (g) return res.status(403).json(g);
-    const r = await updateProjectCondition(req.params.condId, req.body?.body || null,
-      { actor: req.body?.actor || 'human' });
+    // The console route has no caller-scoped project (it is a human's dashboard), so the condition's
+    // own project is the scope — updateProjectConditionScoped then refuses a mismatch BY NAME, the
+    // same rule the scoped remove enforces (an id is not an authorisation).
+    const cond = await one(`SELECT project_id FROM project_condition WHERE id=$1`, [req.params.condId]);
+    if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
+    const r = await updateProjectConditionScoped(req.params.condId, cond.project_id,
+      req.body?.body || null, { actor: req.body?.actor || 'human' });
     if (!r.ok) return res.status(400).json(r);
     res.json(r);
   } catch (e) { res.status(400).json({ error: e.message }); }
