@@ -92,13 +92,15 @@ export function shortestPath(graph, startKey, goalKey) {
   return null;
 }
 
-const edgeKey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
+export const edgeKey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
 
-// When several wires traverse the same corridor (lattice edge), give each its own channel: assign a
-// lane per (edge, wire) and return, per wire, a perpendicular offset VECTOR for each of its segments.
-// The offset is taken from the edge's canonical orientation (low→high key) so wires crossing an edge
-// in opposite directions still separate onto consistent sides. `wires`: [{id, pts:[{x,y,key}]}].
-export function assignLanes(wires, pitch) {
+// When several wires share a corridor (lattice edge), the trace lanes collapse to ONE dashed line
+// whose colour ALTERNATES through the sharing traces' colours: each trace draws the shared edge in
+// its own colour with a dash pattern that shows only its slot — N traces, dasharray [len,(N-1)*len],
+// dashoffset i*len, so colour 0 owns dashes 0..len, colour 1 owns len..2len, and so on. A solo edge
+// (one user) stays solid. Returns, per wire, one dash spec per OUTGOING lattice segment
+// ({dash, offset}; dash null → solid). `wires`: [{id, pts:[{x,y,key}]}].
+export function sharedLaneDashes(wires, dashLen = 8) {
   const users = new Map();                       // edgeKey → [wireId…]
   for (const w of wires) {
     for (let i = 0; i < w.pts.length - 1; i++) {
@@ -107,48 +109,24 @@ export function assignLanes(wires, pitch) {
       users.get(k).push(w.id);
     }
   }
-  const laneOff = new Map();                      // edgeKey → Map(wireId → signed offset)
+  const edgeDash = new Map();                    // edgeKey → Map(wireId → {dash, offset})
   for (const [k, list] of users) {
     const uniq = [...new Set(list)].sort();
+    if (uniq.length < 2) continue;               // a solo edge stays solid
     const m = new Map();
-    uniq.forEach((id, l) => m.set(id, (l - (uniq.length - 1) / 2) * pitch));
-    laneOff.set(k, m);
+    uniq.forEach((id, i) => m.set(id, { dash: `${dashLen} ${(uniq.length - 1) * dashLen}`, offset: i * dashLen }));
+    edgeDash.set(k, m);
   }
   const out = new Map();
   for (const w of wires) {
-    const offs = [];
+    const segs = [];
     for (let i = 0; i < w.pts.length - 1; i++) {
-      const a = w.pts[i], b = w.pts[i + 1];
-      const s = laneOff.get(edgeKey(a.key, b.key)).get(w.id) || 0;
-      const [lo, hi] = a.key < b.key ? [a, b] : [b, a];   // canonical orientation
-      const dx = hi.x - lo.x, dy = hi.y - lo.y, L = Math.hypot(dx, dy) || 1;
-      offs.push([(-dy / L) * s, (dx / L) * s]);           // perpendicular × signed lane offset
+      const k = edgeKey(w.pts[i].key, w.pts[i + 1].key);
+      const spec = edgeDash.get(k)?.get(w.id) || null;
+      segs.push({ a: w.pts[i], b: w.pts[i + 1], dash: spec?.dash || null, offset: spec?.offset || 0 });
     }
-    out.set(w.id, offs);
+    out.set(w.id, segs);
   }
-  return out;
-}
-
-function lineIntersect(p1, d1, p2, d2) {
-  const den = d1[0] * d2[1] - d1[1] * d2[0];
-  if (Math.abs(den) < 1e-6) return null;         // parallel → no miter
-  const t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / den;
-  return [p1[0] + d1[0] * t, p1[1] + d1[1] * t];
-}
-
-// Offset a vertex polyline by a per-segment offset vector, mitring interior corners so the lanes stay
-// continuous. pts: [{x,y}], offs: [[ox,oy]] (one per segment). Returns [[x,y]].
-export function offsetPolyline(pts, offs) {
-  const n = pts.length;
-  if (n < 2) return pts.map((p) => [p.x, p.y]);
-  const out = [[pts[0].x + offs[0][0], pts[0].y + offs[0][1]]];
-  for (let i = 1; i < n - 1; i++) {
-    const a = pts[i - 1], b = pts[i], c = pts[i + 1], o1 = offs[i - 1], o2 = offs[i];
-    const p1 = [b.x + o1[0], b.y + o1[1]], d1 = [b.x - a.x, b.y - a.y];
-    const p2 = [b.x + o2[0], b.y + o2[1]], d2 = [c.x - b.x, c.y - b.y];
-    out.push(lineIntersect(p1, d1, p2, d2) || [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2]);
-  }
-  out.push([pts[n - 1].x + offs[n - 2][0], pts[n - 1].y + offs[n - 2][1]]);
   return out;
 }
 
