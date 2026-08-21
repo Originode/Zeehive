@@ -601,10 +601,12 @@ export function seatXells(list, cols, { reserved = new Set(), pinned = {} } = {}
 }
 
 // Connector wires thread the corridors BETWEEN hexes, so the honeycomb is drawn spaced: each hex is
-// shrunk inside its (gapless) layout cell to open a gap wide enough for the traces that must pass —
-// sized by the grid dimension a wire fans across (columns in portrait, rows in landscape). The
-// routing lattice (<Connectors>) still uses the full CELL size so it stays connected; only the drawn
-// hex shrinks. WIRE_PITCH is the on-screen width one trace needs (stroke + clearance).
+// shrunk inside its (gapless) layout cell just enough to open a SINGLE-LANE corridor. Traces no
+// longer split into parallel channels (Connectors collapses shared corridors into one dashed
+// alternating-colour line), so the gap no longer grows with the number of traces — a hex keeps
+// (nearly) its full cell size whatever the fleet. The routing lattice (<Connectors>) still uses
+// the full CELL size so it stays connected; only the drawn hex shrinks. WIRE_PITCH is the on-screen
+// width one trace needs (stroke + clearance).
 const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
@@ -731,11 +733,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // grid must size for xells + the node or the last xell would overflow the pane.
     const lay = layoutHoneycomb(list.length + 1, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
     const cellSize = lay.size;                    // gapless layout cell → the routing lattice
-    // corridor gap: room for `count` traces to pass (cols in portrait, rows in landscape). Shrink the
-    // drawn hex within its cell to open it, but keep enough hex to stay legible.
-    const portrait = orientation === 'portrait';
-    const count = Math.max(1, portrait ? lay.cols : lay.rows);
-    const gap = count * WIRE_PITCH;
+    // corridor gap: a FIXED single-lane gap — the honeycomb no longer sizes itself by the number of
+    // traces that must pass (the wire overlay collapsed parallel lanes into one dashed alternating-
+    // colour line). Shrink the drawn hex within its cell just enough to open that one corridor, but
+    // keep enough hex to stay legible.
+    const gap = WIRE_PITCH;
     const drawSize = Math.max(cellSize * 0.5, cellSize - gap / SQRT3);   // shrink to open the gap
     const originX = pad, originY = pad;
     // SEATING (see seatXells): managers first, each with its crew in the free cells nearest to it,
