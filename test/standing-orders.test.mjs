@@ -39,7 +39,7 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { standingOrdersBlock, standingOrdersForXell, appendStandingOrders, STANDING_ORDERS_MAX } =
   await import('../server/src/lib/standing-orders.js');
-const { selfStandingOrders, swapBrief } = await import('../server/src/queenzee/self.js');
+const { selfStandingOrders, swapBrief, managerDispatchBrief } = await import('../server/src/queenzee/self.js');
 
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
 const root = mkdtempSync(join(tmpdir(), `standing-${tag}-`));
@@ -159,6 +159,23 @@ try {
   });
   ok(!humanBuilt.brief.includes('## STANDING ORDERS'),
      'a HUMAN swap (manager: null) appends NO standing orders — even though the target has a manager with them');
+
+  // ── INJECTION through the MANAGER DISPATCH path itself: selfDispatch ────────
+  // managerDispatchBrief is the brief selfDispatch hands dispatchXell — the exact task text a
+  // dispatched worker is spawned with. The manager's standing orders must be IN it, verbatim, at the
+  // END. (swapBrief above proves the swap's re-dispatch; THIS proves the fresh dispatch.)
+  console.log('\n── the MANAGER DISPATCH path: the brief selfDispatch hands the spawn carries the block ──');
+  const dispatchBrief = await managerDispatchBrief(mgrXell, 'BUILD the fix the scout scoped.', { router: false });
+  ok(dispatchBrief.startsWith('BUILD the fix the scout scoped.'), 'the per-card --task text leads the dispatch brief');
+  ok(dispatchBrief.includes('## Your manager') && dispatchBrief.includes(mgrXell.slug),
+     'and the standard manager block rides along (the worker knows who is watching)');
+  ok(dispatchBrief.includes('## STANDING ORDERS') && dispatchBrief.endsWith(text),
+     'the dispatch brief ENDS with the manager\'s standing orders, verbatim — this is what a dispatched worker is spawned with');
+
+  const routerBrief = await managerDispatchBrief(mgrXell, 'route this onto a card', { router: true });
+  ok(routerBrief.startsWith('route this onto a card'), 'a ROUTER dispatch brief is the bare text (no manager block — 151)');
+  ok(routerBrief.includes('## STANDING ORDERS') && routerBrief.endsWith(text),
+     'but the router\'s dispatch still carries the standing orders it set (it IS manager-type and this is the same path)');
 
   const cleared = await selfStandingOrders(mgrXell, { action: 'clear' });
   ok(cleared.ok === true && cleared.standing_orders === null, '--clear empties the block');

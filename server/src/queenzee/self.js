@@ -1768,6 +1768,19 @@ function managerBriefBlock(managerSlug, what = 'dispatched you and is watching t
   ].join('\n');
 }
 
+// The brief a manager DISPATCH hands the spawn — exported as a test seam, exactly like swapBrief:
+// the per-card `text` leads, then the standard manager block, then the manager's STANDING ORDERS
+// (ticket #74) appended VERBATIM as a clearly-separate block at the end. A router gets no manager
+// block (151 — it is the front door, not a crew lead) but still carries standing orders if it set
+// any: the router is manager-type, and its dispatch is still this path. EMPTY/unset standing orders
+// return the base brief unchanged — byte-identical to before this feature existed.
+export async function managerDispatchBrief(xell, text, { router = false } = {}) {
+  const base = router
+    ? String(text || '')
+    : [String(text || ''), '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
+  return appendStandingOrders(base, xell.id);
+}
+
 // POST /api/xell/self/dispatch — spawn a WORKER zee that reports to me (`zee dispatch`).
 //
 // NOT human-gated, deliberately: a dispatched worker is a caged agent on a throwaway xell whose every
@@ -1841,15 +1854,7 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // a manager exists, and the reflection loop (and every question it could have asked) dies quietly.
   const { isRouterXell } = await import('../lib/router.js');
   const router = await isRouterXell(xell);
-  let brief = router
-    ? text
-    : [text, '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
-
-  // STANDING ORDERS (ticket #74) — the manager's crew discipline, appended VERBATIM as a clearly
-  // separate block to EVERY brief this manager dispatches. Appended, not merged: the per-card brief
-  // stays the manager's own words, and a worker can tell which is which. NULL/empty renders no block,
-  // so a manager that never set one is byte-identical to before this feature existed.
-  brief = await appendStandingOrders(brief, xell.id);
+  const brief = await managerDispatchBrief(xell, text, { router });
 
   // A DRY POOL must not be a dead end for a manager. A human dispatching from the console can raise
   // the pool target or wait; a caged manager can do neither — it would just be told "no ready xell"
