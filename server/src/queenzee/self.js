@@ -74,6 +74,7 @@ import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '
 // write verb (--add / --remove). The lib owns the domain; this file adds the manager refusal.
 import { listProjectConditions, addProjectCondition, removeProjectConditionScoped } from '../lib/current-conditions.js';
 import { appendStandingOrders, STANDING_ORDERS_MAX } from '../lib/standing-orders.js';
+import { SCRATCHPAD_MAX, scratchpadForXell, scratchpadBlock } from '../lib/xell-scratchpad.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -2011,6 +2012,12 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
   const item = await one(`SELECT id, title, status FROM work_item WHERE xell_id=$1 LIMIT 1`, [target.id]);
   const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [target.project_id]);
   const branchInfo = await branchHandover(target, project?.main_branch || 'main');
+  // The OUTGOING zee's scratchpad (ticket #66) — the working note that must survive the swap. Read
+  // from the target's OWN row, so the incoming zee is told what its predecessor had tried and ruled
+  // out BEFORE it re-derives it. NULL/empty renders NO block, so a xell that never wrote one is
+  // byte-identical to a swap before this feature existed.
+  const scratch = await scratchpadForXell(target.id);
+  const scratchBlock = scratchpadBlock(scratch);
   const firstLines = (t, n) => String(t || '').split('\n').filter((l) => l.trim()).slice(0, n).join('\n');
 
   // The manager the xell reports to — the one a HUMAN swap must not leave unmentioned (a worker
@@ -2048,6 +2055,10 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
     '',
     lastReport?.body ? firstLines(lastReport.body, 25) : '(it reported nothing to its manager)',
     '',
+    // The previous zee's scratchpad, when it wrote one — the analysis that would otherwise die
+    // with the outgoing cage. A distinct sub-section of the handover, so the incoming zee knows it
+    // is the PREVIOUS zee's own working note, not a task or an order.
+    ...(scratchBlock ? [scratchBlock, ''] : []),
     '### What is on the branch right now',
     '',
     ...branchInfo.lines,
@@ -2967,6 +2978,84 @@ export async function selfStandingOrders(xell, { action = null, text = null } = 
   }
 
   return { ok: false, error: `unknown standing-orders action "${action}" — use --set "…", --clear, or nothing to read.` };
+}
+
+// SCRATCHPAD — `zee scratchpad`. EVERY zee has it: a single text on the xell's OWN row in the
+// meta-DB that outlives the cage, written and read through this verb (ticket #66). It is the one
+// durable channel that is not a commit and not a message — the analysis file the ticket's manager
+// kept for fifteen cycles would have survived the reaped container as a scratchpad.
+//
+// The token-scoping half is structural: the verb is resolved from the CALLING xell (routes.js
+// resolveSelf), so a zee can only ever read/write/clear its OWN — there is no parameter that names
+// another xell for a worker. A MANAGER may additionally READ a crew xell's with `--xell <slug>`
+// (scoped by workerOf to the manager's own crew), and a HUMAN may read any xell's in the console —
+// but neither a manager nor a human WRITES a zee's scratchpad: the writer is always the zee that
+// owns the xell. The length is bounded SERVER-SIDE on every write path (a ceiling, not a second
+// manual), and a swap embeds the text in the incoming zee's inheritance brief.
+export async function selfScratchpad(xell, { action = 'read', text = null, xellSlug = null } = {}) {
+  // ── MANAGER read of a crew xell's scratchpad: `zee scratchpad --xell <slug>` ──
+  // A worker calling this is REFUSED by requireManager — a worker can only ever touch its OWN
+  // scratchpad (the branch below), never name another xell. The manager's read is scoped to its own
+  // crew by workerOf, so it never names a xell that is not its own either.
+  if (xellSlug) {
+    const guard = requireManager(xell, 'scratchpad --xell');
+    if (guard) return guard;
+    const target = await workerOf(xell.id, xellSlug);
+    if (!target) {
+      return { ok: false, status: 'refused', error:
+        `no worker "${xellSlug}" in your crew — \`zee zees\` lists the xells you dispatched, and a `
+        + 'manager may only read the scratchpad of one of those. A worker writes its own scratchpad '
+        + 'and cannot read another\'s at all.' };
+    }
+    const row = await one(
+      `SELECT slug, scratchpad, scratchpad_updated_at, scratchpad_updated_by FROM xell WHERE id=$1`,
+      [target.id]);
+    const t = String(row?.scratchpad || '').trim() || null;
+    return { ok: true, xell: row?.slug, scratchpad: t, length: t ? t.length : 0,
+             updated_at: row?.scratchpad_updated_at || null,
+             updated_by: row?.scratchpad_updated_by || null };
+  }
+
+  // ── a zee's OWN scratchpad: read (default), --set, --clear ──
+  if (action === 'set') {
+    const body = String(text || '').trim();
+    if (!body) {
+      return { ok: false, error: 'scratchpad --set needs the text — the note that will survive this cage. '
+        + 'To REMOVE it, use `zee scratchpad --clear`.' };
+    }
+    if (body.length > SCRATCHPAD_MAX) {
+      return { ok: false, error: `the scratchpad is limited to ${SCRATCHPAD_MAX} characters — `
+        + `${body.length} is a whole journal, not a working note. Keep what you have tried and ruled `
+        + 'out; the detail that needs to survive is the summary, not the transcript.' };
+    }
+    await q(`UPDATE xell SET scratchpad=$2, scratchpad_updated_at=now(),
+             scratchpad_updated_by=$3 WHERE id=$1`,
+      [xell.id, body, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} wrote its scratchpad (${body.length} chars) — it now outlives the cage`);
+    return { ok: true, scratchpad: body, length: body.length,
+             message: `Saved (${body.length} chars) — your scratchpad now outlives this cage, and a swap `
+               + 'will hand it to the next zee in its inheritance brief. `zee scratchpad` reads it back; '
+               + '`zee scratchpad --clear` empties it.' };
+  }
+
+  if (action === 'clear') {
+    await q(`UPDATE xell SET scratchpad=NULL, scratchpad_updated_at=now(),
+             scratchpad_updated_by=$2 WHERE id=$1`,
+      [xell.id, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} cleared its scratchpad — swaps carry no scratchpad block again`);
+    return { ok: true, scratchpad: null,
+             message: 'Cleared — your scratchpad is empty, and a swap will carry no scratchpad block.' };
+  }
+
+  const row = await one(
+    `SELECT scratchpad, scratchpad_updated_at, scratchpad_updated_by FROM xell WHERE id=$1`,
+    [xell.id]);
+  const t = String(row?.scratchpad || '').trim() || null;
+  return { ok: true, scratchpad: t, length: t ? t.length : 0,
+           updated_at: row?.scratchpad_updated_at || null,
+           updated_by: row?.scratchpad_updated_by || null };
 }
 
 export async function selfWork(xell, { board = false, item = null } = {}) {
