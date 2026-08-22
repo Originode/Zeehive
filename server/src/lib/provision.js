@@ -710,6 +710,14 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       ORDER BY x.created_at`);
   let checked = 0, rewritten = 0, failed = 0, skipped = 0;
   const broken = [], stale = [], alerted = [];
+  // The PROCESS-ROLE half, counted separately: a rewritten HOST file is invisible to a running
+  // bare process, which read .zeehive.env at boot and keeps the old values in memory until it is
+  // restarted. For a process-runner tier the rewrite only closes the loop when the tier is
+  // RESTARTED onto the new file (or, in simulate, when that restart is REPORTED as due). This is
+  // the gap this ships to close: "the fix was live on disk and dead in memory". Container tiers
+  // are a different problem (their env is baked at container-create) and are deliberately NOT
+  // touched here.
+  let restarted = [], wouldRestart = [], restartFailed = [];
   // The CAGE half, counted separately: a xell's host file and the copy its zee reads are two
   // different files with two different failure modes (emitXellEnv → refreshLiveCxellEnv), and a
   // sweep that reported only the host would say "0 rewritten" on the very fleet it just repaired.
@@ -734,8 +742,52 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       if (!r.changed) continue;
       rewritten++;
       stale.push(x.slug);
+      // A rewritten HOST file is invisible to a RUNNING process-role tier: a bare process read
+      // .zeehive.env at boot and dotenv keeps those values in memory until the process restarts
+      // (start-xell-process.sh: "the process reads its own parameters from the worktree's
+      // .zeehive.env"). So a sweep that only rewrites the file leaves the running server on the
+      // OLD env — the fix live on disk and dead in memory. Restart the RUNNING
+      // process-role tiers now, so the new env is actually loaded. Container tiers are a different
+      // problem and are left alone (their env is baked at container-create, not read from this file).
+      const procRows = await q(
+        `SELECT id, role, health FROM container
+           WHERE owner_xell_id=$1 AND role IN ('server','webapp')
+             AND docker_ctx IS NULL AND image_tag IS NULL`, [x.id]);
+      const hereRestarted = [], hereSkipped = [], hereFailed = [];
+      if (dryRun) {
+        // REPORT the restart a real sweep would do — the same "see, don't touch" contract as the
+        // file rewrite. A nested queenzee (PROVISION_MODE=simulate) walks the REAL fleet's rows
+        // and must never exec into another zee's process tier.
+        for (const pc of procRows) {
+          if (pc.health === 'up') { wouldRestart.push(`${x.slug}:${pc.role}`); hereRestarted.push(pc.role); }
+          else hereSkipped.push(`${pc.role}(${pc.health})`);
+        }
+      } else {
+        const { restartProcessRoleTier } = await import('../lib/build.js');
+        const outcomes = await Promise.all(procRows.map((pc) =>
+          restartProcessRoleTier(pc.id, { mode: 'real' })
+            .catch((e) => ({ restarted: true, role: pc.role, ok: false, failReason: e.message }))));
+        for (const o of outcomes) {
+          if (!o.restarted) { hereSkipped.push(`${o.role}(${o.reason})`); continue; }
+          (o.ok ? hereRestarted : hereFailed).push(o.role);
+          // A failed restart is a FAILED restart — the tier is DOWN, not "restarted onto the new
+          // file". Only a tier that actually came up belongs in `restarted`; a failed one is in
+          // `restart_failed` below. Unmeasurable must never read as "yes".
+          if (o.ok) restarted.push(`${x.slug}:${o.role}`);
+        }
+      }
+      if (hereFailed.length) restartFailed.push(`${x.slug}(${hereFailed.join('+')})`);
       logline('env', `${x.slug}: .zeehive.env is STALE — ${dryRun ? 'NOT rewritten (PROVISION_MODE=simulate: this queenzee models the fleet, it does not touch it)' : 'rewritten from the meta-DB'}`
-        + (!dryRun && x.live
+        + (hereRestarted.length
+          ? ` — process-role tier(s) ${dryRun ? 'WOULD BE restarted' : 'restarted'} to load it [${hereRestarted.join(', ')}]`
+          : '')
+        + (hereSkipped.length
+          ? ` — process-role tier(s) NOT running [${hereSkipped.join(', ')}] — they load the new values at their next build`
+          : '')
+        + (hereFailed.length
+          ? ` — process-role restart FAILED [${hereFailed.join(', ')}]`
+          : '')
+        + (!dryRun && x.live && !hereRestarted.length && !hereFailed.length
           ? ' WHILE A ZEE IS WORKING IN IT. The QUEENZEE wrote that file, not the zee; its app tier '
             + 'still runs on the old values until its next build.'
           : ''));
@@ -774,6 +826,15 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     + `${stale.length ? ` [${stale.slice(0, 5).join(', ')}${stale.length > 5 ? ', …' : ''}]` : ''}`
     + `, ${failed} FAILED${broken.length ? ` [${broken.slice(0, 3).join('; ')}]` : ''}`
     + `, ${skipped} skipped (no worktree on disk)`
+    // The PROCESS-ROLE half: a rewritten host file only reaches a bare process when the tier is
+    // restarted onto it. Counted on the same line, because a sweep that says "rewritten" while the
+    // running servers still hold the old env is the exact "live on disk, dead in memory" gap.
+    + (wouldRestart.length || restarted.length
+      ? ` · process-role tier(s) ${dryRun ? `would be restarted` : `restarted`} [${(dryRun ? wouldRestart : restarted).slice(0, 5).join(', ')}${(dryRun ? wouldRestart : restarted).length > 5 ? ', …' : ''}]`
+      : '')
+    + (restartFailed.length
+      ? `, ${restartFailed.length} restart FAILED [${restartFailed.slice(0, 3).join('; ')}]`
+      : '')
     // The cage half on the SAME line: the host worktree and the copy a zee reads are the two halves
     // of one answer to "is the fleet running on what the meta-DB says?", and split across two lines
     // one of them is the one that scrolls away.
@@ -794,6 +855,10 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
       + `reconciled with the meta-DB: ${broken.join('; ')}`);
   }
+  if (restartFailed.length) {
+    console.error(`[env] ${restartFailed.length} process-role tier(s) could not be restarted onto their `
+      + `new .zeehive.env — they are still running the OLD env: ${restartFailed.join('; ')}`);
+  }
   if (cxellFailed) {
     console.error(`[env] ${cxellFailed} LIVE cxell(s) could not be handed the refreshed .zeehive.env — `
       + `those zees are still reading their old copy: ${cxellBroken.join('; ')}`);
@@ -803,6 +868,7 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       + `and now carry a card in the console: ${alerted.join(', ')}`);
   }
   return { checked, rewritten, failed, skipped, broken, stale, alerted, dry_run: dryRun,
+           restarted, would_restart: wouldRestart, restart_failed: restartFailed,
            cxell_refreshed: cxellRefreshed, cxell_failed: cxellFailed, cxell_would_refresh: cxellWould,
            cxell_broken: cxellBroken, cxell_stale: cxellStale };
 }
