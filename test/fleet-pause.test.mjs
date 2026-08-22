@@ -434,7 +434,7 @@ try {
   const app = read('web/src/App.jsx');
   ok(/<FleetPause\s/.test(app) && /pause=\{fleet\.pause\}/.test(app),
      'the console renders the button from the fleet snapshot');
-  // The control is its OWN component file (like ModeChip/CrewChip), not another few hundred lines of
+  // The control is its OWN component file (like CrewChip), not another few hundred lines of
   // App.jsx — which is also what lets §8 below render it.
   const ctl = read('web/src/FleetPause.jsx');
   ok(/data-testid="fleet-pause-btn"/.test(ctl) && /data-testid="fleet-paused-banner"/.test(ctl),
