@@ -216,20 +216,40 @@ export function ShipPayload({ req }) {
   }
   const s = p.summary || {};
   const yours = s.yours > 0 ? `; ${s.yours} ${s.yours === 1 ? 'is' : 'are'} yours` : '';
+  // The review gate (ticket #79) — the card says WHICH carried commits are unread, and by whom they
+  // were landed, so the human approving a deploy sees exactly what still needs reading. A payload
+  // whose review record could not be read (s.unknown > 0) is the inverse failure: unmeasurable must
+  // never read as "all reviewed", so it renders as its own badge, stronger than "unread".
+  const gateBadge = Number(s.unknown) > 0
+    ? <span className="ship-payload-gate unknown" data-testid="ship-payload-gate-unknown">
+        {s.unknown} commit{s.unknown === 1 ? '' : 's'} with an UNREADABLE review record
+      </span>
+    : Number(s.unread) > 0
+      ? <span className="ship-payload-gate" data-testid="ship-payload-gate-unread">
+          {s.unread} unread commit{s.unread === 1 ? '' : 's'} — auto-approve requires a recorded review or a human
+        </span>
+      : <span className="ship-payload-gate ok" data-testid="ship-payload-gate-ok">every commit reviewed</span>;
   return (
     <div className="ship-payload" data-testid="ship-payload">
       <div className="ship-payload-summary" data-testid="ship-payload-summary">
         <span className="k">payload:</span>{' '}
         <b>{s.commits} commit{s.commits === 1 ? '' : 's'} from {s.xells} xell{s.xells === 1 ? '' : 's'}</b>
         {' '}since the last ship to this target{p.from ? ` (${short(p.from)})` : ''}{yours}
+        {' '}{gateBadge}
       </div>
       <ul className="ship-payload-commits" data-testid="ship-payload-commits">
         {p.commits.map((c, i) => (
-          <li key={i} className={`ship-payload-commit${c.unattributed ? ' unattributed' : ''}`} data-testid="ship-payload-commit">
+          <li key={i} className={`ship-payload-commit${c.unattributed ? ' unattributed' : ''}${c.reviewed === false ? ' unread' : ''}`} data-testid="ship-payload-commit">
             <code>{short(c.sha)}</code> {c.subject}
             <span className="ship-payload-when">
               {' — '}landed by {c.xell_slug || 'unknown'}{c.landed_at ? ` · ${new Date(c.landed_at).toLocaleDateString()}` : ''}
             </span>
+            {c.reviewed === false && (
+              <span className="ship-payload-review-badge unread" data-testid="ship-payload-unread">unread</span>
+            )}
+            {c.reviewed === null && (
+              <span className="ship-payload-review-badge unknown" data-testid="ship-payload-review-unknown">review record unreadable</span>
+            )}
             {(c.ticket || c.work_item) && (
               <span className="ship-payload-work">
                 {' · '}{c.ticket?.number ? `#${c.ticket.number} ` : ''}{c.work_item?.title || c.ticket?.title || 'work item'}

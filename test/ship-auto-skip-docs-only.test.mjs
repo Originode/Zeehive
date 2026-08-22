@@ -10,6 +10,12 @@
 //   3. no deployed sha yet (the diff is uncomputable) → auto-approve still fires — failing toward
 //      shipping is the safe side: a docs-only restart is cheap, an undeployed fix is not;
 //   4. deployed == candidate (an empty diff) → auto-approve still fires — empty is not "docs-only".
+//
+// The REVIEW GATE (ticket #79) is deliberately satisfied in scenarios 2-4 so this test isolates the
+// docs-only skip: every commit the auto-approving ship would carry has a recorded review verdict
+// (ticket #56), and a SHIPPED ship_request establishes the payload's "from" so the payload is a
+// real commit range. The review gate's own behaviour — an unread commit holds the auto-ship — is
+// proven separately in test/ship-auto-review-gate.test.mjs.
 // Everything it creates is torn down in a finally.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
@@ -91,6 +97,19 @@ try {
   const commitAll = (msg) => { git(repo, 'add', '-A'); git(repo, 'commit', '-qm', msg); return git(repo, 'rev-parse', 'HEAD'); };
   const shipRow = (id) => one(`SELECT * FROM ship_request WHERE id=$1`, [id]);
   const freeLock = () => q(`DELETE FROM deploy_lock WHERE project_id=$1`, [PID]);
+  // A SHIPPED ship at `sha` establishes the payload's "from" (lastShippedForTarget) — without one
+  // the payload reads as a FIRST ship, whose whole history is unenumerated and thus never
+  // auto-approves (ticket #79). Status='shipped' does not trip the one-open-ship-per-xell index.
+  // site_id is the DEFAULT site (IDS.site) so it matches the site a site-less requestShip resolves.
+  const shipShipped = (sha) =>
+    q(`INSERT INTO ship_request (project_id, xell_id, site_id, commit, reason, status, requested_at, decided_at, decided_by, finished_at)
+         VALUES ($1,$2,$3,$4,'previous shipped ship','shipped',now()-interval '2 hours',now()-interval '2 hours','human@console',now()-interval '2 hours')`,
+      [PID, xell.id, IDS.site, sha]);
+  // A recorded review verdict (ticket #56) — the fact someone READ the diff. Satisfies the review
+  // gate so this test can isolate the docs-only skip.
+  const reviewCommit = (sha, verdict = 'clean') =>
+    q(`INSERT INTO review (project_id, xell_id, reviewer, commit_sha, verdict, findings_count, report)
+         VALUES ($1,$2,$3,$4,$5,0,NULL)`, [PID, xell.id, xell.slug, sha, verdict]);
   // Close any open ship from a prior scenario so the one-open-ship-per-xell invariant is clear.
   const closeOpenShips = () =>
     q(`UPDATE ship_request SET status='rejected', decided_at=now(), decided_by='test@cleanup'
@@ -107,7 +126,7 @@ try {
 
   console.log('\n── 1. a docs-only diff does NOT auto-approve (request stays pending) ──');
   writeFileSync(join(repo, 'docs', 'guide.md'), '# guide v2\n');
-  await commitAll('docs only');
+  const docsSha = await commitAll('docs only');
   await setDeployed(base);
   await freeLock();
   const rA = await requestShip({ xellId: xell.id, reason: 'docs-only auto-skip test' });
@@ -125,6 +144,11 @@ try {
   await setDeployed(base);
   await closeOpenShips();
   await freeLock();
+  // The payload's "from": a shipped ship at the docs-only tip, so the payload is the ONE mixed
+  // commit — and that commit was READ (review recorded), so the review gate passes and the docs-only
+  // skip is what is actually being exercised.
+  await shipShipped(docsSha);
+  await reviewCommit(mixedSha);
   const rB = await requestShip({ xellId: xell.id, reason: 'mixed auto-approve test' });
   ok(rB.ok === true && rB.request, 'requestShip raised a second request');
   const rBrow = await shipRow(rB.request.id);
@@ -136,9 +160,15 @@ try {
   await freeLock();
 
   console.log('\n── 3. no deployed sha yet (the diff is uncomputable) still auto-approves ──');
+  writeFileSync(join(repo, 'server', 'foo.js'), 'export const x = 3;\n');
+  const nSha = await commitAll('server only');
   await setDeployed(null);
   await closeOpenShips();
   await freeLock();
+  // The new commit was READ too, so again only the docs-only skip is in play — and it CANNOT skip
+  // (no deployed sha), so the auto-approve runs: failing toward shipping is the safe side for the
+  // docs-only optimisation (a docs-only restart is cheap, an undeployed fix is not).
+  await reviewCommit(nSha);
   const rC = await requestShip({ xellId: xell.id, reason: 'no-deployed-sha test' });
   ok(rC.ok === true && rC.request, 'requestShip raised a third request');
   const rCrow = await shipRow(rC.request.id);
@@ -149,7 +179,7 @@ try {
   await freeLock();
 
   console.log('\n── 4. deployed == candidate (an empty diff) still auto-approves ──');
-  await setDeployed(mixedSha);   // master has not moved since scenario 2, so the diff is empty
+  await setDeployed(nSha);   // master has not moved since scenario 3, so the diff is empty
   await closeOpenShips();
   await freeLock();
   const rD = await requestShip({ xellId: xell.id, reason: 'empty-diff test' });
