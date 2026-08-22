@@ -754,34 +754,5 @@ function BundleBar({ count, projectId, onDone }) {
   );
 }
 
-// The padlock badge on whichever xell holds prod. Hover swaps to an unlock icon; clicking asks
-// before taking prod back — a force release while a human is mid-verification is disruptive.
-export function LockBadge({ lock, projectId, onChanged }) {
-  const [hover, setHover] = useState(false);
-  const [busy, setBusy] = useState(false);
-  if (!lock) return null;
-
-  const release = async (e) => {
-    e.stopPropagation();
-    if (!(await confirmForceRelease(lock))) return;
-    setBusy(true);
-    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { showAlert(err.message, { variant: 'error' }); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <button
-      className={`lock-badge${lock.held ? ' held' : ''}`}
-      data-testid="lock-badge"
-      disabled={busy}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onClick={release}
-      title={lock.held
-        ? 'Holds the PRODUCTION lock (held open — no auto-release). Click to force-release.'
-        : 'Holds the PRODUCTION lock. Click to force-release.'}
-    >
-      {busy ? '…' : (hover ? '🔓' : '🔒')}
-    </button>
-  );
-}
+// (LockBadge — the padlock on the deleted XellCard — was removed with it, TKT-29-3AB6. The prod
+// lock's countdown and force-release still live on the ShipPanel; nothing else rendered this.)

@@ -212,105 +212,13 @@ try {
        'a reserved name in the environment is LABELLED as not-injected, rather than silently dropped');
     const app = readFileSync(join(ROOT, 'web/src/App.jsx'), 'utf8');
 
-    // ── the CARD's env chip: rendered, not grepped ────────────────────────
-    // This was `/env-absent/.test(app) && /'no env'/.test(app)` — a grep over App.jsx, which stays
-    // GREEN when the chip is wrapped in a condition that can never be true (checked by hand: the
-    // strings live on in the source and no human ever sees a chip). So the three faces are asserted
-    // off real MARKUP, through the same esbuild + react-dom/server route test/tend-reason.test.mjs
-    // renders this component by. App.jsx exports no XellCard, hence the one-line entry beside it —
-    // written, bundled and deleted here. Its own react + react-dom go in the bundle (one instance:
-    // XellCard calls useState, and a split react/react-dom pair has no dispatcher).
-    const cardEntry = join(ROOT, 'web/src/.xenv-card-entry.jsx');
-    const cardBundle = join(tmp, 'xenv-card.cjs');
-    let cardUi;
-    try {
-      writeFileSync(cardEntry, `${app}\nexport { XellCard };\n`);
-      await esbuild.build({
-        stdin: {
-          contents: `
-            const React = require('react');
-            const { renderToStaticMarkup } = require('react-dom/server');
-            const { XellCard } = require('./.xenv-card-entry.jsx');
-            module.exports = { React, renderToStaticMarkup, XellCard };`,
-          resolveDir: join(ROOT, 'web/src'), loader: 'js',
-        },
-        bundle: true, format: 'cjs', platform: 'node', outfile: cardBundle, jsx: 'automatic',
-        logLevel: 'silent', define: { 'process.env.NODE_ENV': '"development"' },
-      });
-      cardUi = createRequire(cardBundle)(cardBundle);
-    } finally { rmSync(cardEntry, { force: true }); }
-
-    // the chip a human would see, for a xell whose only difference is its env_* columns. Reported as
-    // class + visible text: the title is three paragraphs long and a failure has to be readable.
-    const chipOf = (env) => {
-      let html;
-      try {
-        html = cardUi.renderToStaticMarkup(cardUi.React.createElement(cardUi.XellCard, {
-          x: { id: '00000000-0000-4000-8000-00000000e2c1', slug: 'xenv-card', status: 'claimed',
-               hive_status: 'occ-working', hive_status_label: 'working', head_commit: 'abc123def456',
-               branch: 'spinoff/xenv-card', stack: [], burn: { tokens: 0, cost: 0 }, ...env },
-          diff: null, onDone: () => {}, onMenu: () => {}, prodLock: null, projectId: PID,
-          landing: [], prs: [], ship: null, onDismiss: () => {}, machines: [], onEnv: () => {} }));
-      } catch (e) {
-        // a card that throws is a failed assertion with a reason, not a dead test run
-        return { cls: '', text: '', threw: e?.message || String(e) };
-      }
-      const at = html.indexOf('data-testid="env-chip"');
-      if (at < 0) return null;
-      const span = html.slice(html.lastIndexOf('<span', at), html.indexOf('</span>', at) + 7);
-      return { cls: (span.match(/class="([^"]*)"/) || [, ''])[1], text: span.replace(/<[^>]*>/g, '') };
-    };
-    const NO_CHIP = 'NO env chip in the rendered card at all';
-    const chipSaw = (chip) => (chip === null ? NO_CHIP
-      : chip.threw ? `XellCard THREW while rendering: ${chip.threw}`
-        : `class="${chip.cls}" text="${chip.text}"`);
-    const populated = chipOf({ env_key: 'staging', env_tier: 'dev', env_var_count: 5, env_pinned: true });
-    ok(populated?.text === '❖ staging ·5 📌',
-       `a resolved environment renders its key, var count and pin — expected text "❖ staging ·5 📌", `
-       + `got ${chipSaw(populated)}`);
-    const emptyChip = chipOf({ env_key: 'zeehive-dev', env_tier: 'dev', env_var_count: 0 });
-    ok(emptyChip?.text === '❖ zeehive-dev ∅' && / env-empty\b/.test(emptyChip.cls),
-       `EMPTY renders its own face (∅ + .env-empty), because 0 vars is the state that looks like a `
-       + `bug — got ${chipSaw(emptyChip)}`);
-    const absentChip = chipOf({ env_key: null, env_tier: null, env_var_count: 0 });
-    ok(absentChip?.text === '❖ no env' && / env-absent\b/.test(absentChip.cls),
-       `and ABSENT renders a third face ("no env" + .env-absent) — an absent chip must not read as `
-       + `'fine' — got ${chipSaw(absentChip)}`);
-
-    // The one thing static markup cannot show: WHERE the click goes. The CONTRACT is "XellCard takes
-    // an onEnv prop and calls it" — so that is what is asserted, from the props it DECLARES (parsed
-    // out of a brace-balanced parameter list) rather than from the punctuation around them. Both
-    // earlier versions of this assertion pinned the shape instead and died to it: `onEnv }) {` broke
-    // when a `links` prop was appended, and `XellCard\(\{[^}]*onEnv` breaks on the day any prop
-    // before it carries an object default (`links = {}`).
-    const paramsOf = (src, fn) => {
-      const at = src.indexOf(`function ${fn}(`);
-      if (at < 0) return null;
-      const open = src.indexOf('(', at);
-      let depth = 0;
-      for (let i = open; i < src.length; i++) {
-        if ('([{'.includes(src[i])) depth++;
-        else if (')]}'.includes(src[i]) && --depth === 0) return src.slice(open + 1, i);
-      }
-      return null;
-    };
-    const bodyOf = (src, fn) => {
-      const at = src.indexOf(`function ${fn}(`);
-      if (at < 0) return '';
-      const next = src.indexOf('\nfunction ', at + 1);
-      return src.slice(at, next < 0 ? src.length : next);
-    };
-    const cardParams = paramsOf(app, 'XellCard');
-    ok(cardParams !== null && /\bonEnv\b/.test(cardParams),
-       `XellCard DECLARES an onEnv prop, anywhere in its parameter list — its props are: `
-       + `${cardParams === null ? 'no `function XellCard(` in web/src/App.jsx' : cardParams.trim()}`);
-    const cardBody = bodyOf(app, 'XellCard');
-    ok(/\bonEnv\s*\?\.\s*\(|\bonEnv\s*\(/.test(cardBody),
-       'and CALLS it — the chip signals the env panel through its prop');
-    ok(cardBody !== '' && !/setEnvXell/.test(cardBody),
-       'rather than reaching past its props for the parent\'s setEnvXell');
+    // The env chip that used to render here lived on the DELETED XellCard (TKT-29-3AB6) — its
+    // three faces ("resolved ·N", "∅ empty", "no env") are gone with the card. The env question is
+    // answered on the LIVE surface: the flower's ❖ button opens the panel, and the panel states the
+    // three sentences itself (asserted above from its own source). So what is pinned here is the
+    // flower wiring and the panel's raw dump button — both reachable by a human.
     ok(/if \(kind === 'env'\) \{[\s\S]{0,400}setEnvXell\(x\)/.test(app),
-       "and the flower's ❖ button opens the panel, which is the live surface a human uses");
+       "the flower's ❖ button opens the panel, which is the live surface a human uses");
     ok(/data-testid="xenv-extract"/.test(src),
        'the raw .zeehive.env dump that button used to show is kept, one click away inside the panel');
   }
