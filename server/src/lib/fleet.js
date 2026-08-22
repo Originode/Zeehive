@@ -17,6 +17,7 @@ import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
+import { computeShipPayload } from '../queenzee/ship-payload.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -694,6 +695,10 @@ export async function getFleet(projectId) {
           OR (s.status IN ('shipped','failed')
               AND COALESCE(s.finished_at, s.decided_at) > now() - interval '15 minutes'))
        ORDER BY s.requested_at DESC`, [pid]);
+  // THE PAYLOAD (ticket #65) — what each open/fresh ship actually carries, named commit by commit
+  // with who landed each. ADVISORY: computeShipPayload never throws, so a payload that cannot be
+  // read rides as { ok:false } on the card in words and never blocks the ask or the approval.
+  for (const s of shipping) s.payload = await computeShipPayload(project, s);
   const prodLock = await one(
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
        WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);

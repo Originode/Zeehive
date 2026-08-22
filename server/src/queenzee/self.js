@@ -24,6 +24,7 @@ import { cleanGitEnv, gitLog, worktreeDiff } from '../lib/git.js';
 import { existsSync } from 'node:fs';
 import { landStatus, openLandRequests, holdingRequests, withdrawLandRequest } from './landgate.js';
 import { requestShip, shipStatus, withdrawShipRequest } from './shipgate.js';
+import { computeShipPayload, shipPayloadSummary } from './ship-payload.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { requestXourceClean, xourceCleanStatusFor } from '../lib/xource-clean.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
@@ -925,6 +926,13 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
   if (r.ok === false) return r;                      // requestShip already wrote the loud message
   const req = r.request;
   const decided = ['shipped', 'failed', 'rejected'].includes(req?.status);
+  // THE PAYLOAD (ticket #65) — name what actually rides along, not just that "every landing on
+  // main at this moment" does. Same read the human's card shows; ADVISORY (never throws).
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  const payload = project ? await computeShipPayload(project, req) : null;
+  const payloadLine = payload
+    ? ` PAYLOAD: ${shipPayloadSummary(payload, xell.slug)}.`
+    : '';
   return {
     ...r,
     message: decided
@@ -937,6 +945,7 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
         // a zee that reports "my work shipped" is understating what it just asked a human to deploy.
         + `NOTE: this deploys the CURRENT TIP of main (${String(req.commit).slice(0, 8)}) — every landing `
         + 'on main at this moment, not only your commits. Do not describe it as shipping only your work.'
+        + payloadLine
         + shipSchemaNote(req),
   };
 }

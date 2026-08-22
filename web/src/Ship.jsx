@@ -188,6 +188,60 @@ export function ShipSchema({ req }) {
   );
 }
 
+// THE PAYLOAD THIS SHIP CARRIES (ticket #65) — the commits between the last SHIPPED commit for the
+// same target and the one being deployed, each with who landed it and what it was for. The card
+// already warned "every landing on main, not only the requester's" and never said which; this is
+// the list. ADVISORY: a payload that could not be read renders as such in words and never blocks
+// the ask or the approval — the same degrade-never-block rule as ShipPreflight.
+export function ShipPayload({ req }) {
+  const p = req?.payload;
+  if (!p) return null;
+  if (p.ok === false) {
+    return (
+      <div className="ship-payload" data-testid="ship-payload">
+        <span className="k">payload:</span>{' '}
+        <span className="ship-payload-unknown" data-testid="ship-payload-unknown">
+          could not be read{p.error ? ` — ${p.error}` : ''}
+        </span>
+      </div>
+    );
+  }
+  if (!p.commits?.length) {
+    return (
+      <div className="ship-payload" data-testid="ship-payload">
+        <span className="k">payload:</span>{' '}
+        <span className="ship-payload-note" data-testid="ship-payload-note">{p.note || 'nothing new since the last ship to this target'}</span>
+      </div>
+    );
+  }
+  const s = p.summary || {};
+  const yours = s.yours > 0 ? `; ${s.yours} ${s.yours === 1 ? 'is' : 'are'} yours` : '';
+  return (
+    <div className="ship-payload" data-testid="ship-payload">
+      <div className="ship-payload-summary" data-testid="ship-payload-summary">
+        <span className="k">payload:</span>{' '}
+        <b>{s.commits} commit{s.commits === 1 ? '' : 's'} from {s.xells} xell{s.xells === 1 ? '' : 's'}</b>
+        {' '}since the last ship to this target{p.from ? ` (${short(p.from)})` : ''}{yours}
+      </div>
+      <ul className="ship-payload-commits" data-testid="ship-payload-commits">
+        {p.commits.map((c, i) => (
+          <li key={i} className={`ship-payload-commit${c.unattributed ? ' unattributed' : ''}`} data-testid="ship-payload-commit">
+            <code>{short(c.sha)}</code> {c.subject}
+            <span className="ship-payload-when">
+              {' — '}landed by {c.xell_slug || 'unknown'}{c.landed_at ? ` · ${new Date(c.landed_at).toLocaleDateString()}` : ''}
+            </span>
+            {(c.ticket || c.work_item) && (
+              <span className="ship-payload-work">
+                {' · '}{c.ticket?.number ? `#${c.ticket.number} ` : ''}{c.work_item?.title || c.ticket?.title || 'work item'}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // THE DEPLOY'S PRECONDITIONS, as probed when the ship was raised (ticket #58). The queenzee runs
 // READ-ONLY checks at request time — the migration target db is addressable and inspectable, the
 // build targets have build scripts, the docker contexts answer — and this renders the verdict so a
@@ -383,6 +437,11 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
           The deploy's own guards re-check at deploy time, so an approve after the reason is fixed
           is safe; an approve before it is fixed fails with the SAME named reason on the result. */}
       <ShipPreflight req={req} />
+      {/* THE PAYLOAD (ticket #65) — what this ship actually carries: the commits since the last
+          shipped commit for this target, with who landed each. Distinct from the schema (above)
+          and the pre-flight: those say WHAT the deploy applies and whether its preconditions are
+          met; this says WHOSE work is riding along. */}
+      <ShipPayload req={req} />
       {/* DB scope + the zee's drift assessment — the human approves the SCOPE and the REASONING,
           not a bare green tick. A code-only ship says what it deliberately will not run. */}
       {req.skip_migrations && (

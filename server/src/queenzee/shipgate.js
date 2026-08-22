@@ -20,6 +20,7 @@ import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations, pendingBootMigrations } from './shipmigrate.js';
 import { runShipPreflight, noteShipPreflight } from './ship-preflight.js';
+import { computeShipPayload } from './ship-payload.js';
 import { classifyShipFailure } from '../lib/ship-failure.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
@@ -586,7 +587,8 @@ export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
   // The reviews (224) carried on this ship's commit — so the human approving a deploy sees whether
   // the code being shipped was READ, and by whom. A record, never a gate: nothing here waits on it.
-  return q(
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  const rows = await q(
     `SELECT s.*, x.slug AS xell_slug, ds.key AS site_key,
             (SELECT COALESCE(jsonb_agg(jsonb_build_object(
                      'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
@@ -597,6 +599,14 @@ export async function listShipRequests(projectId, { open = true } = {}) {
        JOIN xell x ON x.id = s.xell_id
        LEFT JOIN deploy_site ds ON ds.id = s.site_id
        WHERE s.project_id=$1 ${where} ORDER BY s.requested_at DESC LIMIT 50`, [projectId]);
+  // THE PAYLOAD (ticket #65) — the commits between the last shipped sha for this ship's target and
+  // the one being deployed, each with who landed it. ADVISORY: computeShipPayload never throws, and
+  // a payload that cannot be read rides as { ok:false } so the card says so in words — it can never
+  // block or refuse a ship.
+  if (project) {
+    for (const s of rows) s.payload = await computeShipPayload(project, s);
+  }
+  return rows;
 }
 
 export async function shipStatus(xellId) {
