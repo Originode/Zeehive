@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { GIT_BEHAVIOR_OPTIONS, gitBehaviorLabel } from './hive/plusMenu.js';
 import {
   createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
   githubAccess, pushProject, pullRequestProject, squashHelps, squashOffer,
@@ -37,7 +38,7 @@ const INGRESS_KINDS = [
 ];
 const ROLES = ['server', 'webapp', 'db', 'infra'];
 
-export default function ProjectSetup({ project: initial, onClose, onChanged, onSelect }) {
+export default function ProjectSetup({ project: initial, onClose, onChanged, onSelect, nested = null }) {
   const [project, setProject] = useState(initial);         // null = create mode
   const [contexts, setContexts] = useState([]);
   useEffect(() => { getDockerContexts().then(setContexts).catch(() => setContexts([])); }, []);
@@ -58,7 +59,7 @@ export default function ProjectSetup({ project: initial, onClose, onChanged, onS
           </datalist>
           {project
             ? <EditSections project={project} onChanged={onChanged} onProject={setProject} />
-            : <CreateForm onCreated={(p) => { setProject(p); onChanged?.(); onSelect?.(p.id); }} />}
+            : <CreateForm onCreated={(p) => { setProject(p); onChanged?.(); onSelect?.(p.id); }} nested={nested} />}
         </div>
       </div>
     </div>,
@@ -69,7 +70,7 @@ export default function ProjectSetup({ project: initial, onClose, onChanged, onS
 // ── create: the minimum to exist, guided by a live probe of the folder ────────
 // Two sources: an EXISTING folder on disk, or a fresh CLONE from a GitHub URL. Cloning is
 // inbound-only — the clone's origin is only ever fetched from (Pull); Zeehive never pushes.
-function CreateForm({ onCreated }) {
+function CreateForm({ onCreated, nested = null }) {
   const [source, setSource] = useState('folder');   // 'folder' | 'clone'
   const [f, setF] = useState({ name: '', repo_root: '', main_branch: 'main', docker_ctx_dev: '', dev_host_ip: '', docker_ctx_prod: '', prod_host_ip: '' });
   const [c, setC] = useState({ remote_url: '', dest: '', token: '' });
@@ -78,6 +79,11 @@ function CreateForm({ onCreated }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const [prog, setProg] = useState(null);           // live clone progress frame (clone mode)
+  // A NESTED project (created inside another project's tree): the folder is confined to the
+  // parent's repo_root and the human must say HOW the nested repo joins the parent's git. The
+  // choice is FORCED (no blank) and persisted on the project row (migration 232); the server
+  // validates the same vocabulary (server/src/lib/projects.js GIT_BEHAVIORS).
+  const [gitBehavior, setGitBehavior] = useState('submodule');   // default: a submodule — the honest default
   // The Folder path resolves on the QUEENZEE's filesystem, not the browser's machine — a
   // containerized queenzee sees /repos (its volume), never the operator's D:\. Ask the server
   // where its repos home is so the hints speak the world the path will actually be checked in.
@@ -159,6 +165,9 @@ function CreateForm({ onCreated }) {
         name: f.name.trim(), main_branch: f.main_branch.trim() || 'main',
         docker_ctx_dev: f.docker_ctx_dev.trim() || null, dev_host_ip: f.dev_host_ip.trim() || null,
         docker_ctx_prod: f.docker_ctx_prod.trim() || null, prod_host_ip: f.prod_host_ip.trim() || null,
+        // a NESTED project carries HOW its repo joins the parent's git; a top-level project leaves
+        // it null (the server's createProject defaults the empty string to null).
+        ...(nested ? { git_behavior: gitBehavior } : {}),
       };
       const p = source === 'clone'
         ? await cloneProject({ ...common, remote_url: c.remote_url.trim(), dest: c.dest.trim() || null, token: c.token.trim() || null })
@@ -191,7 +200,9 @@ function CreateForm({ onCreated }) {
               </button>
             </span>
             {showBrowse && (
-              <FsBrowse start={f.repo_root.trim() || homeDir || ''} repoPicks onPick={pickFolder} />
+              <FsBrowse start={f.repo_root.trim() || (nested ? nested.parent_repo_root : homeDir) || ''}
+                        repoPicks onPick={pickFolder}
+                        confineTo={nested ? nested.parent_repo_root : null} />
             )}
             {/* Host-folder mount — only meaningful when the queenzee is containerized (homeDir
                 set). The server refuses with a clear message on a host-era install anyway. */}
@@ -234,8 +245,9 @@ function CreateForm({ onCreated }) {
                 </button>
               </span>
               {showDestBrowse && (
-                <FsBrowse start={c.dest.trim().replace(/[\\/][^\\/]*$/, '') || homeDir || ''}
-                          pickLabel="✓ clone under this folder" onPick={pickDest} />
+                <FsBrowse start={c.dest.trim().replace(/[\\/][^\\/]*$/, '') || (nested ? nested.parent_repo_root : homeDir) || ''}
+                          pickLabel="✓ clone under this folder" onPick={pickDest}
+                          confineTo={nested ? nested.parent_repo_root : null} />
               )}
             </label>
             <label>GitHub token <span className="pc">(read-only PAT — private repos only, stored in the meta-DB)</span>
@@ -249,6 +261,36 @@ function CreateForm({ onCreated }) {
       </div>
       {source === 'folder' && probe && <ProbeChips probe={probe} />}
       {source === 'clone' && rprobe && <RemoteChips probe={rprobe} />}
+
+      {/* NESTED project — created INSIDE another project's tree (a monorepo sub-project). The
+          folder is confined to the parent's repo_root (the browse pickers never step above it),
+          and the human must say HOW the nested repo joins the parent's git. The choice is FORCED —
+          there is no "not sure" — because an ambiguous nested git is a parent that cannot track its
+          children. The row persists git_behavior (migration 232), so the nesting is self-describing
+          long after this dialog is gone. */}
+      {nested && (
+        <div className="setup-sec nested-proj" data-testid="nested-project">
+          <h3>Nested project <span className="pc">inside {nested.parent_name || 'this project'}</span></h3>
+          <p className="pc">
+            This project will live INSIDE the parent's repo tree — a sub-project of a monorepo.
+            Its folder is confined to{' '}
+            <span className="mono">{nested.parent_repo_root || 'the parent repo'}</span>.
+          </p>
+          <label className="nested-git-label">How does the new repo join the parent's git?</label>
+          <div className="nested-git-opts">
+            {GIT_BEHAVIOR_OPTIONS.map((o) => (
+              <label key={o.value} className={`nested-git-opt${gitBehavior === o.value ? ' sel' : ''}`}
+                     data-testid={`git-behavior-${o.value}`}>
+                <input type="radio" name="git-behavior" checked={gitBehavior === o.value}
+                       onChange={() => setGitBehavior(o.value)} />
+                <span className="nested-git-opt-label">{o.label}</span>
+                <span className="pc">{o.sub}</span>
+              </label>
+            ))}
+          </div>
+          <p className="pc">persisted as <span className="mono">git_behavior = {gitBehaviorLabel(gitBehavior)}</span> on the project row</p>
+        </div>
+      )}
       <h3>Deployment</h3>
       <div className="setup-grid">
         <label>Dev docker context<input list="zh-docker-ctxs" value={f.docker_ctx_dev} onChange={set('docker_ctx_dev')} placeholder="default (this machine)" /></label>
@@ -294,20 +336,34 @@ function CloneProgress({ prog }) {
 // shared by the Folder field and Clone-into. repoPicks: clicking a ⎇ git-repo row picks it
 // outright (existing-folder mode — a repo is the destination); otherwise every row navigates
 // and only the header button picks (clone mode — the pick is a PARENT directory).
-function FsBrowse({ start, onPick, repoPicks = false, pickLabel = '✓ use this folder' }) {
+// `confineTo` (a NESTED project): the picker never steps ABOVE this directory — the ↰ .. button
+// disappears at the confine root — so a sub-project cannot escape its parent's repo tree.
+function FsBrowse({ start, onPick, repoPicks = false, pickLabel = '✓ use this folder', confineTo = null }) {
   const [lvl, setLvl] = useState(null);
   const go = (p) => listFsDirs(p).then(setLvl).catch((e) => setLvl({ ok: false, error: e.message, dirs: [] }));
-  useEffect(() => { go(start || ''); }, []);   // opens at the field's current value / repos home
+  // Clamp the start INTO the confine root if the caller's value somehow sits above it — a nested
+  // project's browser must always open INSIDE the parent's repo tree, never at or above its root.
+  useEffect(() => {
+    const s = start || '';
+    if (confineTo && s && !(s.replace(/[\\/]+$/, '') + '/').startsWith(confineTo.replace(/[\\/]+$/, '') + '/')) {
+      go(confineTo);
+    } else {
+      go(s);
+    }
+  }, []);   // open once at the field's current value / repos home
   if (!lvl) return <span className="pc">loading…</span>;
+  const atConfineRoot = confineTo && lvl.path && lvl.path.replace(/[\\/]+$/, '') === confineTo.replace(/[\\/]+$/, '');
   return (
     <span className="fsbrowse" data-testid="fs-panel">
       <span className="fsb-head">
         <span className="mono fsb-path">{lvl.path || '—'}</span>
         <button type="button" onClick={() => onPick(lvl.path)} disabled={!lvl.ok}>{pickLabel}</button>
       </span>
+      {confineTo && <span className="pc fsb-confine">confined to <b>{confineTo}</b> — a nested project cannot escape its parent's repo</span>}
       {lvl.error && <span className="projpop-err">{lvl.error}</span>}
       <span className="fsb-list">
-        {lvl.parent && <button type="button" className="fsb-dir" onClick={() => go(lvl.parent)}>↰ ..</button>}
+        {lvl.parent && !atConfineRoot &&
+          <button type="button" className="fsb-dir" onClick={() => go(lvl.parent)}>↰ ..</button>}
         {(lvl.dirs || []).map((d) => {
           const full = `${lvl.path.replace(/[\\/]+$/, '')}/${d.name}`;
           return (

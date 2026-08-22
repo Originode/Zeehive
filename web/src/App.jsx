@@ -6,7 +6,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          sendXellMessage,
          swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
-         routePrompt, deployRouter, redeployRouter,
+         routePrompt, deployRouter, redeployRouter, addManagerZee,
          squashHelps, squashOffer } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 import MessageComposer from './MessageComposer.jsx';
@@ -53,7 +53,7 @@ import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
 import WorkConsole from './work/WorkConsole.jsx';
 // the honeycomb's WORK-NODE hierarchy reads the same plan the board does
-import { listWorkItems, deployWorkItem } from './work/workApi.js';
+import { listWorkItems, deployWorkItem, createWorkItem } from './work/workApi.js';
 import DeliveryTelemetry from './DeliveryTelemetry.jsx';
 import Toasts from './Toasts.jsx';
 
@@ -261,7 +261,17 @@ export default function App() {
   // inside the composer (Dispatch.jsx). (Object rather than `true` so a future pin can ride along
   // without flipping the truthy check.)
   const [showDispatch, setShowDispatch] = useState(false);
+  const [showManagerMint, setShowManagerMint] = useState(false); // the Dispatch manager-variant, from the + hexagon
   const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
+  const [workInitialTab, setWorkInitialTab] = useState(null); // force a tracker tab when opened from the + hexagon
+  // ── a NESTED project being onboarded from the + hexagon (project inside this project's tree) ──
+  // { parent_id, parent_name, parent_repo_root } — the CreateForm confines its folder picker to the
+  // parent's repo_root and forces the git-behavior choice. null = the plain "+ add provider" setup.
+  const [nestedProject, setNestedProject] = useState(null);
+  // true when the + hexagon's project option opened the setup — ALWAYS create mode (a NEW project).
+  // The "+ add provider" button keeps the legacy behaviour: edit the selected project if one exists,
+  // create when there is none. The + menu asks for a NEW project either way.
+  const [setupCreate, setSetupCreate] = useState(false);
   // ── the honeycomb's WORK-NODE hierarchy (hive levels) ─────────────────────────
   // 'projects' = the TOP level: every hexagon is a project (its root work_node) — what the console
   // opens on. 'nodes' = inside a project: the level named by nodePath (empty = the project root's
@@ -997,6 +1007,58 @@ export default function App() {
     }
   };
 
+  // ── the '+ hexagon' create menu's actions ────────────────────────────────────
+  // kind ∈ 'prompt'|'manager'|'ticket' (main level) | 'project'|'activity'|'task' (work_node sub).
+  // Each opens the SAME surface the toolbar buttons do — the + menu is a second door, not a second
+  // policy. The one genuinely new path is 'project' INSIDE a project: a NESTED project, whose
+  // folder is confined to the parent's repo_root and whose git behavior is forced (ProjectSetup's
+  // CreateForm renders the choice). Activity/task cut under the current node (server owns legality).
+  const handlePlusAction = useCallback(async (kind) => {
+    switch (kind) {
+      case 'prompt': setShowDispatch({}); return;
+      case 'manager': setShowManagerMint(true); return;
+      case 'ticket': setWorkInitialTab('tickets'); setShowWork(true); return;
+      case 'project': {
+        // Inside a project (hiveMode 'nodes') the new project is NESTED — confine its folder to the
+        // parent's repo_root and force the git-behavior choice. At the top level it is a plain new
+        // project (the existing "＋ add provider" CreateForm, untouched).
+        if (hiveMode === 'nodes') {
+          const parent = rootWorkItem;   // the current project's root work_item (title = project name)
+          setNestedProject({
+            parent_id: parent?.id || null,
+            parent_name: parent?.title || project?.name || '',
+            parent_repo_root: project?.repo_root || '',
+          });
+        } else {
+          setNestedProject(null);
+        }
+        setSetupCreate(true);
+        setShowSetup(true);
+        return;
+      }
+      case 'activity':
+      case 'task': {
+        const parentId = ctxItemId;   // the current node, or the project root at a project's level
+        if (!parentId) {
+          showAlert(`Open a node first — a new ${kind} is cut under the current node, and none is open.`, { variant: 'error' });
+          return;
+        }
+        const title = await showPrompt(`New ${kind} under the current node`, { okLabel: 'Create', placeholder: 'title' });
+        if (!title || !title.trim()) return;
+        try {
+          await createWorkItem({ project: projectId || project?.id, parent_id: parentId, kind, title: title.trim() });
+          const id = `wi-${kind}-${Date.now()}`;
+          pushToast({ id, kind: 'success', title: `${kind} created`, onRetry: null,
+            body: `“${title.trim()}” is queued under the current node.` });
+          setTimeout(() => dismissToast(id), 5000);
+          refresh();
+        } catch (e) { showAlert(e?.message || String(e), { variant: 'error' }); }
+        return;
+      }
+      default: return;
+    }
+  }, [hiveMode, rootWorkItem, project, ctxItemId, projectId, refresh]);
+
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
   // The manager↔crew relation for the DOM surfaces (hive/crew.js — the SAME grouping the honeycomb, the
@@ -1213,6 +1275,7 @@ export default function App() {
                     queenzeeActivity={qzActivity}
                     shipping={fleet.shipping || []}
                     onOpenProject={openProjectLevel} onOpenNode={openNodeLevel} onNodeAssign={assignNodeZee}
+                    onPlusAction={handlePlusAction}
                     onQueenzeeTerminal={openQueenzeeTerminal}
                     qzTerminalStatus={qzTerminal.status}
                     onQueenzeeLogs={() => setShowTerm(true)} />
@@ -1453,7 +1516,7 @@ export default function App() {
             return (
               <button className="new-prompt-btn" data-testid="add-provider-btn"
                       title="No AI provider connected — add a Claude, Codex, or Kimi token to dispatch zees"
-                      onClick={() => setShowSetup(true)}>＋ add provider</button>
+                      onClick={() => { setSetupCreate(false); setNestedProject(null); setShowSetup(true); }}>＋ add provider</button>
             );
           }
           // Whether the single button can be pressed is a pure decision — promptButton() —
@@ -1488,10 +1551,6 @@ export default function App() {
             portalled overlay (no router in this console), so nothing else on this page moves. */}
         <button className="work-btn-open" data-testid="work-btn" title="Open the work tracker — tickets, board, timeline"
                 onClick={() => setShowWork(true)}>▦ work</button>
-        {showWork && (
-          <WorkConsole projectId={projectId || project.id} projectName={project.name}
-                       onClose={() => setShowWork(false)} />
-        )}
         {/* DELIVERY TELEMETRY — the same altitude as the work tracker, and the other half of the
             same question: the tracker says what work exists, this says how that work is actually
             going (cycle time, rework, what dies, what a landing costs, how long a human takes).
@@ -1583,8 +1642,39 @@ export default function App() {
                         ? { parent_work_item: nodePath[nodePath.length - 1].id } : {}) });
                   }} />
       )}
+      {/* the + hexagon's MANAGER option — the SAME Dispatch composer, manager variant, that
+          AddManagerButton opens; a second door to the same mint. */}
+      {showManagerMint && (
+        <Dispatch manager projectId={projectId || project.id} projectName={project.name}
+                  onClose={() => setShowManagerMint(false)}
+                  onDispatch={async (payload) => {
+                    setShowManagerMint(false);
+                    try {
+                      await addManagerZee(payload);
+                      refresh();
+                      const id = `mgr-${Date.now()}`;
+                      pushToast({ id, kind: 'success', title: 'Manager zee added', onRetry: null,
+                        body: 'A manager was minted — it will study the project and propose a programme.' });
+                      setTimeout(() => dismissToast(id), 6000);
+                    } catch (e) { showAlert(e?.message || String(e), { variant: 'error' }); }
+                  }} />
+      )}
+      {/* the + hexagon's PROJECT option: a plain new project at top level; a NESTED project (folder
+          confined to the parent's repo_root, git behavior forced) inside a project. `project={null}`
+          (setupCreate) puts ProjectSetup in CREATE mode; the nested context rides `nested` so the
+          CreateForm can confine and force. The "+ add provider" button keeps setupCreate=false → the
+          legacy edit-the-selected-project behaviour. */}
       {showSetup && (
-        <ProjectSetup project={project} onClose={() => setShowSetup(false)} onChanged={refresh} />
+        <ProjectSetup project={setupCreate ? null : project} nested={nestedProject}
+                      onClose={() => { setShowSetup(false); setNestedProject(null); setSetupCreate(false); }}
+                      onChanged={refresh} onSelect={(id) => selectProject(id)} />
+      )}
+      {/* the WORK TRACKER, opened from the toolbar OR the + hexagon's TICKET option. The + menu
+          forces the Tickets tab (workInitialTab); the toolbar keeps the last-used tab. */}
+      {showWork && (
+        <WorkConsole projectId={projectId || project.id} projectName={project.name}
+                     initialTab={workInitialTab}
+                     onClose={() => { setShowWork(false); setWorkInitialTab(null); }} />
       )}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}
