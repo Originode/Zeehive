@@ -543,6 +543,7 @@ function usage() {
   zee dep --item <dependent-id> --on <prerequisite-id> [--remove]   CHAIN two cards in YOUR project: \`--item\` (the dependent) waits for \`--on\` (the prerequisite) — a dependency edge in the model. Nesting (parent_id) says part-of; a chain (dependency) says AFTER, and the gantt's critical path runs along chains. \`--remove\` takes the edge away. The console drawer has the same picker; this is the CLI half
   zee conversations [--xell <slug>] [--full]   review your crew's uploaded CONVERSATION ARCHIVES (who said what while they worked). --xell narrows to one worker; --full prints its newest transcript
   zee zees                           YOUR CREW: every worker you dispatched — slug, branch, hive status, what it waits on, WHAT IT HAS PRODUCED (landings + its unlanded diff) and its last message
+  zee standing-orders [--set "..." | --clear]   YOUR CREW'S STANDING ORDERS — a short block appended VERBATIM to every brief you dispatch (ticket #74); set it once, clear it when it stops being true (SHORT by design — a hard limit, not a second manual). A worker RECEIVES them in its brief; it never sets them
   zee assign --item <id> --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify]   DEPLOY a worker for a WORK ITEM — the ONLY way any manager (router included) deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --provider names the AI provider the worker runs on (a ROUTER's decision, riding the board deploy). --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch)
   zee dispatch --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--title "..."]   REFUSED for EVERY manager, router included (the board — \`zee work --new\` + \`zee assign --item <id> --task "…"\` — is the only deployment path; a router routes prompts onto cards and does not manage the workers it deploys). It spawns a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness. --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and offers the live link to a human in the console
   zee breakdown --ticket <code|id> --items <file.json>   turn a TICKET into a whole work-item TREE in one call (a JSON array of {title, kind?, body?, parent_id?, ref?, priority?, starts_on?, due_on?} — those keys and no others, so an entry naming a zee/status/progress is refused; a later item may name an earlier one's "ref" as its parent_id). One transaction — either the whole plan exists or the ticket is untouched. ADDITIVE: running it twice cuts a second set
@@ -1263,6 +1264,43 @@ switch (cmd) {
     console.log('\nThese lines are injected into every briefing. If one stops being true, delete it '
       + '(a manager: `zee conditions --remove <id>`; a human: the console). Stale conditions are '
       + 'worse than none.');
+    break;
+  }
+  case 'standing-orders': {
+    // YOUR CREW'S STANDING ORDERS (ticket #74) — a short block appended VERBATIM to every brief you
+    // dispatch. READ is a MANAGER verb (a worker RECEIVES them in its brief, it never sets them);
+    // --set replaces the block, --clear removes it (a brief is then byte-identical to before this
+    // feature). SHORT by design: the server enforces a hard length limit.
+    const set = flag('set');
+    const clear = rest.includes('--clear');
+    if (set != null || clear) {
+      const r = await req('POST', '/api/xell/self/standing-orders', {
+        action: set != null ? 'set' : 'clear',
+        text: set != null ? set : null,
+      });
+      if (rest.includes('--json')) { out(r); break; }
+      const j = r.json || {};
+      if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+      console.log(set != null
+        ? `Standing orders set (${j.length || 0} chars) — every brief you dispatch now carries them verbatim.`
+        : 'Standing orders cleared — dispatches are back to no block.');
+      break;
+    }
+    const r = await req('GET', '/api/xell/self/standing-orders');
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    if (!j.standing_orders) {
+      console.log('No standing orders set — every brief you dispatch carries no standing-orders block. '
+        + 'Set the crew discipline once with `zee standing-orders --set "…"`.');
+      break;
+    }
+    console.log('Your standing orders (appended verbatim to every brief you dispatch):');
+    console.log('');
+    console.log(j.standing_orders);
+    console.log('');
+    console.log(`(${j.length || 0} chars${j.updated_at ? `, set ${String(j.updated_at).slice(0, 10)}` : ''}`
+      + `${j.updated_by ? ` by ${j.updated_by}` : ''}) — clear with \`zee standing-orders --clear\`.`);
     break;
   }
   case 'work': {
