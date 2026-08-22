@@ -13,12 +13,26 @@
 // reached through different host spellings (127.0.0.1 vs localhost) for the alias case, and a
 // second database inside it gives the genuinely-different negative case.
 //
+// DEGRADED PATH — one three-valued identity, TWO deliberate collapses (the card's deeper point):
+//   • sameDatabaseIdentity() is raw (true/false/null); null means "could not measure".
+//   • sameDatabase() is the FAIL-CLOSED boolean the §6.2 REFUSAL GUARDS use. There, a false "not
+//     the meta-DB" is the dangerous answer (it PERMITS a writable bind to the orchestrator's own
+//     database), so when the identity is null it FALLS BACK to the old host:port+dbname string
+//     comparison — if the strings name the same database, refuse. Unmeasurable must never mean SAFE.
+//   • The INPROC PROJECTION uses sameDatabaseIdentity() raw and wants null to mean "not proven" —
+//     the db-shared-dev coupling name is its explicit fallback, never the host-string comparison.
+//
 //   1. sameDatabaseIdentity(127.0.0.1, localhost) === true   — host aliases, same physical database.
 //   2. sameDatabaseIdentity(sandbox, second-db) === false    — genuinely different database.
-//   3. Degraded path: unreachable / unparseable DSN → null (sameDatabaseIdentity) and false
-//      (sameDatabase). Unmeasurable must never mean "yes" — a false "same" is what lets a foreign
-//      DB be taken for the managing meta-DB.
-//   4. sameDatabase() boolean wrapper: true only when the identity check is TRUE.
+//   3. Degraded path — the guard falls back to the string comparison:
+//      sameDatabase(unreachable, unreachable) === true  (strings match → REFUSE — the regression this
+//      file pins: the DB is briefly unreachable and the guard must still refuse, not permit),
+//      sameDatabase(unreachable, unreachable-different-db) === false  (strings differ → no refusal),
+//      sameDatabaseIdentity(unreachable, unreachable) === null  (the raw identity stays null — the
+//      projection sees "not proven").
+//   4. sameDatabase() boolean wrapper: true when the identity is measured true, OR when the identity
+//      is null but the host:port+dbname strings match (fail-closed fallback); false only when both
+//      disagree.
 import { spawnSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -97,14 +111,38 @@ try {
      `the second database shares the cluster system_identifier but has its own name (${idOther?.databaseName}) — `
      + 'the pairing is what makes "same database", not "same cluster"');
 
-  // ── 3. degraded path: unmeasurable must never mean "yes" ────────────────────────────────────
-  console.log('\n── the degraded path refuses to say "yes" ──');
+  // ── 3. degraded path: one identity, two collapses ───────────────────────────────────────────
+  // The guards must never fail OPEN: when the DB is briefly unreachable but the two DSNs name the
+  // same host:port+dbname, the old string comparison still REFUSES. This is the regression the
+  // fail-open sameDatabase() introduced (identity null → "not the meta-DB" → permit a writable bind
+  // to the orchestrator's own database) — pinned here so it cannot come back.
+  console.log('\n── the degraded path: guards refuse on the string fallback, projection says "not proven" ──');
   const unreachable = 'postgresql://postgres@127.0.0.1:1/nope';   // nothing listens on port 1
   const unkUnreachable = await sameDatabaseIdentity(DSN, unreachable);
   ok(unkUnreachable === null,
      `sameDatabaseIdentity(..., unreachable) === null (got ${unkUnreachable}) — unmeasurable`);
   ok(await sameDatabase(DSN, unreachable) === false,
-     'and the boolean wrapper reads unmeasurable as false — never "yes"');
+     'sameDatabase(sandbox, unreachable-different-db) === false — strings differ (port+dbname), so no refusal');
+  // The security case: IDENTICAL strings, both unmeasurable (e.g. the DB is down). Old fail-open
+  // code: null → false → PERMIT. The guards must REFUSE: the strings name the same database.
+  ok(await sameDatabase(unreachable, unreachable) === true,
+     'sameDatabase(unreachable, unreachable) === true — same string, identity null → the guard REFUSES (fail-closed)');
+  ok(await sameDatabase(DSN, 'postgresql://postgres@127.0.0.1:1/postgres') === false,
+     'sameDatabase(sandbox, dead-port-with-same-dbname) === false — the identity side is measured, '
+     + 'the other is null, and the STRING fallback still sees port 1 ≠ sandbox port → different db');
+  // The raw identity stays null: the PROJECTION's collapse is "not proven", not "refuse". The two
+  // directions deliberately disagree on null — that is the whole point.
+  ok(await sameDatabaseIdentity(unreachable, unreachable) === null,
+     'and sameDatabaseIdentity(unreachable, unreachable) is STILL null — the projection reads "not proven"');
+  // The GUARD-level case (the manager's exact ask): identity unmeasurable AND the two DSNs naming
+  // the same database → the guard REFUSES. A bad-role DSN has the same host:port+dbname as the
+  // sandbox (the old string comparison ignores the username) but cannot connect, so identity is
+  // null while the strings say "same". This is what a DB outage looks like to sameDatabase().
+  const sameDbUnmeasurable = DSN.replace('postgres@', 'definitely_no_such_role_zz@');
+  ok(await sameDatabaseIdentity(DSN, sameDbUnmeasurable) === null,
+     'bad-role DSN (same host:port+dbname) is unmeasurable → identity null');
+  ok(await sameDatabase(DSN, sameDbUnmeasurable) === true,
+     'BUT sameDatabase() returns true → the guard REFUSES (unmeasurable + strings match = fail-closed)');
   const unkGarbage = await sameDatabaseIdentity(DSN, 'not a postgres url at all');
   ok(unkGarbage === null, 'unparseable DSN also → null');
   ok(await readDbIdentity(null) === null, 'readDbIdentity(null) → null');

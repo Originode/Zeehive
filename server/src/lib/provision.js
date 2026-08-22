@@ -95,14 +95,27 @@ export function computePorts(slug, project = {}) {
 // is a new oid but the DSNs still say the same name, and "is this the managing meta-DB" is a
 // question about the name.)
 //
-// DEGRADED PATH — decided deliberately. If the identity cannot be measured (unparseable DSN,
-// unreachable host, no permission, an ancient server without pg_control_system(), a query error),
-// readDbIdentity returns null and sameDatabaseIdentity returns null. The house rule is
-// "unmeasurable must never silently mean yes" (xellGateDecision, cxellSourceBase): a false "same
-// database" is the dangerous direction — it is what lets something treat a foreign DB as the
-// managing meta-DB. So null is NOT true; callers that need a boolean treat it as false, and the
-// INPROC projection's db-shared-dev coupling check is demoted to an EXPLICIT FALLBACK that only
-// fires when the identity is null.
+// DEGRADED PATH — decided deliberately, and DIFFERENTLY for the two directions this identity serves.
+// If the identity cannot be measured (unparseable DSN, unreachable host, no permission, an ancient
+// server without pg_control_system(), a query error), readDbIdentity returns null and
+// sameDatabaseIdentity returns null. What null means depends on the QUESTION being asked:
+//
+//   • PROJECTION (QUEENZEE_INPROC, writeXellEnv): the dangerous answer is a FALSE POSITIVE — treating
+//     a foreign database as the managing meta-DB marks it API-only. So null reads "not proven": the
+//     projection does not set the flag on null alone; the db-shared-dev coupling check is demoted to
+//     an EXPLICIT FALLBACK that only fires when the identity is null.
+//
+//   • REFUSAL GUARDS (§6.2 emit, projectProdIsManagingMeta, attachXellDb): the dangerous answer is a
+//     FALSE NEGATIVE — "not the managing meta-DB" when it IS. A false negative is what PERMITS a
+//     writable bind to the orchestrator's own database (a nested queenzee reaping live xells). So
+//     null reads "do not permit": sameDatabase() falls back to the old host:port+dbname string
+//     comparison — if the strings match, refuse. This never loses the old guarantee (the old
+//     sameDatabase was a pure function needing no connection, so it could not fail open from
+//     unreachability) and keeps the alias-catching identity as the primary signal on top.
+//
+// The house rule "unmeasurable must never silently mean yes" (xellGateDecision, cxellSourceBase)
+// therefore resolves to "unmeasurable must never mean SAFE at a guard" and "unmeasurable must never
+// mean PROVEN at the projection" — one three-valued identity, two deliberate collapses.
 export async function readDbIdentity(dsn) {
   if (!dsn) return null;
   let client = null;
@@ -125,22 +138,52 @@ export async function readDbIdentity(dsn) {
   }
 }
 
-// TRUE: the two DSNs are the same physical database (same cluster system_identifier + same database
-// name), whatever host spellings they use. FALSE: both identities were measured and they differ.
-// NULL: either could not be measured — never treat that as "yes".
+// The raw three-valued identity. TRUE: the two DSNs are the same physical database (same cluster
+// system_identifier + same database name), whatever host spellings they use. FALSE: both identities
+// were measured and they differ. NULL: either could not be measured. What NULL means is left to the
+// caller — the projection wants "not proven" (see writeXellEnv), the guards want "do not permit"
+// (see sameDatabase below). One three-valued helper, two deliberate collapses.
 export async function sameDatabaseIdentity(a, b) {
   const [ia, ib] = await Promise.all([readDbIdentity(a), readDbIdentity(b)]);
   if (!ia || !ib) return null;
   return ia.systemIdentifier === ib.systemIdentifier && ia.databaseName === ib.databaseName;
 }
 
-// Boolean convenience for the §6.2 guards: same iff the identity check says TRUE; NULL (unmeasurable)
-// reads false — the card's rule is unmeasurable must never silently mean "yes".
+// The OLD host:port+dbname string comparison, restored as the FAIL-CLOSED fallback for the refusal
+// guards. Pure function: parses two strings, needs NO connection, so it cannot fail open from
+// unreachability — the exact property the identity check lacks. Still blind to host aliases (a 10.x
+// published address and meta-db:5432 name the same postgres with different strings), which is
+// precisely the gap the identity PRIMARY fills; it only runs when the identity is unmeasurable.
+function sameDatabaseByHostPort(a, b) {
+  const parse = (s) => { try { return new URL(String(s).replace(/^postgres(ql)?:/, 'http:')); } catch { return null; } };
+  const ua = parse(a), ub = parse(b);
+  if (!ua || !ub) return String(a) === String(b);
+  const host = (u) => (['localhost', '127.0.0.1', '::1'].includes(u.hostname) ? 'localhost' : u.hostname);
+  return host(ua) === host(ub) && ua.port === ub.port && ua.pathname === ub.pathname;
+}
+
+// FAIL-CLOSED boolean for the §6.2 REFUSAL GUARDS (writeXellEnv §6.2, projectProdIsManagingMeta,
+// attachXellDb). These guards answer "is this the managing meta-DB?" and a FALSE answer is the
+// dangerous one: it PERMITS a writable bind to the orchestrator's own database — a nested queenzee
+// reaping live xells, the exact outcome managingMetaWritableRefusal exists to prevent. Identity is
+// the primary signal; when it is unmeasurable (NULL), fall back to the old host:port+dbname string
+// comparison — if the strings name the same database, refuse. Unmeasurable must never mean SAFE.
 // Exported so attachXellDb (lib/xell-db.js) can REFUSE a db-shared-prod bind whose target IS the
 // managing instance's own meta-DB at ATTACH time — the §6.2 guard only fires at EMIT time, which
 // leaves the xell coupled to prod with no DATABASE_URL and a permanently-failing reconcile.
 export async function sameDatabase(a, b) {
-  return (await sameDatabaseIdentity(a, b)) === true;
+  const id = await sameDatabaseIdentity(a, b);
+  if (id !== null) return id;
+  // LOUD when the guard degrades (a fail-direction that used to be silent): the durable identity
+  // could not be measured, so this falls back to the alias-blind host:port+dbname comparison. If
+  // the strings name the same database it REFUSES — the guard never quietly stops protecting. This
+  // firing means the meta-DB could not answer (load, restart window, connection-limit spike) —
+  // exactly the window when a queenzee is most likely to be reconciling something it should not.
+  const m = (d) => String(d).replace(/:[^:@/]+@/, ':***@');
+  logline('db', `sameDatabase: identity UNMEASURABLE (${m(a)} vs ${m(b)}) — failing CLOSED on the `
+    + 'host:port+dbname comparison (refuses only if the strings name the same database). Check the '
+    + 'meta-DB while this fires: §6.2 is running on the alias-blind fallback, not the durable identity.');
+  return sameDatabaseByHostPort(a, b);
 }
 
 // WHICH DATABASE THIS XELL IS MEANT TO TALK TO — the one rule, in one place.
@@ -306,9 +349,12 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // DATABASE_URL — the one database this xell's zee is meant to talk to (resolveXellDsn above).
   const { dsn: dbUrl } = await resolveXellDsn(xell, project, cs);
   if (dbUrl) {
-    // The §6.2 guard now reads a DB-LEVEL identity (sameDatabaseIdentity), not host strings: a
-    // 10.x published address and meta-db:5432 that name the same postgres compare equal. NULL
-    // (identity unmeasurable) reads false — unmeasurable must never mean "yes" (see sameDatabase).
+    // The §6.2 guard reads a FAIL-CLOSED boolean (sameDatabase): DB-LEVEL identity first (a 10.x
+    // published address and meta-db:5432 that name the same postgres compare equal), and when the
+    // identity is UNMEASURABLE it falls back to the old host:port+dbname string comparison — if the
+    // strings name the same database, refuse. A false "not the meta-DB" is the dangerous answer
+    // here: it PERMITS a writable bind to the orchestrator's own database. Unmeasurable must never
+    // mean SAFE (see sameDatabase / sameDatabaseByHostPort above).
     if (await sameDatabase(dbUrl, config.databaseUrl)) {
       // §6.2, and the ONE exemption — the minted READ-ONLY reader.
       //
@@ -347,7 +393,11 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // restart-loops, while `zee build server --wait` may still report UP. The flag (config.js /
   // index.js) starts the server without the lock and without any loop — every route still serves.
   //
-  // WHEN we project it — KEYED OFF THE DB-LEVEL IDENTITY, not the coupling name:
+  // WHEN we project it — KEYED OFF THE DB-LEVEL IDENTITY, not the coupling name. NOTE the collapse
+  // direction is the OPPOSITE of the refusal guards (sameDatabase above): the dangerous answer HERE
+  // is a FALSE POSITIVE — marking a foreign database API-only — so null reads "not proven", never
+  // "same". This projection therefore uses the raw three-valued sameDatabaseIdentity, NOT the
+  // fail-closed sameDatabase boolean the guards use.
   //   • sameDatabaseIdentity(dbUrl, config.databaseUrl) === true — the xell's DATABASE_URL IS the
   //     managing meta-DB (same cluster system_identifier + same database name), whatever host
   //     spellings the two DSNs use. This is the durable identity check (sameDatabaseIdentity above);
@@ -360,6 +410,9 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   //     shared dev db is the managing meta-DB. It is deliberately NOT consulted when the identity
   //     WAS measured and says different — that is what stops a non-Zeehive project carrying the
   //     db-shared-dev coupling from being marked API-only for a database that is not the meta-DB.
+  //     (This projection deliberately does NOT fall back to the host-string comparison — a false
+  //     positive here only mislabels a foreign db API-only, it never hands out the orchestrator's
+  //     own database. That is the guards' job, and THEY are the fail-closed ones.)
   //
   // WHAT we deliberately leave alone: a xell on its OWN db (clone / isolated / owned container)
   // keeps the default (inproc=true) so a nested queenzee on a private meta still takes the lock
@@ -657,6 +710,14 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       ORDER BY x.created_at`);
   let checked = 0, rewritten = 0, failed = 0, skipped = 0;
   const broken = [], stale = [], alerted = [];
+  // The PROCESS-ROLE half, counted separately: a rewritten HOST file is invisible to a running
+  // bare process, which read .zeehive.env at boot and keeps the old values in memory until it is
+  // restarted. For a process-runner tier the rewrite only closes the loop when the tier is
+  // RESTARTED onto the new file (or, in simulate, when that restart is REPORTED as due). This is
+  // the gap this ships to close: "the fix was live on disk and dead in memory". Container tiers
+  // are a different problem (their env is baked at container-create) and are deliberately NOT
+  // touched here.
+  let restarted = [], wouldRestart = [], restartFailed = [];
   // The CAGE half, counted separately: a xell's host file and the copy its zee reads are two
   // different files with two different failure modes (emitXellEnv → refreshLiveCxellEnv), and a
   // sweep that reported only the host would say "0 rewritten" on the very fleet it just repaired.
@@ -681,8 +742,52 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       if (!r.changed) continue;
       rewritten++;
       stale.push(x.slug);
+      // A rewritten HOST file is invisible to a RUNNING process-role tier: a bare process read
+      // .zeehive.env at boot and dotenv keeps those values in memory until the process restarts
+      // (start-xell-process.sh: "the process reads its own parameters from the worktree's
+      // .zeehive.env"). So a sweep that only rewrites the file leaves the running server on the
+      // OLD env — the fix live on disk and dead in memory. Restart the RUNNING
+      // process-role tiers now, so the new env is actually loaded. Container tiers are a different
+      // problem and are left alone (their env is baked at container-create, not read from this file).
+      const procRows = await q(
+        `SELECT id, role, health FROM container
+           WHERE owner_xell_id=$1 AND role IN ('server','webapp')
+             AND docker_ctx IS NULL AND image_tag IS NULL`, [x.id]);
+      const hereRestarted = [], hereSkipped = [], hereFailed = [];
+      if (dryRun) {
+        // REPORT the restart a real sweep would do — the same "see, don't touch" contract as the
+        // file rewrite. A nested queenzee (PROVISION_MODE=simulate) walks the REAL fleet's rows
+        // and must never exec into another zee's process tier.
+        for (const pc of procRows) {
+          if (pc.health === 'up') { wouldRestart.push(`${x.slug}:${pc.role}`); hereRestarted.push(pc.role); }
+          else hereSkipped.push(`${pc.role}(${pc.health})`);
+        }
+      } else {
+        const { restartProcessRoleTier } = await import('../lib/build.js');
+        const outcomes = await Promise.all(procRows.map((pc) =>
+          restartProcessRoleTier(pc.id, { mode: 'real' })
+            .catch((e) => ({ restarted: true, role: pc.role, ok: false, failReason: e.message }))));
+        for (const o of outcomes) {
+          if (!o.restarted) { hereSkipped.push(`${o.role}(${o.reason})`); continue; }
+          (o.ok ? hereRestarted : hereFailed).push(o.role);
+          // A failed restart is a FAILED restart — the tier is DOWN, not "restarted onto the new
+          // file". Only a tier that actually came up belongs in `restarted`; a failed one is in
+          // `restart_failed` below. Unmeasurable must never read as "yes".
+          if (o.ok) restarted.push(`${x.slug}:${o.role}`);
+        }
+      }
+      if (hereFailed.length) restartFailed.push(`${x.slug}(${hereFailed.join('+')})`);
       logline('env', `${x.slug}: .zeehive.env is STALE — ${dryRun ? 'NOT rewritten (PROVISION_MODE=simulate: this queenzee models the fleet, it does not touch it)' : 'rewritten from the meta-DB'}`
-        + (!dryRun && x.live
+        + (hereRestarted.length
+          ? ` — process-role tier(s) ${dryRun ? 'WOULD BE restarted' : 'restarted'} to load it [${hereRestarted.join(', ')}]`
+          : '')
+        + (hereSkipped.length
+          ? ` — process-role tier(s) NOT running [${hereSkipped.join(', ')}] — they load the new values at their next build`
+          : '')
+        + (hereFailed.length
+          ? ` — process-role restart FAILED [${hereFailed.join(', ')}]`
+          : '')
+        + (!dryRun && x.live && !hereRestarted.length && !hereFailed.length
           ? ' WHILE A ZEE IS WORKING IN IT. The QUEENZEE wrote that file, not the zee; its app tier '
             + 'still runs on the old values until its next build.'
           : ''));
@@ -721,6 +826,15 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     + `${stale.length ? ` [${stale.slice(0, 5).join(', ')}${stale.length > 5 ? ', …' : ''}]` : ''}`
     + `, ${failed} FAILED${broken.length ? ` [${broken.slice(0, 3).join('; ')}]` : ''}`
     + `, ${skipped} skipped (no worktree on disk)`
+    // The PROCESS-ROLE half: a rewritten host file only reaches a bare process when the tier is
+    // restarted onto it. Counted on the same line, because a sweep that says "rewritten" while the
+    // running servers still hold the old env is the exact "live on disk, dead in memory" gap.
+    + (wouldRestart.length || restarted.length
+      ? ` · process-role tier(s) ${dryRun ? `would be restarted` : `restarted`} [${(dryRun ? wouldRestart : restarted).slice(0, 5).join(', ')}${(dryRun ? wouldRestart : restarted).length > 5 ? ', …' : ''}]`
+      : '')
+    + (restartFailed.length
+      ? `, ${restartFailed.length} restart FAILED [${restartFailed.slice(0, 3).join('; ')}]`
+      : '')
     // The cage half on the SAME line: the host worktree and the copy a zee reads are the two halves
     // of one answer to "is the fleet running on what the meta-DB says?", and split across two lines
     // one of them is the one that scrolls away.
@@ -741,6 +855,10 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
       + `reconciled with the meta-DB: ${broken.join('; ')}`);
   }
+  if (restartFailed.length) {
+    console.error(`[env] ${restartFailed.length} process-role tier(s) could not be restarted onto their `
+      + `new .zeehive.env — they are still running the OLD env: ${restartFailed.join('; ')}`);
+  }
   if (cxellFailed) {
     console.error(`[env] ${cxellFailed} LIVE cxell(s) could not be handed the refreshed .zeehive.env — `
       + `those zees are still reading their old copy: ${cxellBroken.join('; ')}`);
@@ -750,6 +868,7 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       + `and now carry a card in the console: ${alerted.join(', ')}`);
   }
   return { checked, rewritten, failed, skipped, broken, stale, alerted, dry_run: dryRun,
+           restarted, would_restart: wouldRestart, restart_failed: restartFailed,
            cxell_refreshed: cxellRefreshed, cxell_failed: cxellFailed, cxell_would_refresh: cxellWould,
            cxell_broken: cxellBroken, cxell_stale: cxellStale };
 }

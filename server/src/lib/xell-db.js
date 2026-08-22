@@ -22,7 +22,7 @@ import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { computePorts, sameDatabaseIdentity } from './provision.js';
+import { computePorts, sameDatabase } from './provision.js';
 import { dbIdentity } from './projects.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
@@ -221,9 +221,14 @@ async function sharedDb(projectId, tier) {
 // live xells. READ-ONLY (db-prod-readonly, a minted SELECT-only role) is the legitimate exemption;
 // prod DATA *writes* go through `zee seed` (queenzee runs landed SQL; the zee never holds the DSN).
 //
-// Compared via the DB-LEVEL identity (sameDatabaseIdentity: cluster system_identifier + database
-// name), never host strings — a 10.x published address and meta-db:5432 that name the same postgres
-// compare equal. NULL (unmeasurable) reads false: unmeasurable must never mean "yes".
+// Compared via the FAIL-CLOSED boolean (sameDatabase): DB-LEVEL identity first (cluster
+// system_identifier + database name — a 10.x published address and meta-db:5432 that name the same
+// postgres compare equal), and when the identity is UNMEASURABLE it falls back to the old
+// host:port+dbname string comparison — if the strings name the same database, still refuse. A false
+// "not the meta-DB" is the dangerous answer HERE: it PERMITS a writable bind to the orchestrator's
+// own database. Unmeasurable must never mean SAFE (see sameDatabase / sameDatabaseByHostPort in
+// lib/provision.js). The INPROC projection, by contrast, wants null to mean "not proven" — different
+// direction, different collapse.
 // Used by attachXellDb (attach-time refusal), selfProdRequest (refuse the ask before a human is
 // bothered) and decideProdBind (refuse confirm so a leftover pending ask cannot half-confirm).
 export async function projectProdIsManagingMeta(projectId) {
@@ -232,7 +237,7 @@ export async function projectProdIsManagingMeta(projectId) {
   const dbid = await dbIdentity(projectId);
   const dsn = target.conn_ref || derivedTcpDsn(target, dbid);
   if (!dsn) return { isMeta: false, dsn: null };
-  return { isMeta: (await sameDatabaseIdentity(dsn, config.databaseUrl)) === true, dsn };
+  return { isMeta: await sameDatabase(dsn, config.databaseUrl), dsn };
 }
 
 // The ONE refusal sentence for a writable bind to the managing meta-DB. Attach, the zee's
@@ -641,7 +646,11 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   if (mode === 'db-shared-prod') {
     const dbid = await dbIdentity(xell.project_id);
     const targetDsn = target?.conn_ref || derivedTcpDsn(target, dbid);
-    if (targetDsn && (await sameDatabaseIdentity(targetDsn, config.databaseUrl)) === true) {
+    // sameDatabase is FAIL-CLOSED: identity first, and when the identity is unmeasurable it falls
+    // back to the host:port+dbname string comparison — if the strings name the same database,
+    // refuse. A false "not the meta-DB" here would PERMIT a writable bind to the orchestrator's own
+    // database, which is exactly what this attach-time refusal exists to prevent.
+    if (targetDsn && await sameDatabase(targetDsn, config.databaseUrl)) {
       throw new Error(managingMetaWritableRefusal(xell.slug, targetDsn));
     }
   }
