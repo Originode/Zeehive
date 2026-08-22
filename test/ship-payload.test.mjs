@@ -171,6 +171,25 @@ try {
   ok(dCommit.xell_slug === 'payload-d', `A1: D1 is attributed to payload-d`);
   ok(dCommit.work_item?.title === 'D polishes the trim', 'A1: D1 carries D\'s work item');
 
+  // ── A1b: the review gate annotation (ticket #79) — every carried commit carries its review state ──
+  console.log('\n── A1b: the review-state annotation ──');
+  ok(p.commits.every((c) => c.reviewed === false) && p.commits.every((c) => Array.isArray(c.reviews)),
+     `A1b: with no review recorded, every commit is reviewed:false with an empty reviews list`);
+  ok(p.summary.unread === 3 && p.summary.unknown === 0 && p.summary.review_error === null,
+     `A1b: the summary counts 3 unread, 0 unknown (got unread=${p.summary.unread}, unknown=${p.summary.unknown})`);
+  // record a review for C1 → it flips to reviewed:true and unread drops to 2
+  await client.query(
+    `INSERT INTO review (project_id, xell_id, reviewer, commit_sha, verdict, findings_count, report)
+       VALUES ($1,$2,'payload-reviewer',$3,'clean',0,NULL)`, [PID, XELL_C, cCommit.sha]);
+  const p2 = await computeShipPayload(project, shipRow);
+  const cCommit2 = p2.commits.find((c) => /^c1:/.test(c.subject));
+  ok(cCommit2.reviewed === true && cCommit2.reviews?.length === 1
+     && cCommit2.reviews[0].reviewer === 'payload-reviewer',
+     'A1b: a recorded review flips that commit to reviewed:true with the review row attached');
+  ok(p2.summary.unread === 2, `A1b: unread drops to 2 (got ${p2.summary.unread})`);
+  const phrase2 = shipPayloadSummary(p2, 'payload-c');
+  ok(/2 unread/.test(phrase2), `A1b: the summary phrase names the remaining unread (${phrase2})`);
+
   // ── A2: the one-line summary counts yours ──
   console.log('\n── A2: the summary ──');
   const s = p.summary;

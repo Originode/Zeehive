@@ -48,15 +48,16 @@ try {
   const full = renderToStaticMarkup(React.createElement(ShipPayload, { req: {
     payload: {
       ok: true, from: SHA2, to: SHA,
-      summary: { commits: 3, xells: 2, yours: 2 },
+      summary: { commits: 3, xells: 2, yours: 2, unread: 1 },
       commits: [
         { sha: SHA, short: 'abcdefa', subject: 'feat: ship the payload', xell_slug: 'payload-c',
           landed_at: '2026-08-20T10:00:00Z', work_item: { title: 'C ships the payload' },
-          ticket: { number: 65, title: 'C ticket' } },
+          ticket: { number: 65, title: 'C ticket' }, reviewed: true, reviews: [] },
         { sha: SHA2, short: '1234567', subject: 'fix: polish the trim', xell_slug: 'payload-d',
-          landed_at: '2026-08-20T11:00:00Z', work_item: { title: 'D polishes the trim' } },
+          landed_at: '2026-08-20T11:00:00Z', work_item: { title: 'D polishes the trim' },
+          reviewed: false, reviews: [] },
         { sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', short: 'deadbee', subject: 'chore: tidy',
-          xell_slug: null, landed_at: null, unattributed: true },
+          xell_slug: null, landed_at: null, unattributed: true, reviewed: false, reviews: [] },
       ],
     },
   } }));
@@ -67,6 +68,31 @@ try {
   ok(/landed by payload-c/.test(full), 'the commit says WHO landed it');
   ok(/#65/.test(full) && /C ships the payload/.test(full), 'the commit carries its ticket + work item');
   ok(/landed by unknown/.test(full), 'an unattributed commit degrades to "unknown", not a blank');
+
+  // ── 1b. the review gate (ticket #79) — the card says WHICH commits are unread ──
+  console.log('\n── the card renders the review state of each carried commit ──');
+  ok(/1 unread commit/.test(full), 'the summary names the unread count');
+  ok(/unread/.test(full) && /data-testid="ship-payload-unread"/.test(full),
+     'an unread commit carries an "unread" badge');
+  ok(full.indexOf('data-testid="ship-payload-unread"') > full.indexOf('1234567'),
+     'the unread badge is on the unread commit (1234567), not the reviewed one');
+  const firstLi = full.slice(full.indexOf('<li'), full.indexOf('</li>'));
+  ok(!/ship-payload-unread/.test(firstLi),
+     'the reviewed commit does NOT carry the unread badge');
+
+  // ── 1c. an UNREADABLE review record renders as its own badge (unmeasurable ≠ reviewed) ──
+  const unk = renderToStaticMarkup(React.createElement(ShipPayload, { req: {
+    payload: {
+      ok: true, from: SHA2, to: SHA,
+      summary: { commits: 1, xells: 1, yours: 0, unread: 0, unknown: 1, review_error: 'db down' },
+      commits: [
+        { sha: SHA, short: 'abcdefa', subject: 'feat: ship the payload', xell_slug: 'payload-c',
+          landed_at: '2026-08-20T10:00:00Z', reviewed: null, reviews: [] },
+      ],
+    },
+  } }));
+  ok(/UNREADABLE review record/.test(unk), 'a payload whose review record could not be read says so in words');
+  ok(/data-testid="ship-payload-review-unknown"/.test(unk), '…with an unreadable-review badge on the commit');
 
   // ── 2. a payload that could not be read — the degrade, in words ──
   console.log('\n── an unreadable payload reads as could-not-be-read, never a block ──');

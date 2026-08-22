@@ -889,6 +889,14 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-payload-commit.unattributed { color: var(--muted); }
 .ship-payload-when { color: var(--muted); }
 .ship-payload-work { color: #ffcf9e; }
+/* The review gate (ticket #79): the card says WHICH carried commits are unread, and by whom. */
+.ship-payload-gate { font-weight: 600; margin-left: 4px; color: #e5a50a; }
+.ship-payload-gate.unknown { color: #ffcf9e; }
+.ship-payload-gate.ok { color: var(--up, #2ecc71); font-weight: 400; }
+.ship-payload-review-badge { font-size: 10.5px; margin-left: 6px; padding: 0 6px; border-radius: 8px;
+  border: 1px solid var(--line); }
+.ship-payload-review-badge.unread { color: #e5a50a; border-color: #e5a50a; }
+.ship-payload-review-badge.unknown { color: #ffcf9e; border-color: #ffcf9e; }
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
 /* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */

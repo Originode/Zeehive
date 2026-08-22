@@ -103,10 +103,40 @@ async function attributeLandings(projectId, commits) {
   });
 }
 
+// The recorded review verdicts for a set of commit shas (ticket #56) — sha → review rows, newest
+// first. The auto-approve gate (ticket #79) reads whether a commit has a review at all, and the
+// card renders the verdicts. THROWS on a db error: the caller decides whether that degrades the
+// payload (advisory) or withholds the gate — the point is it must never read as "reviewed".
+async function reviewsForCommits(projectId, shas) {
+  if (!shas?.length) return new Map();
+  const rows = await q(
+    `SELECT commit_sha, reviewer, verdict::text AS verdict, findings_count, report, created_at
+       FROM review WHERE project_id=$1 AND commit_sha = ANY($2::text[])
+       ORDER BY created_at DESC`,
+    [projectId, shas]);
+  const map = new Map();
+  for (const r of rows) {
+    if (!map.has(r.commit_sha)) map.set(r.commit_sha, []);
+    map.get(r.commit_sha).push(r);
+  }
+  return map;
+}
+
 // The whole payload for one ship request. NEVER throws — an advisory read must not be a new way
 // for the ship gate to break (ship-preflight.js, work-overlap.js). Every failure returns
 // { ok:false, error } so the card says "could not be read", in words.
-export async function computeShipPayload(project, req) {
+//
+// Each payload commit is annotated with whether a REVIEW was recorded for it (ticket #56 → #79):
+//   • reviewed: true  → at least one review row exists for that sha;
+//   • reviewed: false → the sha is enumerated but NO review was recorded — the auto-approve gate
+//                       must hold (a ship may auto-approve only when every commit it carries has
+//                       a recorded review verdict);
+//   • reviewed: null  → the review record could NOT be read (a db failure). This is the inverse
+//                       failure this module was taught twice tonight in ship-preflight.js and
+//                       managers.js: unmeasurable must never mean "all reviewed". It is a
+//                       deliberate third state, never a silent false.
+// `reviewQuery` is a DI seam so tests can prove the unmeasurable case by making the lookup throw.
+export async function computeShipPayload(project, req, { reviewQuery = reviewsForCommits } = {}) {
   try {
     if (!project?.repo_root) return { ok: false, error: 'project has no repo_root' };
     if (!req?.commit) return { ok: false, error: 'ship request has no commit' };
@@ -143,12 +173,42 @@ export async function computeShipPayload(project, req) {
     const payload = await attributeLandings(project.id, commits);
     const xellIds = new Set(payload.filter((c) => c.xell_id).map((c) => c.xell_id));
     const yours = payload.filter((c) => c.xell_id === req.xell_id).length;
+
+    // THE REVIEW RECORD (ticket #56 → gate #79). Every commit the ship carries is checked for a
+    // recorded review verdict; the auto-approve policy reads `reviewed` and refuses to auto-deploy
+    // unread code. This lookup is INSIDE the never-throws contract, but unlike the range it is the
+    // gate, so a failure marks the review state UNKNOWN (reviewed=null), never "all reviewed" —
+    // unmeasurable must never mean yes.
+    let reviewError = null;
+    try {
+      const reviews = await reviewQuery(project.id, payload.map((c) => c.sha));
+      for (const c of payload) {
+        const rs = reviews.get(c.sha) || [];
+        c.reviewed = rs.length > 0;
+        c.reviews = rs;
+      }
+    } catch (e) {
+      reviewError = e.message || String(e);
+      for (const c of payload) {
+        c.reviewed = null;
+        c.reviews = [];
+      }
+    }
+    const unknownCount = reviewError ? payload.length : 0;
+    const unread = reviewError ? 0 : payload.filter((c) => !c.reviewed).length;
     return {
       ok: true,
       from: from.commit,
       to: req.commit,
       commits: payload,
-      summary: { commits: payload.length, xells: xellIds.size, yours },
+      summary: {
+        commits: payload.length,
+        xells: xellIds.size,
+        yours,
+        unread,
+        unknown: unknownCount,
+        review_error: reviewError,
+      },
     };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -166,6 +226,59 @@ export function shipPayloadSummary(payload, requesterSlug = null) {
   const yours = s.yours > 0
     ? `; ${s.yours} ${s.yours === 1 ? 'is' : 'are'} ${requesterSlug ? requesterSlug + "'s" : 'yours'}`
     : '';
+  // The review gate (ticket #79): the summary says how many of the carried commits have NO
+  // recorded review — the number a policy auto-approve refuses to ignore. `unknown` > 0 means the
+  // review record itself could not be read, which is even stronger: unmeasurable must not read as
+  // reviewed. Rendered for the human on the card, and for the zee in the CLI answer.
+  const unread = Number(s.unknown) > 0
+    ? `; ${s.unknown} with an UNREADABLE review record`
+    : Number(s.unread) > 0
+      ? `; ${s.unread} unread`
+      : '';
   return `${s.commits} commit${s.commits === 1 ? '' : 's'} from ${s.xells} xell${s.xells === 1 ? '' : 's'} `
-    + `since the last ship to this target${yours}`;
+    + `since the last ship to this target${yours}${unread}`;
+}
+
+// THE AUTO-APPROVE REVIEW GATE (ticket #79) — a ship may auto-approve only if every commit it
+// carries has a recorded review verdict (ticket #56) or a human approves it explicitly. This is
+// the POLICY half of that gate: given a payload, does auto-approve fire? It is a pure function of
+// the payload so it can be pinned by a unit test without a database.
+//
+// The direction of safety is the OPPOSITE of this module's advisory reads: the payload display
+// degrades to "could not be read" and lets the ask through; THIS gate withholds on unmeasurable.
+// The cost of a wrong "yes" is unread code reaching PRODUCTION, so every way the answer can be
+// unclear — the payload could not be read, the review record could not be read, a first ship whose
+// whole history rides along unenumerated, or commits that were simply never reviewed — resolves to
+// { allowed:false } with the reason said out loud, and the human's manual path stays open.
+export function shipAutoApproveVerdict(payload) {
+  if (!payload || payload.ok === false) {
+    return { allowed: false,
+      reason: `the payload could not be read — auto-approve is withheld`
+        + (payload?.error ? ` (${payload.error})` : '')
+        + '. A human can still ship it manually.' };
+  }
+  if (payload.note && /first ship to this target/.test(payload.note)) {
+    return { allowed: false,
+      reason: 'first ship to this target — no previous shipped sha, so the whole history rides along '
+        + 'and none of it has a verifiable recorded review. A human must approve it manually.' };
+  }
+  if (!payload.commits?.length) {
+    // nothing new since the last ship — there are no commits to be unread, so the gate passes.
+    return { allowed: true };
+  }
+  const unknown = payload.commits.filter((c) => c.reviewed === null);
+  if (unknown.length) {
+    const err = payload.summary?.review_error || 'the review record could not be read';
+    return { allowed: false,
+      reason: `${unknown.length} commit(s) have an UNREADABLE review record — unmeasurable must never `
+        + `mean "reviewed", so auto-approve is withheld (${err}). A human can still ship it manually.` };
+  }
+  const unread = payload.commits.filter((c) => !c.reviewed);
+  if (unread.length) {
+    return { allowed: false,
+      reason: `${unread.length} commit(s) have no recorded review: `
+        + unread.map((c) => `${c.short || String(c.sha).slice(0, 8)} (landed by ${c.xell_slug || 'unknown'})`).join(', ')
+        + '. A human can still ship it manually — or cast a dev-reviewer to read the unread commits.' };
+  }
+  return { allowed: true };
 }
