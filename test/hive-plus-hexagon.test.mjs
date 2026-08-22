@@ -130,6 +130,8 @@ ok(/confineTo=\{nested \? nested\.parent_repo_root : null\}/.test(setup),
    '…and are confined to it (FsBrowse confineTo)');
 ok(/atConfineRoot/.test(setup) && /confineTo/.test(setup),
    'FsBrowse itself hides the ↰ .. button at the confine root');
+ok(/must live inside/.test(setup) && /startsWith\(root \+ '\/'\)/.test(setup),
+   'the free-text path is guarded too — a path escaping the parent repo is refused with a sentence');
 ok(/\.nested-proj/.test(css) && /\.nested-git-opt/.test(css), 'the nested-project form is styled');
 
 // ── 6. the server validates the git-behavior vocabulary ───────────────────────

@@ -157,6 +157,19 @@ function CreateForm({ onCreated, nested = null }) {
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true); setErr(null); setProg(null);
+    // A NESTED project's folder must sit INSIDE the parent's repo tree — the browse picker already
+    // confines to it, but the path field is free text, so say the same thing here: a path that
+    // escapes the parent is refused with a sentence, not sent to the server to discover.
+    if (nested && nested.parent_repo_root) {
+      const target = source === 'clone' ? c.dest.trim() : f.repo_root.trim();
+      const root = nested.parent_repo_root.replace(/[\\/]+$/, '');
+      if (target && !(target.replace(/[\\/]+$/, '') + '/').startsWith(root + '/')) {
+        setBusy(false);
+        setErr(`A nested project must live inside ${nested.parent_name || 'the parent'}'s repo — `
+          + `“${target}” is outside ${root}. Pick a folder under it.`);
+        return;
+      }
+    }
     // Listen for the server's clone frames for the duration of THIS request only. Cloning a big
     // repo is minutes of silence otherwise, which reads as a hung dialog.
     const stop = source === 'clone' ? subscribeCloneProgress(setProg) : null;
