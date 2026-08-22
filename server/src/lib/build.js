@@ -242,6 +242,51 @@ export function processBootLogTail(worktree, role, { lines = 30 } = {}) {
 // by this callback (the monitor skips 'building'), same strand-guard, same recorded commit. The
 // process reads its own ports/DATABASE_URL/modes from the worktree's .zeehive.env, so the script
 // is handed nothing but where, what, and which port to wait on.
+// The AWAITABLE core of a process-role (re)start: spawn start-xell-process.sh, wait for its JSON
+// verdict, and land the row on terminal 'up'/'down' — the SAME transitions a build's background
+// callback makes, so the monitor and `--wait` read a reload the same way they read a build.
+//
+// startProcessRole wraps this in the fire-and-forget background shape a BUILD needs (builds take
+// minutes and never block). The env-reload path (restartProcessRoleTier below) needs to KNOW the
+// tier came up before it claims the new env is live, so it awaits this directly. The caller must
+// have already set health='building' — that transition is the one the two shapes want at different
+// moments.
+async function runProcessRoleStart(c, xell, project, startCmd, mode = MODE) {
+  const { json, err } = await new Promise((res) => {
+    const script = resolve(config.repoRoot, 'scripts', 'start-xell-process.sh');
+    const p = spawn(resolveBash(),
+      [script, String(xell.worktree_path).replace(/\\/g, '/'), c.role, String(c.host_port), mode, ...startCmd.split(/\s+/)],
+      // npmCacheEnv points the script's own `npm ci` at the SHARED cache (ticket #7) — the
+      // script needs no change for it, and with no repos volume it is a no-op.
+      { env: npmCacheEnv(cleanGitEnv()), windowsHide: true });
+    let out = '', errBuf = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (errBuf += d));
+    p.on('close', () => {
+      const line = out.trim().split('\n').filter(Boolean).pop();
+      let json = null; try { json = JSON.parse(line); } catch { /* no JSON line */ }
+      res({ json, err: errBuf.slice(-1500) });
+    });
+    p.on('error', (e) => res({ json: null, err: String(e.message) }));
+  });
+  const ok = !!json && json.ok !== false;
+  const failReason = ok ? null : formatBuildFailure(
+    err || json?.method, 'see .zeehive log');
+  const row = await one(
+    `UPDATE container
+        SET health = $2::container_health, hot_build = false,
+            last_build_commit = COALESCE($3, last_build_commit),
+            last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END,
+            last_build_error = $5
+      WHERE id=$1 RETURNING *`,
+    [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason]);
+  broadcast('container', row);
+  logline('build', ok
+    ? `process UP: ${c.name} @ ${json?.head} (${json?.method})`
+    : `process start FAILED: ${c.name} — ${(failReason || 'see .zeehive log').split('\n').filter(Boolean).pop()}`);
+  return { row, ok, json, failReason };
+}
+
 function startProcessRole(c, xell, project) {
   const startCmd = project?.manifest?.roles?.[c.role]?.start
     || (c.role === 'server' ? 'npm run server' : 'npm run web');
@@ -258,55 +303,84 @@ function startProcessRole(c, xell, project) {
 
     // background — do NOT await; npm install on a cold worktree takes minutes
     (async () => {
-      const { json, err } = await new Promise((res) => {
-        const script = resolve(config.repoRoot, 'scripts', 'start-xell-process.sh');
-        const p = spawn(resolveBash(),
-          [script, String(xell.worktree_path).replace(/\\/g, '/'), c.role, String(c.host_port), MODE, ...startCmd.split(/\s+/)],
-          // npmCacheEnv points the script's own `npm ci` at the SHARED cache (ticket #7) — the
-          // script needs no change for it, and with no repos volume it is a no-op.
-          { env: npmCacheEnv(cleanGitEnv()), windowsHide: true });
-        let out = '', errBuf = '';
-        p.stdout.on('data', (d) => (out += d));
-        p.stderr.on('data', (d) => (errBuf += d));
-        p.on('close', () => {
-          const line = out.trim().split('\n').filter(Boolean).pop();
-          let json = null; try { json = JSON.parse(line); } catch { /* no JSON line */ }
-          res({ json, err: errBuf.slice(-1500) });
-        });
-        p.on('error', (e) => res({ json: null, err: String(e.message) }));
-      });
-      const ok = !!json && json.ok !== false;
-      const failReason = ok ? null : formatBuildFailure(
-        err || json?.method, 'see .zeehive log');
-      const row = await one(
-        `UPDATE container
-            SET health = $2::container_health, hot_build = false,
-                last_build_commit = COALESCE($3, last_build_commit),
-                last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END,
-                last_build_error = $5
-          WHERE id=$1 RETURNING *`,
-        [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason]);
-      broadcast('container', row);
-      logline('build', ok
-        ? `process UP: ${c.name} @ ${json?.head} (${json?.method})`
-        : `process start FAILED: ${c.name} — ${(failReason || 'see .zeehive log').split('\n').filter(Boolean).pop()}`);
-    })().catch(async (e) => {
-      // Same stranded-'building' hazard as the docker path: this callback is the only thing that
-      // can move the row off 'building', so it must always land somewhere terminal. Persist the
-      // thrown message — same contract as the docker catch (ticket #173).
-      const failReason = formatBuildFailure(e?.message || e, 'process start errored');
       try {
-        const row = await one(
-          `UPDATE container SET health='down', last_build_error=$2
-            WHERE id=$1 AND health='building' RETURNING *`,
-          [c.id, failReason]);
-        if (row) broadcast('container', row);
-      } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
-      logline('build', `process start ERRORED: ${c.name} — ${failReason} (marked down; hammer again when ready)`);
-    });
+        await runProcessRoleStart(c, xell, project, startCmd, MODE);
+      } catch (e) {
+        // Same stranded-'building' hazard as the docker path: this callback is the only thing that
+        // can move the row off 'building', so it must always land somewhere terminal. Persist the
+        // thrown message — same contract as the docker catch (ticket #173).
+        const failReason = formatBuildFailure(e?.message || e, 'process start errored');
+        try {
+          const row = await one(
+            `UPDATE container SET health='down', last_build_error=$2
+              WHERE id=$1 AND health='building' RETURNING *`,
+            [c.id, failReason]);
+          if (row) broadcast('container', row);
+        } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
+        logline('build', `process start ERRORED: ${c.name} — ${failReason} (marked down; hammer again when ready)`);
+      }
+    })();
 
     return { status: 'building', container: c.name, role: c.role, hot: false, mode: MODE, runner: 'process' };
   })();
+}
+
+// RESTART A RUNNING PROCESS-ROLE TIER so it re-reads its worktree's .zeehive.env — the verb the
+// boot env reconcile (provision.reconcileXellEnvs) calls after a ship rewrote the projection. A
+// process role is a bare process started FROM the file (start-xell-process.sh unsets every key the
+// file owns so dotenv re-reads it), so rewriting the file underneath it changes nothing until the
+// process restarts — the fix was live on disk and dead in memory, and no one could tell.
+//
+// This is that restart, AWAITED so the caller knows the tier actually came up on the new file.
+// Gated on the tier RUNNING (health='up'): a 'down' tier is not running on any env, so starting it
+// is the pool/dispatch's job, and a 'building' tier is already being built — for both, returning
+// { restarted:false, reason } lets the reconcile say the state honestly (never "reloaded").
+//
+// `mode` defaults to the module BUILD_MODE, but the reconcile passes 'real' explicitly: the
+// decision to restart lives in PROVISION_MODE, and a real reconcile must spawn a real process even
+// when a nested queenzee's BUILD_MODE=simulate.
+export async function restartProcessRoleTier(containerId, { mode = MODE } = {}) {
+  const c = await one(`SELECT * FROM container WHERE id=$1`, [containerId]);
+  if (!c) throw new Error('container not found');
+  const isProcessRow = !c.image_tag && !c.docker_ctx;
+  if (!isProcessRow) {
+    return { restarted: false, containerId, role: c.role, reason: 'not-a-process-row' };
+  }
+  if (c.health !== 'up') {
+    return { restarted: false, containerId, role: c.role, health: c.health,
+             reason: c.health === 'building' ? 'already building' : 'not running' };
+  }
+  const xell = await one(`SELECT slug, worktree_path, project_id FROM xell WHERE id=$1`, [c.owner_xell_id]);
+  if (!xell?.worktree_path) {
+    return { restarted: false, containerId, role: c.role, reason: 'no worktree' };
+  }
+  const project = await one(`SELECT repo_root, env_file, manifest FROM project WHERE id=$1`, [xell.project_id]);
+  const startCmd = project?.manifest?.roles?.[c.role]?.start
+    || (c.role === 'server' ? 'npm run server' : 'npm run web');
+  const reachHost = processRoleReachableHost();
+  const reachUrl = processRolePublishedUrl(c.host_port);
+  const building = await one(
+    `UPDATE container SET health='building', host=$2, url=$3, last_build_error=NULL WHERE id=$1 RETURNING *`,
+    [c.id, reachHost, reachUrl]);
+  broadcast('container', building);
+  logline('build', `env reload restart: ${c.name} (${mode}) — "${startCmd}" in ${xell.slug} @ ${reachHost}:${c.host_port}`);
+  try {
+    const { row, ok, json, failReason } = await runProcessRoleStart(c, xell, project, startCmd, mode);
+    return { restarted: true, containerId, role: c.role, ok, health: row.health,
+             head: json?.head || null, failReason };
+  } catch (e) {
+    // Same stranded-'building' guard as the build path: the row must never sit 'building' with no
+    // process behind it. Land on 'down' with the reason, so the failure is visible, not stuck.
+    const failReason = formatBuildFailure(e?.message || e, 'env reload restart errored');
+    try {
+      const row = await one(
+        `UPDATE container SET health='down', last_build_error=$2 WHERE id=$1 AND health='building' RETURNING *`,
+        [c.id, failReason]);
+      if (row) broadcast('container', row);
+    } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
+    logline('build', `env reload restart ERRORED: ${c.name} — ${failReason} (marked down)`);
+    return { restarted: true, containerId, role: c.role, ok: false, health: 'down', failReason };
+  }
 }
 
 // Is this xell's stack built from the code that is in its worktree RIGHT NOW?
