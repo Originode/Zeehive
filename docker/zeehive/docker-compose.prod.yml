@@ -159,11 +159,15 @@ services:
       # produced 396 orphaned worktrees against a cloned project with no .env.
       PROVISION_APP_TIER: ${PROVISION_APP_TIER:-false}
       ZEEHIVE_CXELL_SSH: network            # SSH to cxells by container name over zee-hive-net
-      # cxells reach the queenzee by SERVICE NAME over zee-hive-net — no host-networking
-      # assumption, so this works the same on Docker Desktop and native Linux. Same value as
-      # bootstrap; see the identity rule in the header.
+      # cxells reach the queenzee at the STABLE address: host.docker.internal:4700 (the queenzee's
+      # published port on the host). The service name FLAPS (ENOTFOUND while the container is
+      # recreated); host.docker.internal always resolves and only ever fails with a legible
+      # connection-refused (ticket #94). cxellRunArgs adds the host-gateway alias to every cage, so
+      # this is not a host-networking assumption. Same value as bootstrap; see the identity rule in
+      # the header. The service name stays as the explicit fallback for scripts (ZEEHIVE_API_FALLBACK).
       CXELL_IMAGE: ${CXELL_IMAGE:-ghcr.io/originode/zeehive-zee-agent:latest}
-      CXELL_API_BASE: http://zeehive_server:4700
+      CXELL_API_BASE: http://host.docker.internal:4700
+      CXELL_API_FALLBACK: http://zeehive_server:4700
     # host-gateway: a containerized queenzee reaches host-published services at
     # host.docker.internal:<port>. Docker Desktop adds that name automatically; native Linux needs
     # the alias, exactly like the web service above.

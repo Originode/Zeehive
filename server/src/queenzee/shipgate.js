@@ -20,7 +20,7 @@ import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations, pendingBootMigrations } from './shipmigrate.js';
 import { runShipPreflight, noteShipPreflight } from './ship-preflight.js';
-import { computeShipPayload } from './ship-payload.js';
+import { computeShipPayload, shipAutoApproveVerdict } from './ship-payload.js';
 import { classifyShipFailure } from '../lib/ship-failure.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
@@ -296,10 +296,16 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // main, countdown) — nothing about the deploy itself is bypassed, only the human decision. The
   // landed-work refusal above still applies, so an unlanded ship is refused even under auto-approve.
   //
-  // One deliberate exception: if the diff from what prod already RUNS to this candidate touches
-  // only docs/**, the auto-approve does NOT fire — the prod images do not copy docs/, so the ship
-  // would only restart the live orchestrator for nothing. The request stays pending; a human can
-  // still ship it manually. The skip is said out loud in the note and the ship log, never silent.
+  // Two deliberate exceptions, both said out loud and both leaving the request PENDING for a human
+  // who can still ship manually — policy declines, the human path stays:
+  //   • docs-only — if the diff from what prod already RUNS to this candidate touches only docs/**,
+  //     the auto-approve does NOT fire: the prod images do not copy docs/, so the ship would only
+  //     restart the live orchestrator for nothing.
+  //   • unread commits (ticket #79) — a ship may auto-approve only if every commit it carries has a
+  //     recorded review verdict (ticket #56) or a human approves it explicitly. The payload names
+  //     the commits; the gate holds when any has NO review, and it holds HARD when the review record
+  //     cannot be read — unmeasurable must never mean "all reviewed". The card renders which commits
+  //     are unread and by whom they were landed, so the human sees exactly what needs reading.
   if (project.auto_approve_ship) {
     if (preflight.status === 'missing') {
       // A DEFINITE missing prerequisite is exactly what the pre-flight exists to catch — auto-
@@ -322,8 +328,20 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
           + 'prod images do not copy, so this ship would only restart prod with no code change. The '
           + 'request is left pending for a human to ship manually.' };
     }
+    // THE REVIEW GATE (ticket #79). computeShipPayload NEVER throws (it degrades), and the verdict
+    // is a pure function of the payload, so the one thing that can go wrong here is the payload
+    // being unreadable — which is exactly the inverse failure this gate must refuse on.
+    const payload = await computeShipPayload(project, row);
+    const verdict = shipAutoApproveVerdict(payload);
+    if (!verdict.allowed) {
+      logline('ship', `auto-ship HELD for ${xell.slug} @ ${String(commit).slice(0, 8)}`
+        + `${shipSite ? ` → site ${shipSite.key}` : ''} — ${verdict.reason}`);
+      return { ok: true, request: row,
+        note: `auto-ship held — ${verdict.reason}` };
+    }
     logline('ship', `AUTO-APPROVING ship from ${xell.slug} @ ${String(commit).slice(0, 8)}`
-      + `${shipSite ? ` → site ${shipSite.key}` : ''} — auto-approve policy (no human review)`);
+      + `${shipSite ? ` → site ${shipSite.key}` : ''} — auto-approve policy (no human review)`
+      + (payload?.summary?.unread === 0 ? ' — every carried commit has a recorded review' : ''));
     const approved = await decideShip(row.id, 'approved', 'auto-approve@policy');
     return { ok: true, request: approved, note: 'auto-approved by policy — deploying' };
   }
