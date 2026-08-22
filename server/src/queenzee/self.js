@@ -73,6 +73,7 @@ import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '
 // injected into every briefing. `zee conditions` is the read verb (every zee) and the manager's
 // write verb (--add / --remove). The lib owns the domain; this file adds the manager refusal.
 import { listProjectConditions, addProjectCondition, removeProjectConditionScoped } from '../lib/current-conditions.js';
+import { appendStandingOrders, STANDING_ORDERS_MAX } from '../lib/standing-orders.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -1767,6 +1768,19 @@ function managerBriefBlock(managerSlug, what = 'dispatched you and is watching t
   ].join('\n');
 }
 
+// The brief a manager DISPATCH hands the spawn — exported as a test seam, exactly like swapBrief:
+// the per-card `text` leads, then the standard manager block, then the manager's STANDING ORDERS
+// (ticket #74) appended VERBATIM as a clearly-separate block at the end. A router gets no manager
+// block (151 — it is the front door, not a crew lead) but still carries standing orders if it set
+// any: the router is manager-type, and its dispatch is still this path. EMPTY/unset standing orders
+// return the base brief unchanged — byte-identical to before this feature existed.
+export async function managerDispatchBrief(xell, text, { router = false } = {}) {
+  const base = router
+    ? String(text || '')
+    : [String(text || ''), '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
+  return appendStandingOrders(base, xell.id);
+}
+
 // POST /api/xell/self/dispatch — spawn a WORKER zee that reports to me (`zee dispatch`).
 //
 // NOT human-gated, deliberately: a dispatched worker is a caged agent on a throwaway xell whose every
@@ -1840,9 +1854,7 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // a manager exists, and the reflection loop (and every question it could have asked) dies quietly.
   const { isRouterXell } = await import('../lib/router.js');
   const router = await isRouterXell(xell);
-  const brief = router
-    ? text
-    : [text, '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
+  const brief = await managerDispatchBrief(xell, text, { router });
 
   // A DRY POOL must not be a dead end for a manager. A human dispatching from the console can raise
   // the pool target or wait; a caged manager can do neither — it would just be told "no ready xell"
@@ -2059,7 +2071,14 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
       : []),
   ].join('\n');
 
-  return { brief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo, manager: watcher || null };
+  // STANDING ORDERS (ticket #74) — a manager-run swap is a re-dispatch of the same crew, so the
+  // incoming zee is briefed with the same standing orders every dispatch carries. A HUMAN swap has
+  // no manager caller (`manager` is null) and inherits nothing new — the target's own manager (the
+  // `watcher`, when there is one) is named in the manager block above, but standing orders are the
+  // DISPATCHING manager's, so a human swap does not append them.
+  const finalBrief = await appendStandingOrders(brief, manager?.id || null);
+
+  return { brief: finalBrief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo, manager: watcher || null };
 }
 
 // POST /api/xell/self/swap — replace the ZEE working one of my crew xells (`zee swap`).
@@ -2888,6 +2907,66 @@ export async function selfConditions(xell, { action = null, body = null, id = nu
     return removeProjectConditionScoped(id, xell.project_id);
   }
   return { ok: false, error: `unknown conditions action "${action}" — use --add "…" or --remove <id>` };
+}
+
+// STANDING ORDERS — `zee standing-orders`. READ is a MANAGER verb (a worker never sets one; it
+// RECEIVES them appended to its brief), and WRITE is MANAGER-only with the same `requireManager`
+// wall as `zee conditions --add`. A manager sets a short block once and every brief it dispatches
+// carries it verbatim — the thing the ticket's manager retyped by hand into thirteen briefs.
+//
+// The "same refusals as any brief" half is structural: the text lives on the manager's OWN xell row
+// and is APPENDED to the brief at dispatch time — it never changes what the dispatched worker IS
+// (worker harness, worker db, no prod), and the dispatch still runs through selfDispatch with all
+// its refusals. The length is bounded so the block cannot grow into a second manual, and --clear
+// makes pruning trivial. A worker that calls this is told it is a MANAGER verb (requireManager).
+export async function selfStandingOrders(xell, { action = null, text = null } = {}) {
+  // READ and WRITE are BOTH MANAGER-only — the verb is manager-scoped end to end. A worker that
+  // calls it at all (read or write) is told it is a MANAGER verb: a worker RECEIVES standing orders
+  // appended to its brief, it does not author or inspect them.
+  const guard = requireManager(xell, 'standing-orders');
+  if (guard) return guard;
+
+  if (action === 'read') {
+    const row = await one(`SELECT standing_orders, standing_orders_updated_at, standing_orders_updated_by
+                             FROM xell WHERE id=$1`, [xell.id]);
+    const standing = String(row?.standing_orders || '').trim() || null;
+    return { ok: true, standing_orders: standing, length: standing ? standing.length : 0,
+             updated_at: row?.standing_orders_updated_at || null,
+             updated_by: row?.standing_orders_updated_by || null };
+  }
+
+  if (action === 'set') {
+    const body = String(text || '').trim();
+    if (!body) {
+      return { ok: false, error: 'standing-orders --set needs the text — the block every brief will carry. '
+        + 'To REMOVE it, use `zee standing-orders --clear`.' };
+    }
+    if (body.length > STANDING_ORDERS_MAX) {
+      return { ok: false, error: `standing orders are limited to ${STANDING_ORDERS_MAX} characters — `
+        + `${body.length} is a second manual, not a short block. Cut it down, or use \`zee conditions\` `
+        + 'for the project\'s live impediments (a different list, and dated).' };
+    }
+    await q(`UPDATE xell SET standing_orders=$2, standing_orders_updated_at=now(),
+             standing_orders_updated_by=$3 WHERE id=$1`,
+      [xell.id, body, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} set its standing orders (${body.length} chars) — every dispatch will append them verbatim`);
+    return { ok: true, standing_orders: body, length: body.length,
+             message: `Set — every brief you dispatch now carries this block verbatim (${body.length} chars). `
+               + 'Clear it with `zee standing-orders --clear` when it stops being true.' };
+  }
+
+  if (action === 'clear') {
+    await q(`UPDATE xell SET standing_orders=NULL, standing_orders_updated_at=now(),
+             standing_orders_updated_by=$2 WHERE id=$1`,
+      [xell.id, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} cleared its standing orders — dispatches are back to no block`);
+    return { ok: true, standing_orders: null,
+             message: 'Cleared — your dispatches are back to carrying no standing-orders block.' };
+  }
+
+  return { ok: false, error: `unknown standing-orders action "${action}" — use --set "…", --clear, or nothing to read.` };
 }
 
 export async function selfWork(xell, { board = false, item = null } = {}) {

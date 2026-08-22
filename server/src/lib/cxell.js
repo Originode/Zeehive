@@ -330,8 +330,9 @@ export async function stopCxell({ ctx = 'default', slug, timeoutMs = 60000 }) {
 // not. The script is idempotent and re-reads what is already on disk.
 //
 // ⚠ NO ENV IS PASSED, and that is not an oversight. cxell-sshd.sh OVERWRITES /etc/environment
-// whenever CXELL_ENV is set, and openCxellSsh always sets it (it appends ZEEHIVE_API
-// unconditionally) — so calling openCxellSsh with no credentials to re-open a door would replace a
+// whenever CXELL_ENV is set, and openCxellSsh always sets it (it appends ZEEHIVE_API and
+// ZEEHIVE_API_FALLBACK unconditionally) — so calling openCxellSsh with no credentials to re-open
+// a door would replace a
 // live cage's provider token and identity token with a one-line file, and the zee would come back
 // unable to authenticate to anything. The restart path has nothing new to write: every line is
 // already in the container's own /etc/environment.
@@ -803,6 +804,13 @@ export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source',
 export function cxellRunArgs({ name, net, port, img, xellId, prep = null }) {
   return ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
     '-p', `127.0.0.1:${port}:22`,
+    // The stable API address from a cage: host.docker.internal:4700 (the queenzee's published
+    // port on the host) is the injected ZEEHIVE_API — it always resolves and only ever fails
+    // with a legible ECONNREFUSED while the queenzee is down, never a DNS ENOTFOUND that reads
+    // as "the fleet is gone". Docker Desktop adds this name automatically; native Linux needs
+    // the explicit host-gateway alias, exactly like the web container's extra_hosts. Without it
+    // the CLI's own default and the injected address both die on native Linux cages.
+    '--add-host', 'host.docker.internal:host-gateway',
     // ONE npm cache for the whole fleet: without it every cxell re-downloads the same tarballs
     // into its own empty ~/.npm, which is the repetition ticket #7 is about. Empty when disabled.
     // The project's SPAWN TEMPLATE (migration 121) decides the mode, and whether an apt archive
@@ -1172,6 +1180,10 @@ export async function openCxellSsh({ ctx, name, publicKey, agentEnv = {}, xellTo
   // Where the `zee` CLI finds the queenzee. Explicit (not the CLI's baked default) so a
   // containerized queenzee can re-aim every cxell by config alone (CXELL_API_BASE).
   envLines.push(`ZEEHIVE_API=${config.cxellApiBase}`);
+  // The SECOND name a script (or the CLI) can try when the primary does not resolve — the
+  // compose-network name the queenzee used to inject. host.docker.internal is the stable one;
+  // this is the "the first name is not the only name" fallback (ticket #94).
+  envLines.push(`ZEEHIVE_API_FALLBACK=${config.cxellApiFallback}`);
   if (envLines.length) env.push('-e', `CXELL_ENV=${envLines.join('\n')}`);
   const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cxell-sshd.sh']);
   return r.out.trim();
@@ -1595,6 +1607,7 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
     // the firewall already allows the queenzee host:port.
     ...(xellToken ? ['-e', `ZEEHIVE_XELL_TOKEN=${xellToken}`] : []),
     '-e', `ZEEHIVE_API=${config.cxellApiBase}`,   // same reason as openCxellSsh's CXELL_ENV line
+    '-e', `ZEEHIVE_API_FALLBACK=${config.cxellApiFallback}`,   // the second name (ticket #94)
     name, 'bash', '-lc',
     `cd /work/repo && ${adapter.execCmd({ model })}`];
   const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...cmd];

@@ -73,8 +73,13 @@ export const config = {
   reposDir: process.env.REPOS_DIR || null,
   // How a CXELL reaches the queenzee API. host.docker.internal:4700 works from a cxell whether
   // the queenzee is the host process or a container publishing 4700; override with the compose
-  // service name if host publishing ever stops.
+  // service name if host publishing ever stops. This is the PRIMARY address injected as
+  // ZEEHIVE_API; a cage also gets ZEEHIVE_API_FALLBACK (cxellApiFallback) so a script (and the
+  // `zee` CLI) has a second name to try when the first does not resolve — the zeehive_server
+  // compose name FLAPS (ENOTFOUND while the container is recreated), so host.docker.internal is
+  // the stable one and the compose-network name is the fallback, not the other way round.
   cxellApiBase: process.env.CXELL_API_BASE || 'http://host.docker.internal:4700',
+  cxellApiFallback: process.env.CXELL_API_FALLBACK || 'http://host.docker.internal:4700',
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),
