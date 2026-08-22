@@ -121,7 +121,7 @@ import { listCredentialInjectRequests, decideCredentialInject, dismissCredential
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor, getWorkItemOverlap } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
-         selfWorkItem, selfConditions } from '../queenzee/self.js';
+         selfWorkItem, selfConditions, selfStandingOrders } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
@@ -649,6 +649,85 @@ router.delete('/project-conditions/:condId', async (req, res) => {
     const r = await removeProjectConditionScoped(req.params.condId, cond.project_id);
     if (!r.ok) return res.status(400).json(r);
     res.json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
+// sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same
+// rules: a worker xell has no standing orders (it does not dispatch), the text is bounded (SHORT by
+// design), and it never widens a worker — it is appended to the brief at dispatch time. These routes
+// carry the same PARTIAL worker-token wall as the conditions routes (refuseWorkerZeeToken above): /api
+// has no router-level auth, so this narrows an identified worker and nothing else (card 492743d2).
+async function refuseWorkerZeeTokenForStandingOrders(req) {
+  const auth = req.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
+  if (!token) return null;
+  const xell = await xellForToken(token);
+  if (!xell) return null;
+  if (xell.zee_type !== 'manager') {
+    return { ok: false, status: 'refused',
+      error: 'setting standing orders is MANAGER-only (they reach every brief a manager dispatches). '
+        + 'A manager sets its own with `zee standing-orders`; a human sets them in the console.' };
+  }
+  return null;
+}
+// Read a xell's standing orders (any xell — a worker's is null, a manager's is its block).
+router.get('/xells/:id/standing-orders', async (req, res) => {
+  try {
+    const x = await one(`SELECT id, zee_type, slug, standing_orders, standing_orders_updated_at, standing_orders_updated_by
+                           FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    res.json({ ok: true, xell: x.slug, zee_type: x.zee_type,
+               standing_orders: x.standing_orders, length: x.standing_orders ? x.standing_orders.length : 0,
+               updated_at: x.standing_orders_updated_at, updated_by: x.standing_orders_updated_by });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// Set a manager xell's standing orders (human). A worker target is refused — only a manager
+// dispatches, so only a manager's standing orders mean anything.
+router.put('/xells/:id/standing-orders', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeTokenForStandingOrders(req);
+    if (g) return res.status(403).json(g);
+    const { STANDING_ORDERS_MAX } = await import('../lib/standing-orders.js');
+    const x = await one(`SELECT id, slug, zee_type FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    if (x.zee_type !== 'manager') {
+      return res.status(400).json({ ok: false, error: `${x.slug} is a ${x.zee_type} xell — standing orders `
+        + 'belong to a MANAGER (the xell that dispatches). A worker receives them appended to its brief; '
+        + 'it does not author them.' });
+    }
+    const body = String(req.body?.text || '').trim();
+    if (!body) {
+      return res.status(400).json({ ok: false, error: 'standing orders text is required — to clear them, DELETE this route.' });
+    }
+    if (body.length > STANDING_ORDERS_MAX) {
+      return res.status(400).json({ ok: false, error: `standing orders are limited to ${STANDING_ORDERS_MAX} characters — `
+        + `${body.length} is a second manual, not a short block.` });
+    }
+    const r = await one(
+      `UPDATE xell SET standing_orders=$2, standing_orders_updated_at=now(), standing_orders_updated_by=$3
+        WHERE id=$1 RETURNING standing_orders, standing_orders_updated_at, standing_orders_updated_by`,
+      [x.id, body, req.body?.actor || 'human@console']);
+    broadcast('xell', { id: x.id });
+    res.json({ ok: true, xell: x.slug, ...r, length: r.standing_orders.length,
+               message: `Set — every brief ${x.slug} dispatches now carries this block verbatim.` });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// Clear a manager xell's standing orders (human) — trivial on purpose, like a condition delete.
+router.delete('/xells/:id/standing-orders', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeTokenForStandingOrders(req);
+    if (g) return res.status(403).json(g);
+    const x = await one(`SELECT id, slug, zee_type FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    if (x.zee_type !== 'manager') {
+      return res.status(400).json({ ok: false, error: `${x.slug} is a ${x.zee_type} xell — only a manager has standing orders.` });
+    }
+    await one(`UPDATE xell SET standing_orders=NULL, standing_orders_updated_at=now(), standing_orders_updated_by=$2
+                WHERE id=$1 RETURNING id`, [x.id, req.body?.actor || 'human@console']);
+    broadcast('xell', { id: x.id });
+    res.json({ ok: true, xell: x.slug, standing_orders: null,
+               message: `Cleared — ${x.slug}'s dispatches are back to no standing-orders block.` });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -3015,6 +3094,23 @@ router.post('/xell/self/conditions', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     const r = await selfConditions(x, { action: b.action || null, body: b.body || null, id: b.id || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// ── STANDING ORDERS (`zee standing-orders`) — the manager's crew discipline, appended VERBATIM to
+// every brief it dispatches (ticket #74). READ and WRITE are MANAGER-only (a worker RECEIVES them
+// appended to its brief; it never sets them) — the same `requireManager` wall as `zee conditions`.
+router.get('/xell/self/standing-orders', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfStandingOrders(x, { action: 'read' })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/standing-orders', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const r = await selfStandingOrders(x, { action: b.action || null, text: b.text || null });
     if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
     if (r.ok === false) return res.status(400).json(r);
     res.json(r); }

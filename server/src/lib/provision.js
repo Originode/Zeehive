@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
+import pg from 'pg';
 import { pool, q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
@@ -77,17 +78,69 @@ export function computePorts(slug, project = {}) {
 // `docker compose --env-file .env --env-file .zeehive.env -f <spinoff compose> up` works with
 // ZEEHIVE stopped. Parameters ONLY — never secrets (those stay in the main checkout's .env).
 // Pure projection of meta-DB truth: regenerable at any time, meaningless to hand-edit.
-// Two postgres URLs meaning the same database? Compared on host:port+dbname, not string equality
-// — localhost spellings differ but the port+db pair is what actually collides.
+// THE DURABLE IDENTITY OF A DATABASE — compared on a DB-LEVEL value, never host strings.
+//
+// sameDatabase() used to compare host:port+dbname. That is blind to host aliases: a 10.x published
+// address and meta-db:5432 name the SAME postgres with different host strings, so the old helper
+// returned false while the advisory lock (715533001) still collided — which is why the INPROC
+// projection keyed off db_coupling === 'db-shared-dev' (a NAME, not an identity) instead. It also
+// misfired the other way: a non-Zeehive project carrying that coupling got the flag for a database
+// that is not the managing meta-DB.
+//
+// What a database IS, durably: the CLUSTER it lives in (system_identifier from pg_control_system(),
+// written to pg_control at initdb — unique per cluster, never a host string) plus WHICH database
+// inside that cluster (current_database()). Two DSNs are the same physical database iff both match.
+// system_identifier alone proves only "same cluster" — two databases in one cluster share it — so it
+// is always paired with the database name. (The NAME, not the oid: a dropped-and-recreated meta-DB
+// is a new oid but the DSNs still say the same name, and "is this the managing meta-DB" is a
+// question about the name.)
+//
+// DEGRADED PATH — decided deliberately. If the identity cannot be measured (unparseable DSN,
+// unreachable host, no permission, an ancient server without pg_control_system(), a query error),
+// readDbIdentity returns null and sameDatabaseIdentity returns null. The house rule is
+// "unmeasurable must never silently mean yes" (xellGateDecision, cxellSourceBase): a false "same
+// database" is the dangerous direction — it is what lets something treat a foreign DB as the
+// managing meta-DB. So null is NOT true; callers that need a boolean treat it as false, and the
+// INPROC projection's db-shared-dev coupling check is demoted to an EXPLICIT FALLBACK that only
+// fires when the identity is null.
+export async function readDbIdentity(dsn) {
+  if (!dsn) return null;
+  let client = null;
+  try {
+    client = new pg.Client({
+      connectionString: String(dsn),
+      connectionTimeoutMillis: 3000,
+      query_timeout: 5000,
+    });
+    await client.connect();
+    const { rows } = await client.query(
+      `SELECT (pg_control_system()).system_identifier::text AS sid, current_database() AS datname`);
+    const row = rows?.[0];
+    if (!row?.sid || !row?.datname) return null;
+    return { systemIdentifier: row.sid, databaseName: row.datname };
+  } catch {
+    return null;   // unmeasurable — never "yes"
+  } finally {
+    await client?.end().catch(() => {});
+  }
+}
+
+// TRUE: the two DSNs are the same physical database (same cluster system_identifier + same database
+// name), whatever host spellings they use. FALSE: both identities were measured and they differ.
+// NULL: either could not be measured — never treat that as "yes".
+export async function sameDatabaseIdentity(a, b) {
+  const [ia, ib] = await Promise.all([readDbIdentity(a), readDbIdentity(b)]);
+  if (!ia || !ib) return null;
+  return ia.systemIdentifier === ib.systemIdentifier && ia.databaseName === ib.databaseName;
+}
+
+// Boolean convenience for the §6.2 guards: same iff the identity check says TRUE; NULL (unmeasurable)
+// reads false — the card's rule is unmeasurable must never silently mean "yes".
 // Exported so attachXellDb (lib/xell-db.js) can REFUSE a db-shared-prod bind whose target IS the
 // managing instance's own meta-DB at ATTACH time — the §6.2 guard only fires at EMIT time, which
 // leaves the xell coupled to prod with no DATABASE_URL and a permanently-failing reconcile.
-export function sameDatabase(a, b) {
-  const parse = (s) => { try { return new URL(String(s).replace(/^postgres(ql)?:/, 'http:')); } catch { return null; } };
-  const ua = parse(a), ub = parse(b);
-  if (!ua || !ub) return String(a) === String(b);
-  const host = (u) => (['localhost', '127.0.0.1', '::1'].includes(u.hostname) ? 'localhost' : u.hostname);
-  return host(ua) === host(ub) && ua.port === ub.port && ua.pathname === ub.pathname;
+export async function sameDatabase(a, b) {
+  return (await sameDatabaseIdentity(a, b)) === true;
 }
 
 // WHICH DATABASE THIS XELL IS MEANT TO TALK TO — the one rule, in one place.
@@ -253,7 +306,10 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // DATABASE_URL — the one database this xell's zee is meant to talk to (resolveXellDsn above).
   const { dsn: dbUrl } = await resolveXellDsn(xell, project, cs);
   if (dbUrl) {
-    if (sameDatabase(dbUrl, config.databaseUrl)) {
+    // The §6.2 guard now reads a DB-LEVEL identity (sameDatabaseIdentity), not host strings: a
+    // 10.x published address and meta-db:5432 that name the same postgres compare equal. NULL
+    // (identity unmeasurable) reads false — unmeasurable must never mean "yes" (see sameDatabase).
+    if (await sameDatabase(dbUrl, config.databaseUrl)) {
       // §6.2, and the ONE exemption — the minted READ-ONLY reader.
       //
       // What the refusal protects against is a nested queenzee OPERATING on the managing instance's
@@ -291,15 +347,19 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // restart-loops, while `zee build server --wait` may still report UP. The flag (config.js /
   // index.js) starts the server without the lock and without any loop — every route still serves.
   //
-  // WHEN we project it (both signals mean the same physical fact — "this xell's db IS the
-  // managing meta-DB"):
-  //   • db_coupling === 'db-shared-dev' — the shared-dev coupling for process-runner Zeehive
-  //     xells (resolveXellDsn source 'shared-dev-container'). sameDatabase() alone is not enough
-  //     here: the published host:port (10.x:32768) and the queenzee's in-network DSN (meta-db:5432)
-  //     name the same postgres with different host strings, so the §6.2 helper returns false while
-  //     the lock still collides.
-  //   • sameDatabase(dbUrl, config.databaseUrl) — covers the db-prod-readonly exemption (and any
-  //     future path) that emits the managing meta-DB DSN under a different coupling name.
+  // WHEN we project it — KEYED OFF THE DB-LEVEL IDENTITY, not the coupling name:
+  //   • sameDatabaseIdentity(dbUrl, config.databaseUrl) === true — the xell's DATABASE_URL IS the
+  //     managing meta-DB (same cluster system_identifier + same database name), whatever host
+  //     spellings the two DSNs use. This is the durable identity check (sameDatabaseIdentity above);
+  //     it covers the db-prod-readonly exemption (a minted reader DSN that points at the meta-DB)
+  //     and the real db-shared-dev alias case (published 10.x:32768 vs in-network meta-db:5432).
+  //   • FALLBACK (identity unmeasurable === null): db_coupling === 'db-shared-dev' still projects
+  //     the flag. This is the EXPLICIT degraded-path fallback, demoted from being the primary key:
+  //     when the identity cannot be measured (the xell's DSN uses a hostname the queenzee cannot
+  //     resolve, e.g. a compose-network alias) the coupling name is the best signal left that the
+  //     shared dev db is the managing meta-DB. It is deliberately NOT consulted when the identity
+  //     WAS measured and says different — that is what stops a non-Zeehive project carrying the
+  //     db-shared-dev coupling from being marked API-only for a database that is not the meta-DB.
   //
   // WHAT we deliberately leave alone: a xell on its OWN db (clone / isolated / owned container)
   // keeps the default (inproc=true) so a nested queenzee on a private meta still takes the lock
@@ -309,8 +369,8 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // Both eras read this projection: start-xell-process.sh unsets every key the file owns so
   // dotenv re-reads it (process runner); compose spinoffs that load the worktree projection get
   // the same value. A structural key — reserved below so an environment cannot flip it back.
-  if (xell.db_coupling === 'db-shared-dev'
-      || (dbUrl && sameDatabase(dbUrl, config.databaseUrl))) {
+  const sameMeta = dbUrl ? await sameDatabaseIdentity(dbUrl, config.databaseUrl) : null;
+  if (sameMeta === true || (sameMeta === null && xell.db_coupling === 'db-shared-dev')) {
     lines.push('# —— QUEENZEE_INPROC=false: shared meta-DB → API-only (no lock 715533001, no loops; TKT-136) ——');
     lines.push('QUEENZEE_INPROC=false');
   }
