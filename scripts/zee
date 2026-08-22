@@ -594,6 +594,7 @@ function usage() {
 
  the work tracker (the PLAN this job is part of):
   zee conditions [--add "..." | --remove <id>]   YOUR PROJECT'S CURRENT CONDITIONS: the short, dated list of LIVE IMPEDIMENTS injected into every briefing (ticket #67) — read it any time, and trust it over any doc older than it is. READ is every zee's (NOT gated); --add/--remove are MANAGER-only, scoped to your own project by your token, and delete is trivial on purpose (stale conditions are worse than none)
+  zee scratchpad [--set "..." | --clear] [--xell <slug>]   YOUR XELL'S SCRATCHPAD (ticket #66): the per-xell working note that OUTLIVES this cage — write what you have tried and ruled out, and a SWAP hands it to the next zee in its inheritance brief. Written/read by YOU only; a hard length cap applies (SERVER-side). --xell <slug> is the MANAGER read of a crew xell's scratchpad (scoped to your own crew); --clear empties it
   zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
   zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--after <sibling-id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". PARENT-FIRST: a task needs a home — cut the parent as --kind activity, nest tasks under it with --parent, or chain a task after an existing sibling with --after (which also adds the FS dependency: the new card waits for that sibling). Creating a card dispatches nobody
   zee item [<id>] --status <s> [--progress N] [--note "..."] [--estimate <hours>] [--starts-on YYYY-MM-DD] [--due-on YYYY-MM-DD]   report where the WORK has got to — and size the card for the gantt (--estimate/--starts-on/--due-on PATCH the work_item and dual-write the plan node). A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
@@ -1362,6 +1363,51 @@ switch (cmd) {
     console.log('');
     console.log(`(${j.length || 0} chars${j.updated_at ? `, set ${String(j.updated_at).slice(0, 10)}` : ''}`
       + `${j.updated_by ? ` by ${j.updated_by}` : ''}) — clear with \`zee standing-orders --clear\`.`);
+    break;
+  }
+  case 'scratchpad': {
+    // YOUR XELL'S SCRATCHPAD (ticket #66) — the per-xell working note that OUTLIVES the cage. A zee
+    // writes/reads/clears its OWN (token-scoped — a worker can never name another xell); a MANAGER
+    // reads a crew xell's with --xell <slug> (scoped to its own crew). A hard length cap is enforced
+    // server-side, and a swap hands the note to the next zee in its inheritance brief.
+    const set = flag('set');
+    const clear = rest.includes('--clear');
+    const xellSlug = flag('xell');
+    if (set != null || clear) {
+      const r = await req('POST', '/api/xell/self/scratchpad', {
+        action: set != null ? 'set' : 'clear',
+        text: set != null ? set : null,
+      });
+      if (rest.includes('--json')) { out(r); break; }
+      const j = r.json || {};
+      if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+      console.log(set != null
+        ? `Scratchpad saved (${j.length || 0} chars) — it now outlives this cage, and a swap hands it to the next zee.`
+        : 'Scratchpad cleared — a swap will carry no scratchpad block.');
+      break;
+    }
+    const path = xellSlug
+      ? `/api/xell/self/scratchpad?xell=${encodeURIComponent(xellSlug)}`
+      : '/api/xell/self/scratchpad';
+    const r = await req('GET', path);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    if (!j.scratchpad) {
+      console.log(xellSlug
+        ? `No scratchpad on record for ${j.xell || xellSlug}.`
+        : 'No scratchpad yet — write what you have tried and ruled out with `zee scratchpad --set "…"` '
+          + 'so it survives this cage and reaches the next zee on a swap.');
+      break;
+    }
+    console.log(xellSlug
+      ? `Scratchpad of ${j.xell || xellSlug}:`
+      : 'Your scratchpad (it outlives this cage):');
+    console.log('');
+    console.log(j.scratchpad);
+    console.log('');
+    console.log(`(${j.length || 0} chars${j.updated_at ? `, updated ${String(j.updated_at).slice(0, 10)}` : ''}`
+      + `${j.updated_by ? ` by ${j.updated_by}` : ''}) — clear with \`zee scratchpad --clear\`.`);
     break;
   }
   case 'work': {

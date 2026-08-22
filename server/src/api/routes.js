@@ -121,7 +121,7 @@ import { listCredentialInjectRequests, decideCredentialInject, dismissCredential
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor, getWorkItemOverlap } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
-         selfWorkItem, selfConditions, selfStandingOrders } from '../queenzee/self.js';
+         selfWorkItem, selfConditions, selfStandingOrders, selfScratchpad } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
@@ -728,6 +728,20 @@ router.delete('/xells/:id/standing-orders', async (req, res) => {
     broadcast('xell', { id: x.id });
     res.json({ ok: true, xell: x.slug, standing_orders: null,
                message: `Cleared — ${x.slug}'s dispatches are back to no standing-orders block.` });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── SCRATCHPAD for a xell (ticket #66) — the HUMAN's read surface. A zee writes its OWN through
+// `zee scratchpad`; this route lets a human in the console read ANY xell's scratchpad (a manager
+// reads a crew xell's through `zee scratchpad --xell <slug>`). Read-only by design: the scratchpad
+// is the zee's own thinking, never something a human edits. Same shape as the standing-orders read.
+router.get('/xells/:id/scratchpad', async (req, res) => {
+  try {
+    const x = await one(`SELECT id, slug, scratchpad, scratchpad_updated_at, scratchpad_updated_by
+                           FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    res.json({ ok: true, xell: x.slug,
+               scratchpad: x.scratchpad, length: x.scratchpad ? x.scratchpad.length : 0,
+               updated_at: x.scratchpad_updated_at, updated_by: x.scratchpad_updated_by });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -3111,6 +3125,27 @@ router.post('/xell/self/standing-orders', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     const r = await selfStandingOrders(x, { action: b.action || null, text: b.text || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// ── SCRATCHPAD (`zee scratchpad`) — EVERY zee's per-xell working note that outlives the cage
+// (ticket #66). A zee reads/writes/clears its OWN (token-scoped — a worker can never name another
+// xell); a MANAGER reads a crew xell's with `--xell <slug>` (scoped by workerOf to its own crew);
+// a human reads any xell's via GET /xells/:id/scratchpad.
+router.get('/xell/self/scratchpad', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const r = await selfScratchpad(x, { action: 'read', xellSlug: req.query.xell || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/scratchpad', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const r = await selfScratchpad(x, { action: b.action || null, text: b.text || null, xellSlug: b.xell || null });
     if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
     if (r.ok === false) return res.status(400).json(r);
     res.json(r); }
