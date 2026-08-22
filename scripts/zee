@@ -42,7 +42,14 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import net from 'node:net';
 
-const api = process.env.ZEEHIVE_API || 'http://host.docker.internal:4700';
+// The queenzee API address. $ZEEHIVE_API is injected at spawn (the STABLE address,
+// host.docker.internal:4700 — the queenzee's published host port, ticket #94); the CLI's own
+// baked default is the same address. $ZEEHIVE_API_FALLBACK is the SECOND name a script or this
+// CLI can try when the primary does not resolve — for a cage born before the stable address, or
+// a deployment where host publishing is unavailable, that is the compose-network name the
+// queenzee used to inject (e.g. http://zeehive_server:4700).
+const FALLBACK_API = process.env.ZEEHIVE_API_FALLBACK || 'http://host.docker.internal:4700';
+const api = process.env.ZEEHIVE_API || FALLBACK_API;
 // The identity token is injected into the cage's env at spawn, and that is where it is read from.
 // /etc/environment is the SAME value, written into the cage at spawn as well (the nudge path reads
 // it back from there), and it is the fallback for a process whose env did not inherit it — a hook
@@ -218,11 +225,13 @@ function multi(name) {
   return out.length ? out : null;
 }
 
-function req(method, path, body) {
+// One HTTP request against ONE base URL. Resolves { code, json } — an HTTP 4xx/5xx RESOLVES with
+// its status, exactly as before. Rejects only on a NETWORK failure (ENOTFOUND / ECONNREFUSED /
+// ETIMEDOUT / ECONNRESET / …): the "this name did not resolve" class that ticket #94 is about.
+function requestOnce(base, method, path, data) {
   return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : null;
-    const lib = api.startsWith('https') ? https : http;
-    const r = lib.request(`${api}${path}`, {
+    const lib = base.startsWith('https') ? https : http;
+    const r = lib.request(`${base}${path}`, {
       method,
       headers: {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -236,6 +245,58 @@ function req(method, path, body) {
     if (data) r.write(data);
     r.end();
   });
+}
+
+// Talk to the queenzee, with the ticket-#94 fallback. $ZEEHIVE_API is the STABLE address
+// (host.docker.internal:4700) but a cage born before that — or a human-set ZEEHIVE_API — can name
+// a compose service that FLAPS: a DNS ENOTFOUND from a sealed container reads as "the fleet is
+// down" when it is really one name not resolving. So on a NETWORK error (never on an HTTP status)
+// try $ZEEHIVE_API_FALLBACK once, and SAY SO — an unresolvable primary must be legible, not look
+// like a dead queenzee. If both fail, reject with a message that names what failed and what to use
+// instead.
+let fallbackWarned = false;   // warn once, not on every poll-loop iteration while the primary flaps
+function req(method, path, body) {
+  const data = body ? JSON.stringify(body) : null;
+  return requestOnce(api, method, path, data).catch((e) => {
+    if (api === FALLBACK_API) throw new Error(legibleApiError(e, api));
+    return requestOnce(FALLBACK_API, method, path, data).then((r) => {
+      if (!fallbackWarned) {
+        fallbackWarned = true;
+        const host = apiHost(api);
+        console.error(`\n  ⚠ the queenzee at ${api} was unreachable (${e.code || e.message}).`);
+        if (e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN') {
+          console.error(`    That is a NAME problem, not a dead fleet — ${host} did not resolve from this cage.`);
+        } else {
+          console.error(`    The name ${host} resolved but the connection failed — a deploy/restart window, not proof the fleet is down.`);
+        }
+        console.error(`    Fell back to ${FALLBACK_API} and it answered. For a SCRIPT you write, read $ZEEHIVE_API_FALLBACK`);
+        console.error(`    (the stable address is http://host.docker.internal:4700) instead of a hardcoded service name.\n`);
+      }
+      return r;
+    }, (e2) => {
+      throw new Error(`${legibleApiError(e, api)}\n    and the fallback ${FALLBACK_API} also failed (${e2.code || e2.message}).`);
+    });
+  });
+}
+
+// The host part of a base URL, defensively (the fallback message must never itself throw).
+function apiHost(base) {
+  try { return new URL(base).host; } catch { return base; }
+}
+
+// The legible form of a network failure: name the address, say what "did not resolve" means, and
+// never let a DNS error read as "the queenzee is gone". The address to point at is the KNOWN
+// STABLE one (host.docker.internal:4700) — never $ZEEHIVE_API_FALLBACK, which the caller may have
+// overridden with a name that is just as bad.
+const STABLE_API = 'http://host.docker.internal:4700';
+function legibleApiError(e, base) {
+  const host = apiHost(base);
+  const why = e.code || e.message;
+  if (e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN') {
+    return `could not reach the queenzee at ${base} (${why}). The name ${host} did not resolve from this cage — `
+      + `point ZEEHIVE_API at the stable ${STABLE_API} (or unset it); the fleet is not down.`;
+  }
+  return `could not reach the queenzee at ${base} (${why}). This usually means it is down or mid-deploy/restart — retry in a moment.`;
 }
 
 // Print the queenzee's answer — and, when the answer is "no", SAY SO and exit non-zero.
@@ -558,7 +619,7 @@ function usage() {
   zee ticket --title "..." [--body "..."] [--kind bug|feature|chore|question|incident] [--priority 1..5] [--labels a,b] [--notify]   FILE A TICKET in YOUR OWN project's tracker (reporter = your slug) — the one write an ops critique gets: a ticket opens no gate and changes nothing until a human or a manager breaks it down and takes it up. --notify also drops it into every OTHER live manager's inbox. \`zee ticket --list [--status s] [--q text]\` reads what is already filed, so you never file the same criticism twice
   NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — deploy a worker onto a card instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused. A ROUTER additionally has NO crew verbs — \`zee zees\`, \`zee say\`, \`zee swap\`, \`zee suggest-done\`, \`zee conversations\` are refused (it routes prompts onto cards and does not manage the workers it deploys).
 
-env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host.docker.internal:4700)`);
+env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (stable, default host.docker.internal:4700), ZEEHIVE_API_FALLBACK (second name to try when the primary does not resolve)`);
   process.exit(cmd ? 1 : 0);
 }
 
