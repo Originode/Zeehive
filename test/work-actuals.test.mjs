@@ -69,14 +69,23 @@ section('actual_start — an unassign or a zee-gone note is NOT a start');
      'an assigned event naming a real xell IS a start');
 }
 
-section('actual_start — the zee_turn fallback, and earliest-of-events-vs-turns');
+section('actual_start — the zee_turn fallback, and the item\'s own events win');
 {
   const turns = [{ started_at: T('2026-07-02T09:00:00Z') }, { started_at: T('2026-07-01T09:00:00Z') }];
   ok(eq(actualStartFrom([], turns), T('2026-07-01T09:00:00Z')),
      'the FIRST zee_turn of the linked xell is the start when there are no events');
+  // THE LEAK (TKT-153): a multi-item xell's FIRST turn was earned on an earlier item, and min()
+  // let it beat this item's own assignment — pulling the start back to a DIFFERENT item's work.
+  // The item's OWN start event must win; a turn is evidence only in its absence.
   const events = [EV('status', T('2026-07-04T10:00:00Z'), 'working')];
-  ok(eq(actualStartFrom(events, turns), T('2026-07-01T09:00:00Z')),
-     'and the EARLIEST of an event and a turn wins');
+  ok(eq(actualStartFrom(events, turns), T('2026-07-04T10:00:00Z')),
+     'the item\'s OWN start event wins — an earlier xell turn no longer pulls the start back');
+  // scope the fallback to the item's own window: a turn before the item existed in the ledger
+  // cannot be this item's work.
+  const createdOnly = [EV('created', T('2026-07-01T09:00:00Z'))];
+  const earlyTurn = [{ started_at: T('2026-06-30T09:00:00Z') }];
+  ok(actualStartFrom(createdOnly, earlyTurn) === null,
+     'a zee_turn before the item\'s own earliest event is rejected (it belongs to a different item)');
 }
 
 section('actual_start — empty and malformed inputs');
@@ -104,7 +113,7 @@ section('actual_end — the terminal event or the landing that closed it');
      'no terminal event and no landing → null (still in flight)');
 }
 
-section('actual_end — cancelled counts, landings are the fallback, earliest wins');
+section('actual_end — cancelled counts, landings are the fallback, the terminal event wins');
 {
   const cancelled = [EV('status', T('2026-07-11T10:00:00Z'), 'cancelled')];
   ok(eq(actualEndFrom(cancelled, []), T('2026-07-11T10:00:00Z')), 'cancelled is a terminal end too');
@@ -112,9 +121,19 @@ section('actual_end — cancelled counts, landings are the fallback, earliest wi
                     { status: 'landed', landed_at: T('2026-07-13T09:00:00Z') }];
   ok(eq(actualEndFrom([], landings), T('2026-07-11T09:00:00Z')),
      'the FIRST landed landing is the end when there is no terminal event');
+  // THE LEAK (TKT-153): a landing is per-XELL, not per-item — the xell's earliest-ever landing
+  // (earned on a DIFFERENT item) used to beat this item's own done event via min(). The item's
+  // OWN terminal event must win; a landing is evidence only in its absence.
   const both = [EV('status', T('2026-07-12T10:00:00Z'), 'done'), EV('status', T('2026-07-11T10:00:00Z'), 'working')];
-  ok(eq(actualEndFrom(both, landings), T('2026-07-11T09:00:00Z')),
-     'and the EARLIEST of the terminal event and the landed landing wins');
+  ok(eq(actualEndFrom(both, landings), T('2026-07-12T10:00:00Z')),
+     'the item\'s OWN terminal event wins — an earlier landing no longer beats it');
+  // scope the fallback to the item's own window: a landing before the item started is evidence
+  // of a DIFFERENT item's work, and must not end this one.
+  ok(actualEndFrom([], [{ status: 'landed', landed_at: T('2026-07-11T09:00:00Z') }],
+                       { start: T('2026-07-12T10:00:00Z') }) === null,
+     'a landing before the item started is rejected (it ended a different item)');
+  ok(eq(actualEndFrom([], landings, { start: T('2026-07-11T09:30:00Z') }), T('2026-07-13T09:00:00Z')),
+     'a landing AFTER the start is accepted — the fallback keeps working when the item has no terminal event');
   ok(actualEndFrom([], [{ status: 'pending', landed_at: null }]) === null,
      'a PENDING landing is not an end');
 }
@@ -147,6 +166,45 @@ section('deriveActuals — a live item has a start and no end');
   });
   ok(eq(a.actual_start, T('2026-07-02T10:00:00Z')) && a.actual_end === null,
      'in flight = a start with no end (the live zee proves it, the read models resolve it)');
+}
+
+section('deriveActuals — the multi-item xell leak is closed');
+{
+  // The xell's FIRST landing (07-10) was earned on item 1. Item 2 started 07-12 and was
+  // delivered by its own landing on 07-13. min() over the xell's whole history stamps 07-10
+  // on item 2 too — an end 2 days before it started. The scoped rule must pick the landing
+  // INSIDE item 2's own window.
+  const item2 = {
+    events: [
+      EV('assigned', T('2026-07-12T10:00:00Z'), null, { xell_id: 'x' }),
+      EV('status', T('2026-07-12T11:00:00Z'), 'working'),
+    ],
+    zeeTurns: [{ started_at: T('2026-07-12T09:00:00Z') }],   // a turn from item 1's era — must NOT pull the start back
+    landings: [
+      { status: 'landed', landed_at: T('2026-07-10T09:00:00Z') },  // item 1's landing
+      { status: 'landed', landed_at: T('2026-07-13T10:00:00Z') },  // item 2's landing
+    ],
+  };
+  const a = deriveActuals(item2);
+  ok(eq(a.actual_start, T('2026-07-12T10:00:00Z')),
+     `start comes from item 2's OWN assignment, not the xell's earlier turn (${a.actual_start?.toISOString()})`);
+  ok(eq(a.actual_end, T('2026-07-13T10:00:00Z')),
+     `end is the landing INSIDE the item's window, not the xell's earliest (${a.actual_end?.toISOString()})`);
+  ok(!a.actual_end || a.actual_end >= a.actual_start, 'the derived range is never inverted');
+}
+
+section('deriveActuals — an impossible range is rejected, not stored');
+{
+  // A done event BEFORE the item's own start is contradictory data. The rule must not persist
+  // an inverted range: the end is rejected (null) rather than stored as end < start.
+  const a = deriveActuals({
+    events: [
+      EV('status', T('2026-07-10T10:00:00Z'), 'working'),
+      EV('status', T('2026-07-09T10:00:00Z'), 'done'),   // done BEFORE the start
+    ],
+  });
+  ok(a.actual_end === null,
+     'an end before the start is rejected (null), never stored as an inverted range');
 }
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');

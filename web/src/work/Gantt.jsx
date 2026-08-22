@@ -414,7 +414,8 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                       )}
                       {/* ACTUAL — what the record PROVES happened, read-only. */}
                       {actualSpan && (
-                        <div className="work-gbar actual" data-testid="work-gbar-actual"
+                        <div className={`work-gbar actual${actualSpan.inverted ? ' inverted' : ''}`}
+                             data-testid="work-gbar-actual"
                              style={{ left: actualSpan.x, width: actualSpan.w }}
                              onMouseEnter={(e) => setTip({ row: r, x: e.clientX, y: e.clientY })}
                              onMouseLeave={() => setTip(null)}>
@@ -533,6 +534,12 @@ export function Tip({ row, x, y }) {
         <div className="work-gtip-r actual">
           <span>actual</span>
           <span>{p(row.actual_start)} → {row.actual_end ? p(row.actual_end) : '… · in flight'}</span>
+        </div>
+      )}
+      {(row.actual_start && row.actual_end && new Date(row.actual_end) < new Date(row.actual_start)) && (
+        <div className="work-gtip-r late">
+          <span>⚠ inverted</span>
+          <span>the recorded actual end is before the recorded start — a bad derivation, not a real range</span>
         </div>
       )}
       {!!row.waiting_start && (

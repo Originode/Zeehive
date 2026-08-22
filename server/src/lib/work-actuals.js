@@ -64,31 +64,64 @@ function isStartEvent(e) {
 }
 
 // actual_start from the event ledger + zee turns. Pure, exported, tested standalone.
+//
+// THE WINDOW RULE (TKT-153 — the unbounded-xell leak): a xell works MANY items over its life, and
+// "the first zee_turn of any linked xell" is the xell's first turn EVER — earned on whichever item
+// it worked first. min(event, turn) lets that foreign turn beat this item's own assignment and
+// pull the start back to a DIFFERENT item's work. So the item's OWN start events WIN; a zee_turn
+// is evidence only when the ledger has no start event, and only when it falls inside the item's
+// own window (a turn before the item's earliest ledger event belongs to an earlier item).
 export function actualStartFrom(events = [], zeeTurns = []) {
   const fromEvents = earliestTs(events.filter(isStartEvent).map((e) => e.ts));
+  if (fromEvents) return fromEvents;
   const fromTurns = earliestTs((zeeTurns || []).map((t) => t.started_at));
-  return minDate(fromEvents, fromTurns);
+  if (!fromTurns) return null;
+  // The item's own earliest ledger row bounds the fallback: a turn before the item existed in the
+  // ledger cannot be this item's work. (The events array always includes a 'created' row, so this
+  // bound is normally the item's creation.)
+  const earliestEvent = earliestTs((events || []).map((e) => e.ts));
+  if (earliestEvent && fromTurns < earliestEvent) return null;
+  return fromTurns;
 }
 
 // actual_end from the event ledger + landings. Pure, exported, tested standalone.
-export function actualEndFrom(events = [], landings = []) {
+//
+// THE WINDOW RULE (TKT-153 — the unbounded-xell leak): a landing is per-XELL, not per-item — "the
+// first land_request that landed for a linked xell" is the xell's earliest-ever landing, earned on
+// whichever item it shipped first, and min() stamps that one timestamp on every item the xell ever
+// touched (14 prod items shared one landing timestamp; 26 had end < start). A landing only ends an
+// item if it happened DURING that item's work, so:
+//   • the item's OWN terminal event (done/cancelled) WINS — a landing is evidence only in its absence;
+//   • a landing counts only when landed_at >= the item's actual_start (the item's own window).
+export function actualEndFrom(events = [], landings = [], { start = null } = {}) {
   const fromEvents = earliestTs(events
     .filter((e) => e?.kind === 'status' && END_STATUSES.has(e.to_status))
     .map((e) => e.ts));
-  const fromLandings = earliestTs((landings || [])
+  if (fromEvents) return fromEvents;
+  const startMs = start ? new Date(start).getTime() : null;
+  return earliestTs((landings || [])
     .filter((l) => l?.status === 'landed' && l.landed_at)
+    .filter((l) => startMs === null || new Date(l.landed_at).getTime() >= startMs)
     .map((l) => l.landed_at));
-  return minDate(fromEvents, fromLandings);
 }
 
 // The whole derivation for one item, as pure data. The workflow-rehab programme reuses this to
 // reconstruct actuals for its Plane-3 execution migration — feed it an item's events/turns/landings
 // and it answers { actual_start, actual_end } (each a Date, or null when there is no evidence).
 export function deriveActuals({ events = [], zeeTurns = [], landings = [] } = {}) {
-  return {
-    actual_start: actualStartFrom(events, zeeTurns),
-    actual_end: actualEndFrom(events, landings),
-  };
+  const actual_start = actualStartFrom(events, zeeTurns);
+  let actual_end = actualEndFrom(events, landings, { start: actual_start });
+  // NEVER PERSIST AN IMPOSSIBLE RANGE: actual_end < actual_start is a contradiction the renderer
+  // would draw as a silent negative bar. Reject the end (null = "the record cannot place it")
+  // rather than storing an inverted pair, and say so — the row is the one worth looking at.
+  if (actual_end && actual_start && actual_end < actual_start) {
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn(`[work-actuals] deriveActuals: end ${actual_end.toISOString()} is before start `
+        + `${actual_start.toISOString()} — rejecting the end (impossible range)`);
+    }
+    actual_end = null;
+  }
+  return { actual_start, actual_end };
 }
 
 // Recompute and WRITE one item's stored columns, through the SAME SQL function the triggers call.
