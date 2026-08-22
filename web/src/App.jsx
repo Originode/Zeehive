@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
@@ -348,11 +348,30 @@ export default function App() {
   // (tier 'prod', the row the terminal bridge resolves process roles into). Same ContainerTerminal
   // the inventory chips open, so the auth/gating is exactly the existing human-console door —
   // and the same tmux attach-or-create session retention (close the modal, reopen, still there).
-  const openQueenzeeTerminal = useCallback(() => {
-    const qz = (fleet?.containers?.server || []).find((c) => c.tier === 'prod' && c.health !== 'down')
-      || (fleet?.containers?.server || []).find((c) => c.tier === 'prod');
-    if (qz) setShellFor(qz);
+  //
+  // The node needs to SHOW a "no terminal" state BEFORE the click, not silently no-op after it,
+  // so the terminal's availability is resolved here (into qzTerminal) and passed to HiveCanvas.
+  // Three states:
+  //   'ready'  — a prod server container is shellable (health 'up' for a real container): the
+  //              node is live, clicking opens the shell.
+  //   'down'   — a prod server container EXISTS but is not shellable. That is a REAL fault in the
+  //              container-shell path (the bridge will refuse with "not running"), so the node
+  //              says "server down" and the click still opens the shell to surface the bridge error
+  //              rather than painting a "no terminal" badge over a genuine breakage.
+  //   'none'   — no prod server container at all: the node is explicitly disabled ("no terminal"),
+  //              and the click does nothing because there is nothing to shell into.
+  const qzTerminal = useMemo(() => {
+    const servers = fleet?.containers?.server || [];
+    const ready = servers.find((c) => c.tier === 'prod' && c.shellable);
+    if (ready) return { status: 'ready', container: ready };
+    const present = servers.find((c) => c.tier === 'prod');
+    if (present) return { status: 'down', container: present };
+    return { status: 'none', container: null };
   }, [fleet]);
+  const openQueenzeeTerminal = useCallback(() => {
+    const c = qzTerminal.container;
+    if (c) setShellFor(c);
+  }, [qzTerminal]);
   // Close on any outside interaction — NO full-screen scrim (that could block the whole UI).
   // Effect is keyed on `menu`, so listeners attach only while a menu is open and after the
   // opening event has finished (so it can't immediately close itself).
@@ -1199,6 +1218,7 @@ export default function App() {
                     shipping={fleet.shipping || []}
                     onOpenProject={openProjectLevel} onOpenNode={openNodeLevel} onNodeAssign={assignNodeZee}
                     onQueenzeeTerminal={openQueenzeeTerminal}
+                    qzTerminalStatus={qzTerminal.status}
                     onQueenzeeLogs={() => setShowTerm(true)} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs

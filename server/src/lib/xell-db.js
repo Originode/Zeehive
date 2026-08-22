@@ -22,7 +22,7 @@ import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { computePorts, sameDatabase } from './provision.js';
+import { computePorts, sameDatabaseIdentity } from './provision.js';
 import { dbIdentity } from './projects.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
@@ -221,7 +221,9 @@ async function sharedDb(projectId, tier) {
 // live xells. READ-ONLY (db-prod-readonly, a minted SELECT-only role) is the legitimate exemption;
 // prod DATA *writes* go through `zee seed` (queenzee runs landed SQL; the zee never holds the DSN).
 //
-// Compared via sameDatabase (host:port+dbname), never string equality — localhost spellings differ.
+// Compared via the DB-LEVEL identity (sameDatabaseIdentity: cluster system_identifier + database
+// name), never host strings — a 10.x published address and meta-db:5432 that name the same postgres
+// compare equal. NULL (unmeasurable) reads false: unmeasurable must never mean "yes".
 // Used by attachXellDb (attach-time refusal), selfProdRequest (refuse the ask before a human is
 // bothered) and decideProdBind (refuse confirm so a leftover pending ask cannot half-confirm).
 export async function projectProdIsManagingMeta(projectId) {
@@ -230,7 +232,7 @@ export async function projectProdIsManagingMeta(projectId) {
   const dbid = await dbIdentity(projectId);
   const dsn = target.conn_ref || derivedTcpDsn(target, dbid);
   if (!dsn) return { isMeta: false, dsn: null };
-  return { isMeta: sameDatabase(dsn, config.databaseUrl), dsn };
+  return { isMeta: (await sameDatabaseIdentity(dsn, config.databaseUrl)) === true, dsn };
 }
 
 // The ONE refusal sentence for a writable bind to the managing meta-DB. Attach, the zee's
@@ -639,7 +641,7 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   if (mode === 'db-shared-prod') {
     const dbid = await dbIdentity(xell.project_id);
     const targetDsn = target?.conn_ref || derivedTcpDsn(target, dbid);
-    if (targetDsn && sameDatabase(targetDsn, config.databaseUrl)) {
+    if (targetDsn && (await sameDatabaseIdentity(targetDsn, config.databaseUrl)) === true) {
       throw new Error(managingMetaWritableRefusal(xell.slug, targetDsn));
     }
   }
