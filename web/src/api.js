@@ -883,23 +883,9 @@ export async function getAdbDevices(machineId, projectId = null) {
   const r = await fetch(`/api/machines/${machineId}/adb-devices${projectId ? `?project=${encodeURIComponent(projectId)}` : ''}`);
   return jsonOrThrow(r, 'list adb devices');
 }
-// Attach a device to a named xell by id (the dashboard's "attach device"). kind overrides the
-// project's manifest default (emulator | physical).
-export async function attachXellDevice(xellId, kind = null) {
-  const r = await fetch(`/api/xells/${xellId}/device`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(kind ? { kind } : {}),
-  });
-  return jsonOrThrow(r, 'attach device');
-}
-// Detach (emulator: stop+remove; physical: unlink) the device attached to a xell.
-export async function detachXellDevice(xellId) {
-  const r = await fetch(`/api/xells/${xellId}/device`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ action: 'detach' }),
-  });
-  return jsonOrThrow(r, 'detach device');
-}
+// Attach/detach XellCard's device-slot — the only callers of these wrappers — was deleted
+// (TKT-29-3AB6). The server routes they hit (/api/xells/:id/device) stay; the wrappers had no
+// remaining consumer.
 
 // Build every buildable (server + webapp) container of a xell.
 export async function buildXell(xellId, hot = false) {

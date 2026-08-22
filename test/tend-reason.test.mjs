@@ -76,9 +76,9 @@ ok(/tend: r\.tend_pending \? \{ open: true, reason: why\.brief, full: why\.full 
 
 // ── 4. the console shows it (the surface that was missing entirely) ──
 //
-// Rendered for real: App.jsx's own NeedsYouBar and XellCard, bundled with esbuild and rendered to
-// static markup, so this asserts what a human would SEE — not that a string appears in a source
-// file. (App.jsx exports neither, so the entry is App.jsx verbatim + an export line.)
+// Rendered for real: App.jsx's own NeedsYouBar, bundled with esbuild and rendered to static
+// markup, so this asserts what a human would SEE — not that a string appears in a source file.
+// (App.jsx exports it under no name, so the entry is App.jsx verbatim + an export line.)
 console.log('\n── the console renders it ──');
 const { build } = await import('esbuild');
 const { createElement: h } = await import('react');
@@ -88,7 +88,7 @@ const { writeFileSync, rmSync } = await import('node:fs');
 const WEB = resolve(here, '..', 'web/src');
 const entry = `${WEB}/.tend-reason.test-entry.jsx`;
 const outfile = `${WEB}/.tend-reason.test-bundle.mjs`;
-writeFileSync(entry, read('web/src/App.jsx') + '\nexport { NeedsYouBar, XellCard };\n');
+writeFileSync(entry, read('web/src/App.jsx') + '\nexport { NeedsYouBar };\n');
 let ui;
 try {
   await build({ entryPoints: [entry], outfile, bundle: true, format: 'esm', platform: 'node',
@@ -112,8 +112,6 @@ const quiet = { ...tending, hive_status: 'occ-working', hive_status_label: 'work
 const barOf = (x, expandedId) => renderToStaticMarkup(h(ui.NeedsYouBar, {
   xells: [x], landingByXell: {}, prsFor: () => [], visible: (a) => a || [],
   onJump: () => {}, expandedId, onDecided: () => {}, onDismiss: () => {} }));
-const cardOf = (x) => renderToStaticMarkup(h(ui.XellCard, { x, diff: null, onDone: () => {}, onMenu: () => {},
-  prodLock: null, projectId: 'p1', landing: [], prs: [], ship: null, onDismiss: () => {}, machines: [] }));
 
 const bar = barOf(tending, 'x1');
 ok(bar.includes(WHY), 'the "waiting on you" note says WHAT the zee needs a human for');
@@ -123,16 +121,11 @@ ok(/title="tend \(needs a human\): the landing gate/.test(bar), 'the full reason
 ok(!/Open its session to see why/.test(bar),
    'the old "open its session to see why" instruction is gone — the console answers that itself');
 
-const card = cardOf(tending);
-ok(card.includes('data-testid="tend-reason"'), 'the xell card grows a tend row');
-ok(/🖐 the landing gate declined twice[^<]*…/.test(card), 'clipped to one line on the card');
-ok(card.includes(`title="${WHY_FULL}`), 'with the FULL reason (and what a tend is) in its title');
-
-ok(barOf(quiet, null) === '' && !cardOf(quiet).includes('tend-reason'),
-   'a xell with no open tend renders neither — the row exists only while a human is actually wanted');
+ok(barOf(quiet, null) === '',
+   'a xell with no open tend renders nothing — the bar exists only while a human is actually wanted');
 
 const css = read('web/src/styles.css');
-ok(/\.tendwhy\s*\{/.test(css) && /\.ny-why\s*\{/.test(css), 'both surfaces are styled (no unstyled class)');
+ok(/\.ny-why\s*\{/.test(css), 'the "waiting on you" surface is styled (no unstyled class)');
 
 // ── 5. the CLI asks for it before spending a round-trip ──
 console.log('\n── the CLI ──');

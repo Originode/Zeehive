@@ -124,8 +124,8 @@ ok(/r\.held_paused/.test(cage) && /is PAUSED, and a[\s\S]{0,40}resume is a turn/
    'and the one outcome that looks like a half-failure is named: the cage came back, the resume did not, '
    + 'because the pause switch is holding it — "press play" is the fix, not another restart');
 const app = read('web/src/App.jsx');
-ok(/data-testid="restart-cage"/.test(app) && /restartXellCage\(x, onDone\)/.test(app),
-   'the xell card carries the button, beside the terminal it is the cure for');
+ok(/kind === 'cage'/.test(app) && /restartXellCage\(x, refresh\)/.test(app),
+   "App's flower action dispatches ⟳ cage — the xell card that used to carry the button was deleted (TKT-29-3AB6)");
 const term = read('web/src/ZeeTerminal.jsx');
 ok(/data-testid="term-restart-cage"/.test(term) && /restartXellCage\(xell, null\)/.test(term),
    'and so does the terminal modal — the place a wedged cage is actually discovered');
