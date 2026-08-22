@@ -2739,10 +2739,10 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-mhead .work-col-h { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line);
   border-bottom: 0; background: var(--panel); }
 .work-col-actions { display: inline-flex; align-items: center; gap: 6px; }
-.work-col-hide { flex: 0 0 auto; background: none; border: 0; color: var(--muted); cursor: pointer;
+.work-col-hide { flex: 0 0 auto; background: none; border: 0; color: var(--accent); cursor: pointer;
   font-size: 11px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
 .work-col-hide:hover { color: var(--text); background: var(--panel2); }
-.work-col-hide.off { color: var(--building); }
+.work-col-hide.off { color: var(--muted); opacity: .7; }
 .work-mbody { display: flex; flex-direction: column; border: 1px solid var(--line);
   border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden; }
 
