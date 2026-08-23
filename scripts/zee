@@ -186,6 +186,13 @@ async function pollBuild(role, secs, { watch = false } = {}) {
         // published-port branch — a failed finalize sets health=down AND the port probe also reads
         // down, and without this order the zee only ever saw "port refused" with no stderr.
         console.error(`  ✗ ${c.role} (${c.name}) is ${String(c.health).toUpperCase()} — the build FAILED.`);
+        // The classified next step (INFRA — not your code / CODE — your worktree) is computed
+        // server-side and rides the status payload, so --wait and --watch print the same sentence.
+        if (c.last_build_error_next_step) {
+          console.error('');
+          for (const line of String(c.last_build_error_next_step).split('\n')) console.error(`  ${line}`);
+          console.error('');
+        }
         console.error('  ── last build error ──');
         for (const line of String(c.last_build_error).split('\n')) console.error(`  ${line}`);
         console.error('  ─────────────────────');
