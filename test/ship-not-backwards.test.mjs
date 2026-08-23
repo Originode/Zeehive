@@ -19,9 +19,14 @@
 //   4. that the guard is asked BEFORE anything is deployed (before the migration apply and the
 //      container builds in runShipBody) — the placement is the fix, not the check;
 //   5. the belt-and-braces refusal in scripts/self-ship-sync.sh, by RUNNING it: a backwards target
-//      must leave the checkout untouched, a forward one must still sync.
+//      must leave the checkout untouched, a forward one must still sync;
+//   6. END TO END through runShipBody against a throwaway postgres (`zee db-sandbox --migrate`) and
+//      the same real repo: the backwards ship lands 'failed' with the named cause, its build script
+//      is NEVER executed, and the site's lock gets its release countdown — while the forward control
+//      ships and DOES execute the build. Skipped loudly (never silently) without DATABASE_URL.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import pg from 'pg';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -200,6 +205,96 @@ try {
   // the same-sha case is a no-op sync, never a refusal
   const noop = sync(C);
   ok(noop.code === 0 && g('rev-parse', 'HEAD') === C, 're-syncing to the sha already checked out is fine');
+  g('checkout', '-q', 'master');
+
+  // ── 6. END TO END: runShipBody against a real database ────────────────────────
+  // The sections above prove the DECISION and the placement; this one proves the WIRING — that the
+  // refusal's own SQL runs, that the failed row carries the cause the console renders, that the
+  // build script is never executed, and that the site's lock is released on a countdown (a guard
+  // that wedged the prod lock would be worse than the bug it fixes).
+  if (!process.env.DATABASE_URL) {
+    console.log('\n── 6. end-to-end through runShipBody (SKIPPED — no DATABASE_URL; use `zee db-sandbox --migrate`) ──');
+  } else {
+    console.log('\n── 6. end-to-end through runShipBody (real db, real repo) ──');
+    const PID = '00000000-0000-4000-8000-0000000ba110';
+    const XOURCE = '00000000-0000-4000-8000-0000000ba220';
+    const XELL = '00000000-0000-4000-8000-0000000ba330';
+    const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    await client.connect();
+    try {
+      await client.query('DELETE FROM project WHERE id=$1', [PID]).catch(() => {});
+      const { runShipBody } = await import('../server/src/queenzee/shipgate.js');
+
+      // A build script that leaves a MARKER when it runs. Its absence is the evidence that the
+      // refusal happened BEFORE anything was deployed — not merely that the row says 'failed'.
+      const marker = join(parent, 'built.log');
+      const script = join(parent, 'fake-build.sh');
+      writeFileSync(script, '#!/usr/bin/env bash\n'
+        + `echo "built ref=\$6 mode=\$4" >> "${marker}"\n`
+        + 'printf \'{"ok":true,"head":"unknown","method":"test-build"}\\n\'\n');
+
+      await client.query(
+        `INSERT INTO project (id, name, repo_root, main_branch) VALUES ($1,'ship-backwards-test',$2,'master')`,
+        [PID, repo]);
+      await client.query('INSERT INTO xource (id, project_id, ref) VALUES ($1,$2,$3)', [XOURCE, PID, 'master']);
+      await client.query(
+        `INSERT INTO xell (id, project_id, xource_id, slug, branch, worktree_path, status)
+           VALUES ($1,$2,$3,'ship-backwards-cove','spinoff/ship-backwards',$4,'working')`,
+        [XELL, PID, XOURCE, repo]);
+      await client.query(
+        `INSERT INTO container (project_id, role, tier, isolation, name, build_script, docker_ctx, site_id)
+           VALUES ($1,'server','prod','shared','prod_server_test',$2,'default',NULL)`, [PID, script]);
+      const xellRow = (await client.query('SELECT * FROM xell WHERE id=$1', [XELL])).rows[0];
+      const projRow = (await client.query('SELECT * FROM project WHERE id=$1', [PID])).rows[0];
+
+      // the ledger: production was last given C (the 17:08 ship)
+      await client.query(
+        `INSERT INTO ship_request (project_id, xell_id, commit, status, targets, finished_at, decided_at, decided_by)
+           VALUES ($1,$2,$3,'shipped',ARRAY['server','webapp'], now(), now(),'human@console')`, [PID, XELL, C]);
+      // …and the stale request, approved 49 minutes after it was raised, still aimed at A
+      const stale = (await client.query(
+        `INSERT INTO ship_request (project_id, xell_id, commit, status, targets, reason, decided_at, decided_by)
+           VALUES ($1,$2,$3,'approved',ARRAY['server'],'the 16:26 request, approved at 17:15', now(),'human@console')
+         RETURNING *`, [PID, XELL, A])).rows[0];
+      await client.query(
+        `INSERT INTO deploy_lock (project_id, container, xell_id, phase, ship_id) VALUES ($1,'prod',$2,'shipping',$3)`,
+        [PID, XELL, stale.id]);
+
+      await runShipBody(stale, xellRow, projRow, null, 'prod', 'simulate');
+
+      const after = (await client.query('SELECT * FROM ship_request WHERE id=$1', [stale.id])).rows[0];
+      ok(after.status === 'failed', `the backwards ship ends 'failed' (${after.status}) — a visible failure, not a silent skip`);
+      ok(after.failure_cause === SHIP_BEHIND_LIVE_CAUSE, `failure_cause = ${after.failure_cause}`);
+      ok(/BACKWARDS/.test(after.error || ''), 'the error a human reads says it would have rolled production backwards');
+      ok((after.error || '').includes(A.slice(0, 8)) && (after.error || '').includes(C.slice(0, 8)),
+         'and names the requested sha and the live one');
+      ok(Array.isArray(after.containers) && after.containers[0]?.role === 'direction-guard',
+         'the step that refused is recorded on the row');
+      ok(!existsSync(marker), 'THE BUILD NEVER RAN — production was not touched');
+      const lock = (await client.query('SELECT * FROM deploy_lock WHERE ship_id=$1', [stale.id])).rows[0];
+      ok(lock?.phase === 'failed' && !!lock?.auto_release_at,
+         'the site lock is on its release countdown — a refusal must never wedge production');
+
+      // the FORWARD control, same machinery: production last got A, this ship carries C
+      await client.query(`UPDATE ship_request SET commit=$2 WHERE project_id=$1 AND status='shipped'`, [PID, A]);
+      const fwdShip = (await client.query(
+        `INSERT INTO ship_request (project_id, xell_id, commit, status, targets, reason, decided_at, decided_by)
+           VALUES ($1,$2,$3,'approved',ARRAY['server'],'a normal forward ship', now(),'human@console')
+         RETURNING *`, [PID, XELL, C])).rows[0];
+      await client.query('DELETE FROM deploy_lock WHERE project_id=$1', [PID]);
+      await client.query(
+        `INSERT INTO deploy_lock (project_id, container, xell_id, phase, ship_id) VALUES ($1,'prod',$2,'shipping',$3)`,
+        [PID, XELL, fwdShip.id]);
+
+      await runShipBody(fwdShip, xellRow, projRow, null, 'prod', 'simulate');
+      const fwdAfter = (await client.query('SELECT * FROM ship_request WHERE id=$1', [fwdShip.id])).rows[0];
+      ok(fwdAfter.status === 'shipped', `the forward ship still SHIPS (${fwdAfter.status}) — the guard is not in its way`);
+      ok(existsSync(marker), 'and its build script DID run (the guard only ever stops a backwards move)');
+    } finally {
+      await client.query('DELETE FROM project WHERE id=$1', [PID]).catch(() => {});
+      await client.end().catch(() => {});
+    }
+  }
 } finally {
   rmSync(parent, { recursive: true, force: true });
 }
