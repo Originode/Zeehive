@@ -19,17 +19,20 @@ const eq = (a, b, m) => ok(a === b, `${m} (got ${JSON.stringify(a)}, want ${JSON
 const close = (server) => new Promise((res) => server.close(res));
 const servers = [];
 
-// A mock gateway on a given HOST (defaults to a random free port): answers /api/hello 200
-// {ok:true} like the real gateway's index.js mount, and counts how many times the probe hit it
-// (to prove the cache skips round-trips). Primary/fallback share GATEWAY_PORT and differ only by
-// host, so the fallback mock is created with the SAME port as the primary but on 127.0.0.2.
-function mockGateway(host, port = 0) {
+// A mock gateway on a given HOST (defaults to a random free port): answers /api/hello
+// {ok:true} like the real gateway's index.js mount (unless helloStatus says otherwise), and counts
+// how many times the probe hit it (to prove the cache skips round-trips). Primary/fallback share
+// GATEWAY_PORT and differ only by host, so the fallback mock is created with the SAME port as the
+// primary but on 127.0.0.2.
+function mockGateway(host, port = 0, helloStatus = 200) {
   const hits = { count: 0 };
   const server = http.createServer((req, res) => {
     if (req.url === '/api/hello') {
       hits.count++;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+      res.writeHead(helloStatus, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(helloStatus === 200
+        ? { ok: true, service: 'zeehive-llm-gateway' }
+        : { error: 'not the gateway' }));
     } else {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end('{"error":"not the gateway"}');
@@ -109,6 +112,22 @@ try {
   let envRefused = null;
   try { await gatewayEnv({ xellToken: 'tok' }); } catch (e) { envRefused = e; }
   ok(!!envRefused && /LLM gateway unreachable/.test(envRefused.message), 'gatewayEnv refuses loudly too');
+
+  console.log('\n── 7. ANY HTTP answer is reachable — a 404 on /api/hello is still proof the port serves ──');
+  // Measured 2026-08-23: from a cage, host.docker.internal:4701 refused (connection refused) while
+  // zeehive_server:4701 answered HTTP 404 — 404 IS reachable. What the probe must reject is the
+  // dead-address family (refused / ENOTFOUND / timeout), never an HTTP answer of any status.
+  _resetGatewayProbeCache();
+  const four = await mockGateway('127.0.0.1', 0, 404);   // a server that answers 404, like the compose-name probe
+  const Q = four.port;
+  process.env.CXELL_API_BASE = `http://127.0.0.1:${Q}`;
+  process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;
+  process.env.GATEWAY_PORT = String(Q);
+  eq(await probeGatewayBase(`http://127.0.0.1:${Q}`), true, 'a 404 answer is REACHABLE (not a dead address)');
+  eq(await chooseGatewayBaseUrl(), `http://127.0.0.1:${Q}`, 'choose mints the 404-answering address');
+  const fourEnv = await gatewayEnv({ xellToken: 'tok' });
+  eq(fourEnv.ANTHROPIC_BASE_URL, `http://127.0.0.1:${Q}/x/tok/claude`, 'a 404-answering base is minted for the cage');
+  await close(four.server);
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {

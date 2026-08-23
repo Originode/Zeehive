@@ -1109,6 +1109,13 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayFallbackBaseUrl, probeGate
 // network round-trip, so a working address stays trusted for a short TTL and a dead address is
 // re-probed sooner — a transient blip recovers fast, a real outage surfaces at the next mint with
 // a NAMED refusal instead of a silently dead env. Overridable via env so a test can shrink the TTL.
+//
+// REACH = ANY HTTP ANSWER, NOT JUST 200 (measured 2026-08-23 by the manager): from a cage,
+// host.docker.internal:4701 refused (connection refused — the TKT-179 incident shape) while
+// zeehive_server:4701 answered HTTP 404. A 404 is PROOF the port resolves and a server answers —
+// the exact thing a provider CLI needs to reach the gateway — so it counts as reachable. What the
+// probe rejects is the dead-address family: connection refused, DNS ENOTFOUND, timeout, no server
+// at all. Anything that gets an HTTP response back is an address the cage can use.
 const PROBE_TIMEOUT_MS = Number(process.env.GATEWAY_PROBE_TIMEOUT_MS || 2000);
 const PROBE_TTL_OK_MS = Number(process.env.GATEWAY_PROBE_TTL_OK_MS || 30000);
 const PROBE_TTL_FAIL_MS = Number(process.env.GATEWAY_PROBE_TTL_FAIL_MS || 3000);
@@ -1134,7 +1141,10 @@ export async function probeGatewayBase(baseUrl) {
       headers: { accept: 'application/json' },
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
-    verdict = res.ok;
+    // ANY HTTP answer (any status) is proof the port resolves and a server listens — a 404 from
+    // the compose-name /api/hello is reachable (measured). Only the connection-failure family
+    // (refused / ENOTFOUND / timeout) fails the probe.
+    verdict = true;
   } catch { /* connection refused / timeout / DNS — verdict stays false */ }
   probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
   return verdict;
