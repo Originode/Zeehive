@@ -14,6 +14,18 @@ export function gatewayHealthWord(g) {
   const addr = g?.address || null;
   const where = addr ? ` at ${addr}` : '';
   if (!g || !g.state || g.state === 'unknown') {
+    // 'unknown' with an error is a DECISION, not "not yet probed": the probe RAN and this is what
+    // it decided — a GATEWAY_PORT === PORT install (the gateway is OFF BY CONFIGURATION), or no
+    // gateway address configured. Say that in words instead of claiming the monitor has not ticked.
+    // And name NO address: none was ever a gateway in this state (gateway-health.js keeps address
+    // null once a decision is made).
+    if (g?.error && g.state === 'unknown') {
+      return {
+        kind: 'gateway_unknown',
+        chip: `gateway off by configuration — ${g.error}`,
+        why: g.error,
+      };
+    }
     return {
       kind: 'gateway_unknown',
       chip: `gateway not yet probed${where}`,

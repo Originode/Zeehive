@@ -54,6 +54,16 @@ ok(unknown.kind === 'gateway_unknown', 'not-yet-probed is its own kind');
 ok(unknown.chip.includes('not yet probed'), 'and says so in words');
 ok(gatewayHealthWord(null).kind === 'gateway_unknown', 'a missing snapshot renders the honest "not yet probed"');
 ok(gatewayHealthWord({}).kind === 'gateway_unknown', 'an empty snapshot is not mistaken for healthy');
+// A GATEWAY_PORT === PORT install is a DECISION, not "not yet probed": the probe RAN and decided the
+// gateway is OFF BY CONFIGURATION. The chip must say so in words — and must NOT name an address,
+// because none was ever a gateway (gateway-health.js keeps address null once a decision is made) (S2).
+const offByConfig = gatewayHealthWord({ state: 'unknown', address: null, error: 'no separate LLM gateway (GATEWAY_PORT === PORT)' });
+ok(offByConfig.kind === 'gateway_unknown', 'off-by-config stays its own kind (never a false down)');
+ok(offByConfig.chip.includes('off by configuration') && !offByConfig.chip.includes('not yet probed'),
+   'and says the gateway is OFF BY CONFIGURATION, not "not yet probed" forever');
+ok(!offByConfig.chip.includes('http://') && !offByConfig.chip.includes('4700'),
+   'and names no address — the API port was never a gateway');
+ok(offByConfig.why.includes('no separate LLM gateway'), 'the tooltip says what the probe actually decided');
 
 // ── every result is a WORD, never a shade ─────────────────────────────────────────────────────────
 for (const [label, g] of [['down', down], ['ok', okState], ['unknown', unknown]]) {

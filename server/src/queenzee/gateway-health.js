@@ -23,10 +23,17 @@ const cache = { state: 'unknown', address: null, at: null, error: null, code: nu
 let lastLine = '';
 
 // The cached snapshot — what getFleet reads. No network, never throws.
+//
+// `address` is the address that was ACTUALLY probed — the truth. The `gatewayBaseUrl()` fallback
+// exists ONLY for the never-probed state (error null): a snapshot the monitor has not ticked for
+// yet names the probe TARGET so the chip says what WILL be checked. Once a decision is recorded
+// (error set), the cached address is authoritative — a GATEWAY_PORT === PORT install has NO gateway
+// address (cache.address is null), and naming gatewayBaseUrl() there would present the API port as
+// a gateway that never was (S2).
 export function gatewayHealth() {
   return {
     ...cache,
-    address: cache.address || gatewayBaseUrl() || null,
+    address: cache.error === null ? (cache.address || gatewayBaseUrl() || null) : cache.address,
   };
 }
 
