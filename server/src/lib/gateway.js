@@ -58,6 +58,7 @@ import { tokenForSpawn, PROVIDERS } from './provider-tokens.js';
 // gateway only calls a handful of named functions, it does not own the capture logic.
 import { BODY_CAP, gatewayBodyCaptureEnabled, secretValuesForProject, captureRequestText,
          scrubBodyText, persistBodies } from './gateway-bodies.js';
+import { GATEWAY_UPSTREAM_UNREACHABLE_PREFIX } from './gateway-upstream.js';
 
 // The gateway's own port. The queenzee API stays on PORT; the gateway is a SEPARATE listener so
 // it can never shadow API routes (/v1/messages is not an API route, but keeping the two doors
@@ -988,7 +989,7 @@ export async function gatewayProxy(req, res) {
   });
   proxyReq.on('error', (e) => {
     if (!res.headersSent) {
-      res.status(502).json({ error: `gateway upstream unreachable: ${e.message}` });
+      res.status(502).json({ error: `${GATEWAY_UPSTREAM_UNREACHABLE_PREFIX}: ${e.message}` });
     } else { try { res.destroy(); } catch { /* already gone */ } }
     completeRequest(rowId, { status: 502, error: e.message, durationMs: Date.now() - t0 });
     // The request body is already captured (it was read before the forward); persist it with
@@ -1158,6 +1159,11 @@ export async function probeGatewayBase(baseUrl) {
 // neither answers, REFUSE with a named sentence quoting both addresses — never a cage full of
 // vendor-branded ConnectionRefused (TKT-179: one unpublished port failed every provider for 13h).
 let loggedEqualFallback = false;
+// The fallback address we last SAID we were probing — so the "primary unreachable" line is a
+// STATE CHANGE, not a 30s tick. The health monitor (queenzee/gateway-health.js) calls this every
+// ~30s; a primary that stays down while the fallback answers must not print the same line forever.
+// null = never logged (or the primary has answered since — a fresh episode is loud again).
+let lastFallbackProbeLogged = null;
 
 export async function chooseGatewayBaseUrl() {
   const primary = gatewayBaseUrl();
@@ -1168,9 +1174,16 @@ export async function chooseGatewayBaseUrl() {
       + 'An install that sets no CXELL_API_FALLBACK has only ONE name to try; if that port is unpublished '
       + 'every gateway mint will refuse loudly.');
   }
-  if (await probeGatewayBase(primary)) return primary;
-  logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  if (await probeGatewayBase(primary)) {
+    lastFallbackProbeLogged = null;   // the primary answered — a later fallback is a NEW episode, say it loud
+    return primary;
+  }
+  if (lastFallbackProbeLogged !== fallback) {
+    lastFallbackProbeLogged = fallback;
+    logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  }
   if (await probeGatewayBase(fallback)) return fallback;
+  lastFallbackProbeLogged = null;     // both refused — the throw below is the loud word; a recovery is a new episode
   throw new Error(
     `LLM gateway unreachable: neither ${primary} nor ${fallback} answers /api/hello. `
     + 'The queenzee refuses to hand a cage a gateway address it cannot reach itself. '
