@@ -67,19 +67,28 @@ ok(snap.state === 'ok' && snap.error === null && snap.address === `http://127.0.
    `the real gateway hello is ok, no caveat (${JSON.stringify(snap)})`);
 await close(two.server);
 
-// ── 3. the connection-failure family is DOWN — and names the address ─────────────────────────────
+// ── 3. the connection-failure family is DOWN — and names BOTH genuinely different addresses ──────
 console.log('\n── 3. the connection-failure family is unreachable — the outage shape ──');
 gw._resetGatewayProbeCache();
 const dead = two.port + 1;   // a port nothing listens on
-process.env.CXELL_API_BASE = `http://127.0.0.1:${dead}`;
-process.env.CXELL_API_FALLBACK = `http://127.0.0.1:${dead + 1}`;   // ALSO dead — so both refuse
+// TWO GENUINELY DIFFERENT candidates — the entire point of f2743e5. The primary (host.docker.internal)
+// and the fallback (the compose-network name) share GATEWAY_PORT and differ only in HOST, so the
+// test must stand them in with TWO DIFFERENT hosts. 127.0.0.1 and 127.0.0.2 are distinct loopback
+// addresses, both dead on the gateway port. (The old fixture made the two differ only in PORT,
+// which gatewayFallbackBaseUrl() strips — so primary and fallback collapsed to ONE address and
+// "neither X nor Y answers" passed without ever trying a second candidate.)
+process.env.CXELL_API_BASE = `http://127.0.0.1:4700`;       // host only — GATEWAY_PORT supplies the port
+process.env.CXELL_API_FALLBACK = `http://127.0.0.2:4700`;   // a DIFFERENT host, same dead GATEWAY_PORT
 process.env.GATEWAY_PORT = String(dead);
+const primaryDead = `http://127.0.0.1:${dead}`;
+const fallbackDead = `http://127.0.0.2:${dead}`;
 snap = await probe.probeGatewayHealth();
 ok(snap.state === 'down', `a closed port is DOWN (${JSON.stringify(snap.state)})`);
-ok(snap.address === `http://127.0.0.1:${dead}`,
+ok(snap.address === primaryDead,
    `and names the address cages were given (${JSON.stringify(snap.address)})`);
-ok(/neither .* nor .* answers/.test(snap.error || ''),
-   `the why names BOTH addresses — primary and fallback (${JSON.stringify(snap.error)})`);
+ok(primaryDead !== fallbackDead, 'the two candidates are GENUINELY DIFFERENT hosts — the point of f2743e5');
+ok((snap.error || '').includes(primaryDead) && (snap.error || '').includes(fallbackDead),
+   `the why names BOTH DIFFERENT addresses — primary and fallback (${JSON.stringify(snap.error)})`);
 
 // ── 4. gateway-off config is never a false alarm ────────────────────────────────────────────────
 // config.gatewayPort is read at module import, so this case needs a FRESH process (env set first).
@@ -96,6 +105,12 @@ const offOut = execFileSync(process.execPath, ['--input-type=module', '-e', `
 const offSnap = JSON.parse(offOut.trim().split('\n').pop());
 ok(offSnap.state === 'unknown' && /no separate LLM gateway/.test(offSnap.error || ''),
    `gateway-off config stays 'unknown', never a false 'down' (${JSON.stringify(offSnap.state)})`);
+// The off-by-config snapshot must NOT name an address — the API port was never a gateway, so the
+// console must not present it as one (S2). The gatewayHealth() fallback (address || gatewayBaseUrl())
+// previously resurrected the API port here, showing "gateway not yet probed at http://127.0.0.1:4700"
+// forever after the probe HAD already decided the gateway is off.
+ok(offSnap.address === null,
+   `and names NO address — the API port was never a gateway (${JSON.stringify(offSnap.address)})`);
 
 console.log(failures ? `\n${failures} FAILED` : '\nall good');
 process.exit(failures ? 1 : 0);
