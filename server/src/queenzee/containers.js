@@ -10,6 +10,7 @@ import { deviceBootState } from '../lib/devices.js';
 import { machineDbHost } from '../lib/machines.js';
 import { derivedTcpDsn } from '../lib/xell-db.js';
 import { config } from '../config.js';
+import { probeGatewayHealth } from './gateway-health.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
 // role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
@@ -223,6 +224,11 @@ let knownOrphans = '';
 let lastHealthLine = '';
 
 export async function checkContainers() {
+  // GATEWAY REACHABILITY rides this same health tick — the one cadence the console already polls —
+  // rather than a new poller. Best-effort and cached in memory (queenzee/gateway-health.js): a
+  // probe failure can never fail this tick, and the fleet read model reads the CACHE, never a fetch.
+  await probeGatewayHealth().catch(() => {});
+
   // Address self-heal first: a db row that has only a port gets its URL filled in (see
   // healHostlessDbRows). Cheap and idempotent — a healthy fleet matches no rows and skips.
   await healHostlessDbRows();

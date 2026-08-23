@@ -42,7 +42,8 @@ import { broadcast } from '../lib/events.js';
 import { recordEvent, setTend } from '../lib/status.js';
 import { xellPaused } from '../lib/fleet-pause.js';
 import { classifyTurnDeath, classifyTurnDeathEx, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MIN,
-         HOST_RESTART_DEATH, CAGE_RESTART_DEATH } from '../lib/turn-death.js';
+         HOST_RESTART_DEATH, CAGE_RESTART_DEATH, GATEWAY_UNREACHABLE_DEATH } from '../lib/turn-death.js';
+import { GATEWAY_PORT, gatewayBaseUrl } from '../lib/gateway.js';
 import { providerForRuntimeKey } from '../lib/cxell-runtimes.js';
 import { raiseAuthDeathRequest, injectedRevivePrompt, scrubSecrets } from '../lib/credential-inject.js';
 import { quarantineOnAuthDeath } from '../lib/account-quarantine.js';
@@ -81,7 +82,31 @@ const TICK_MS = Number(process.env.REVIVE_TICK_MS) || 60000;
 const DIED_WHERE = {
   [HOST_RESTART_DEATH.signal]: 'with the zeehive machine',
   [CAGE_RESTART_DEATH.signal]: 'when a human restarted its cxell',
+  [GATEWAY_UNREACHABLE_DEATH.signal]: 'on the zeehive gateway',
 };
+
+// The gateway context a death classifier needs to name OUR door instead of the vendor's: the
+// addresses our cages are actually given (gatewayBaseUrl()'s host:port — and the FALLBACK's when
+// CXELL_API_FALLBACK names a different host — both with the gateway port substituted), and whether
+// ALL of this zee's AI traffic crosses our gateway (a cxell CLI's does — lib/gateway.js gatewayEnv
+// rewrites every provider base-url to the gateway, so a transport failure from it IS against our
+// gateway even when the CLI prints no address).
+function gatewayContextFor(zee) {
+  const addresses = [];
+  const primary = gatewayBaseUrl();
+  if (primary) addresses.push(primary);
+  const fallback = process.env.CXELL_API_FALLBACK || '';
+  if (fallback && fallback !== process.env.CXELL_API_BASE) {
+    try {
+      const host = String(fallback).replace(/:\d+$/, '');
+      if (host) addresses.push(`${host}:${GATEWAY_PORT}`);
+    } catch { /* a malformed fallback — nothing to name */ }
+  }
+  return {
+    gatewayAddresses: [...new Set(addresses.filter(Boolean))],
+    allTrafficIsGateway: zee.entrypoint === 'cxell-cli',
+  };
+}
 
 export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', resumable = true,
                                       source = 'turn', death: deathOverride = null,
@@ -98,12 +123,18 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     if (!zee) return { classified: false };
     const name = slug || zee.slug || String(zee.xell_id).slice(0, 8);
     const provider = providerForRuntimeKey(zee.runtime_key) || 'claude';
+    // A transport failure against OUR OWN gateway wears the GATEWAY's name, not the vendor's — the
+    // classifier stays dependency-free, so the gateway context is PASSED IN here (see
+    // gatewayContextFor above). A 2026-08-22 outage killed ~13h of dispatches with "API Error:
+    // Unable to connect to API (ConnectionRefused)" — the VENDOR's words — and read as all three
+    // providers being down; the port was ours, and the name should have been ours.
+    const gatewayCtx = gatewayContextFor(zee);
 
     const death = deathOverride
       ? { kind: deathOverride.kind, signal: deathOverride.signal, message: String(reason || '') }
       : (code != null || err || result)
-        ? classifyTurnDeathEx({ message: reason, code, err, result })
-        : classifyTurnDeath(reason);
+        ? classifyTurnDeathEx({ message: reason, code, err, result, gateway: gatewayCtx })
+        : classifyTurnDeath(reason, gatewayCtx);
     const verdict = decideRevive({
       kind: death.kind,
       attempts: zee.revive_attempts || 0,
@@ -125,23 +156,30 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     // entirely: revive_class stays NULL, so it cannot be counted as an unclassifiable death.
     // The CAPTURE rides the same statement: the process exit code, a bounded tail of stderr and the
     // vendor's structured error object (migration 213), all scrubbed before they touch the row.
+    // A GATEWAY death also rewrites the stop_reason ON THE ROW: the caller (intake.js) may already
+    // have written the vendor's sentence, and the one line a human reads to find out what happened
+    // must name OUR door — 'zeehive gateway unreachable at http://host.docker.internal:4701
+    // (ECONNREFUSED)' — not "three providers are down".
     const notADeath = death.kind === 'none';
+    const isGatewayDeath = !deathOverride && death.signal === GATEWAY_UNREACHABLE_DEATH.signal;
+    const effectiveReason = isGatewayDeath ? death.message : String(reason || '');
     const errTail = String(err || '').trim().split('\n').slice(-5).join('\n').slice(0, 500) || null;
     const scrubbedResult = result ? JSON.parse(scrubSecrets(JSON.stringify(result))) : null;
+    // A vendor error can ECHO THE KEY back ("your api key: sk-ant-… is invalid") — scrub token-
+    // shaped substrings before the reason lands in the row, the event log or the tend (finding [10]).
+    const scrubbedReason = scrubSecrets(effectiveReason);
     await q(`UPDATE zee SET revive_class = $2, revive_signal = $3,
                             revive_next_at = CASE WHEN $4::int IS NULL THEN NULL
                                                   ELSE now() + ($4::int || ' minutes')::interval END,
                             last_death_code = $5, last_death_stderr = $6, last_death_error = $7,
-                            revive_class_source = $8
+                            revive_class_source = $8,
+                            last_stop_reason = COALESCE($9, last_stop_reason)
                WHERE id = $1`,
             [zee.id, notADeath ? null : death.kind, notADeath ? null : death.signal,
              verdict.action === 'revive' ? verdict.delayMinutes : null,
              Number.isInteger(code) ? code : null,
              errTail ? scrubSecrets(errTail) : null, scrubbedResult,
-             'live']);
-    // A vendor error can ECHO THE KEY back ("your api key: sk-ant-… is invalid") — scrub token-
-    // shaped substrings before the reason lands in the event log or the tend (finding [10]).
-    const scrubbedReason = scrubSecrets(String(reason || ''));
+             'live', isGatewayDeath ? scrubbedReason : null]);
 
     // THE CONSECUTIVE-DEATH STREAK (ticket #81) — the counter belongs to the CAGE, so it lives on
     // the xell row, and every death path funnels through this one choke point. A REAL death bumps
@@ -192,7 +230,8 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
       broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
       return { classified: true, kind: death.kind, signal: death.signal, scheduled: true,
                in_minutes: verdict.delayMinutes,
-               xell_quarantined: xellQuarantined };
+               xell_quarantined: xellQuarantined,
+               message: isGatewayDeath ? scrubbedReason : null };
     }
 
     if (verdict.action === 'tend') {
@@ -269,6 +308,7 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
         siblingId: quarantine.siblingId || null,
         siblingLabel: quarantine.siblingLabel || null,
         noSibling: !!quarantine.noSibling,
+        message: isGatewayDeath ? scrubbedReason : null,
       };
     }
 
@@ -280,7 +320,8 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
              quarantined: !!quarantine.paused,
              xell_quarantined: xellQuarantined,
              siblingId: quarantine.siblingId || null,
-             noSibling: !!quarantine.noSibling };
+             noSibling: !!quarantine.noSibling,
+             message: isGatewayDeath ? scrubbedReason : null };
   } catch (e) {
     logline('revive', `could not classify the death of zee ${String(zeeId).slice(0, 8)} (${String(e.message).slice(0, 140)})`);
     return { classified: false, error: e.message };

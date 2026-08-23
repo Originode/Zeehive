@@ -82,6 +82,95 @@ const RULES = [
   { kind: 'transient', signal: 'killed', test: /exited 137\b|\bSIGKILL\b|process (was )?killed/i },
 ];
 
+// A TRANSPORT FAILURE AGAINST OUR OWN GATEWAY — not the provider, not "three providers down".
+//
+// Every cxell CLI points its provider base-url at OUR LLM gateway (lib/gateway.js gatewayEnv), so
+// a ConnectionRefused / ENOTFOUND / EAI_AGAIN from a cxell is our own door not answering at the
+// address we minted — the port was closed (2026-08-22: host.docker.internal:4701, a port no
+// compose file published; for ~13h every dispatch died "API Error: Unable to connect to API
+// (ConnectionRefused)" and read as all three providers being down). A genuine VENDOR outage
+// through a WORKING gateway surfaces as the gateway's own 502 "gateway upstream unreachable",
+// which matches the generic '5xx' rule — never this one.
+//
+// The classifier stays dependency-free: it does not import gateway.js. The CALLER passes the
+// gateway context — the addresses our cages are given (gatewayBaseUrl()'s host:port, or the
+// fallback's) and whether ALL of this zee's AI traffic crosses our gateway (a cxell CLI's does,
+// so even a transport failure that prints NO address is against our gateway).
+export const GATEWAY_UNREACHABLE_DEATH = Object.freeze({ kind: 'transient', signal: 'gateway-unreachable' });
+
+// The transport-failure markers that can be OURS: the node connect errors (ECONNREFUSED,
+// ENOTFOUND, EAI_AGAIN, ECONNRESET, EPIPE, ETIMEDOUT), the .NET casing of the measured outage
+// (ConnectionRefused), and the generic phrases a CLI wraps them in ("Unable to connect to API",
+// "socket hang up", "connection refused", "network error", "fetch failed").
+const GATEWAY_TRANSPORT_RE = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|EPIPE|ETIMEDOUT|ConnectionRefused|connection\s*refused|unable to connect|socket hang ?up|network error|fetch failed/i;
+const GATEWAY_CODE_RE = /(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|EPIPE|ETIMEDOUT|ConnectionRefused|connection refused)/i;
+
+// Build the match tokens from the caller's gateway addresses. `tokens` carries the addresses as
+// given (the FULL urls, so a message containing the full url matches first); `hostToUrl` maps each
+// bare host:port to its FULL url, so a vendor error that prints just 'host.docker.internal:4701'
+// still matches AND the rewritten message carries the scheme (http://host.docker.internal:4701),
+// exactly like the task's example. A bare host:port passed in works too.
+function gatewayTokens(gatewayAddresses) {
+  const tokens = [];
+  const hostToUrl = new Map();
+  for (const a of gatewayAddresses || []) {
+    const s = String(a ?? '').trim();
+    if (!s) continue;
+    tokens.push(s);
+    try {
+      const u = new URL(s.includes('://') ? s : `http://${s}`);
+      if (u.host) hostToUrl.set(u.host, s);
+    } catch { /* keep s as an opaque token */ }
+  }
+  return { tokens, hostToUrl };
+}
+
+// Which of OUR gateway addresses does this message actually name (if any)? Full urls first, then
+// bare host:ports resolved back to their full url. Null when no OUR address is mentioned.
+function mentionedGatewayAddress(text, { tokens, hostToUrl }) {
+  for (const t of tokens) if (text.includes(t)) return t;
+  for (const [host, url] of hostToUrl) if (text.includes(host)) return url;
+  return null;
+}
+
+// Does the message name ANY host:port / host at all (ours or foreign)? Used to tell "a transport
+// failure that printed no address" (ours to name when all traffic crosses our gateway) apart from
+// "the gateway forwarded and the UPSTREAM refused" (the upstream's host is right there — never ours).
+const ANY_ADDRESS_RE = /(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?::\d+)?|localhost(?::\d+)?|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?/;
+function messageNamesAnyAddress(text) { return ANY_ADDRESS_RE.test(text); }
+
+function gatewayDeath(address, text) {
+  const code = GATEWAY_CODE_RE.exec(text)?.[1] || 'connection refused';
+  return {
+    kind: GATEWAY_UNREACHABLE_DEATH.kind,
+    signal: GATEWAY_UNREACHABLE_DEATH.signal,
+    message: `zeehive gateway unreachable at ${address} (${code})`,
+  };
+}
+
+// Is this a transport failure against OUR gateway? Pure, never throws.
+//   message  — the death sentence (last_stop_reason / a CLI's stderr tail).
+//   ctx      — { gatewayAddresses: ['http://host.docker.internal:4701', …],
+//               allTrafficIsGateway: bool } — the addresses OUR cages are given, and whether ALL
+//               of this zee's traffic crosses our gateway (a cxell CLI's does).
+// Returns the full classification (with a rewritten message naming the GATEWAY + address) or null
+// when the message is not a transport failure against our gateway. A message that names a FOREIGN
+// host is the gateway forwarding an UPSTREAM refusal — the gateway itself answered, so it is never
+// named OURS, however loudly the vendor's error reads.
+export function classifyGatewayUnreachable(message, { gatewayAddresses = [], allTrafficIsGateway = false } = {}) {
+  const text = String(message ?? '').trim();
+  if (!text || !GATEWAY_TRANSPORT_RE.test(text)) return null;
+  const addr = gatewayTokens(gatewayAddresses);
+  const address = mentionedGatewayAddress(text, addr);
+  if (address) return gatewayDeath(address, text);
+  // No OUR address in the text. A message that names SOME OTHER address is about a foreign host —
+  // the upstream the gateway forwarded to — not our door. Only an ADDRESSLESS transport failure
+  // from a zee whose traffic ALL crosses our gateway is ours to name.
+  if (messageNamesAnyAddress(text)) return null;
+  if (allTrafficIsGateway && gatewayAddresses[0]) return gatewayDeath(gatewayAddresses[0], text);
+  return null;
+}
+
 // A deliberate end the classifier was never meant to see (see the note at the top — the measured
 // 16). Anchored where the marker is a whole sentence, unanchored where it is a prefix a real reason
 // is built from. Matching these is what keeps a healthy finish or a manager's act from inflating
@@ -120,15 +209,21 @@ export const CAGE_RESTART_DEATH = Object.freeze({ kind: 'transient', signal: 'ca
 const TRANSIENT_CAUSE = {
   [HOST_RESTART_DEATH.signal]: 'the zeehive machine restarted under this turn',
   [CAGE_RESTART_DEATH.signal]: 'a human restarted this zee\'s cxell under this turn',
+  [GATEWAY_UNREACHABLE_DEATH.signal]: 'the zeehive gateway was unreachable at the address this cage was given',
 };
 
 // Classify the sentence a dead turn left behind (zee.last_stop_reason, a CLI's final result text, a
 // docker exec's stderr). Never throws; an empty message is UNKNOWN, not an error.
+// `ctx` (optional) is the gateway context passed by a caller that knows our gateway addresses
+// ({ gatewayAddresses, allTrafficIsGateway }) — a transport failure against OUR gateway is then
+// named OURS before the generic 'closed' rule gets to name it after the provider.
 // → { kind: 'transient' | 'terminal' | 'unknown' | 'none', signal, message }
-export function classifyTurnDeath(text) {
+export function classifyTurnDeath(text, ctx = {}) {
   const message = String(text ?? '').trim();
   if (!message) return { kind: 'unknown', signal: null, message: '' };
   if (NON_DEATH_RE.test(message)) return { kind: 'none', signal: NON_DEATH_SIGNAL, message };
+  const gatewayDeath = classifyGatewayUnreachable(message, ctx);
+  if (gatewayDeath) return gatewayDeath;
   for (const r of RULES) if (r.test.test(message)) return { kind: r.kind, signal: r.signal, message };
   return { kind: 'unknown', signal: null, message };
 }
@@ -143,14 +238,18 @@ export function classifyTurnDeath(text) {
 //   3. a recognised kill exit code (137 = SIGKILL, the OOM-killer's exit);
 //   4. the stderr tail, which may hold the provider sentence the message field lost.
 // Anything still unmatched stays UNKNOWN — the honest default, never a louder guess.
+// `gateway` (optional) is the gateway context from classifyTurnDeath, threaded through every layer
+// so the stderr tail — the layer that most often holds the vendor's bare transport sentence — is
+// still named OURS when it is a transport failure against our gateway.
 // → { kind, signal, message }
-export function classifyTurnDeathEx({ message = '', code = null, err = '', result = null } = {}) {
-  const fromMessage = classifyTurnDeath(message);
+export function classifyTurnDeathEx({ message = '', code = null, err = '', result = null, gateway = null } = {}) {
+  const ctx = gateway || undefined;
+  const fromMessage = classifyTurnDeath(message, ctx);
   if (fromMessage.kind !== 'unknown') return fromMessage;
 
   const structured = String(result?.error?.message || result?.error?.type || result?.subtype || '');
   if (structured) {
-    const fromStructured = classifyTurnDeath(structured);
+    const fromStructured = classifyTurnDeath(structured, ctx);
     if (fromStructured.kind !== 'unknown') return fromStructured;
   }
 
@@ -158,7 +257,7 @@ export function classifyTurnDeathEx({ message = '', code = null, err = '', resul
     return { kind: 'transient', signal: 'killed', message: String(message ?? '').trim() };
   }
 
-  const fromErr = classifyTurnDeath(err);
+  const fromErr = classifyTurnDeath(err, ctx);
   if (fromErr.kind !== 'unknown') return fromErr;
 
   return fromMessage;
