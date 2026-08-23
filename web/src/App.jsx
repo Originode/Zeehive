@@ -56,32 +56,10 @@ import WorkConsole from './work/WorkConsole.jsx';
 import { listWorkItems, deployWorkItem } from './work/workApi.js';
 import DeliveryTelemetry from './DeliveryTelemetry.jsx';
 import Toasts from './Toasts.jsx';
+// THE URL IS THE WORK-NODE PATH — /<project>/<child>/<child>. See web/src/route.js for the scheme.
+import { findProject, formatPath, legacyProjectParam, parsePath, pathSegments, resolveNodes } from './route.js';
 
 const PROJECT_KEY = 'zeehive.project';
-const PROJECT_PARAM = 'project';
-
-// Resolve a project from a URL token (?project=…), matched against either the id or the name
-// (case-insensitive), so a link/refresh lands on a specific project instead of "the first one".
-const findByToken = (ps, token) =>
-  token
-    ? ps.find((p) => p.id === token || p.name?.toLowerCase() === String(token).toLowerCase())
-    : null;
-
-const readProjectParam = () => {
-  try { return new URLSearchParams(window.location.search).get(PROJECT_PARAM); }
-  catch { return null; }
-};
-
-// Keep the URL in step with the selected project (its name — readable, and it survives a refresh)
-// WITHOUT adding history entries, so Back doesn't walk through every project you clicked.
-const writeProjectParam = (project) => {
-  try {
-    const url = new URL(window.location.href);
-    if (project?.name) url.searchParams.set(PROJECT_PARAM, project.name);
-    else url.searchParams.delete(PROJECT_PARAM);
-    window.history.replaceState(null, '', url);
-  } catch { /* history unavailable — non-fatal */ }
-};
 
 // Display only — the DB role is still 'webapp'. "App" is what the thing IS; "webapp" was naming
 // its delivery mechanism, which is the least interesting fact about it.
@@ -268,8 +246,16 @@ export default function App() {
   // children), where a child work_node is a hexagon — the assigned xell when it has one, a vacant
   // dashed seat when it does not — and drilling into a node makes IT the context every new prompt
   // is cut under (parent_work_item on the dispatch).
-  const [hiveMode, setHiveMode] = useState('projects');
+  // The URL IS this pair (route.js): `/` = the projects level, `/<project>/<child>/…` = 'nodes' at
+  // that depth. So both are seeded FROM the address on first paint — a refresh or a shared link
+  // restores the level you were on, which a `?project=` URL could never say.
+  const initialUrl = useRef(parsePath(typeof window === 'undefined' ? '/' : window.location.pathname));
+  const [hiveMode, setHiveMode] = useState(initialUrl.current.project ? 'nodes' : 'projects');
   const [nodePath, setNodePath] = useState([]);      // [{id,title}] from the project root downward
+  // Node segments from the address, held until the plan they name has actually loaded. The URL is
+  // read on the first frame; `workItems` arrives an HTTP round-trip later, and only then can a slug
+  // become a node. Also re-armed by popstate (Back/Forward) and by a project switch.
+  const pendingNodes = useRef(initialUrl.current.nodes);
   const [workItems, setWorkItems] = useState([]);    // the selected project's plan (flat, from /work-items)
   const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
@@ -732,15 +718,76 @@ export default function App() {
   useEffect(() => {
     getLogs().then((ls) => setLogs(ls));
     loadProjects().then((ps) => {
-      // URL param wins (a shared/refreshed link is explicit intent), then the last-used project
-      // from localStorage, and only then fall back to the first project we can see.
-      const fromUrl = findByToken(ps, readProjectParam());
+      // The URL wins (a shared/refreshed link is explicit intent) — the PATH first, then the legacy
+      // `?project=` an old bookmark may still carry — then the last-used project from localStorage,
+      // and only then the first project we can see.
+      const fromPath = findProject(ps, initialUrl.current.project);
+      const fromUrl = fromPath || findProject(ps, legacyProjectParam(window.location.search));
       const stored = localStorage.getItem(PROJECT_KEY);
       const picked = fromUrl || ps.find((p) => p.id === stored) || ps[0] || null;
       setProjectId(picked?.id || null);
-      writeProjectParam(picked);   // normalise the URL (fill it in, or fix an unknown token)
+      // An address that named a project — including the legacy param — is a request to be INSIDE
+      // it; a bare `/` is the projects level, and stays there whatever we resolved to load.
+      if (fromUrl) setHiveMode('nodes');
+      if (!fromPath) pendingNodes.current = [];   // a legacy link carries no node path
     });
   }, [loadProjects]);
+
+  // ── the URL ⇄ the level, both ways ───────────────────────────────────────────
+  // STATE → URL. One idempotent effect: whatever the console is showing, the address says it. The
+  // first write REPLACES (normalising `?project=x`, a stale node segment, or `/` into the address
+  // of what actually rendered — none of which a human navigated to), and every later change PUSHES,
+  // so Back walks the levels you drilled through. That is new: the `?project=` era deliberately
+  // never touched history, because walking back through a query param nobody could read was noise.
+  const urlNormalised = useRef(false);
+  useEffect(() => {
+    if (!projects.length) return;                       // nothing resolved yet — don't write a guess
+    const name = projects.find((p) => p.id === projectId)?.name || null;
+    const want = formatPath({
+      project: hiveMode === 'nodes' ? name : null,
+      nodes: hiveMode === 'nodes' ? pathSegments(workItems, nodePath) : [],
+    });
+    // Unresolved segments are still in flight (the plan has not loaded) — leave the address alone
+    // rather than truncating a deep link the moment it is opened.
+    if (pendingNodes.current.length && hiveMode === 'nodes') return;
+    const here = window.location.pathname + window.location.search;
+    if (here === want) return;
+    try {
+      if (urlNormalised.current) window.history.pushState(null, '', want);
+      else window.history.replaceState(null, '', want);
+    } catch { /* history unavailable — non-fatal */ }
+    urlNormalised.current = true;
+  }, [projects, projectId, hiveMode, nodePath, workItems]);
+
+  // URL → STATE, for Back/Forward only. Re-arms the same pending-slug resolution the first paint
+  // uses, so stepping back into a deep level works even when that project's plan must reload.
+  useEffect(() => {
+    const onPop = () => {
+      const at = parsePath(window.location.pathname);
+      const p = findProject(projectsRef.current, at.project);
+      pendingNodes.current = at.nodes;
+      setHiveMode(at.project ? 'nodes' : 'projects');
+      if (!at.nodes.length) setNodePath([]);
+      if (p && p.id !== projectId) {
+        setProjectId(p.id);
+        localStorage.setItem(PROJECT_KEY, p.id);
+        setWorkItems([]);
+      }
+      setExpandedId(null);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [projectId]);
+
+  // The plan has arrived — turn the address's slugs into the nodePath they name. A segment that no
+  // longer resolves (the node was deleted, or renamed since the link was made) lands on the longest
+  // valid prefix, and the effect above then rewrites the address to what is actually on screen.
+  useEffect(() => {
+    if (!pendingNodes.current.length || !workItems.length) return;
+    const { nodes } = resolveNodes(workItems, pendingNodes.current);
+    pendingNodes.current = [];
+    setNodePath(nodes);
+  }, [workItems]);
 
   // (re)load the selected project's data + subscribe to its live stream. Re-runs when the
   // selected project changes (projectId may be null on first paint → server uses the default).
@@ -774,11 +821,14 @@ export default function App() {
   const selectProject = useCallback((id) => {
     setProjectId(id);
     localStorage.setItem(PROJECT_KEY, id);
-    writeProjectParam(projectsRef.current.find((p) => p.id === id));
-    // a project switch lands at ITS root level — the previous project's node path means nothing here
+    // a project switch lands at ITS root level — the previous project's node path means nothing
+    // here, and neither does an address still holding that project's segments
+    pendingNodes.current = [];
     setHiveMode('nodes');
     setNodePath([]);
     setWorkItems([]);
+    // …the URL follows from that state, in the sync effect above — one writer, so a switch, a drill
+    // and a Back all produce the address the same way.
   }, []);
 
   const handleCreate = useCallback(async (body) => {
@@ -795,7 +845,9 @@ export default function App() {
       const next = nextProject?.id || null;
       setProjectId(next);
       if (next) localStorage.setItem(PROJECT_KEY, next); else localStorage.removeItem(PROJECT_KEY);
-      writeProjectParam(nextProject);
+      pendingNodes.current = [];
+      setNodePath([]);
+      if (!next) setHiveMode('projects');   // nothing left to be inside — the address is `/`
     }
     return r;
   }, [loadProjects, projectId]);
@@ -1380,8 +1432,11 @@ export default function App() {
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided in the composer
               (or by the router on a router-gated fleet), opened from the single "+ prompt" button. */}
-          {/* The phone-first mobile chat UI (/m) — a same-tab switch, preserving the project. */}
-          <a className="cs-mobile" href={`./m?project=${encodeURIComponent(project.name)}`}
+          {/* The phone-first mobile chat UI — a same-tab switch to the SAME address under /m, so the
+              project (and the node path you are on) survive the hop: /a/b/c → /m/a/b/c. */}
+          <a className="cs-mobile"
+             href={formatPath({ mobile: true, project: project.name,
+                                nodes: pathSegments(workItems, nodePath) })}
              title="Open the phone-first mobile chat UI">📱 Mobile</a>
           {/* Console settings (browser-local): terminal engine xterm↔wterm, etc. Not project setup. */}
           <button type="button" className="cs-gear" data-testid="console-settings-btn"

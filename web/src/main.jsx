@@ -24,7 +24,8 @@ window.fetch = (input, init) =>
 // FileViewerHost is the same shape again: the terminal's file explorer opens a file with
 // showFileViewer(...), which the root-mounted host routes by file type to the right viewer.
 //
-// The MOBILE CHAT UI lives at /m (http://<webapp>:<port>/m?project=<name>). It is a phone-first
+// The MOBILE CHAT UI lives under /m (http://<webapp>:<port>/m/<project>/…, mirroring the console's
+// own work-node path — web/src/route.js is the one authority for both). It is a phone-first
 // sibling of the console: one box per xell, a prompt button to deploy zees, and a per-xell detail
 // screen with observability + chat + a deep-linked terminal. It is a pure pathname split — the
 // server already SPA-falls-back every non-asset path to index.html (nginx try_files / vite), so no
