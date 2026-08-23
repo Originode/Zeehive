@@ -24,7 +24,7 @@ import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { startPreviewPorts } from './lib/preview-ports.js';
 import { attachStreamWebSocket } from './lib/stream.js';
-import { gatewayProxy, gatewayHello, GATEWAY_PORT, verifyGatewayReachable } from './lib/gateway.js';
+import { gatewayProxy, gatewayHello, gatewayHealth, GATEWAY_PORT, verifyGatewayReachable } from './lib/gateway.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -265,6 +265,10 @@ if (config.gatewayPort !== config.port) {
   // express mounts a wildcard; gatewayProxy parses the identity/provider from req.url.
   gatewayApp.get('/api/hello', gatewayHello);
   gatewayApp.head('/api/hello', gatewayHello);
+  // The gateway's SIGNATURE route — the reachability probe's identification half. Tiny, no auth,
+  // no provider path: it exists so the probe can tell "the port serves a server" apart from "the
+  // port serves OUR gateway", without ever turning an answering address into a refusal.
+  gatewayApp.get('/_gw/health', gatewayHealth);
   gatewayApp.all('/x/*', gatewayProxy);
   gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: expected /x/<xell-token>/<provider>/v1/…' }));
   const gatewayServer = gatewayApp.listen(GATEWAY_PORT, '0.0.0.0', () => {

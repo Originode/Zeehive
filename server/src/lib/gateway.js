@@ -672,6 +672,17 @@ export function gatewayHello(_req, res) {
   return res.status(200).json({ ok: true, service: 'zeehive-llm-gateway' });
 }
 
+// THE GATEWAY'S SIGNATURE ROUTE — a tiny unauthenticated GET that names the service and its port.
+// The reachability probe (probeGatewayBase) hits this in ADDITION to /api/hello, so an answering
+// address that is NOT our gateway (a foreign service sitting on the port) can be told apart from a
+// working gateway. It is IDENTIFICATION, never a reachability gate: an answering address that does
+// not identify as ours stays REACHABLE and is minted — this route only feeds the "answered but did
+// not identify" once-per-address log line. No auth, no DB, no provider path — it never touches
+// /x/* routing.
+export function gatewayHealth(_req, res) {
+  return res.status(200).json({ service: 'zeehive-llm-gateway', port: GATEWAY_PORT });
+}
+
 // Resolve the upstream for a request: which provider URL + credential. Returns
 // { provider, upstreamUrl, token, kind, accountId, accountLabel } or null when the caller is
 // not a known xell / the project has no account for the provider.
@@ -1041,8 +1052,9 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 }
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayFallbackBaseUrl, probeGatewayBase,
-                 invalidateGatewayProbe, _resetGatewayProbeCache, chooseGatewayBaseUrl,
-                 verifyGatewayReachable, gatewayProxy, gatewayHello, requestsForXell,
+                 invalidateGatewayProbe, gatewayIdentified, _resetGatewayProbeCache,
+                 chooseGatewayBaseUrl, verifyGatewayReachable, gatewayProxy, gatewayHello,
+                 gatewayHealth, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
                  classifyResponseText,
                  extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
@@ -1120,12 +1132,15 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayFallbackBaseUrl, probeGate
 const PROBE_TIMEOUT_MS = Number(process.env.GATEWAY_PROBE_TIMEOUT_MS || 2000);
 const PROBE_TTL_OK_MS = Number(process.env.GATEWAY_PROBE_TTL_OK_MS || 30000);
 const PROBE_TTL_FAIL_MS = Number(process.env.GATEWAY_PROBE_TTL_FAIL_MS || 3000);
-const probeCache = new Map();   // baseUrl → { ok, at }
+const probeCache = new Map();   // baseUrl → { ok, identified, at }
 // Single-flight: a COLD cache (or one whose TTL just expired) can be hit by N concurrent dispatches
 // at once — a fleet of spawns arriving together all fired their own probe, N requests against an
 // already-suspect port (TKT-179). The first caller starts the probe; the rest await the same
 // in-flight promise instead of each firing one. The slot is deleted when the probe settles.
 const probeInFlight = new Map();   // baseUrl → Promise<boolean>
+// The once-per-process "answered but did not identify as our gateway" warning — one line per
+// address, however many mints hit it.
+const loggedUnidentified = new Set();
 
 // TEST-ONLY: clear the probe verdict cache (+ the once-only "no second name" warning). The
 // standalone choose/refuse test drives the same module across scenarios (primary → fallback →
@@ -1133,6 +1148,7 @@ const probeInFlight = new Map();   // baseUrl → Promise<boolean>
 export function _resetGatewayProbeCache() {
   probeCache.clear();
   probeInFlight.clear();
+  loggedUnidentified.clear();
   loggedEqualFallback = false;
 }
 
@@ -1145,6 +1161,7 @@ export async function probeGatewayBase(baseUrl) {
   if (inFlight) return inFlight;
   const started = (async () => {
     let verdict = false;
+    let identified = false;
     try {
       const res = await fetch(`${baseUrl}/api/hello`, {
         method: 'GET',
@@ -1155,13 +1172,45 @@ export async function probeGatewayBase(baseUrl) {
       // the compose-name /api/hello is reachable (measured). Only the connection-failure family
       // (refused / ENOTFOUND / timeout) fails the probe.
       verdict = true;
+      // IDENTIFICATION — a second, best-effort probe against the gateway's signature route. It is
+      // NOT a reachability gate: an address that answers /api/hello but not /_gw/health stays
+      // REACHABLE and is minted. It only records whether the answering server is OUR gateway, so
+      // the mint can say once "this port serves a server, but it is not the zeehive gateway".
+      try {
+        const idRes = await fetch(`${baseUrl}/_gw/health`, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+        });
+        const body = await idRes.json().catch(() => null);
+        identified = !!(body && body.service === 'zeehive-llm-gateway');
+      } catch { /* identification failure stays unidentified — reachability already decided */ }
     } catch { /* connection refused / timeout / DNS — verdict stays false */ }
-    probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
+    probeCache.set(baseUrl, { ok: verdict, identified, at: Date.now() });
     return verdict;
   })();
   probeInFlight.set(baseUrl, started);
   started.finally(() => probeInFlight.delete(baseUrl));
   return started;
+}
+
+// Was the last probe of this base IDENTIFIED as OUR gateway (it answered /_gw/health with our
+// signature)? True when it is, false when it answered /api/hello but not the signature route, null
+// when the address was never probed (no cached verdict). Reachability is unchanged — this is only
+// the "what is actually answering?" detail behind the once-per-address warning.
+export function gatewayIdentified(baseUrl) {
+  return probeCache.get(baseUrl)?.identified ?? null;
+}
+
+// Say ONCE, per address per process, that the minted gateway address answered but did not identify
+// as our gateway. The address is REACHABLE and IS minted — the port just serves a server that is
+// not the zeehive LLM gateway. Never throws.
+function maybeLogUnidentified(baseUrl) {
+  if (!baseUrl || gatewayIdentified(baseUrl)) return;
+  if (loggedUnidentified.has(baseUrl)) return;
+  loggedUnidentified.add(baseUrl);
+  logline('gateway', `WARNING: gateway address ${baseUrl} answered but did not identify as our gateway — `
+    + 'the port serves a server, but it is not the zeehive LLM gateway. The address is still reachable and minted.');
 }
 
 // A gateway that DIED right after a good probe would keep being minted for the OK verdict's whole
@@ -1199,13 +1248,17 @@ export async function chooseGatewayBaseUrl() {
   }
   if (await probeGatewayBase(primary)) {
     lastFallbackProbeLogged = null;   // the primary answered — a later fallback is a NEW episode, say it loud
+    maybeLogUnidentified(primary);
     return primary;
   }
   if (lastFallbackProbeLogged !== fallback) {
     lastFallbackProbeLogged = fallback;
     logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
   }
-  if (await probeGatewayBase(fallback)) return fallback;
+  if (await probeGatewayBase(fallback)) {
+    maybeLogUnidentified(fallback);
+    return fallback;
+  }
   lastFallbackProbeLogged = null;     // both refused — the throw below is the loud word; a recovery is a new episode
   throw new Error(
     `LLM gateway unreachable: neither ${primary} nor ${fallback} answers /api/hello. `

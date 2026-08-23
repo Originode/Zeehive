@@ -52,7 +52,9 @@ try {
   process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;   // SAME host as the base → the no-second-name trap
   process.env.GATEWAY_PORT = String(P);
   const { gatewayBaseUrl, gatewayFallbackBaseUrl, chooseGatewayBaseUrl, gatewayEnv,
-          gatewayEnvForBase, probeGatewayBase, invalidateGatewayProbe, _resetGatewayProbeCache } = await import('../server/src/lib/gateway.js');
+          gatewayEnvForBase, probeGatewayBase, invalidateGatewayProbe, gatewayIdentified,
+          _resetGatewayProbeCache } = await import('../server/src/lib/gateway.js');
+  const { recentLogs } = await import('../server/src/lib/logbus.js');
 
   console.log('\n── 1. primary and fallback are derived, and the equal-default trap is real ──');
   eq(gatewayBaseUrl(), `http://127.0.0.1:${P}`, 'primary = CXELL_API_BASE host + GATEWAY_PORT');
@@ -185,6 +187,61 @@ try {
   eq(inv.hits.count, 2, 'invalidateGatewayProbe forced a SECOND real probe, not a stale cached verdict');
   invalidateGatewayProbe('http://never-probed:1');   // unknown address — must be a no-op, not a throw
   await close(inv.server);
+
+  console.log('\n── 10. IDENTIFICATION — an answering server that is NOT our gateway stays minted, and says so once ──');
+  // TKT-179: ANY HTTP answer = reachable, and the probe must NOT turn an answering address into a
+  // refusal. ON TOP of that the gateway answers a tiny unauthenticated signature route
+  // (GET /_gw/health, {service:'zeehive-llm-gateway', port}) so a mint can tell "the port serves OUR
+  // gateway" from "the port serves SOME server". An unidentified-but-answering address stays
+  // REACHABLE and IS minted — the probe only logs ONCE per address, naming it, saying it answered
+  // but did not identify as the zeehive LLM gateway.
+  _resetGatewayProbeCache();
+
+  // (a) answers /api/hello but NOT the signature route → REACHABLE, unidentified, still minted, warning names it.
+  const anon = await mockGateway('127.0.0.1');   // _gw/health falls into the 404 else branch
+  const AN = anon.port;
+  process.env.CXELL_API_BASE = `http://127.0.0.1:${AN}`;
+  process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;
+  process.env.GATEWAY_PORT = String(AN);
+  const anonBase = `http://127.0.0.1:${AN}`;
+  eq(await probeGatewayBase(anonBase), true, 'an address that answers /api/hello but not /_gw/health is still REACHABLE');
+  eq(gatewayIdentified(anonBase), false, 'and it is recorded unidentified (answered, but not OUR gateway)');
+  const anonEnv = await gatewayEnv({ xellToken: 'tok' });
+  eq(anonEnv.ANTHROPIC_BASE_URL, `http://127.0.0.1:${AN}/x/tok/claude`, 'the unidentified-but-answering base is STILL MINTED');
+  const warns = recentLogs().filter((l) => l.scope === 'gateway' && /did not identify as our gateway/.test(l.msg));
+  ok(warns.length >= 1 && warns.some((l) => l.msg.includes(anonBase)),
+     `the warning NAMES the unidentified address once (${JSON.stringify(warns.map((l) => l.msg).slice(-1)[0] || '(none)')})`);
+  await close(anon.server);
+
+  // (b) a REAL gateway (answers the signature route) → identified TRUE, no warning at all.
+  _resetGatewayProbeCache();
+  const realHits = { count: 0 };
+  const realGw = http.createServer((req, res) => {
+    realHits.count++;
+    if (req.url === '/api/hello') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+    } else if (req.url === '/_gw/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ service: 'zeehive-llm-gateway', port: 0 }));
+    } else {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":"not the gateway"}');
+    }
+  });
+  servers.push(realGw);
+  const RG = await new Promise((resolve) => realGw.listen(0, '127.0.0.1', () => resolve(realGw.address().port)));
+  process.env.CXELL_API_BASE = `http://127.0.0.1:${RG}`;
+  process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;
+  process.env.GATEWAY_PORT = String(RG);
+  const rgBase = `http://127.0.0.1:${RG}`;
+  eq(await probeGatewayBase(rgBase), true, 'the real gateway is reachable');
+  eq(gatewayIdentified(rgBase), true, 'and IDENTIFIED as OUR gateway via /_gw/health');
+  const realEnv = await gatewayEnv({ xellToken: 'tok' });
+  eq(realEnv.ANTHROPIC_BASE_URL, `http://127.0.0.1:${RG}/x/tok/claude`, 'the identified gateway is minted normally');
+  const warnsAfter = recentLogs().filter((l) => l.scope === 'gateway' && /did not identify as our gateway/.test(l.msg) && l.msg.includes(rgBase));
+  eq(warnsAfter.length, 0, 'an IDENTIFIED gateway logs NO unidentified warning');
+  await close(realGw);
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
