@@ -12,12 +12,9 @@
 // with NO network at read time. Never a new poller, never a request on the fleet read, never able
 // to fail an AI call or a page render: the probe is best-effort, bounded, and a failure just
 // records 'down' — it cannot throw out of the container tick.
-import { gatewayBaseUrl } from '../lib/gateway.js';
+import { gatewayBaseUrl, chooseGatewayBaseUrl } from '../lib/gateway.js';
 import { config } from '../config.js';
 import { logline } from '../lib/logbus.js';
-
-// Bounded so a hung host can delay the container tick by at most this long, never forever.
-const PROBE_TIMEOUT_MS = 3000;
 
 // The in-memory cache. `state` is 'ok' | 'down' | 'unknown'; 'unknown' is the honest default until
 // the monitor has ticked at least once. `address` is the address probed (the cage-facing one).
@@ -61,34 +58,33 @@ export async function probeGatewayHealth() {
     return gatewayHealth();
   }
   cache.address = address;
-  const url = `${address}/api/hello`;
   const t0 = Date.now();
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-    // ANY HTTP answer proves the door answers — reachable. The service check is a detail, not the
-    // verdict: the fleet-health surface must never say "unreachable" while the mint probe says
-    // reachable (that contradiction is exactly the 2026-08-22 blind spot in reverse).
-    const body = await res.json().catch(() => null);
-    const gatewayHello = body?.service === 'zeehive-llm-gateway';
+    // THE MINT'S OWN DECISION — the address cages are ACTUALLY given. chooseGatewayBaseUrl probes
+    // primary (host.docker.internal:<port>) THEN fallback (zeehive_server:<port>) and returns the
+    // FIRST that answers /api/hello — the exact base-url gatewayEnv() mints into every cage. Any
+    // HTTP answer (a 404 included) is reachable, matching the landed probe (7287cd3). This is the
+    // only way the health surface can never contradict the address cages are given: today primary
+    // REFUSES while fallback answers 404, so a probe that only checks the primary would cry
+    // "unreachable at host.docker.internal" while every cage was minted with the fallback that works.
+    const chosen = await chooseGatewayBaseUrl();
     cache.state = 'ok';
-    cache.error = gatewayHello ? null : `HTTP ${res.status} (${body?.service ? 'not the gateway' : 'not the gateway hello'})`;
+    cache.address = chosen;
+    cache.error = null;
     cache.code = null;
   } catch (e) {
-    // node's fetch wraps the connect error in `cause` ("fetch failed" ← cause.message
-    // "connect ECONNREFUSED 127.0.0.1:4701") — unwrap it so the console says WHY, not just "failed".
-    const cause = e?.cause?.message || e?.cause || '';
-    const detail = String(cause && cause !== e?.message ? `${e?.message}: ${cause}` : (e?.message || 'connection failed')).slice(0, 120);
+    // chooseGatewayBaseUrl throws ONLY when NEITHER address answers — its refusal sentence names
+    // both ("LLM gateway unreachable: neither <a> nor <b> answers /api/hello …"), which is exactly
+    // what a human needs to read. cache.address stays the primary (set above) so the chip names one
+    // address even when down; the full sentence is in error.
     cache.state = 'down';
-    cache.error = detail;
-    cache.code = /ECONNREFUSED/i.test(detail) ? 'ECONNREFUSED'
-      : /ENOTFOUND/i.test(detail) ? 'ENOTFOUND'
-      : /ETIMEDOUT/i.test(detail) ? 'ETIMEDOUT'
-      : /EAI_AGAIN/i.test(detail) ? 'EAI_AGAIN' : null;
+    cache.error = String(e?.message || 'gateway unreachable').slice(0, 200);
+    cache.code = null;
   }
   cache.at = new Date().toISOString();
   // Say it when it CHANGES, not every 30s — the same change-only discipline as the docker health
   // line, so a healthy gateway is not noise in a shared terminal.
-  const line = `gateway health: ${cache.state} at ${address}${cache.error ? ` (${cache.error})` : ''} (${Date.now() - t0}ms)`;
+  const line = `gateway health: ${cache.state} at ${cache.address || address}${cache.error ? ` (${cache.error})` : ''} (${Date.now() - t0}ms)`;
   if (line !== lastLine) { lastLine = line; logline('gateway', line); }
   return gatewayHealth();
 }
