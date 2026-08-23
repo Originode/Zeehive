@@ -1,4 +1,13 @@
-# CLAUDE.md — start here
+-- OPTION B (docs/entry-point-doc-source.md): project_doc.body is the SINGLE source of truth,
+-- and a committed entry-point file (CLAUDE.md/AGENTS.md) is a GENERATED ARTEFACT the queenzee
+-- supersedes in every xell (written over, git-excluded, skip-worktree'd). This migration carries the
+-- row from the Option A text (which said the committed file wins and the row is a projection) to the
+-- Option B text: the row is the source, and content changes go through the Docs tab or a migration.
+--
+-- Idempotent (it sets a known text). A database with no zeehive project_doc row is a no-op, correctly:
+-- with no row, lib/project-docs.js generates nothing, so there is no source to reconcile.
+UPDATE project_doc
+   SET body = $doc$# CLAUDE.md — start here
 
 **ZEEHIVE** is a deterministic agent-environment orchestrator: it cuts isolated environments
 (**xells**), runs agents (**zees**) inside caged containers (**cxells**), and puts a human gate in
@@ -215,3 +224,7 @@ it. But it was written for a **host** session on one Windows machine in an earli
 and zees have repeatedly read it as their orientation and gone chasing paths, containers and verbs
 that do not exist here. **This file is your orientation; HANDOFF.md is background reading.** Anything
 in it that names a drive letter, a docker context or a machine is history — check before you trust.
+$doc$,
+       updated_at = now()
+ WHERE project_id = (SELECT id FROM project WHERE lower(name) = 'zeehive' ORDER BY created_at LIMIT 1)
+   AND cardinality(targets) > 0;

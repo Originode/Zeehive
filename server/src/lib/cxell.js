@@ -2127,19 +2127,39 @@ export async function writeFileIntoCxellIfChanged({ ctx = 'default', slug, relPa
   return { changed: r.verdict === 'WROTE', path: full, rel: safe, exit_code: r.code };
 }
 
-// Write a GENERATED file into a cxell — but never over a git-TRACKED path.
+// Write a GENERATED file into a cxell — over a git-tracked path ONLY when the caller says the path is
+// one the meta-DB owns (project_doc rows / harness files), and never over an unrelated tracked one.
 //
 // This is the injector for the project entry-point docs (lib/project-docs.js): markdown the meta-DB
 // owns and the queenzee materializes into a xell, exactly like the harness files. The difference is
-// WHERE they land — a repo-relative path like AGENTS.md, which the project itself may already have
-// committed. Writing over that would replace the project's own instructions with an operator's, dirty
-// the worktree of every xell, and put a file nobody wrote into a landing diff for a human to approve.
+// WHERE they land — a repo-relative path like CLAUDE.md/AGENTS.md, which the project itself may have
+// committed. Writing over that used to be refused outright (house rule 11), which is exactly why the
+// generated docs were ALWAYS skipped in this repo: CLAUDE.md is committed, so the row's text never
+// landed. Option B (docs/entry-point-doc-source.md) reverses that: the ROW is the single source and
+// the committed file is the generated copy, so a tracked entry-point path the meta-DB owns is now
+// superseded — written over, git-excluded, and skip-worktree'd so it can never dirty a landing diff.
 //
-// So git decides, inside the cage, in the same exec that would do the writing: tracked → nothing is
-// written and the caller is told why; untracked → written AND added to .git/info/exclude, so the
-// artefact can never travel into a commit either. The payload is buffered to a temp file first so the
-// decision cannot half-happen (and so a skip does not break the pipe mid-write).
-export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000 }) {
+// An UNRELATED tracked path (a file no project_doc row claims — README.md, a project's own source)
+// stays protected exactly as before: writing over that would still replace the project's own work with
+// an operator's. The caller owns the exemption by passing `overwriteTracked:true`; default is the old
+// refusal, so no caller silently gains clobber power.
+//
+// So git decides, inside the cage, in the same exec that would do the writing:
+//   tracked + !overwriteTracked → nothing is written, caller is told why (TRACKED);
+//   tracked +  overwriteTracked → written, added to .git/info/exclude, and skip-worktree so the
+//                                 superseded committed copy can never surface in a diff (WROTE_TRACKED);
+//   untracked                   → written AND added to .git/info/exclude (WROTE, unchanged).
+//
+// Why skip-worktree on a tracked path AND the exclude line? The exclude line is what keeps a FRESH
+// write from showing up; skip-worktree is what keeps the SUPERSEDED index entry from showing up as a
+// deletion the moment a landing diff or `git add -A` runs. `git rm --cached` would also silence it but
+// rewrites the index in a way that makes a later `zee sync` merge against the file noisier; the
+// skip-bit is the lighter touch and it is what keeps the xell's working tree honest for the zee.
+//
+// The payload is buffered to a temp file first so the decision cannot half-happen (and so a skip does
+// not break the pipe mid-write).
+export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000,
+                                                   overwriteTracked = false } = {}) {
   const name = cxellName(slug);
   const safe = String(relPath).replace(/\\/g, '/').split('/')
     .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
@@ -2151,22 +2171,39 @@ export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPat
     `P=${sq(safe)}`,
     'tmp="$(mktemp)"',
     'cat > "$tmp"',
-    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
+    'T=0',
+    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then T=1; fi',
+    // OVERWRITE_TRACKED is injected by THIS docker exec (-e below) from the caller's flag — never
+    // read from the cage's own env. A zee cannot widen its own doc writes; the default when the flag
+    // is absent (or a caller forgets to pass it) is 0, i.e. the old protected behaviour.
+    'if [ "$T" = 1 ] && [ "${OVERWRITE_TRACKED:-0}" != 1 ]; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
     'mkdir -p "$(dirname "$P")"',
     'mv "$tmp" "$P"',
     'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
-    'echo WROTE',
+    // skip-worktree: the file was tracked and is now superseded — without this, the index entry would
+    // read as a staged DELETION in every landing diff (`git add -A` sweeps it in). The skip-bit keeps
+    // the superseded committed copy invisible while leaving the index entry in place for `zee sync`.
+    'if [ "$T" = 1 ]; then git update-index --skip-worktree -- "$P" >/dev/null 2>&1 || true; echo WROTE_TRACKED; else echo WROTE; fi',
   ].join('\n');
   // Through dkVerdict, like every other exec that states its own outcome. This site is where the
   // verdict was read as `String(await dk(...))` — '[object Object]', matching nothing — so every doc
   // the container really DID write was reported as skipped: the write worked and the report lied. The
   // helper hands back a STRING there is no object to stringify by accident.
-  const r = await dkVerdict(ctx, ['exec', '-i', name, 'bash', '-lc', script],
-                            { markers: ['WROTE', 'TRACKED'], label: `${name}: ${safe}`,
+  const args = ['exec', '-i', name, 'bash', '-lc', script];
+  // The -e goes into the docker exec, so the SCRIPT is one text for both modes — the caller's flag
+  // only decides which value the exec injects. This keeps the guard-testable script (test
+  // project-docs.test.mjs §3 reads it out of the source) identical for protected and supersede runs.
+  args.splice(2, 0, '-e', `OVERWRITE_TRACKED=${overwriteTracked ? '1' : '0'}`);
+  const r = await dkVerdict(ctx, args,
+                            { markers: ['WROTE', 'WROTE_TRACKED', 'TRACKED'], label: `${name}: ${safe}`,
                               input: String(text ?? ''), timeoutMs });
   if (r.verdict === 'TRACKED') {
     return { written: false, skipped: 'tracked', rel: safe,
-      reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
+      reason: `${safe} is tracked by git in this xell and no project doc row owns it — the project's own committed copy is left alone` };
+  }
+  if (r.verdict === 'WROTE_TRACKED') {
+    return { written: true, superseded: true, rel: safe, path: `/work/repo/${safe}`,
+      reason: `${safe} was committed in this repo; the meta-DB row now owns it, so the committed copy is superseded and git-excluded` };
   }
   if (r.verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
   // No verdict AND a failed exec: the container never got to speak (no such container, the script died

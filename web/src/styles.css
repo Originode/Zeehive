@@ -813,7 +813,10 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .mx-head.off { opacity: .45; }
 .mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
-.mx-name { display: flex; align-items: center; gap: 6px; }
+/* The header packs up to six items (name, ＋prod, conn, build-ready, bootstrap, ✕) into a
+   minmax(120px,1fr) column — they must WRAP: unwrapped nowrap buttons cannot shrink, and the
+   overflow paints straight over the neighbouring machine's column. */
+.mx-name { display: flex; align-items: center; gap: 3px 6px; flex-wrap: wrap; }
 .mx-name b { font-size: 13px; }
 /* the per-machine connection probe (Deploy tab) — one button that is also the verdict */
 .mx-conn { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
@@ -2738,6 +2741,11 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   background: var(--panel2); border-right: 1px solid var(--line); border-radius: 10px 0 0 0; }
 .work-mhead .work-col-h { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line);
   border-bottom: 0; background: var(--panel); }
+.work-col-actions { display: inline-flex; align-items: center; gap: 6px; }
+.work-col-hide { flex: 0 0 auto; background: none; border: 0; color: var(--accent); cursor: pointer;
+  font-size: 11px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
+.work-col-hide:hover { color: var(--text); background: var(--panel2); }
+.work-col-hide.off { color: var(--muted); opacity: .7; }
 .work-mbody { display: flex; flex-direction: column; border: 1px solid var(--line);
   border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden; }
 
@@ -2760,6 +2768,20 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-row-count { color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
   display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
 .work-row-count b { color: var(--text); font-size: 13px; }
+
+/* a HIDDEN column's per-row summary card: one per swimlane row band at every depth, reading as a
+   count of every leaf under that row with that status. A button so it opens the row's drawer like
+   the row title does. */
+.work-col-summary { display: inline-flex; align-items: baseline; gap: 5px; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 5px 9px; color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
+  white-space: nowrap; max-width: 100%; }
+.work-col-summary b { color: var(--text); font-size: 14px; line-height: 1; }
+.work-col-summary:hover { border-color: var(--accent); }
+
+/* the leaf-pack / leaf / tail lanes of a hidden column: no cards, no drop targets — a quiet empty
+   strip that keeps the matrix columns aligned. */
+.work-row-lane.is-hidden { background: color-mix(in srgb, var(--muted) 3%, transparent); }
 
 /* a COLLAPSED row still occupies its full-width lane strip; tint the ONE lane that is its own
    status so where the row stands reads at a glance. The tint is `--st` — the same status colour
