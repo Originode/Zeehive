@@ -37,6 +37,14 @@ export function gatewayHealth() {
 // throws — it hangs off the container health tick, and a probe failure must not fail that tick.
 // The gateway answers `GET <base>/api/hello` with { ok: true, service: 'zeehive-llm-gateway' }
 // (lib/gateway.js gatewayHello) — the same probe the CLIs themselves send before their first POST.
+//
+// REACH = ANY HTTP ANSWER, matching the address-mint probe's landed definition (gateway.js
+// probeGatewayBase, 7287cd3): a 404 on /api/hello is PROOF the port resolves and a server answers,
+// which is exactly what a provider CLI needs to reach the gateway — so it is NOT the outage shape.
+// The outage shape is the connection-failure family (refused / ENOTFOUND / timeout / no server at
+// all), and that is what the console calls "unreachable". The service-body check is a BONUS detail
+// recorded on the snapshot (so a non-gateway answer is discoverable), never a reason to flip to
+// 'down' — a wrong server is a different problem, not a dead address.
 export async function probeGatewayHealth() {
   // When the gateway shares the API port there IS no separate door (lib/gateway.js gatewayEnv
   // returns {} and index.js never mounts the gateway listener) — nothing to probe, so stay honest:
@@ -57,11 +65,14 @@ export async function probeGatewayHealth() {
   const t0 = Date.now();
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+    // ANY HTTP answer proves the door answers — reachable. The service check is a detail, not the
+    // verdict: the fleet-health surface must never say "unreachable" while the mint probe says
+    // reachable (that contradiction is exactly the 2026-08-22 blind spot in reverse).
     const body = await res.json().catch(() => null);
-    const ok = res.ok && body?.service === 'zeehive-llm-gateway';
-    cache.state = ok ? 'ok' : 'down';
-    cache.error = ok ? null : `HTTP ${res.status}`;
-    cache.code = ok ? null : null;
+    const gatewayHello = body?.service === 'zeehive-llm-gateway';
+    cache.state = 'ok';
+    cache.error = gatewayHello ? null : `HTTP ${res.status} (${body?.service ? 'not the gateway' : 'not the gateway hello'})`;
+    cache.code = null;
   } catch (e) {
     // node's fetch wraps the connect error in `cause` ("fetch failed" ← cause.message
     // "connect ECONNREFUSED 127.0.0.1:4701") — unwrap it so the console says WHY, not just "failed".

@@ -33,10 +33,17 @@ export function gatewayHealthWord(g) {
           + 'provider base-urls at this gateway, so no AI call can reach a provider until it answers.',
     };
   }
-  // 'ok'
+  // 'ok' — ANY HTTP answer proves the door answers (the reachability definition the address-mint
+  // probe landed: a 404 on /api/hello is reachable, only the connection-failure family is down).
+  // A non-gateway answer still says 'ok' (the port serves — the outage shape is not present) but
+  // the caveat rides the tooltip so a wrong server is discoverable, not hidden.
   return {
     kind: 'gateway_ok',
     chip: `gateway ok${where}`,
-    why: 'The LLM gateway answers at the address cages are given.',
+    why: g.error
+      ? `The gateway door answers at ${addr} — reachable — but its hello route answered "${g.error}" `
+        + 'rather than the zeehive gateway service. Verify this address actually serves the gateway '
+        + 'routes before trusting it for provider calls.'
+      : 'The LLM gateway answers at the address cages are given.',
   };
 }

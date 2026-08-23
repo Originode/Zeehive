@@ -40,6 +40,14 @@ ok(okState.chip.includes('ok') && !okState.chip.includes('⚠') && !okState.chip
    'the word says ok, with no alarm');
 ok(okState.chip.includes('http://host.docker.internal:4701'), 'and still names the address it answers at');
 
+// a 404 answer is REACHABLE (the landed address-mint definition) — the chip says ok, never
+// "unreachable"; the caveat rides the tooltip so a wrong server is discoverable, not hidden.
+const okCaveat = gatewayHealthWord({ state: 'ok', address: 'http://zeehive_server:4701', error: 'HTTP 404 (not the gateway hello)' });
+ok(okCaveat.kind === 'gateway_ok' && !okCaveat.chip.includes('unreachable') && !okCaveat.chip.includes('⚠'),
+   'a 404-answering address is REACHABLE — the chip says ok, not unreachable');
+ok(okCaveat.chip.includes('http://zeehive_server:4701'), 'and names the address it answers at');
+ok(okCaveat.why.includes('HTTP 404'), 'while the tooltip says why the hello route was not the gateway service');
+
 // ── unknown / missing: honest, never a false alarm ────────────────────────────────────────────────
 const unknown = gatewayHealthWord({ state: 'unknown', address: null });
 ok(unknown.kind === 'gateway_unknown', 'not-yet-probed is its own kind');
