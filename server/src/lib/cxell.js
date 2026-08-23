@@ -1582,7 +1582,7 @@ function credentialEnvFor(adapter, { token, baseUrl = null, model = null } = {})
 // transport failure). onEvent(obj) fires per normalized event — init (session id), assistant
 // turns, result. Bypass/auto mode inside is safe HERE and only here — the cxell is the
 // permission system, and every adapter runs its CLI's equivalent of skip-permissions.
-export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
+export async function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
   // The credential goes through the ONE guarded door (credentialEnvFor): a token that is plainly
   // another vendor's throws HERE, before docker is spawned, so the dispatch fails with a sentence
   // naming both vendors instead of the cage burning a turn on the vendor's own "invalid api key".
@@ -1597,7 +1597,7 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
     // off (GATEWAY_PORT === PORT), gatewayEnv returns {} and the adapter's real URLs are kept.
     // Without the xell identity token the gateway would 401 every call, so the env is only added
     // when one is present — a caller with no token keeps the adapter's direct URLs.
-    ...(xellToken ? Object.entries(gatewayEnv({ xellToken, provider: adapter.provider }))
+    ...(xellToken ? Object.entries(await gatewayEnv({ xellToken, provider: adapter.provider }))
       .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ];
   const cmd = ['exec', '-i',
@@ -1834,7 +1834,7 @@ export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, 
   // URLs are kept).
   const env = [
     ...credentialEnvFor(adapter, { token: vendorTok, model }),
-    ...(identTok ? Object.entries(gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
+    ...(identTok ? Object.entries(await gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
       .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ].flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);

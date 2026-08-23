@@ -129,7 +129,7 @@ try {
 
   // ── the driver's gateway wiring (part C: the config the model is pointed at) ──────────────
   console.log('\n── A. the model is pointed at the GATEWAY, not the provider ──');
-  const cfg = chatModelConfig({ provider: 'deepseek', xellToken });
+  const cfg = await chatModelConfig({ provider: 'deepseek', xellToken });
   ok(cfg.baseUrl.includes(`/x/${xellToken}/deepseek`), `the base url is the gateway path (got ${cfg.baseUrl})`);
   ok(cfg.baseUrl.startsWith(CXELL_API_BASE), 'the gateway path is on the gateway host');
   ok(!cfg.baseUrl.includes('api.deepseek.com'), 'it is NOT the provider\'s own URL');

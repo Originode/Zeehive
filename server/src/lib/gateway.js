@@ -75,6 +75,22 @@ export function gatewayBaseUrl() {
   return `${host}:${port}`;
 }
 
+// The SECOND name a cage can use for the gateway: the compose-network host ZEEHIVE_API_FALLBACK
+// names (ticket #94), one port over. A provider CLI base-url is ONE string — the cage cannot try a
+// second name itself, so the queenzee chooses primary-then-fallback at dispatch time and mints only
+// the one that answers /api/hello (chooseGatewayBaseUrl).
+//
+// TRAP, inherited from the API (config.js): cxellApiFallback DEFAULTS to the same string as
+// cxellApiBase, so an install that sets no CXELL_API_FALLBACK has NO second name at all.
+// chooseGatewayBaseUrl says so loudly rather than pretending a fallback exists. Read the env
+// lazily (like gatewayBaseUrl) so the two stay comparable and a test can flip the fallback.
+export function gatewayFallbackBaseUrl() {
+  const api = process.env.CXELL_API_FALLBACK || config.cxellApiFallback || 'http://host.docker.internal:4700';
+  const host = api.replace(/:\d+$/, '');          // strip the API port
+  const port = Number(process.env.GATEWAY_PORT || 4701);
+  return `${host}:${port}`;
+}
+
 // ── token→usage→cost ──────────────────────────────────────────────────────────────────────────
 
 // The OpenAI-compatible usage shape { prompt_tokens, completion_tokens, total_tokens } vs the
@@ -1023,13 +1039,15 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
   }
 }
 
-export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
+export default { GATEWAY_PORT, gatewayBaseUrl, gatewayFallbackBaseUrl, probeGatewayBase,
+                 _resetGatewayProbeCache, chooseGatewayBaseUrl, verifyGatewayReachable,
+                 gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
                  classifyResponseText,
                  extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
                  probeDeepseekBalance,
                  providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
-                 completeRequest, gatewayEnv, zeeTurnForXell };
+                 completeRequest, gatewayEnv, gatewayEnvForBase, zeeTurnForXell };
 
 // ── the cxell-facing env ──────────────────────────────────────────────────────────────────────
 // The base URL every cxell CLI points at the gateway, per provider, carrying the xell's identity
@@ -1046,9 +1064,15 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 // cross-provider misrouting the credential gates exist to stop.
 //
 // OFF SWITCH: when GATEWAY_PORT === PORT the gateway listener is NOT mounted (index.js), so the
-// base URLs would point at a dead port and every AI call would fail. In that case return an EMPTY
-// env — the adapters' own real base URLs (the provider's actual API) are used unchanged, exactly
-// the pre-gateway behaviour.
+// base URLs would point at a dead port and every AI call would fail. In that case gatewayEnv()
+// returns an EMPTY env — the adapters' own real base URLs (the provider's actual API) are used
+// unchanged, exactly the pre-gateway behaviour. The probe never runs when the gateway is off.
+//
+// PROVE THE ADDRESS BEFORE MINTING IT (TKT-179). gatewayEnv() is the only place the gateway
+// base-url is minted for a cage, and it now CHOOSES the base URL by probing /api/hello — a
+// provider CLI base-url is a single string, so a cage handed a dead address has no second name to
+// try and every provider fails with the VENDOR's words. The queenzee proves the address itself,
+// cached, and refuses loudly when neither candidate answers instead of minting a dead env.
 //
 // Path shape (measured: claude 2.1.222 preserves the base-url path prefix on both the /api/hello
 // probe and the /v1/messages POST):
@@ -1078,9 +1102,93 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 // own cli-chat-proxy.grok.com instead, so its turns are NOT observed to pass through this gateway
 // and may not be metered here. The seat is billed by the weekly pool rather than per call, so
 // nothing is spent unseen; what is missing is the RECORD. Measure it before claiming either way.
-export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
-  if (config.gatewayPort === config.port) return {};
-  const base = gatewayBaseUrl();
+
+// ── the gateway reachability probe ────────────────────────────────────────────────────────────
+// GET <base>/api/hello — the same connectivity probe the CLIs send (gatewayHello). Best-effort,
+// bounded, CACHED, never throws: the probe must never fail a live AI call. A spawn must not pay a
+// network round-trip, so a working address stays trusted for a short TTL and a dead address is
+// re-probed sooner — a transient blip recovers fast, a real outage surfaces at the next mint with
+// a NAMED refusal instead of a silently dead env. Overridable via env so a test can shrink the TTL.
+const PROBE_TIMEOUT_MS = Number(process.env.GATEWAY_PROBE_TIMEOUT_MS || 2000);
+const PROBE_TTL_OK_MS = Number(process.env.GATEWAY_PROBE_TTL_OK_MS || 30000);
+const PROBE_TTL_FAIL_MS = Number(process.env.GATEWAY_PROBE_TTL_FAIL_MS || 3000);
+const probeCache = new Map();   // baseUrl → { ok, at }
+
+// TEST-ONLY: clear the probe verdict cache (+ the once-only "no second name" warning). The
+// standalone choose/refuse test drives the same module across scenarios (primary → fallback →
+// both dead) and needs one scenario's cached verdict to not leak into the next.
+export function _resetGatewayProbeCache() {
+  probeCache.clear();
+  loggedEqualFallback = false;
+}
+
+export async function probeGatewayBase(baseUrl) {
+  if (!baseUrl) return false;
+  const cached = probeCache.get(baseUrl);
+  const ttl = cached ? (cached.ok ? PROBE_TTL_OK_MS : PROBE_TTL_FAIL_MS) : 0;
+  if (cached && Date.now() - cached.at < ttl) return cached.ok;
+  let verdict = false;
+  try {
+    const res = await fetch(`${baseUrl}/api/hello`, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    verdict = res.ok;
+  } catch { /* connection refused / timeout / DNS — verdict stays false */ }
+  probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
+  return verdict;
+}
+
+// ── the gateway base-url CHOICE ───────────────────────────────────────────────────────────────
+// PRIMARY host.docker.internal:<gatewayPort> (the stable address — the compose name FLAPS with
+// ENOTFOUND while the container is recreated; config.js documents why). FALLBACK the compose-network
+// name derived from config.cxellApiFallback (zeehive_server:<gatewayPort> in prod). When the two
+// resolve equal there is NO second name, and that is said loudly rather than pretended away. When
+// neither answers, REFUSE with a named sentence quoting both addresses — never a cage full of
+// vendor-branded ConnectionRefused (TKT-179: one unpublished port failed every provider for 13h).
+let loggedEqualFallback = false;
+
+export async function chooseGatewayBaseUrl() {
+  const primary = gatewayBaseUrl();
+  const fallback = gatewayFallbackBaseUrl();
+  if (primary === fallback && !loggedEqualFallback) {
+    loggedEqualFallback = true;
+    logline('gateway', `WARNING: no gateway fallback — CXELL_API_FALLBACK resolves equal to CXELL_API_BASE (${fallback}). `
+      + 'An install that sets no CXELL_API_FALLBACK has only ONE name to try; if that port is unpublished '
+      + 'every gateway mint will refuse loudly.');
+  }
+  if (await probeGatewayBase(primary)) return primary;
+  logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  if (await probeGatewayBase(fallback)) return fallback;
+  throw new Error(
+    `LLM gateway unreachable: neither ${primary} nor ${fallback} answers /api/hello. `
+    + 'The queenzee refuses to hand a cage a gateway address it cannot reach itself. '
+    + 'Check that GATEWAY_PORT is published in BOTH docker-compose.prod.yml and docker-compose.bootstrap.yml '
+    + 'and that the gateway listener is up.'
+  );
+}
+
+// PROVE the gateway address once at startup, BEFORE any dispatch — the boot-time half of TKT-179.
+// Best-effort and never fatal: a gateway the queenzee itself cannot reach is logged LOUDLY so a
+// human sees it at boot, and the dispatch path (chooseGatewayBaseUrl) still refuses per-mint if the
+// state persists. Never crashes the boot.
+export async function verifyGatewayReachable() {
+  try {
+    const base = await chooseGatewayBaseUrl();
+    logline('gateway', `gateway reachable at ${base} — cages will get a working provider base-url`);
+    return { ok: true, base };
+  } catch (e) {
+    const msg = `GATEWAY UNREACHABLE AT STARTUP: ${e.message}`;
+    console.error(`[zeehive] ${msg}`);
+    try { logline('gateway', msg); } catch { /* logbus needs the db too */ }
+    return { ok: false, error: e.message };
+  }
+}
+
+// The pure env SHAPE for a GIVEN base URL — split from gatewayEnv so the shape is testable without
+// a network probe (gatewayEnv chooses the base, this mints the per-provider vars unchanged).
+export function gatewayEnvForBase(base, { xellToken = null, provider = 'claude' } = {}) {
   const ident = xellToken ? `/x/${encodeURIComponent(xellToken)}` : '';
   // Anthropic-dialect providers run the claude CLI: claude → /claude, deepseek → /deepseek.
   const anthro = provider === 'deepseek' ? 'deepseek' : 'claude';
@@ -1090,6 +1198,16 @@ export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
     KIMI_MODEL_BASE_URL: `${base}${ident}/kimi/v1`,
     GROK_XAI_API_BASE_URL: `${base}${ident}/grok`,
   };
+}
+
+// Mint the cxell-facing gateway env for a dispatch. ASYNC because it PROVES the address first
+// (chooseGatewayBaseUrl — cached, so a spawn normally pays no round-trip) and refuses loudly when
+// neither candidate answers. Off switch intact: GATEWAY_PORT === PORT returns {} without probing,
+// so the adapters' real URLs are used unchanged.
+export async function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
+  if (config.gatewayPort === config.port) return {};
+  const base = await chooseGatewayBaseUrl();
+  return gatewayEnvForBase(base, { xellToken, provider });
 }
 
 // Parse the xell identity + provider from a gateway path. Returns { xellToken, provider, forward }

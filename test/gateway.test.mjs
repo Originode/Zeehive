@@ -33,7 +33,7 @@ import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
-import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
+import { parseGatewayPath, normalizeUsage, gatewayEnv, gatewayEnvForBase, recordRequest, completeRequest,
          requestsForXell, gatewayHello, usageFromStream, modelFromStream, providerUpstreamUrl,
          joinUpstreamPath, zeeTurnForXell, modelPrice, costOf, extractRateLimit,
          classifyResponseText } from '../server/src/lib/gateway.js';
@@ -113,26 +113,28 @@ eq(extractRateLimit(null), null, 'null headers → null');
 eq(extractRateLimit({ 'content-type': 'application/json' }), null, 'unrelated headers → null');
 
 // ── D. gatewayEnv — the base URLs cxells get ─────────────────────────────────────────────────
+// The SHAPE is pure and tested against gatewayEnvForBase (the async gatewayEnv only CHOOSES the
+// base — its env shape is identical, asserted below against a mock /api/hello).
 console.log('\n── D. gatewayEnv — the base URLs cxells get ──');
-const env = gatewayEnv({ xellToken: 'abc123' });
+const env = gatewayEnvForBase('http://host.docker.internal:4701', { xellToken: 'abc123' });
 ok(env.ANTHROPIC_BASE_URL.includes('/x/abc123/claude'), 'claude base url carries the xell identity');
 ok(env.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'openai base url carries the xell identity');
 ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'kimi base url points at the kimi segment (not openai)');
 ok(env.GROK_XAI_API_BASE_URL?.includes('/x/abc123/grok'), 'grok base url carries the xell identity');
 ok(!env.ANTHROPIC_BASE_URL.includes('/openai'), 'anthropic base url does not point at the openai segment');
-const de = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
+const de = gatewayEnvForBase('http://host.docker.internal:4701', { xellToken: 'abc123', provider: 'deepseek' });
 ok(de.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'deepseek base url points at the deepseek segment (not claude)');
 ok(de.OPENAI_BASE_URL.includes('/x/abc123/openai') && de.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi')
   && de.GROK_XAI_API_BASE_URL?.includes('/x/abc123/grok'), 'deepseek env still carries the other providers gateway URLs');
 // The path provider segment drives the gateway's ACCOUNT resolution, so it must name the xell's
 // ACTUAL provider — a deepseek cxell must not hit /claude (or the gateway uses the claude key).
-const denv = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
+const denv = gatewayEnvForBase('http://host.docker.internal:4701', { xellToken: 'abc123', provider: 'deepseek' });
 ok(denv.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'a deepseek cxell is pointed at /deepseek, not /claude');
 ok(!denv.ANTHROPIC_BASE_URL.includes('/claude'), 'a deepseek zee is never pointed at the claude provider route');
-const kenv = gatewayEnv({ xellToken: 'abc123', provider: 'kimi' });
+const kenv = gatewayEnvForBase('http://host.docker.internal:4701', { xellToken: 'abc123', provider: 'kimi' });
 ok(kenv.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'a kimi cxell is pointed at /kimi, not /openai');
 ok(!kenv.KIMI_MODEL_BASE_URL.includes('/openai'), 'a kimi zee is never pointed at the openai provider route');
-const oenv = gatewayEnv({ xellToken: 'abc123', provider: 'openai' });
+const oenv = gatewayEnvForBase('http://host.docker.internal:4701', { xellToken: 'abc123', provider: 'openai' });
 ok(oenv.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'a codex cxell stays at /openai');
 // Dialect composition: OpenAI-compatible CLIs (codex, kimi) carry the /v1 in the BASE and append
 // /chat/completions; Anthropic CLIs (claude/deepseek/grok) append /v1/messages to a bare base.

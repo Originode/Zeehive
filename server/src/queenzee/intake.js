@@ -1877,7 +1877,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // adapter's own base URL (the adapter.env baseUrl above is the provider's real URL; the gateway
     // replaces it). The token stays the provider key (adapter.env's token) — unchanged credential
     // model, the identity travels in the URL.
-    const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
+    const gwEnv = await gatewayEnv({ xellToken, provider: adapter.provider });
     logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
     await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
@@ -2057,8 +2057,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
-                          extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
+  const handle = await runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
+                                extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.

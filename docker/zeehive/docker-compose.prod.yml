@@ -105,7 +105,11 @@ services:
     # the web container's nginx does not proxy to.
     container_name: zeehive_server
     restart: unless-stopped
-    # 4700 is the API. The RANGE is xell webapp PREVIEW ports (docs/visual-verification-
+    # 4700 is the API; 4701 is the LLM GATEWAY (GATEWAY_PORT — the door every cxell CLI points its
+    # provider base-urls at). 4701 was unpublished once and every provider failed with the vendor's
+    # words for 13h (TKT-179): host.docker.internal:4701 is what a cage uses, and it only resolves
+    # when THIS port is published. Never unpublish it. The RANGE is xell webapp PREVIEW ports
+    # (docs/visual-verification-
     # diagnosis.md §7): the meta-DB allocates each xell webapp a unique fleet-wide port
     # (project.port_web_base + slot, mod port_slot_mod — Zeehive 5300-5389), the app-tier
     # processes run INSIDE this container, and lib/preview-ports.js makes every such port
@@ -121,6 +125,7 @@ services:
     # collide with fleet container ports; keep this file and any sibling compose in lockstep.
     ports:
       - "4700:4700"
+      - "4701:4701"
       - "5300-5389:5300-5389"
     depends_on:
       meta-db: { condition: service_healthy }

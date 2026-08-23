@@ -94,6 +94,13 @@ function startMockUpstream() {
 function startGateway() {
   return new Promise((resolve, reject) => {
     gwServer = http.createServer((req, res) => {
+      // The connectivity probe the gateway mints VERIFY against (TKT-179): gatewayEnv now PROVES
+      // the address by hitting /api/hello before minting, so the mock must answer it 200 like the
+      // real gateway's index.js mount (gatewayApp.get('/api/hello', gatewayHello)).
+      if (req.url === '/api/hello') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+      }
       let body = '';
       req.on('data', (d) => (body += d));
       req.on('end', () => {
