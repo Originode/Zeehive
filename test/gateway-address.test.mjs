@@ -52,7 +52,7 @@ try {
   process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;   // SAME host as the base → the no-second-name trap
   process.env.GATEWAY_PORT = String(P);
   const { gatewayBaseUrl, gatewayFallbackBaseUrl, chooseGatewayBaseUrl, gatewayEnv,
-          gatewayEnvForBase, probeGatewayBase, _resetGatewayProbeCache } = await import('../server/src/lib/gateway.js');
+          gatewayEnvForBase, probeGatewayBase, invalidateGatewayProbe, _resetGatewayProbeCache } = await import('../server/src/lib/gateway.js');
 
   console.log('\n── 1. primary and fallback are derived, and the equal-default trap is real ──');
   eq(gatewayBaseUrl(), `http://127.0.0.1:${P}`, 'primary = CXELL_API_BASE host + GATEWAY_PORT');
@@ -164,6 +164,27 @@ try {
   ok(verdicts.every((v) => v === true), 'all five concurrent callers get the SAME true verdict');
   eq(slowHits.count, 1, 'one HTTP probe hit for five concurrent callers (single-flight)');
   await close(slow);
+
+  console.log('\n── 9. INVALIDATION — a gateway that dies after a good probe is NOT minted for the OK TTL ──');
+  // The OK verdict is cached 30s, so a gateway that dies right after a good probe would keep being
+  // minted for up to 30s (TKT-179, bounded). When a real dispatch/turn fails against a minted base
+  // (classified gateway-unreachable), noteTurnDeath invalidates the OK verdict so the NEXT mint
+  // re-probes. This proves the invalidate actually forces a fresh probe.
+  _resetGatewayProbeCache();
+  const inv = await mockGateway('127.0.0.1');
+  const IV = inv.port;
+  process.env.CXELL_API_BASE = `http://127.0.0.1:${IV}`;
+  process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;
+  process.env.GATEWAY_PORT = String(IV);
+  const base = `http://127.0.0.1:${IV}`;
+  eq(await probeGatewayBase(base), true, 'the first probe is reachable');
+  eq(await probeGatewayBase(base), true, 'the second probe is served from the cache');
+  eq(inv.hits.count, 1, 'one probe hit so far — the cache skipped the second round-trip');
+  invalidateGatewayProbe(base);
+  eq(await probeGatewayBase(base), true, 'after invalidation the address is probed again (and still answers)');
+  eq(inv.hits.count, 2, 'invalidateGatewayProbe forced a SECOND real probe, not a stale cached verdict');
+  invalidateGatewayProbe('http://never-probed:1');   // unknown address — must be a no-op, not a throw
+  await close(inv.server);
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
