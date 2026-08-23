@@ -813,7 +813,10 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .mx-head.off { opacity: .45; }
 .mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
-.mx-name { display: flex; align-items: center; gap: 6px; }
+/* The header packs up to six items (name, ＋prod, conn, build-ready, bootstrap, ✕) into a
+   minmax(120px,1fr) column — they must WRAP: unwrapped nowrap buttons cannot shrink, and the
+   overflow paints straight over the neighbouring machine's column. */
+.mx-name { display: flex; align-items: center; gap: 3px 6px; flex-wrap: wrap; }
 .mx-name b { font-size: 13px; }
 /* the per-machine connection probe (Deploy tab) — one button that is also the verdict */
 .mx-conn { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
