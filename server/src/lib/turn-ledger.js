@@ -29,6 +29,16 @@ import { logline } from './logbus.js';
 export const TURN_KIND = { spawn: 'spawn', resume: 'resume', interactive: 'interactive' };
 export const TURN_STATUS = { started: 'started', ended: 'ended', errored: 'errored', paused: 'paused' };
 
+// ── TURN BUDGET — warn a zee as its turn approaches the vendor ceiling ──────────────────────────
+// Bare-'error' deaths in this fleet average 18.8M tokens and $12.15 a turn, against 9.8M and
+// $7.02 for healthy turns (zee rows, all time, 2026-08). A turn that runs past ~19M dies with the
+// unclassifiable bare 'error' — the ceiling, not a random fault — and takes its unlanded work with
+// it (~$158 of finished work fleet-wide). 12M is the warning threshold: well above the healthy
+// average (9.8M), well below where deaths cluster (18.8M), and far enough below the ceiling to
+// leave the zee runway to commit + land. ONE named constant so the next person can move it against
+// outcomes (the firing is recorded on the turn row — see meta.turn_budget_warning).
+export const TURN_BUDGET_WARNING_TOKENS = 12_000_000;
+
 // ── THINKING vs CONVERSATION — the classifier the whole feature rides on ──────────────
 // An assistant feed event's content blocks carry BOTH the model's internal reasoning and the
 // text it actually outputs. Anthropic's extended thinking names the first
@@ -135,6 +145,7 @@ export async function endTurn(turnId, { status = 'ended', burn = null, stopReaso
        b.metered !== false, stopReason || null, summary || null,
        meta ? JSON.stringify(meta) : null]);
     if (!row) logline('turn', `endTurn: no OPEN zee_turn row ${String(turnId).slice(0, 8)} to close (already ended, or absent)`);
+    _turnBudget.delete(turnId); // the turn is over — drop its running total (a new turn re-accumulates)
     return row;
   } catch (e) {
     logline('turn', `could not end turn ${String(turnId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
@@ -331,6 +342,156 @@ export function resetFeedWriteStats() {
   _feedFail = 0;
 }
 
+// ── TURN-BUDGET RUNNING TOTAL ──────────────────────────────────────────────────────────────────
+// The per-turn running token total, accumulated from the SAME feed stream the queenzee already
+// reads (recordFeedEvent). The claude/grok CLI streams carry PER-CALL usage in `stream_event`
+// wrappers (message_start = the input/cache-write for one API request, message_delta = the
+// output/cache-read for that request); summing them across the turn gives the running total, which
+// is what a zee can act on before the vendor ceiling arrives. The `result` event's usage is the
+// CUMULATIVE checkpoint for the whole turn — it is NOT a delta, so it is not accumulated here
+// (adding it would double-count the per-call events that already summed to it).
+//
+// The state is process-local, exactly like the feed-write counters: a queenzee restart loses the
+// running totals (turns also end on a restart, so this is a minor gap), and the WARNING FIRING is
+// what is recorded durably (meta.turn_budget_warning on the turn row), never the transient total.
+
+const _turnBudget = new Map();   // turnId -> { total, warned }
+let _budgetWarned = 0;           // process-local count of warnings fired (test/ops visibility)
+
+/** Test/ops visibility into the turn-budget accumulator. */
+export function turnBudgetWarningStats() {
+  return { fired: _budgetWarned };
+}
+
+/** Test/ops helper — reset the accumulator state without restarting the process. */
+export function resetTurnBudgetWarningStats() {
+  _turnBudget.clear();
+  _budgetWarned = 0;
+}
+
+/** The current accumulated token total for a turn (0 when nothing has been seen). */
+export function turnBudgetRunningTotal(turnId) {
+  return turnId ? (_turnBudget.get(turnId)?.total || 0) : 0;
+}
+
+// The ONE warning a turn gets. Half the deliverable is the TEXT: it must tell the zee how much of
+// the budget it has spent, that the ceiling (not a person) will kill the turn, and what to do —
+// commit + land NOW, before starting anything new. A warning the zee cannot act on is noise.
+export const turnBudgetWarningMessage = (tokens) =>
+  `⚠ TURN BUDGET — this turn has used ~${Math.round(Number(tokens) / 1_000_000)}M tokens `
+  + `(${Number(tokens).toLocaleString('en-US')}). Turns in this fleet that run past ~19M tokens DIE: `
+  + `the vendor's ceiling cuts the turn — that is the ceiling, not a person and not a rejection of `
+  + `your work — and a dead turn takes its unlanded work with it. You are still under the ceiling, `
+  + 'so ACT NOW: commit everything that works and land it (`zee land`), then report where you are '
+  + '(`zee item --status working --note "…"`). Do NOT begin anything new until what exists is landed.';
+
+// Extract the per-event token usage a feed event contributes to the turn's running total. Handles
+// the `stream_event` wrappers the claude/grok streams emit (and the SDK path's SDKPartialAssistantMessage,
+// which is the same shape) plus bare message_start/message_delta events. Returns all-zero for
+// events that carry no usage — including the `result` event, whose usage is the turn's CUMULATIVE
+// total rather than a delta. Pure and never throws.
+export function usageFromFeedEvent(event) {
+  const out = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  if (!event || typeof event !== 'object') return out;
+  const inner = (event.type === 'stream_event' && event.event && typeof event.event === 'object')
+    ? event.event
+    : event;
+  const u = (inner.message && typeof inner.message === 'object' ? inner.message.usage : null) || inner.usage;
+  if (!u || typeof u !== 'object') return out;
+  if (inner.type === 'message_start') {
+    out.input = Number(u.input_tokens || 0) || 0;
+    out.cacheWrite = Number(u.cache_creation_input_tokens || 0) || 0;
+  } else if (inner.type === 'message_delta') {
+    out.output = Number(u.output_tokens || 0) || 0;
+    out.cacheRead = Number(u.cache_read_input_tokens || 0) || 0;
+  }
+  return out;
+}
+
+// Accumulate one feed event's tokens into a turn's running total, and fire the ONE warning when the
+// running total crosses TURN_BUDGET_WARNING_TOKENS. Returns the warnTurnBudget promise when the
+// warning fires (so a caller that AWAITS recordFeedEvent sees the row update deterministically), or
+// null otherwise. NEVER throws — the feed must never depend on the budget.
+//
+// The `result` event is deliberately NOT accumulated (usageFromFeedEvent returns all-zero for it).
+// DO NOT "fix" this by adding the result event back: its usage is the turn's CUMULATIVE checkpoint
+// — the sum of every request's deltas ALREADY in the running total — so adding it double-counts the
+// whole turn, and it arrives at the very END of the turn, after the only moment a warning could have
+// helped (warning a zee whose turn just ended, to land NOW, would be noise at best and a false alarm
+// at worst). The warning is for the LIVE stream: message_start (this request's input + cache writes)
+// and message_delta (this request's output + cache reads), summed across every request the turn makes.
+async function accumulateTurnBudget(turnId, xellId, event) {
+  if (!turnId || !event) return null;
+  const u = usageFromFeedEvent(event);
+  const tokens = (u.input + u.output + u.cacheRead + u.cacheWrite) || 0;
+  if (!tokens) return null;
+  const st = _turnBudget.get(turnId) || { total: 0, warned: false };
+  st.total += tokens;
+  _turnBudget.set(turnId, st);
+  if (st.total >= TURN_BUDGET_WARNING_TOKENS && !st.warned) {
+    st.warned = true; // in-memory one-shot — a second crossing this turn cannot re-fire
+    _budgetWarned += 1;
+    return warnTurnBudget(turnId, xellId, st.total);
+  }
+  return null;
+}
+
+// Record the turn-budget warning on the turn row (durably, so the threshold can be tuned against
+// outcomes) and tell the zee to land. The UPDATE's WHERE `meta->'turn_budget_warning' IS NULL`
+// makes the DB write a one-shot even if two processes race a turn — a turn can never be warned
+// twice. NEVER throws, and NEVER ends the turn: the ceiling does that, our job is only to warn
+// before it arrives. Returns { fired:true, tokens, delivery, sent } (so the caller can assert it).
+//
+// THE HONEST SHAPE OF THE DELIVERY — read this before touching the nudge. The warning fires
+// MID-TURN by definition: a turn only crosses TURN_BUDGET_WARNING_TOKENS while it is still running.
+// Mid-turn delivery is QUEUED by zee-turn.js decideMessageDelivery (MID_TURN_STATUSES includes
+// 'working' — server/src/lib/zee-turn.js:77), and the queue drains only when the turn ends
+// (cxell.js cxellTalkCommand / zee-attach.sh type it in the moment the headless run is over). So a
+// turn that DIES at the ceiling — the exact scenario this card exists for — will NOT receive the
+// warning before it dies: the message waits in the talk queue and reaches the RESUMED zee after the
+// death. That makes this RECOVERY (the zee is told its turn died near the ceiling) rather than
+// PREVENTION, until a mid-turn channel exists (an open question for a human — see the card). That is
+// exactly why the delivery verdict is recorded below: the first week of data answers "how often was
+// this warning actually deliverable in time" instead of us asserting a delivery that does not happen.
+async function warnTurnBudget(turnId, xellId, tokens) {
+  // Deliver FIRST so the record carries the verdict that actually happened.
+  let verdict = null;
+  try {
+    // Dynamic import to avoid a require cycle: nudge.js imports startTurn/endTurn/lastAssistantText
+    // from THIS module, so a static import here would be circular. The nudge is best-effort — a zee
+    // with no live cxell (viewer_kind !== 'ssh-terminal') is refused by sendMessageToXell, which is
+    // the correct behaviour for a turn whose warning cannot be typed anywhere (see the comment above
+    // for what 'queued' — the mid-turn verdict — actually means).
+    const { nudgeXellForTurnBudget } = await import('../queenzee/nudge.js');
+    verdict = await nudgeXellForTurnBudget(xellId, { tokens: Number(tokens) || 0, by: 'queenzee' });
+  } catch (e) {
+    logline('turn', `could not nudge the zee about the turn-budget warning (${String(e.message).slice(0, 120)})`);
+    verdict = { sent: false, delivery: 'none', reason: `nudge threw: ${String(e.message).slice(0, 120)}` };
+  }
+  const d = verdict && typeof verdict === 'object'
+    ? { sent: !!verdict.sent, delivery: verdict.delivery || 'none',
+        reason: String(verdict.reason || verdict.error || '').slice(0, 200) || null }
+    : { sent: false, delivery: 'none', reason: 'nudge returned no verdict' };
+  try {
+    await q(
+      `UPDATE zee_turn SET meta = meta || $2::jsonb
+        WHERE id = $1 AND meta->'turn_budget_warning' IS NULL`,
+      [turnId, JSON.stringify({
+        turn_budget_warning: {
+          fired: true,
+          tokens: Number(tokens) || 0,
+          delivery: d.delivery,
+          delivery_sent: d.sent,
+          delivery_reason: d.reason,
+        },
+      })]);
+  } catch (e) {
+    logline('turn', `could not record turn-budget warning for turn ${String(turnId).slice(0, 8)} `
+      + `(${String(e.message).slice(0, 120)})`);
+  }
+  return { fired: true, tokens: Number(tokens) || 0, delivery: d.delivery, sent: d.sent };
+}
+
 /**
  * Persist one stream-json feed event against a turn. Skips system/init noise (same filter the
  * original inline INSERT used). Returns the inserted row, or null when skipped/failed.
@@ -339,6 +500,12 @@ export function resetFeedWriteStats() {
  */
 export async function recordFeedEvent({ turnId, zeeId = null, xellId = null, event = null, sessionId = null } = {}) {
   if (!turnId || !event?.type || event.type === 'system') return null;
+  // TURN BUDGET — count this event's tokens toward the turn's running total and warn ONCE when the
+  // threshold crosses. Best-effort, never throws, and NEVER ends the turn: the vendor's ceiling does
+  // that; our job is to warn a zee before it arrives so it can land what it has. Awaited here so a
+  // caller that awaits recordFeedEvent sees the warning's row update deterministically — the live
+  // feed callers (intake.js) fire-and-forget, so this never blocks a stream.
+  await accumulateTurnBudget(turnId, xellId, event);
   const toolName = event.type === 'assistant'
     && event.message?.content?.[0]?.type === 'tool_use'
     ? (event.message.content[0].name || null)
@@ -372,5 +539,7 @@ export default {
   startTurn, endTurn, turnsForXell, eventsForTurn, conversationForXell,
   classifyAssistantEvent, extractCaptureFromEvent,
   recordFeedEvent, feedWriteStats, resetFeedWriteStats,
+  TURN_BUDGET_WARNING_TOKENS, turnBudgetWarningMessage, usageFromFeedEvent,
+  turnBudgetRunningTotal, turnBudgetWarningStats, resetTurnBudgetWarningStats,
   TURN_KIND, TURN_STATUS,
 };

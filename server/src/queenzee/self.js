@@ -23,7 +23,8 @@ import { pushToXource, catchUpToXource } from './xellgit.js';
 import { cleanGitEnv, gitLog, worktreeDiff } from '../lib/git.js';
 import { existsSync } from 'node:fs';
 import { landStatus, openLandRequests, holdingRequests, withdrawLandRequest } from './landgate.js';
-import { requestShip, shipStatus } from './shipgate.js';
+import { requestShip, shipStatus, withdrawShipRequest } from './shipgate.js';
+import { computeShipPayload, shipPayloadSummary } from './ship-payload.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { requestXourceClean, xourceCleanStatusFor } from '../lib/xource-clean.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
@@ -56,6 +57,7 @@ import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '.
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
          NO_PUSH_REASON } from '../lib/managers.js';
+import { xellQuarantineRefusal } from '../lib/xell-quarantine.js';
 // The harness DOMAIN (lib/harness.js) — listed/authored here for the manager harness verbs at the
 // bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
 // check: this file adds the manager REFUSALS, never a second copy of the rules.
@@ -67,6 +69,12 @@ import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
 // The A2A MEET group-chat rooms (`zee meet`, docs/zee-meet-plan.md) — the DB half lives here so
 // the self verbs below are thin. Any live zee of a project may create/attend a room by code.
 import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '../lib/a2a-meet.js';
+// CURRENT CONDITIONS (ticket #67) — the short, dated, per-PROJECT list of live impediments
+// injected into every briefing. `zee conditions` is the read verb (every zee) and the manager's
+// write verb (--add / --remove). The lib owns the domain; this file adds the manager refusal.
+import { listProjectConditions, addProjectCondition, removeProjectConditionScoped } from '../lib/current-conditions.js';
+import { appendStandingOrders, STANDING_ORDERS_MAX } from '../lib/standing-orders.js';
+import { SCRATCHPAD_MAX, scratchpadForXell, scratchpadBlock } from '../lib/xell-scratchpad.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -245,6 +253,9 @@ export async function selfStatus(xell) {
           // dismissed: the request exists but a human took its card off their screen. It is NOT
           // something anyone is looking at, so a zee must never read it as "awaiting approval".
           dismissed: !!ship.dismissed_at,
+          // A zee's own retraction (`zee ship --withdraw`) — terminal, and NOT a human decision.
+          // Symmetric with the landing half: the card left the human's screen, nothing shipped.
+          withdrawn: ship.status === 'withdrawn',
           pending: ['pending', 'approved', 'shipping'].includes(ship.status)
             && !ship.deferred_at && !ship.dismissed_at }
       : null,
@@ -349,6 +360,15 @@ export async function selfLand(xell) {
   }
   if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to land from` };
 
+  // (#77) WHICH SIBLING LANDINGS TOUCHED FILES THIS ZEE CHANGED — a note, never a block. Computed
+  // best-effort BEFORE any heal/catch-up so every outcome below carries it, including the conflict
+  // case where it is the most useful ("your commits CONFLICT" names the exact siblings to read).
+  // siblingOverlapForXell never throws and nothing below branches on it; a failure degrades to
+  // fewer warnings, never to a land that was refused.
+  const { siblingOverlapForXell } = await import('../lib/work-overlap.js');
+  const sibling = await siblingOverlapForXell(xell);
+  const withNote = (msg) => (sibling?.note ? `${msg}\n\n${sibling.note}` : msg);
+
   // Is a live cxell driving this xell? If so, reconciliation happens by delivering the xource INTO
   // the container and merging there (self-heal) — never by a behind-the-zee's-back worktree merge.
   const live = await cxellRunning({ ctx: 'default', slug: xell.slug });
@@ -427,7 +447,8 @@ export async function selfLand(xell) {
       ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp, healed,
       conflict: caughtUp.state === 'conflict' ? (caughtUp.output || null) : null,
       error: caughtUp.state === 'error' ? (caughtUp.output || null) : undefined,
-      message: msg,
+      message: withNote(msg),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -443,7 +464,8 @@ export async function selfLand(xell) {
   if (push.landed) {
     return {
       ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request: await landStatus(xell.id),
-      message: `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`,
+      message: withNote(`LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -461,14 +483,15 @@ export async function selfLand(xell) {
       ok: true, status: 'holding', landed: false, collected, catch_up: caughtUp, healed, request,
       position: request.holding_position,
       behind: ahead ? { xell_slug: ahead.xell_slug, new_sha: ahead.new_sha, status: ahead.status } : null,
-      message: `HOLDING at position ${request.holding_position} — ${ahead?.xell_slug || 'another xell'} already has a landing `
+      message: withNote(`HOLDING at position ${request.holding_position} — ${ahead?.xell_slug || 'another xell'} already has a landing `
         + `open on ${(request.ref || '').replace('refs/heads/', '') || 'main'}${ahead ? ` (${String(ahead.new_sha).slice(0, 8)}, ${ahead.status})` : ''}, and the runway takes ONE at a `
         + 'time. Your push was NOT rejected and NOT dropped: it is recorded (land_request '
         + `${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote} and your commits are safe on your branch. `
         + 'No card was raised for a human, deliberately — two landings on one ref is how one of them ends up stale. '
         + 'You do NOT need to poll or re-push: when the runway clears the queenzee RESUMES your session and tells you '
         + 'to `zee sync` and then `zee land` again. Keep working, or stop here. To leave the pattern instead, '
-        + '`zee land --withdraw --reason "…"`.',
+        + '`zee land --withdraw --reason "…"`.'),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -483,7 +506,7 @@ export async function selfLand(xell) {
     return {
       ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, healed, request,
       superseded: stale.map((r) => ({ id: r.id, new_sha: r.new_sha, status: r.status, requested_at: r.requested_at })),
-      message: `Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
+      message: withNote(`Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
         + `(land_request ${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote}. Your commits `
         + 'are safe on your branch; nothing lands until a human agrees. You do NOT need to re-run land: when a human '
         + 'approves, the queenzee lands it AND nudges you to continue. To block meanwhile, `zee land --wait` (or '
@@ -493,7 +516,8 @@ export async function selfLand(xell) {
             + `(${stale.map((r) => String(r.new_sha).slice(0, 8)).join(', ')}). A human sees one card each and cannot `
             + 'tell which one you still mean. Do not stack them up: `zee land --withdraw --reason "…"` un-asks your '
             + 'open landings, so the order is WITHDRAW first, then `zee land` again for one fresh card.'
-          : ''),
+          : '')),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
 
@@ -503,13 +527,14 @@ export async function selfLand(xell) {
     ok: false, status: request ? request.status : 'unknown', landed: false, collected, catch_up: caughtUp,
     request: request || null,
     push_output: push.output ? String(push.output).slice(-800) : null,
-    message: request
+    message: withNote(request
       ? (request.status === 'rejected'
         ? `A human REJECTED this exact sha (${String(request.new_sha).slice(0, 8)}) — re-pushing will not help; talk to them.`
         : `Push did not land and the latest land_request is '${request.status}' (sha ${String(request.new_sha).slice(0, 8)}), `
           + `not a fresh pending hold for ${String(push.head).slice(0, 8)}. Check the ZEEHIVE console — this is NOT a clean held landing.`)
       : 'Push did not land and NO land_request was raised — the gate held nothing (a non-fast-forward the catch-up '
-        + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.',
+        + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.'),
+    ...(sibling ? { sibling_overlap: sibling } : {}),
   };
 }
 
@@ -584,6 +609,79 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
       + 'branch exactly as they were. When the work really is ready, `zee land` raises ONE fresh request.'
       + (hadHint ? ' Your land? hint was lowered with it.' : '')
       + (approved.length ? ` (Note: ${approved.length} APPROVED landing(s) were left alone — a decision is not yours to retract.)` : ''),
+  };
+}
+
+// ── POST /api/xell/self/ship/withdraw — UN-ASK a held ship request ─────────────
+// The symmetric verb to selfWithdrawLand (above): a zee that raises a ship and immediately learns
+// the deploy is bigger than described can take the card off the human's screen WITHOUT deploying,
+// rejecting or reverting anything — the escape hatch for the ask that was wrong anyway. It is the
+// zee un-asking a question it should not have asked, and the row keeps the withdrawal in the ship
+// ledger exactly the way a landing withdrawal is kept.
+//
+// It withdraws THIS xell's pending/approved ship requests — normally exactly one (the open-ship
+// unique index enforces one per xell). `{ request: <id> }` targets a single one. Once the deploy has
+// STARTED (status='shipping', or the prod lock is taken) it is REFUSED — see withdrawShipRequest.
+export async function selfWithdrawShip(xell, { reason = null, request = null } = {}) {
+  const open = await q(
+    `SELECT * FROM ship_request WHERE xell_id=$1 AND status IN ('pending','approved') ORDER BY requested_at DESC`,
+    [xell.id]);
+  const targets = request ? open.filter((r) => r.id === request) : open;
+  if (request && !targets.length) {
+    const mine = await one(`SELECT * FROM ship_request WHERE id=$1 AND xell_id=$2`, [request, xell.id]);
+    return { ok: false, status: mine && mine.status === 'shipping' ? 'started' : 'not-found', withdrawn: [],
+      error: mine
+        ? (mine.status === 'shipping'
+            ? `ship_request ${String(request).slice(0, 8)} has already STARTED — the deploy is running. `
+              + 'Withdraw is refused; if it must be stopped, `zee tend --reason "…"` now so a human sees prod is mid-deploy.'
+            : `ship_request ${String(request).slice(0, 8)} is '${mine.status}', not pending or approved — there is nothing open to withdraw`)
+        : 'no such pending ship request for this xell',
+      message: mine
+        ? (mine.status === 'shipping'
+            ? 'The deploy has already started — this verb only un-asks a ship that has NOT begun.'
+            : 'That ship is history — it was decided or already finished. You can only withdraw a request that is still pending (or approved but not yet started).')
+        : 'You can only withdraw a ship YOUR xell raised, and only while it is still pending/approved.' };
+  }
+
+  if (!targets.length) {
+    const latest = await shipStatus(xell.id);
+    const started = latest?.status === 'shipping'
+      || !!(await one(`SELECT 1 FROM deploy_lock WHERE xell_id=$1 AND phase='shipping'`, [xell.id]));
+    if (started) {
+      return { ok: false, status: 'started', withdrawn: [], request: latest,
+        error: `your ship @ ${String(latest?.commit || '').slice(0, 8)} has already STARTED — the deploy is running. `
+          + 'Withdraw is refused; if it must be stopped, `zee tend --reason "…"` now so a human sees prod is mid-deploy.',
+        message: 'The deploy has already started — this verb only un-asks a ship that has NOT begun.' };
+    }
+    return {
+      ok: true, status: 'nothing-to-withdraw', withdrawn: [],
+      request: latest || null,
+      message: latest
+        ? `Nothing to withdraw — your latest ship request is '${latest.status}', not pending or approved.`
+        : 'Nothing to withdraw — this xell has never raised a ship request.',
+    };
+  }
+
+  const done = [];
+  for (const r of targets) {
+    const row = await withdrawShipRequest(r.id, `zee@${xell.slug}`, reason)
+      .catch((e) => ({ error: e.message, id: r.id }));
+    done.push(row.error ? { id: r.id, error: row.error } : { id: row.id, commit: row.commit, status: row.status });
+  }
+  const okCount = done.filter((d) => !d.error).length;
+  // A ship HINT is the same claim one notch quieter ("this looks ship-ready — a human should
+  // decide"). Un-asking the ship while leaving the hint up would light the ship? button for work
+  // the zee just said it does not want shipped, so the retraction lowers both. Best-effort.
+  const hadHint = await hintOpen(xell.id, 'ship').catch(() => false);
+  if (okCount && hadHint) await setHint(xell.id, 'ship', false, { reason: reason || 'ship withdrawn' }).catch(() => {});
+  logline('self', `${xell.slug} withdrew ${okCount} ship request(s)${reason ? ` — ${String(reason).slice(0, 120)}` : ''}`);
+  broadcast('xell', { id: xell.id });
+  return {
+    ok: okCount > 0, status: okCount ? 'withdrawn' : 'error', withdrawn: done,
+    message: `WITHDRAWN ${okCount} held ship request(s) — ${done.filter((d) => !d.error).map((d) => String(d.commit).slice(0, 8)).join(', ') || 'none'}. `
+      + 'The card is off the human\'s screen and nothing was deployed, decided or reverted: the ship simply did not '
+      + 'happen. When the work really is ready, `zee ship --reason "…"` raises ONE fresh request.'
+      + (hadHint ? ' Your ship? hint was lowered with it.' : ''),
   };
 }
 
@@ -668,8 +766,18 @@ export async function selfSync(xell, { rebuild = true } = {}) {
   const ref = await xourceRef(xell.id);
   if (!ref) return { ok: false, status: 'error', error: `cannot resolve the xource ref for ${xell.slug}` };
 
+  // (#77) WHICH SIBLING LANDINGS TOUCHED FILES THIS ZEE CHANGED — a note, never a block. Computed
+  // best-effort BEFORE the merge so it describes the landings the merge is about to pull in (and the
+  // conflict case, where it is the most useful — "your commits CONFLICT" names the exact siblings to
+  // read). siblingOverlapForXell never throws and nothing below branches on it; a failure degrades to
+  // fewer warnings, never to a sync that did not happen.
+  const { siblingOverlapForXell } = await import('../lib/work-overlap.js');
+  const sibling = await siblingOverlapForXell(xell);
+  const withNote = (msg) => (sibling?.note ? `${msg}\n\n${sibling.note}` : msg);
+
   const heal = await selfHealSync(xell, ref);
-  if (!heal.ok) return heal;
+  if (!heal.ok) return { ...heal, message: heal.message ? withNote(heal.message) : heal.message,
+    ...(sibling ? { sibling_overlap: sibling } : {}) };
 
   // Clean merge (or already current). On an actual merge, collect the merged HEAD onto the worktree
   // and rebuild so the zee's containers run the reconciled code; re-verification is the zee's to do.
@@ -686,7 +794,8 @@ export async function selfSync(xell, { rebuild = true } = {}) {
     : `Merged current ${ref} into your cxell cleanly (HEAD ${String(heal.head).slice(0, 8)}).`
       + (built && !built.error ? ' A rebuild was started — run `zee build --wait` (background) to confirm it serves your HEAD, then re-run your tests.' : '')
       + (built && built.error ? ` (rebuild could not start: ${built.error})` : '');
-  return { ok: true, status: heal.state, ref, head: heal.head || null, collected, built, message: note };
+  return { ok: true, status: heal.state, ref, head: heal.head || null, collected, built,
+           message: withNote(note), ...(sibling ? { sibling_overlap: sibling } : {}) };
 }
 
 // ── POST /api/xell/self/catchup — roll THIS cxell's own db up to prod's schema ──
@@ -819,6 +928,13 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
   if (r.ok === false) return r;                      // requestShip already wrote the loud message
   const req = r.request;
   const decided = ['shipped', 'failed', 'rejected'].includes(req?.status);
+  // THE PAYLOAD (ticket #65) — name what actually rides along, not just that "every landing on
+  // main at this moment" does. Same read the human's card shows; ADVISORY (never throws).
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  const payload = project ? await computeShipPayload(project, req) : null;
+  const payloadLine = payload
+    ? ` PAYLOAD: ${shipPayloadSummary(payload, xell.slug)}.`
+    : '';
   return {
     ...r,
     message: decided
@@ -831,6 +947,7 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
         // a zee that reports "my work shipped" is understating what it just asked a human to deploy.
         + `NOTE: this deploys the CURRENT TIP of main (${String(req.commit).slice(0, 8)}) — every landing `
         + 'on main at this moment, not only your commits. Do not describe it as shipping only your work.'
+        + payloadLine
         + shipSchemaNote(req),
   };
 }
@@ -1652,6 +1769,19 @@ function managerBriefBlock(managerSlug, what = 'dispatched you and is watching t
   ].join('\n');
 }
 
+// The brief a manager DISPATCH hands the spawn — exported as a test seam, exactly like swapBrief:
+// the per-card `text` leads, then the standard manager block, then the manager's STANDING ORDERS
+// (ticket #74) appended VERBATIM as a clearly-separate block at the end. A router gets no manager
+// block (151 — it is the front door, not a crew lead) but still carries standing orders if it set
+// any: the router is manager-type, and its dispatch is still this path. EMPTY/unset standing orders
+// return the base brief unchanged — byte-identical to before this feature existed.
+export async function managerDispatchBrief(xell, text, { router = false } = {}) {
+  const base = router
+    ? String(text || '')
+    : [String(text || ''), '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
+  return appendStandingOrders(base, xell.id);
+}
+
 // POST /api/xell/self/dispatch — spawn a WORKER zee that reports to me (`zee dispatch`).
 //
 // NOT human-gated, deliberately: a dispatched worker is a caged agent on a throwaway xell whose every
@@ -1725,9 +1855,7 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // a manager exists, and the reflection loop (and every question it could have asked) dies quietly.
   const { isRouterXell } = await import('../lib/router.js');
   const router = await isRouterXell(xell);
-  const brief = router
-    ? text
-    : [text, '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
+  const brief = await managerDispatchBrief(xell, text, { router });
 
   // A DRY POOL must not be a dead end for a manager. A human dispatching from the console can raise
   // the pool target or wait; a caged manager can do neither — it would just be told "no ready xell"
@@ -1738,7 +1866,8 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // a manager xell handed to it is refused downstream (it would otherwise be downgraded off
   // production). If the only ready xell is a manager's, this pool IS dry — provision, don't grab it.
   const ready = await one(
-    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' AND COALESCE(zee_type,'worker') <> 'manager'
+    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' AND quarantined_at IS NULL
+       AND COALESCE(zee_type,'worker') <> 'manager'
       ORDER BY ready_at DESC NULLS LAST LIMIT 1`,
     [xell.project_id]);
   let provisioned = null;
@@ -1883,6 +2012,12 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
   const item = await one(`SELECT id, title, status FROM work_item WHERE xell_id=$1 LIMIT 1`, [target.id]);
   const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [target.project_id]);
   const branchInfo = await branchHandover(target, project?.main_branch || 'main');
+  // The OUTGOING zee's scratchpad (ticket #66) — the working note that must survive the swap. Read
+  // from the target's OWN row, so the incoming zee is told what its predecessor had tried and ruled
+  // out BEFORE it re-derives it. NULL/empty renders NO block, so a xell that never wrote one is
+  // byte-identical to a swap before this feature existed.
+  const scratch = await scratchpadForXell(target.id);
+  const scratchBlock = scratchpadBlock(scratch);
   const firstLines = (t, n) => String(t || '').split('\n').filter((l) => l.trim()).slice(0, n).join('\n');
 
   // The manager the xell reports to — the one a HUMAN swap must not leave unmentioned (a worker
@@ -1920,6 +2055,10 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
     '',
     lastReport?.body ? firstLines(lastReport.body, 25) : '(it reported nothing to its manager)',
     '',
+    // The previous zee's scratchpad, when it wrote one — the analysis that would otherwise die
+    // with the outgoing cage. A distinct sub-section of the handover, so the incoming zee knows it
+    // is the PREVIOUS zee's own working note, not a task or an order.
+    ...(scratchBlock ? [scratchBlock, ''] : []),
     '### What is on the branch right now',
     '',
     ...branchInfo.lines,
@@ -1943,7 +2082,14 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
       : []),
   ].join('\n');
 
-  return { brief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo, manager: watcher || null };
+  // STANDING ORDERS (ticket #74) — a manager-run swap is a re-dispatch of the same crew, so the
+  // incoming zee is briefed with the same standing orders every dispatch carries. A HUMAN swap has
+  // no manager caller (`manager` is null) and inherits nothing new — the target's own manager (the
+  // `watcher`, when there is one) is named in the manager block above, but standing orders are the
+  // DISPATCHING manager's, so a human swap does not append them.
+  const finalBrief = await appendStandingOrders(brief, manager?.id || null);
+
+  return { brief: finalBrief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo, manager: watcher || null };
 }
 
 // POST /api/xell/self/swap — replace the ZEE working one of my crew xells (`zee swap`).
@@ -2114,6 +2260,14 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
       `${target.slug} is RETIRED — its cxell is torn down and its worktree is gone, so there is no zee `
       + 'to replace and nothing for a new one to inherit. A swap keeps a LIVE xell and changes who is '
       + 'in it; starting fresh work is a dispatch.' };
+  }
+
+  // A QUARANTINED cage gets no new agent — and a swap IS feeding it a new agent (ticket #81). This
+  // is the swap CORE: both `zee swap` and the console's human swap pass through here, so one refusal
+  // covers both. A swap was the exact recovery path that happily re-caged the incident's xell.
+  const qRefusal = xellQuarantineRefusal(target);
+  if (qRefusal) {
+    return { ok: false, status: 'refused', error: qRefusal };
   }
 
   // A MANAGER xell is not re-crewed by anybody — not by its own kind (`zee swap` refuses it upstream
@@ -2478,6 +2632,42 @@ export async function selfReport(xell, { message = null, kind = 'report' } = {})
       + deliveryReceipt(r.delivery?.delivery, manager.slug, r.delivery?.reason || r.delivery?.error || null) };
 }
 
+// POST /api/xell/self/review — RECORD a review of a landed diff (`zee review --of <sha>`).
+//
+// Ticket #56: a reviewer cast on a landed diff found a cross-project write hole and a
+// mass-assignment path within an hour, and the system recorded neither the review nor its findings.
+// This is the record: WHO read a landed commit, what they concluded (clean / changes-required), how
+// many findings, and the report. It is deliberately NOT a gate — nothing on the landing or ship path
+// waits on it, and recording one must never slow a landing. Its job is to make the landing/ship
+// cards say whether the code has been READ and by whom, so shipping an unreviewed change is a
+// human's knowing decision rather than an accident.
+export async function selfReview(xell, { commit = null, verdict = null, findings_count = 0, report = null } = {}) {
+  const sha = String(commit || '').trim();
+  if (!sha) return { ok: false, error: 'review needs --of <sha> — the full 40-char commit sha you read' };
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    return { ok: false, error: `"${sha}" is not a full 40-char commit sha — pass the tip of the landed diff you read (a landing's new_sha, a ship's commit)` };
+  }
+  // The CLI spells the verdict `changes-required`; the enum stores `changes_required`. Normalize.
+  const v = String(verdict || '').trim().replace(/-/g, '_');
+  if (!['clean', 'changes_required'].includes(v)) {
+    return { ok: false, error: 'review needs --verdict clean|changes-required' };
+  }
+  const n = Math.max(0, Math.floor(Number(findings_count) || 0));
+  const text = String(report || '').trim() || null;
+  const zee = await liveZee(xell.id);
+  const row = await one(
+    `INSERT INTO review (project_id, xell_id, zee_id, reviewer, commit_sha, verdict, findings_count, report)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [xell.project_id, xell.id, zee?.id || null, xell.slug, sha, v, n, text]);
+  broadcast('review', row);
+  broadcast('xell', { id: xell.id });
+  logline('review', `${xell.slug} recorded a ${v === 'clean' ? 'CLEAN' : 'CHANGES-REQUIRED'} review of ${sha.slice(0, 10)} (${n} finding${n === 1 ? '' : 's'})`);
+  return {
+    ok: true, review: row,
+    message: `Review of ${sha.slice(0, 10)} recorded — ${v === 'clean' ? 'clean' : 'changes required'}, ${n} finding${n === 1 ? '' : 's'}. `
+      + 'It is a record, not a gate: nothing on the landing or ship path waited on it.' };
+}
+
 // GET /api/xell/self/inbox — what other zees sent ME (`zee inbox`). Reading marks read.
 export async function selfInbox(xell, { all = false } = {}) {
   const rows = await inboxFor(xell.id, { all });
@@ -2709,6 +2899,165 @@ export async function selfTicketList(xell, { status = null, q: search = null } =
 // A MANAGER gets its project's plan in tree order (with each item's status, assignee and live zee);
 // a WORKER gets the item it is assigned to, with the ancestors/ticket/history it was briefed from.
 // `--item <id>` reads one item, scoped the same way.
+// CURRENT CONDITIONS — `zee conditions`. READ is every zee's: the short, dated, per-PROJECT list
+// of live impediments injected into every briefing (ticket #67). WRITE (--add / --remove) is a
+// MANAGER verb — the same `requireManager` wall as `zee work --new` — scoped to the caller's OWN
+// project by its token, opening no gate and touching nothing irreversible (it is a line of text in
+// the meta-DB that the next briefing renders).
+export async function selfConditions(xell, { action = null, body = null, id = null } = {}) {
+  if (!action) {
+    return { ok: true, conditions: await listProjectConditions(xell.project_id) };
+  }
+  const guard = requireManager(xell, 'conditions');
+  if (guard) return guard;
+  if (action === 'add') {
+    return addProjectCondition(xell.project_id, body, { actor: xell.slug });
+  }
+  if (action === 'remove') {
+    if (!id) return { ok: false, error: 'conditions --remove needs --id <condition-id>' };
+    return removeProjectConditionScoped(id, xell.project_id);
+  }
+  return { ok: false, error: `unknown conditions action "${action}" — use --add "…" or --remove <id>` };
+}
+
+// STANDING ORDERS — `zee standing-orders`. READ is a MANAGER verb (a worker never sets one; it
+// RECEIVES them appended to its brief), and WRITE is MANAGER-only with the same `requireManager`
+// wall as `zee conditions --add`. A manager sets a short block once and every brief it dispatches
+// carries it verbatim — the thing the ticket's manager retyped by hand into thirteen briefs.
+//
+// The "same refusals as any brief" half is structural: the text lives on the manager's OWN xell row
+// and is APPENDED to the brief at dispatch time — it never changes what the dispatched worker IS
+// (worker harness, worker db, no prod), and the dispatch still runs through selfDispatch with all
+// its refusals. The length is bounded so the block cannot grow into a second manual, and --clear
+// makes pruning trivial. A worker that calls this is told it is a MANAGER verb (requireManager).
+export async function selfStandingOrders(xell, { action = null, text = null } = {}) {
+  // READ and WRITE are BOTH MANAGER-only — the verb is manager-scoped end to end. A worker that
+  // calls it at all (read or write) is told it is a MANAGER verb: a worker RECEIVES standing orders
+  // appended to its brief, it does not author or inspect them.
+  const guard = requireManager(xell, 'standing-orders');
+  if (guard) return guard;
+
+  if (action === 'read') {
+    const row = await one(`SELECT standing_orders, standing_orders_updated_at, standing_orders_updated_by
+                             FROM xell WHERE id=$1`, [xell.id]);
+    const standing = String(row?.standing_orders || '').trim() || null;
+    return { ok: true, standing_orders: standing, length: standing ? standing.length : 0,
+             updated_at: row?.standing_orders_updated_at || null,
+             updated_by: row?.standing_orders_updated_by || null };
+  }
+
+  if (action === 'set') {
+    const body = String(text || '').trim();
+    if (!body) {
+      return { ok: false, error: 'standing-orders --set needs the text — the block every brief will carry. '
+        + 'To REMOVE it, use `zee standing-orders --clear`.' };
+    }
+    if (body.length > STANDING_ORDERS_MAX) {
+      return { ok: false, error: `standing orders are limited to ${STANDING_ORDERS_MAX} characters — `
+        + `${body.length} is a second manual, not a short block. Cut it down, or use \`zee conditions\` `
+        + 'for the project\'s live impediments (a different list, and dated).' };
+    }
+    await q(`UPDATE xell SET standing_orders=$2, standing_orders_updated_at=now(),
+             standing_orders_updated_by=$3 WHERE id=$1`,
+      [xell.id, body, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} set its standing orders (${body.length} chars) — every dispatch will append them verbatim`);
+    return { ok: true, standing_orders: body, length: body.length,
+             message: `Set — every brief you dispatch now carries this block verbatim (${body.length} chars). `
+               + 'Clear it with `zee standing-orders --clear` when it stops being true.' };
+  }
+
+  if (action === 'clear') {
+    await q(`UPDATE xell SET standing_orders=NULL, standing_orders_updated_at=now(),
+             standing_orders_updated_by=$2 WHERE id=$1`,
+      [xell.id, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} cleared its standing orders — dispatches are back to no block`);
+    return { ok: true, standing_orders: null,
+             message: 'Cleared — your dispatches are back to carrying no standing-orders block.' };
+  }
+
+  return { ok: false, error: `unknown standing-orders action "${action}" — use --set "…", --clear, or nothing to read.` };
+}
+
+// SCRATCHPAD — `zee scratchpad`. EVERY zee has it: a single text on the xell's OWN row in the
+// meta-DB that outlives the cage, written and read through this verb (ticket #66). It is the one
+// durable channel that is not a commit and not a message — the analysis file the ticket's manager
+// kept for fifteen cycles would have survived the reaped container as a scratchpad.
+//
+// The token-scoping half is structural: the verb is resolved from the CALLING xell (routes.js
+// resolveSelf), so a zee can only ever read/write/clear its OWN — there is no parameter that names
+// another xell for a worker. A MANAGER may additionally READ a crew xell's with `--xell <slug>`
+// (scoped by workerOf to the manager's own crew), and a HUMAN may read any xell's in the console —
+// but neither a manager nor a human WRITES a zee's scratchpad: the writer is always the zee that
+// owns the xell. The length is bounded SERVER-SIDE on every write path (a ceiling, not a second
+// manual), and a swap embeds the text in the incoming zee's inheritance brief.
+export async function selfScratchpad(xell, { action = 'read', text = null, xellSlug = null } = {}) {
+  // ── MANAGER read of a crew xell's scratchpad: `zee scratchpad --xell <slug>` ──
+  // A worker calling this is REFUSED by requireManager — a worker can only ever touch its OWN
+  // scratchpad (the branch below), never name another xell. The manager's read is scoped to its own
+  // crew by workerOf, so it never names a xell that is not its own either.
+  if (xellSlug) {
+    const guard = requireManager(xell, 'scratchpad --xell');
+    if (guard) return guard;
+    const target = await workerOf(xell.id, xellSlug);
+    if (!target) {
+      return { ok: false, status: 'refused', error:
+        `no worker "${xellSlug}" in your crew — \`zee zees\` lists the xells you dispatched, and a `
+        + 'manager may only read the scratchpad of one of those. A worker writes its own scratchpad '
+        + 'and cannot read another\'s at all.' };
+    }
+    const row = await one(
+      `SELECT slug, scratchpad, scratchpad_updated_at, scratchpad_updated_by FROM xell WHERE id=$1`,
+      [target.id]);
+    const t = String(row?.scratchpad || '').trim() || null;
+    return { ok: true, xell: row?.slug, scratchpad: t, length: t ? t.length : 0,
+             updated_at: row?.scratchpad_updated_at || null,
+             updated_by: row?.scratchpad_updated_by || null };
+  }
+
+  // ── a zee's OWN scratchpad: read (default), --set, --clear ──
+  if (action === 'set') {
+    const body = String(text || '').trim();
+    if (!body) {
+      return { ok: false, error: 'scratchpad --set needs the text — the note that will survive this cage. '
+        + 'To REMOVE it, use `zee scratchpad --clear`.' };
+    }
+    if (body.length > SCRATCHPAD_MAX) {
+      return { ok: false, error: `the scratchpad is limited to ${SCRATCHPAD_MAX} characters — `
+        + `${body.length} is a whole journal, not a working note. Keep what you have tried and ruled `
+        + 'out; the detail that needs to survive is the summary, not the transcript.' };
+    }
+    await q(`UPDATE xell SET scratchpad=$2, scratchpad_updated_at=now(),
+             scratchpad_updated_by=$3 WHERE id=$1`,
+      [xell.id, body, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} wrote its scratchpad (${body.length} chars) — it now outlives the cage`);
+    return { ok: true, scratchpad: body, length: body.length,
+             message: `Saved (${body.length} chars) — your scratchpad now outlives this cage, and a swap `
+               + 'will hand it to the next zee in its inheritance brief. `zee scratchpad` reads it back; '
+               + '`zee scratchpad --clear` empties it.' };
+  }
+
+  if (action === 'clear') {
+    await q(`UPDATE xell SET scratchpad=NULL, scratchpad_updated_at=now(),
+             scratchpad_updated_by=$2 WHERE id=$1`,
+      [xell.id, xell.slug]);
+    broadcast('xell', { id: xell.id });
+    logline('crew', `${xell.slug} cleared its scratchpad — swaps carry no scratchpad block again`);
+    return { ok: true, scratchpad: null,
+             message: 'Cleared — your scratchpad is empty, and a swap will carry no scratchpad block.' };
+  }
+
+  const row = await one(
+    `SELECT scratchpad, scratchpad_updated_at, scratchpad_updated_by FROM xell WHERE id=$1`,
+    [xell.id]);
+  const t = String(row?.scratchpad || '').trim() || null;
+  return { ok: true, scratchpad: t, length: t ? t.length : 0,
+           updated_at: row?.scratchpad_updated_at || null,
+           updated_by: row?.scratchpad_updated_by || null };
+}
+
 export async function selfWork(xell, { board = false, item = null } = {}) {
   const { workItemTree, itemForXell } = await import('../lib/work-assign.js');
   const { getWorkItem } = await import('../lib/work-items.js');

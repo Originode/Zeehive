@@ -28,6 +28,8 @@ const req = {
   commit: 'abcdef1234567890',
   site_key: 'eu',
   error: 'webapp build returned non-zero',
+  failure_cause: 'npm-install',
+  failure_line: 'npm ERR! No matching version found for react@19.0.0',
   containers: [
     { role: 'migrations', ok: true, applied: ['051_x.sql'] },
     { role: 'server', ok: true, method: 'build' },
@@ -36,6 +38,8 @@ const req = {
 };
 const body = shipFailureReport(req);
 ok(body.includes('Ship of abcdef12 to production @ eu FAILED.'), 'headline names the short sha + site');
+ok(body.includes('Cause: npm-install — npm ERR! No matching version found for react@19.0.0'),
+   'the classified cause leads the report (ticket #58) — the one-line diagnosis before the raw log');
 ok(body.includes('Error: webapp build returned non-zero'), 'includes the top-level ship error');
 ok(body.includes('── webapp (build) ──'), 'includes the FAILED container step header');
 ok(body.includes('exit 1'), "includes the failed step's error");

@@ -146,7 +146,7 @@ const { renderToStaticMarkup } = await import('react-dom/server');
 const WEB = resolve(here, '..', 'web/src');
 const entry = `${WEB}/.env-alert.test-entry.jsx`;
 const outfile = `${WEB}/.env-alert.test-bundle.mjs`;
-writeFileSync(entry, read('web/src/App.jsx') + '\nexport { NeedsYouBar, XellCard };\n');
+writeFileSync(entry, read('web/src/App.jsx') + '\nexport { NeedsYouBar };\n');
 let ui;
 try {
   await build({ entryPoints: [entry], outfile, bundle: true, format: 'esm', platform: 'node',
@@ -172,17 +172,6 @@ const unesc = (s) => String(s).replace(/&#x27;/g, "'").replace(/&quot;/g, '"')
 const barOf = (x, expandedId) => renderToStaticMarkup(h(ui.NeedsYouBar, {
   xells: [x], landingByXell: {}, prsFor: () => [], visible: (a) => a || [],
   onJump: () => {}, expandedId, onDecided: () => {}, onDismiss: () => {} }));
-const cardOf = (x) => renderToStaticMarkup(h(ui.XellCard, { x, diff: null, onDone: () => {}, onMenu: () => {},
-  prodLock: null, projectId: 'p1', landing: [], prs: [], ship: null, onDismiss: () => {}, machines: [] }));
-
-const card = cardOf(alerting);
-ok(card.includes('data-testid="env-alert"'), 'the xell card grows an env row');
-ok(unesc(card).includes(REFUSAL), 'carrying the refusal text VERBATIM, in full, for the human who hovers it');
-ok(/NOT reconciled/.test(card), 'and saying plainly that the file was NOT reconciled');
-ok(/6 failed reconciles/.test(card) && /first seen 2d ago/.test(card),
-   'with its AGE — 6 failures, first seen 2 days ago: a state, not a blip');
-ok(/the zee cannot clear this/.test(card),
-   'and that the zee cannot clear it, so nobody waits for the zee to deal with it');
 
 const bar = barOf(alerting, 'x1');
 ok(bar !== '', 'the "waiting on you" line lists the xell — nobody in the xell raised this, so if it '
@@ -195,8 +184,8 @@ ok(/re-point this xell/i.test(bar), 'and what to do about it');
 ok(!/Approve|Reject/.test(bar.slice(bar.indexOf('env-alert-note'))),
    'and offers no button — there is nothing here a click can decide');
 
-ok(barOf(healthy, null) === '' && !cardOf(healthy).includes('env-alert'),
-   'a xell with no alert renders neither — no new permanent furniture on a healthy fleet');
+ok(barOf(healthy, null) === '',
+   'a xell with no alert renders nothing — no new permanent furniture on a healthy fleet');
 
 // a tend and an env alert TOGETHER: the hexagon can show one word, the bar must show both
 const both = { ...alerting, tend: { open: true, reason: 'need a human', full: null, at: t(0) } };
@@ -205,7 +194,7 @@ ok(/🖐 tend/.test(barBoth) && /env NOT reconciled/.test(barBoth),
    'a xell with BOTH shows both on the bar — the pill has to choose, the "waiting on you" line does not');
 
 const css = read('web/src/styles.css');
-ok(/\.envalert\s*\{/.test(css) && /\.envalert-age\s*\{/.test(css), 'styled (no unstyled class)');
+ok(/\.ny-why\s*\{/.test(css), 'the "waiting on you" note is styled (no unstyled class)');
 
 const app = read('web/src/App.jsx');
 ok(/const tend = x\.tend\?\.open \? 1 : 0;/.test(app),

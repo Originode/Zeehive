@@ -17,12 +17,17 @@ export function shipHasFailureOutput(req) {
 }
 
 // The message body: the same failure information the ship card shows, laid out for the zee to act on.
+// The classified cause (ticket #58) leads the report when the queenzee stored one — the raw log
+// follows, so the zee gets BOTH the one-line diagnosis and the evidence to act on.
 export function shipFailureReport(req) {
   if (!req) return '';
   const lines = [
     `Ship of ${short(req.commit)} to production${req.site_key ? ` @ ${req.site_key}` : ''} FAILED.`,
     '',
   ];
+  if (req.failure_cause) {
+    lines.push(`Cause: ${req.failure_cause}${req.failure_line ? ` — ${req.failure_line}` : ''}`, '');
+  }
   if (req.error) lines.push(`Error: ${req.error}`, '');
   const steps = Array.isArray(req.containers) ? req.containers : [];
   for (const r of steps) {

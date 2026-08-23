@@ -7,14 +7,21 @@
 //
 // This pins the projection rule in lib/provision.writeXellEnv / emitXellEnv:
 //
-//   1. db_coupling === 'db-shared-dev'  →  .zeehive.env carries QUEENZEE_INPROC=false
-//      (process-runner Zeehive xells; start-xell-process.sh unsets+reloads the file so the value
-//      wins over the parent queenzee's env).
-//   2. A xell on its OWN db (clone / isolated / owned container) does NOT get the flag — full
+//   1. A xell whose DATABASE_URL is the managing meta-DB — measured by the DB-LEVEL identity
+//      (sameDatabaseIdentity: cluster system_identifier + database name) — carries
+//      QUEENZEE_INPROC=false. The db-prod-readonly exemption path (a minted reader DSN that points
+//      at the meta-DB) is the canonical case, and so is the db-shared-dev alias case (published
+//      10.x:32768 vs in-network meta-db:5432 — different host strings, same physical database).
+//   2. When the identity is UNMEASURABLE (null), db_coupling === 'db-shared-dev' is the EXPLICIT
+//      FALLBACK: process-runner Zeehive xells whose shared-dev DSN the queenzee cannot resolve
+//      (compose-network alias) still get the flag. The coupling name is never a primary key.
+//   3. A xell whose DATABASE_URL is MEASURED to be a different database does NOT get the flag,
+//      even with db-shared-dev coupling — the identity beats the coupling name (this is what stops
+//      a non-Zeehive project carrying the coupling from being marked API-only for a db that is not
+//      the managing meta-DB).
+//   4. A xell on its OWN db (clone / isolated / owned container) does NOT get the flag — full
 //      inproc stays the default so a nested queenzee on a private meta still takes the lock.
-//   3. sameDatabase(DATABASE_URL, managing meta-DB) also projects the flag (the db-prod-readonly
-//      exemption path that emits the managing meta-DB DSN under a different coupling name).
-//   4. QUEENZEE_INPROC is a reserved structural name — an environment cannot flip it back to true.
+//   5. QUEENZEE_INPROC is a reserved structural name — an environment cannot flip it back to true.
 //
 // Does NOT boot index.js (that is queenzee-inproc-api-only.test.mjs). This only asserts what the
 // projection WRITES, which is the start-path seam both eras read.
@@ -22,6 +29,7 @@ import { mkdtempSync, rmSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import pg from 'pg';
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
@@ -160,6 +168,43 @@ try {
   ok(roFile.vars.QUEENZEE_INPROC === 'false',
      `sameDatabase(meta) → QUEENZEE_INPROC=false even under db-prod-readonly `
      + `(got ${roFile.vars.QUEENZEE_INPROC ?? '(unset)'})`);
+
+  // ── 3b. THE IDENTITY CHECK BEATS THE COUPLING NAME (the card's risk 1) ──────────────────────
+  // A db-shared-dev xell whose DATABASE_URL is MEASURED to be a different database must NOT get the
+  // flag — the coupling name is only a fallback when the identity is NULL, never a primary key.
+  // Without this, any non-Zeehive project carrying the db-shared-dev coupling would be marked
+  // API-only for a database that is not the managing meta-DB. Needs a REACHABLE different database
+  // to measure against, so it runs when DATABASE_URL is a loopback sandbox (this cage's zee
+  // db-sandbox); a shared dev db would make CREATE DATABASE unsafe (frozen schema).
+  console.log('\n── db-shared-dev + identity says DIFFERENT → NO flag (identity beats the coupling name) ──');
+  const dsnUrl = new URL(config.databaseUrl.replace(/^postgres(ql)?:/, 'http:'));
+  const isSandbox = ['127.0.0.1', 'localhost', '::1'].includes(dsnUrl.hostname);
+  if (isSandbox) {
+    const OTHER_DB = `other_${tag}`;
+    const admin = new pg.Client({ connectionString: config.databaseUrl });
+    await admin.connect();
+    try { await admin.query(`CREATE DATABASE ${OTHER_DB}`); }
+    finally { await admin.end().catch(() => {}); }
+    const otherUrl = new URL(config.databaseUrl.replace(/^postgres(ql)?:/, 'http:'));
+    otherUrl.pathname = `/${OTHER_DB}`;
+    const OTHER_DSN = String(otherUrl).replace(/^http:/, 'postgresql:');
+    const otherSharedId = (await one(
+      `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, internal_port, conn_ref)
+         VALUES ($1,'db','dev','shared',$2,'default',5432,$3) RETURNING id`,
+      [pid, `inproc_other_${tag}`, OTHER_DSN])).id;
+    const sharedOther = await mkXell('shared-other', { coupling: 'db-shared-dev' });
+    await q(`INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'uses')`,
+            [sharedOther.id, otherSharedId]);
+    await emitXellEnv(sharedOther.id);
+    const sharedOtherFile = readEmitted(sharedOther.wt);
+    ok(sharedOtherFile.vars.QUEENZEE_INPROC === undefined,
+       `db-shared-dev whose db is MEASURED different → NO QUEENZEE_INPROC=false `
+       + `(got ${sharedOtherFile.vars.QUEENZEE_INPROC ?? '(unset)'}) — identity beats the coupling name`);
+    ok(sharedOtherFile.vars.DATABASE_URL === OTHER_DSN,
+       'and the projected DATABASE_URL is the different database');
+  } else {
+    ok(true, `SKIPPED (DATABASE_URL is not a loopback sandbox: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
+  }
 
   // ── 4. reserved: an environment cannot flip QUEENZEE_INPROC back to true ────────────────────
   console.log('\n── QUEENZEE_INPROC is reserved — environment cannot override ──');

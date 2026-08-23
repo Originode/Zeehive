@@ -39,7 +39,8 @@ export async function getDiffs(projectId) {
 
   // Which of these xells is being driven by a LIVE cxell zee right now? (Same live-status set the
   // monitor treats as "a zee is present".) Only these need the cxell read; everything else is a
-  // host-worktree diff. slug → cxell container name; head_commit → the base the cxell diffs against.
+  // host-worktree diff. slug → cxell container name; head_commit → the recorded head cxellDiff uses
+  // as the fallback while computing its fork-point base (it is NOT diffed against directly).
   const cxellRows = await q(
     `SELECT DISTINCT z.xell_id FROM zee z
        JOIN agent_runtime r ON r.id = z.runtime_id
@@ -70,8 +71,9 @@ export async function getDiffs(projectId) {
     let d = null;
     // Live cxell zee: read the diff from the cxell, where the uncollected work is. `behind` isn't
     // visible in the cxell (the source ref isn't cloned in), so it comes from the host — how far the
-    // source advanced past the provisioning base. Cached briefly to keep the exec load flat. On any
-    // cxell failure (unreachable, no base) cxellDiff returns null and we fall through to the host path.
+    // source advanced past the recorded head_commit (the merged HEAD once the zee has synced, so this
+    // reads 0 after a sync). Cached briefly to keep the exec load flat. On any cxell failure
+    // (unreachable, no base) cxellDiff returns null and we fall through to the host path.
     if (cxell.has(x.id) && x.head_commit) {
       const hit = cxellDiffCache.get(x.id);
       if (hit && Date.now() - hit.at < CXELL_DIFF_TTL_MS) {

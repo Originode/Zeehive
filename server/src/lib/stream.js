@@ -23,7 +23,7 @@
 // the server's 'upgrade' event next to attachTerminalBridge; both use the noServer pattern, and
 // `ws` is already a dependency (the terminal bridge uses it).
 import { WebSocketServer } from 'ws';
-import { bus } from './events.js';
+import { bus, activityFanout } from './events.js';
 import { getFleet } from './fleet.js';
 
 const DEFAULT_PING_MS = 20000;   // same cadence as the SSE route's comment frames
@@ -43,13 +43,15 @@ export function attachStreamWebSocket(server) {
 
 async function openStream(ws, url) {
   const send = (obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
+  // The connection's ?project=<id> (null = whole-fleet view) — used both for the snapshot and
+  // to scope the queenzee-activity fan-out below.
+  const project = new URL(url, 'http://localhost').searchParams.get('project');
 
   // The leading fleet snapshot, so a fresh client renders immediately — the same promise the SSE
   // route makes. Deliberately best-effort: a NAS blip must not kill the stream (the lesson of the
   // async-route unhandled rejection that took the queenzee down), so a failed snapshot becomes an
   // `error` frame and the live channel still works.
   try {
-    const project = new URL(url, 'http://localhost').searchParams.get('project');
     const fleet = await getFleet(project);
     if (fleet) send({ type: 'snapshot', payload: fleet });
     else send({ type: 'error', payload: { error: 'no project' } });
@@ -58,11 +60,13 @@ async function openStream(ws, url) {
     send({ type: 'error', payload: { error: err.message } });
   }
 
-  // Every bus event rides out as one frame, exactly as the SSE route writes it.
-  const onEvent = (e) => send({ type: e.type, payload: e.payload });
+  // Every bus event rides out as one frame, exactly as the SSE route writes it. Project-scope +
+  // cap the queenzee-activity fan-out per connection (activityFanout); other event types pass.
+  const { onEvent, close } = activityFanout(project, (e) => send({ type: e.type, payload: e.payload }));
   bus.on('event', onEvent);
   // Keep the socket alive through idle proxies — mirrors the SSE route's :ping comment frames.
   const ping = setInterval(() => send(PING_TEXT), DEFAULT_PING_MS);
-  ws.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
-  ws.on('error', () => { clearInterval(ping); bus.off('event', onEvent); });
+  const cleanup = () => { clearInterval(ping); bus.off('event', onEvent); close(); };
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
 }

@@ -13,6 +13,26 @@ import { shipFailureReport, shipHasFailureOutput } from './shipFailure.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
+// WHO READ THIS COMMIT (ticket #56) — the review records attached to the sha a ship carries, so a
+// human approving a PRODUCTION deploy sees whether anyone actually read the code, and what they
+// concluded. A record, never a gate: its absence never blocks a ship, and its presence is the
+// information the ticket said the system was missing — a review happened and nobody could see it.
+export function ShipReviewNote({ req }) {
+  const reviews = Array.isArray(req.reviews) ? req.reviews : [];
+  if (!reviews.length) return null;
+  return (
+    <div className="land-reviews" data-testid="ship-reviews">
+      {reviews.map((r, i) => (
+        <span key={i} className={`review-chip review-${r.verdict}`}
+              title={r.report || `${r.reviewer}'s review of ${short(req.commit)}`}>
+          {r.verdict === 'clean' ? '✓' : '⚠'} reviewed by {r.reviewer} — {r.verdict.replace('_', '-')}
+          {Number(r.findings_count) > 0 ? ` · ${r.findings_count} finding${Number(r.findings_count) === 1 ? '' : 's'}` : ''}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // The schema half of the approve confirmation, in one line per set. Exported for the same reason
 // ShipSchema is: the "UNKNOWN, never none" rule is a contract, so it is read from real output.
 export function schemaConfirmLine(req) {
@@ -106,12 +126,21 @@ function LiveBuildLog({ lines }) {
 // unknown, and saying "none" there is exactly the bug this fixes.
 export function ShipSchema({ req }) {
   const deploy = Array.isArray(req?.migrations) ? req.migrations : [];
+  const deployErr = req?.migrations_error || null;
   const boot = req?.boot_migrations && typeof req.boot_migrations === 'object' ? req.boot_migrations : null;
   const bootOn = !!boot?.applicable;
+  // A pendingMigrations() failure at request time makes the DEPLOY-time count unknown — "no
+  // migrations ride this ship" would be a lie. Same rule the boot-time set already followed (075).
   if (!deploy.length && !bootOn) {
     return (
       <div className="ship-schema" data-testid="ship-schema">
-        <span className="k">schema:</span> <span className="ship-schema-none">no migrations ride this ship</span>
+        <span className="k">schema:</span>{' '}
+        {deployErr
+          ? <b className="ship-schema-unknown" data-testid="ship-schema-deploy-unknown">UNKNOWN</b>
+          : <span className="ship-schema-none">no migrations ride this ship</span>}
+        {deployErr && (
+          <span className="ship-schema-when"> — the deploy-time migration set could not be read: {deployErr}</span>
+        )}
       </div>
     );
   }
@@ -126,7 +155,12 @@ export function ShipSchema({ req }) {
         <span className="k">at deploy:</span>{' '}
         {deploy.length
           ? <b>{deploy.length} migration(s)</b>
-          : <span className="ship-schema-none">none</span>}
+          : deployErr
+            ? <b className="ship-schema-unknown" data-testid="ship-schema-deploy-unknown">UNKNOWN</b>
+            : <span className="ship-schema-none">none</span>}
+        {deployErr && !deploy.length && (
+          <span className="ship-schema-when"> — the deploy-time migration set could not be read: {deployErr}</span>
+        )}
         <span className="ship-schema-when"> — the queenzee applies these to the production database before the containers build</span>
         {deploy.length > 0 && list(deploy)}
       </div>
@@ -150,6 +184,132 @@ export function ShipSchema({ req }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// THE PAYLOAD THIS SHIP CARRIES (ticket #65) — the commits between the last SHIPPED commit for the
+// same target and the one being deployed, each with who landed it and what it was for. The card
+// already warned "every landing on main, not only the requester's" and never said which; this is
+// the list. ADVISORY: a payload that could not be read renders as such in words and never blocks
+// the ask or the approval — the same degrade-never-block rule as ShipPreflight.
+export function ShipPayload({ req }) {
+  const p = req?.payload;
+  if (!p) return null;
+  if (p.ok === false) {
+    return (
+      <div className="ship-payload" data-testid="ship-payload">
+        <span className="k">payload:</span>{' '}
+        <span className="ship-payload-unknown" data-testid="ship-payload-unknown">
+          could not be read{p.error ? ` — ${p.error}` : ''}
+        </span>
+      </div>
+    );
+  }
+  if (!p.commits?.length) {
+    return (
+      <div className="ship-payload" data-testid="ship-payload">
+        <span className="k">payload:</span>{' '}
+        <span className="ship-payload-note" data-testid="ship-payload-note">{p.note || 'nothing new since the last ship to this target'}</span>
+      </div>
+    );
+  }
+  const s = p.summary || {};
+  const yours = s.yours > 0 ? `; ${s.yours} ${s.yours === 1 ? 'is' : 'are'} yours` : '';
+  // The review gate (ticket #79) — the card says WHICH carried commits are unread, and by whom they
+  // were landed, so the human approving a deploy sees exactly what still needs reading. A payload
+  // whose review record could not be read (s.unknown > 0) is the inverse failure: unmeasurable must
+  // never read as "all reviewed", so it renders as its own badge, stronger than "unread".
+  const gateBadge = Number(s.unknown) > 0
+    ? <span className="ship-payload-gate unknown" data-testid="ship-payload-gate-unknown">
+        {s.unknown} commit{s.unknown === 1 ? '' : 's'} with an UNREADABLE review record
+      </span>
+    : Number(s.unread) > 0
+      ? <span className="ship-payload-gate" data-testid="ship-payload-gate-unread">
+          {s.unread} unread commit{s.unread === 1 ? '' : 's'} — auto-approve requires a recorded review or a human
+        </span>
+      : <span className="ship-payload-gate ok" data-testid="ship-payload-gate-ok">every commit reviewed</span>;
+  return (
+    <div className="ship-payload" data-testid="ship-payload">
+      <div className="ship-payload-summary" data-testid="ship-payload-summary">
+        <span className="k">payload:</span>{' '}
+        <b>{s.commits} commit{s.commits === 1 ? '' : 's'} from {s.xells} xell{s.xells === 1 ? '' : 's'}</b>
+        {' '}since the last ship to this target{p.from ? ` (${short(p.from)})` : ''}{yours}
+        {' '}{gateBadge}
+      </div>
+      <ul className="ship-payload-commits" data-testid="ship-payload-commits">
+        {p.commits.map((c, i) => (
+          <li key={i} className={`ship-payload-commit${c.unattributed ? ' unattributed' : ''}${c.reviewed === false ? ' unread' : ''}`} data-testid="ship-payload-commit">
+            <code>{short(c.sha)}</code> {c.subject}
+            <span className="ship-payload-when">
+              {' — '}landed by {c.xell_slug || 'unknown'}{c.landed_at ? ` · ${new Date(c.landed_at).toLocaleDateString()}` : ''}
+            </span>
+            {c.reviewed === false && (
+              <span className="ship-payload-review-badge unread" data-testid="ship-payload-unread">unread</span>
+            )}
+            {c.reviewed === null && (
+              <span className="ship-payload-review-badge unknown" data-testid="ship-payload-review-unknown">review record unreadable</span>
+            )}
+            {(c.ticket || c.work_item) && (
+              <span className="ship-payload-work">
+                {' · '}{c.ticket?.number ? `#${c.ticket.number} ` : ''}{c.work_item?.title || c.ticket?.title || 'work item'}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// THE DEPLOY'S PRECONDITIONS, as probed when the ship was raised (ticket #58). The queenzee runs
+// READ-ONLY checks at request time — the migration target db is addressable and inspectable, the
+// build targets have build scripts, the docker contexts answer — and this renders the verdict so a
+// failing precondition turns the card into "cannot ship, because X" BEFORE a human spends attention
+// approving it. The stored checks are rendered as-is (the card never reclassifies), so the record
+// and the card cannot disagree.
+export function ShipPreflight({ req }) {
+  const checks = Array.isArray(req?.preflight) && req.preflight.length ? req.preflight : null;
+  if (!checks) return null;
+  const failed = checks.filter((c) => !c.ok && !c.unknown && !c.skipped);
+  const unknown = checks.filter((c) => c.unknown);
+  const passed = checks.filter((c) => c.ok && !c.skipped);
+  const skipped = checks.filter((c) => c.skipped);
+
+  if (failed.length) {
+    return (
+      <div className="ship-preflight bad" data-testid="ship-preflight">
+        <div className="ship-preflight-head" data-testid="ship-preflight-bad">⛔ cannot ship, because:</div>
+        {failed.map((c) => (
+          <div className="ship-preflight-fail" key={c.check} data-testid="ship-preflight-fail">
+            <b>{c.check}:</b> {c.detail}
+          </div>
+        ))}
+        {unknown.length > 0 && (
+          <div className="ship-preflight-unknown" data-testid="ship-preflight-partial">
+            …plus {unknown.length} check{unknown.length === 1 ? '' : 's'} that could not be verified:
+            {' '}{unknown.map((c) => c.check).join(', ')}
+          </div>
+        )}
+        {req.preflight_error && (
+          <div className="ship-preflight-err" data-testid="ship-preflight-error">{req.preflight_error}</div>
+        )}
+      </div>
+    );
+  }
+  if (unknown.length) {
+    return (
+      <div className="ship-preflight unknown" data-testid="ship-preflight">
+        <span className="k">pre-flight:</span> could not verify everything —{' '}
+        {unknown.map((c) => `${c.check}: ${c.detail}`).join(' · ')}
+      </div>
+    );
+  }
+  return (
+    <div className="ship-preflight ok" data-testid="ship-preflight">
+      <span className="k">pre-flight:</span> ready —
+      {' '}{passed.length} precondition{passed.length === 1 ? '' : 's'} verified
+      {skipped.length ? ` · ${skipped.length} skipped` : ''}
     </div>
   );
 }
@@ -281,12 +441,27 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
       <div className="land-stat">
         builds local <b>main</b> @ <b>{short(req.commit)}</b> — not the xell's worktree, not origin
       </div>
+      {/* WHO READ THIS COMMIT (ticket #56) — the reviews recorded against the sha this ship carries,
+          so approving a deploy to PRODUCTION is done knowing whether the code was reviewed, and by
+          whom. A record, never a gate: its absence never blocks a ship, and its presence is the
+          information the ticket said the system was missing. */}
+      <ShipReviewNote req={req} />
       {/* THE SCHEMA THIS SHIP CARRIES — both sets, never merged (ticket #12). The card used to show
           nothing at all unless the ship was code-only, and `migrations` is empty for a project that
           migrates itself at BOOT: a Zeehive deploy told the approving human "no migrations" while
           applying five to the live meta-DB, two of which rewrote the manual every zee reads. The
           gate is only as good as what it tells the human. */}
       <ShipSchema req={req} />
+      {/* THE DEPLOY'S PRECONDITIONS, probed at request time (ticket #58). A failing precondition
+          turns the card into "cannot ship, because X" BEFORE the human spends attention approving.
+          The deploy's own guards re-check at deploy time, so an approve after the reason is fixed
+          is safe; an approve before it is fixed fails with the SAME named reason on the result. */}
+      <ShipPreflight req={req} />
+      {/* THE PAYLOAD (ticket #65) — what this ship actually carries: the commits since the last
+          shipped commit for this target, with who landed each. Distinct from the schema (above)
+          and the pre-flight: those say WHAT the deploy applies and whether its preconditions are
+          met; this says WHOSE work is riding along. */}
+      <ShipPayload req={req} />
       {/* DB scope + the zee's drift assessment — the human approves the SCOPE and the REASONING,
           not a bare green tick. A code-only ship says what it deliberately will not run. */}
       {req.skip_migrations && (
@@ -332,7 +507,19 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
       {req.status === 'shipping' && <LiveBuildLog lines={live} />}
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
       {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
-      {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
+      {req.status === 'failed' && (
+        <>
+          {/* The classified cause rides beside the raw log — the card says WHY it failed instead of
+              handing out a 400-character tail to scroll (ticket #58). */}
+          {req.failure_cause && (
+            <div className="ship-cause" data-testid="ship-cause">
+              ✗ {req.failure_cause.replaceAll('-', ' ')}
+              {req.failure_line && <span className="ship-cause-line" data-testid="ship-cause-line"> — {req.failure_line}</span>}
+            </div>
+          )}
+          <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>
+        </>
+      )}
       {/* A ship built by the queenzee and failed — hand the zee the exact build output so it can
           fix and re-ship, instead of the operator copy-pasting logs into the message composer by
           hand. Opens the same 📨 composer, pre-filled with the failure report; the human can add a
@@ -567,34 +754,5 @@ function BundleBar({ count, projectId, onDone }) {
   );
 }
 
-// The padlock badge on whichever xell holds prod. Hover swaps to an unlock icon; clicking asks
-// before taking prod back — a force release while a human is mid-verification is disruptive.
-export function LockBadge({ lock, projectId, onChanged }) {
-  const [hover, setHover] = useState(false);
-  const [busy, setBusy] = useState(false);
-  if (!lock) return null;
-
-  const release = async (e) => {
-    e.stopPropagation();
-    if (!(await confirmForceRelease(lock))) return;
-    setBusy(true);
-    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { showAlert(err.message, { variant: 'error' }); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <button
-      className={`lock-badge${lock.held ? ' held' : ''}`}
-      data-testid="lock-badge"
-      disabled={busy}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onClick={release}
-      title={lock.held
-        ? 'Holds the PRODUCTION lock (held open — no auto-release). Click to force-release.'
-        : 'Holds the PRODUCTION lock. Click to force-release.'}
-    >
-      {busy ? '…' : (hover ? '🔓' : '🔒')}
-    </button>
-  );
-}
+// (LockBadge — the padlock on the deleted XellCard — was removed with it, TKT-29-3AB6. The prod
+// lock's countdown and force-release still live on the ShipPanel; nothing else rendered this.)

@@ -167,8 +167,9 @@ export function prodDbAddress(db) {
 }
 
 // The docker inspect --format template for an address mode. Alias needs the network membership;
-// a published port needs the port bindings.
-function inspectFormatFor(mode) {
+// a published port needs the port bindings. EXPORTED for the ship pre-flight (ship-preflight.js),
+// which runs the SAME guard at request time — one copy of the template, never two.
+export function inspectFormatFor(mode) {
   return mode === 'alias' ? '{{json .NetworkSettings.Networks}}' : '{{json .NetworkSettings.Ports}}';
 }
 

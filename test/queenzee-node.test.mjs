@@ -70,6 +70,60 @@ ok(logoDraws === 1, `the logo is drawn once via drawImage (got ${logoDraws})`);
 ok(!logoRec.rec.text.map((t) => t.t).includes('⌂'), 'the ⌂ glyph is not drawn when the logo is present');
 ok(logoRec.rec.text.map((t) => t.t).includes('QUEENZEE'), 'the QUEENZEE label still sits under the logo');
 
+// ── 1b. the disabled / "no terminal" state — the dead click is now visible ────
+// openQueenzeeTerminal used to silently no-op when no prod server container existed. The node now
+// carries an explicit state so the absence is visible BEFORE the click: 'none' = no prod server
+// (genuinely disabled), 'down' = a prod server exists but the shell would fail (a real fault to
+// surface, not a "no terminal" badge). Both are drawn; a ready node draws neither tag.
+console.log('\nthe queenzee node draws an explicit "no terminal" / "server down" disabled state');
+const noneRec = recorder();
+drawQueenzeeNode(noneRec, 200, 200, 70, { terminal: 'none' });
+const noneTexts = noneRec.rec.text.map((t) => t.t);
+ok(noneTexts.includes('no terminal'), 'no prod server → the node says "no terminal"');
+ok(noneTexts.includes('▚ logs'), 'the logs button still draws on a disabled node (logs ≠ terminal)');
+ok(noneTexts.includes('QUEENZEE'), 'the node identity still draws while disabled');
+const downRec = recorder();
+drawQueenzeeNode(downRec, 200, 200, 70, { terminal: 'down' });
+const downTexts = downRec.rec.text.map((t) => t.t);
+ok(downTexts.includes('server down'), 'a prod server that exists but is down says "server down", not "no terminal"');
+const readyRec = recorder();
+drawQueenzeeNode(readyRec, 200, 200, 70, {});
+const readyTexts = readyRec.rec.text.map((t) => t.t);
+ok(!readyTexts.some((t) => /terminal|server down/.test(t)), 'a ready node draws no terminal-state tag');
+// the wiring: App.jsx resolves the status and hands it to the canvas
+const appSrc = readFileSync('web/src/App.jsx', 'utf8');
+ok(appSrc.includes('qzTerminalStatus={qzTerminal.status}'), 'App.jsx passes the resolved terminal status to HiveCanvas');
+ok(src.includes('terminal: qzTerminalStatus'), 'HiveCanvas passes the status into drawQueenzeeNode');
+ok(/status:\s*'none'/.test(appSrc),
+   'App.jsx distinguishes "no prod server" (none) from a present-but-down server');
+// the context menu disables the terminal item when there is nothing to shell into
+ok(src.includes("disabled={qzTerminalStatus === 'none'}"), 'the queenzee context menu disables the terminal item when no prod server exists');
+
+// ── 1c. the bloom must not bury the node ─────────────────────────────────────
+// An expanded xell adjacent to cell (0,0) draws a flower petal over the queenzee node. The node is
+// drawn on top of the flower (z-order), and when a petal actually lands on its cell it draws a halo
+// so it stays readable — WITHOUT trading away the flower's click precedence (hitFlower still answers
+// before hitQueenzee in the expanded click branch).
+console.log('\nthe bloom must not bury the queenzee node');
+const haloRec = recorder();
+drawQueenzeeNode(haloRec, 200, 200, 70, { overlapped: true });
+const plainRec = recorder();
+drawQueenzeeNode(plainRec, 200, 200, 70, {});
+ok(haloRec.rec.ops.filter((o) => o === 'stroke').length
+   === plainRec.rec.ops.filter((o) => o === 'stroke').length + 1,
+  'an overlapped node draws one extra halo stroke (the bloom lift)');
+// the halo is painted BEFORE the hex fill — it rings the node rather than covering it
+ok(haloRec.rec.ops.lastIndexOf('stroke') > haloRec.rec.ops.indexOf('fill'),
+  'the node still fills its hex after the halo (the halo rings it)');
+ok(src.includes('qzOverlapped') && src.includes('overlapped: qzOverlapped'),
+  'HiveCanvas computes whether a bloom petal sits on the node cell and passes it to the draw');
+// the CLICK precedence stays with the flower: in the expanded onPointerUp branch, hitFlower is
+// checked before hitQueenzee, so a click on the overlapping petal opens the flower — never the node.
+const fHit = src.indexOf('const f = hitFlower(wx, wy)');
+const qzHit = src.indexOf('if (hitQueenzee(wx, wy)) { onQueenzeeTerminal');
+ok(fHit >= 0 && qzHit >= 0 && fHit < qzHit,
+  'in the expanded click branch hitFlower is tested before hitQueenzee (flower wins, pinned)');
+
 // ── 2. the arrows animate: dashed lines in the right direction + an arrowhead ─
 console.log('\nqueenzee↔xell arrows draw as dashed lines with arrowheads');
 const qz = { cx: 0, cy: 0, size: 30 };
@@ -139,15 +193,15 @@ ok(Object.keys(cells).length === list.length, 'every xell still gets a seat');
 // ── 5. the ship path aims the arrow at PRODUCTION, not the work xell ─────────
 console.log('\nshipgate emits queenzee→production activity when a ship runs');
 const shipgate = readFileSync('server/src/queenzee/shipgate.js', 'utf8');
-ok(/activity\('q2x',\s*p\.id,\s*'ship'\)/.test(shipgate)
-  || /activity\("q2x",\s*p\.id,\s*"ship"\)/.test(shipgate),
-  "runShipBody emits activity('q2x', prodId, 'ship') for each production xell");
+ok(/activity\('q2x',\s*p\.id,\s*'ship'(?:,\s*[^)]+)?\)/.test(shipgate)
+  || /activity\("q2x",\s*p\.id,\s*"ship"(?:,\s*[^)]+)?\)/.test(shipgate),
+  "runShipBody emits activity('q2x', prodId, 'ship'[, projectId]) for each production xell");
 ok(/is_production AND status <> 'retired'/.test(shipgate)
   || (/is_production/.test(shipgate) && /activity\('q2x'/.test(shipgate)),
   'the ship activity targets is_production xells of the project');
 // the ask is still xell→queenzee (the human sees the request arrive)
-ok(/activity\('x2q',\s*xellId,\s*'ship'\)/.test(shipgate),
-  "requestShip still emits activity('x2q', xellId, 'ship') for the ask");
+ok(/activity\('x2q',\s*xellId,\s*'ship'(?:,\s*[^)]+)?\)/.test(shipgate),
+  "requestShip still emits activity('x2q', xellId, 'ship'[, projectId]) for the ask");
 // the asset is present for the webapp build to serve
 ok(existsSync('web/public/zeehive-logo.svg'), 'web/public/zeehive-logo.svg is committed for the console to serve');
 // byte-identical to the prompt attachment when present — do not "clean up" or re-export the mark

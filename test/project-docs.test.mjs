@@ -19,8 +19,10 @@
 //   2. the FAN-OUT and the generated text: one body → one file per target, each stamped with what
 //      generated it, who reads it and its siblings; the body verbatim; the XELL STACK appended when a
 //      xell is named and cleanly absent when it is not; disabled/empty rows skipped;
-//   3. the TRACKED-FILE REFUSAL, run against real `git ls-files` — the exact script the injector
-//      executes inside the cage, so this is the decision itself and not a paraphrase of it;
+//   3. the TRACKED-PATH CONTRACT, run against real `git ls-files` — the exact script the injector
+//      executes inside the cage, so this is the decision itself and not a paraphrase of it. A tracked
+//      path the meta-DB row OWNS (overwriteTracked) is written + git-excluded + skip-worktree'd
+//      (WROTE_TRACKED); a tracked path no row claims stays TRACKED and untouched;
 //   4. that an untracked write is git-EXCLUDED, so the artefact can never travel into a commit;
 //   5. and the INJECTOR'S OWN RETURN VALUE, driven through the real writeGeneratedDocIntoCxell with a
 //      fake `docker` on PATH.
@@ -230,15 +232,18 @@ try {
   await q(`DELETE FROM container WHERE owner_xell_id=$1`, [stackXell.id]);
   await q(`DELETE FROM xell WHERE id=$1`, [stackXell.id]);
 
-  // ── 3. the tracked-file refusal, decided by real git ────────────────────────────────────────
+  // ── 3. the tracked-path contract, decided by real git ────────────────────────────────────────
   // This runs the SAME shell the injector execs inside the cxell (lib/cxell.js), against a real repo:
   // the decision itself, not a description of it. There is no docker in a cxell to exec into, and the
-  // git behaviour is the whole point.
-  console.log('\n── a generated doc never overwrites a file the project committed ──');
+  // git behaviour is the whole point. The NEW contract (Option B): a tracked entry-point path the row
+  // OWNS (OVERWRITE_TRACKED=1) is written + excluded + skip-worktree'd; a tracked path no row claims
+  // (OVERWRITE_TRACKED unset) stays TRACKED and untouched.
+  console.log('\n── a generated doc supersedes a path the row owns, and protects an unrelated tracked file ──');
   mkdirSync(repo, { recursive: true });
   git('init', '-q', '-b', 'master'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
   writeFileSync(join(repo, 'CLAUDE.md'), '# the project\'s OWN committed instructions\n');
-  git('add', '-A'); git('commit', '-qm', 'the repo brings its own CLAUDE.md');
+  writeFileSync(join(repo, 'README.md'), '# the project\'s own README\n');
+  git('add', '-A'); git('commit', '-qm', 'the repo brings its own CLAUDE.md and README');
 
   // the injector's script, verbatim from lib/cxell.js — kept in one place so a change there is
   // caught here rather than diverging quietly
@@ -249,22 +254,42 @@ try {
     .filter((l) => l && !l.startsWith('exec') && l !== '-i' && l !== 'bash' && l !== '-lc');
   ok(steps.includes('cd /work/repo') && steps.some((l) => /git ls-files --error-unmatch/.test(l)),
      'the injector really asks git before writing (its script is read out of the source here)');
+  ok(steps.some((l) => /OVERWRITE_TRACKED/.test(l)) && steps.some((l) => /WROTE_TRACKED/.test(l)),
+     'and the overwrite flag + supersede verdict are in the script (the caller owns the exemption)');
+  ok(steps.some((l) => /skip-worktree/.test(l)),
+     'and a superseded tracked path is skip-worktree\'d so it can never surface in a landing diff');
   // the target path is interpolated by the caller (shell-quoted there), so it is supplied here the
   // same way: everything else is the source's own lines, in the source's own order.
   ok(block.includes('P=${sq(safe)}'), 'and the path it asks about is the shell-quoted target');
-  const run = (relPath, text) => {
+  const run = (relPath, text, env = {}) => {
     const script = [`cd ${repo}`, `P='${relPath}'`,
       ...steps.filter((l) => l !== 'cd /work/repo')].join('\n');
-    const r = spawnSync('bash', ['-lc', script], { input: text, encoding: 'utf8' });
+    const r = spawnSync('bash', ['-lc', script], { input: text, encoding: 'utf8', env: { ...process.env, ...env } });
     return { verdict: String(r.stdout || '').trim().split('\n').pop(), status: r.status, err: r.stderr };
   };
 
-  const tracked = run('CLAUDE.md', 'GENERATED — must not land\n');
-  ok(tracked.verdict === 'TRACKED', `a tracked path answers TRACKED (${tracked.verdict}) and is not written`);
-  ok(readFileSync(join(repo, 'CLAUDE.md'), 'utf8').includes("project's OWN"),
-     "the project's committed file is byte-for-byte untouched");
+  // ── 3a. a tracked path NO row owns stays protected (the old contract, for unrelated files) ──
+  const protected_ = run('README.md', 'GENERATED — must not land\n');
+  ok(protected_.verdict === 'TRACKED',
+     `an unrelated tracked path answers TRACKED (${protected_.verdict}) and is not written`);
+  ok(readFileSync(join(repo, 'README.md'), 'utf8').includes("project's own README"),
+     "that file is byte-for-byte untouched");
   ok(git('status', '--porcelain') === '', 'and the worktree is still clean — nothing to dirty a landing diff');
 
+  // ── 3b. a tracked path the row OWNS is superseded (the new contract, Option B) ──────────────
+  const owned = run('CLAUDE.md', `${P.docBanner('CLAUDE.md')}\n\ngenerated body ${tag}\n`, { OVERWRITE_TRACKED: '1' });
+  ok(owned.verdict === 'WROTE_TRACKED',
+     `a tracked entry-point path the row owns is superseded (${owned.verdict})`);
+  ok(readFileSync(join(repo, 'CLAUDE.md'), 'utf8').includes(`generated body ${tag}`),
+     'the generated content is what the zee now reads');
+  ok(readFileSync(join(repo, '.git/info/exclude'), 'utf8').split('\n').includes('CLAUDE.md'),
+     'and the superseded path is git-excluded, so it can never land in a commit');
+  ok(git('status', '--porcelain') === '',
+     'and the worktree is clean — skip-worktree keeps the superseded index entry out of every diff');
+  const skip = git('ls-files', '-v', 'CLAUDE.md');
+  ok(/^S /.test(skip), `and the index entry carries the skip-worktree bit (${skip})`);
+
+  // ── 3c. an untracked path is written (unchanged) ────────────────────────────────────────────
   const fresh = run('AGENTS.md', `${P.docBanner('AGENTS.md')}\n\ngenerated body ${tag}\n`);
   ok(fresh.verdict === 'WROTE', `an untracked path is written (${fresh.verdict})`);
   ok(readFileSync(join(repo, 'AGENTS.md'), 'utf8').includes(`generated body ${tag}`), 'with the generated content');
@@ -327,6 +352,10 @@ try {
     const wrote = await inject('WROTE\n');
     ok(wrote.written === true && wrote.rel === 'AGENTS.md' && wrote.path === '/work/repo/AGENTS.md',
        `WROTE → written:true (${JSON.stringify(wrote)})`);
+    // the new supersede verdict: a tracked path the row owns
+    const superseded = await inject('WROTE_TRACKED\n');
+    ok(superseded.written === true && superseded.superseded === true && superseded.rel === 'AGENTS.md',
+       `WROTE_TRACKED → written:true + superseded:true (${JSON.stringify(superseded)})`);
     const trackedR = await inject('TRACKED\n');
     ok(trackedR.written === false && trackedR.skipped === 'tracked' && /tracked by git/.test(trackedR.reason),
        'TRACKED → written:false with the reason a human reads');

@@ -41,6 +41,7 @@ import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harne
          resolveHarness, harnessFitsType, typeMismatchReason } from '../lib/harness.js';
 import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.js';
 import { projectDocFiles } from '../lib/project-docs.js';
+import { currentConditionsMarkdownForProject } from '../lib/current-conditions.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
@@ -48,6 +49,7 @@ import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { noteTurnDeath } from './revive.js';
+import { resetXellConsecutiveDeaths, xellQuarantineRefusal } from '../lib/xell-quarantine.js';
 import { SPIN_STOP_REASON } from '../lib/spin-detector.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
@@ -103,6 +105,7 @@ async function readyXells(projectId, { zeeType = null } = {}) {
        LEFT JOIN machine m ON m.docker_ctx = sc.docker_ctx AND m.enabled
        LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = x.project_id
       WHERE x.project_id = $1 AND x.status = 'ready'
+        AND x.quarantined_at IS NULL
         AND ($2::text IS DISTINCT FROM 'worker' OR COALESCE(x.zee_type, 'worker') <> 'manager')
       ORDER BY COALESCE(mp.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
     [projectId, zeeType]);
@@ -131,6 +134,61 @@ class NeedsWorktree extends Error {
   constructor(detail) { super('not-in-worktree'); this.code = 'NEEDS_WORKTREE'; this.detail = detail; }
 }
 
+// THE SKILL-CLAIM TAKE: ready → claimed, in one statement — the claimXell twin of the dispatch
+// path's claimReadyXell (lib/xell-claim.js), and the same compare-and-set. The pool sweep takes a
+// pooled xell with an equally conditional ready → tearing-down (takeReadyXellForSweep), and Postgres
+// serialises concurrent updates of one row, so exactly ONE of the two statements can win. If the
+// sweep won, this returns null: the xell the session is standing in is being decommissioned, and
+// flipping it back to 'claimed' would resurrect a xell whose worktree/containers are mid-removal
+// (the skill-claim half of TKT-88-D6B4, which fixed only the dispatch half).
+//
+// Deliberately NO `AND NOT is_production` — unlike a dispatch, a /xell skill-claim of a production
+// xell is legitimate (the /xell-prod flow: a human standing in that worktree claims it), so this
+// claim must be able to transition a ready production xell. status='ready' + quarantined_at IS NULL
+// are the whole guard.
+//
+// QUARANTINE (ticket #81): a /xell claim is a RECOVERY path — it starts a fresh agent in the cage —
+// and the header of lib/xell-quarantine.js promises every one of them refuses a quarantined xell
+// until a human explicitly decides rescue vs reap. The readyXells SELECT upstream excludes
+// quarantined xells and the quarantinedHere guard tells a human standing in one — but both read
+// BEFORE this CAS, and a quarantine can stamp between that read and this write (readyXells sees the
+// xell clean, the quarantine fires, this claim then flips a NOW-quarantined cage to 'claimed' with
+// nobody told). Guarding the CAS itself closes that race: the claim is the last door, so refusing
+// HERE is what makes "a quarantined cage gets no new agent by ANY path" a fact rather than a list of
+// callers that remembered to check. The human is not blocked from working — they clear the
+// quarantine (the explicit rescue arm) and /xell again.
+export async function claimReadyXellForSkill(xellId) {
+  if (!xellId) return null;
+  return one(
+    `UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 AND status='ready' AND quarantined_at IS NULL RETURNING *`, [xellId]);
+}
+
+// The legible refusal when a skill-claim cannot take the xell it is standing in. The session is
+// bound to the worktree it is physically standing in, so there is no "pick another" — say exactly
+// why, so the host session knows what to DO (clear the quarantine and re-run for a quarantined cage;
+// open a fresh worktree and re-run for a decommissioned one) instead of retrying the same doomed one.
+export function skillClaimUnavailable(xellId, state) {
+  // A QUARANTINED xell is NOT "being decommissioned" — the CAS refused it because the cage has
+  // killed agents and a human has not yet decided rescue vs reap. Naming a decommission would send
+  // the human to the wrong action (wait for reprovision vs. rescue the branch), so the quarantine
+  // gets its own sentence, naming both arms exactly like the card does.
+  if (state?.quarantined_at) {
+    const refusal = xellQuarantineRefusal(state)
+      || `${state.slug || xellId} is QUARANTINED — a /xell claim cannot take it until a human decides`;
+    const err = new Error(
+      `xell ${state.slug || xellId} is QUARANTINED — a /xell claim is a recovery path and is refused `
+      + `until a human decides between rescue and reap. ${refusal}`);
+    err.code = 'XELL_QUARANTINED';
+    return err;
+  }
+  const err = new Error(
+    `xell ${state?.slug || xellId} is ${state?.status || 'gone'} — it was decommissioned while this `
+    + 'session was claiming it, so claiming it would resurrect a xell whose worktree is being removed. '
+    + 'A fresh ready xell will be provisioned; open its worktree and re-run /xell there.');
+  err.code = 'XELL_UNAVAILABLE';
+  return err;
+}
+
 // POST /api/xell/claim  { session_id, cwd, task, runtime?, project? }
 // The zee gets 'claimed' — and may begin work — ONLY when its session is physically inside a
 // ready xell's worktree. Anything else refuses: a session in the xource (main repo) or a
@@ -150,6 +208,24 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   const xell = readyXellForCwd(ready, cwd); // the worktree the caller is STANDING IN, or null
 
   if (!xell) {
+    // A QUARANTINED xell is excluded from the ready list (ticket #81), so standing in one would
+    // otherwise read as "not in a worktree" and point the caller at a DIFFERENT xell while the cage
+    // they are actually in waits for a human. Name it: the caller is told the cage is quarantined
+    // and what a human must decide, not sent off to dispatch somewhere else.
+    const quarantinedHere = cwd ? await one(
+      `SELECT slug, quarantined_at, quarantine_deaths, quarantine_reason FROM xell
+        WHERE project_id=$1 AND quarantined_at IS NOT NULL AND worktree_path = $2`,
+      [projectId, norm(cwd)]).catch(() => null) : null;
+    if (quarantinedHere) {
+      throw new NeedsWorktree({
+        needs_worktree: true,
+        can_dispatch: false,
+        project: { id: projectId, name: null, repo_root: null },
+        your_cwd: cwd || null,
+        message: xellQuarantineRefusal(quarantinedHere)
+          || `${quarantinedHere.slug} is quarantined — no agent will be claimed into it until a human decides.`,
+      });
+    }
     // Not in a worktree → cannot claim. Make sure a ready worktree EXISTS to open (provision
     // on demand if the pool is dry), then tell the caller to open it and re-run /xell there.
     let open = ready[0];
@@ -212,7 +288,26 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
      VALUES ($1,$2,'skill-claim',$3,$4,$5,'online',$6,$7, now()) RETURNING *`,
     [xell.id, session_id, rt?.id || null, viewer.url, viewer.kind, xell.worktree_path, session_id]);
 
-  const updatedXell = await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 RETURNING *`, [xell.id]);
+  // THE CLAIM IS CONDITIONAL (ready → claimed, one statement — claimReadyXellForSkill above). The
+  // readyXells SELECT above saw this xell 'ready', but the pool sweep may have taken it since: it
+  // claims with the SAME compare-and-set, so if the sweep won, this returns null — the xell the
+  // caller is standing in is being decommissioned. Flip it back and a zee starts working in a
+  // worktree the reaper is removing (TKT-88-D6B4's resurrection, which the dispatch fix closed and
+  // this is the skill-claim half of). Compensate the zee row this call already created and refuse
+  // legibly: the session is bound to THIS worktree, so "pick another" is not available to it.
+  const updatedXell = await claimReadyXellForSkill(xell.id);
+  if (!updatedXell) {
+    // Read the quarantine columns too: the CAS now refuses a quarantined xell, and the refusal the
+    // human reads must name the QUARANTINE (rescue vs reap), not a decommission (reprovision).
+    const state = await one(
+      `SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`,
+      [xell.id]).catch(() => null);
+    await q(`DELETE FROM zee WHERE id=$1`, [zee.id]).catch(() => {
+      logline('intake', `warn: could not compensate zee ${zee.id} for unclaimable xell ${xell.slug} — `
+        + `a zee row may be left pointing at an unclaimable xell`);
+    });
+    throw skillClaimUnavailable(xell.id, state);
+  }
   broadcast('zee', zee);
   broadcast('xell', updatedXell);
   logline('intake', `xell ${xell.slug} claimed (skill) by session ${String(session_id).slice(0, 8)} — in-worktree ✓`);
@@ -354,7 +449,14 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   if (xell_id && !claimed) {
     // Not fatal by itself — the xell is very often legitimately claimed already. It IS fatal when
     // the xell is on its way out, and that is precisely the case a dispatch used to walk into.
-    const state = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xell_id]);
+    const state = await one(`SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`, [xell_id]);
+    // A QUARANTINED cage is the one "already claimed" case a dispatch must NEVER walk into: the whole
+    // point of the quarantine (ticket #81) is that no recovery path feeds it another agent until a
+    // human decides. The claim above refused it (claimReadyXell), so we land here with the row in
+    // hand — say WHY, loudly, instead of letting the caller read the failure as "someone else claimed it".
+    if (state?.quarantined_at) {
+      throw new Error(xellQuarantineRefusal(state) || `${state.slug || xell_id} is quarantined`);
+    }
     if (!state || state.status === 'tearing-down' || state.status === 'retired') {
       throw new Error(
         `xell ${state?.slug || xell_id} is ${state?.status || 'gone'} — it is being decommissioned, so `
@@ -943,9 +1045,16 @@ export async function setZeeMode(zeeId, permissionMode) {
 // Best-effort: no live cxell → nothing to do; NEVER throws.
 // GENERATE this project's entry-point docs (AGENTS.md/CLAUDE.md …) into a cxell. Same trigger as the
 // harness files — a zee being assigned — because they answer the same question for a zee arriving with
-// no context: what is this project and how do I work in it. Never overwrites a git-tracked path
-// (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
-// and a zee never received is exactly the silence this whole mechanism exists to remove.
+// no context: what is this project and how do I work in it.
+//
+// The meta-DB row is the SOURCE of truth (docs/entry-point-doc-source.md, Option B) — every xell gets
+// the generated file at deployment, including at a path the repo has committed (this repo's CLAUDE.md
+// is exactly that). So the injector is called with overwriteTracked:true for these entry-point paths:
+// the paths are ones project_doc rows own, and lib/cxell.js then writes over the committed copy,
+// git-excludes it and skip-worktrees it. An UNRELATED tracked path (a file no row claims) stays
+// protected — the same lib/cxell.js decision, with the caller's flag defaulting to false there.
+// Every outcome is logged: a doc an operator wrote and a zee never received is exactly the silence
+// this whole mechanism exists to remove.
 export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
   // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
   // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
@@ -956,7 +1065,7 @@ export async function injectProjectDocsIntoXell({ ctx = 'default', slug, project
   const skipped = [];
   for (const f of files) {
     try {
-      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text });
+      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text, overwriteTracked: true });
       if (r.written) written++; else skipped.push(r.reason || `${f.relPath} not written`);
     } catch (e) {
       failed++;
@@ -1057,8 +1166,18 @@ export async function reinjectHarnessIntoXell(xellId) {
 // of running headless. Without this it gets a bare task string — it doesn't know it's a zee, what
 // it owns, how to build, or that nobody can answer a question, so it researches and then stalls
 // asking "want me to continue?" into a void.
-async function briefing(xellId, zee, task, { headless = true, cxell = false } = {}) {
+// Exported for test/current-conditions.test.mjs — the injection point is the seam the card's
+// judge looks at ("I can see it in a briefing"), so a test calls the REAL composer, not a mock.
+export async function briefing(xellId, zee, task, { headless = true, cxell = false } = {}) {
   const b = await bindingFor(xellId, zee, task, { cxell });
+  // CURRENT CONDITIONS (ticket #67) — the short, dated, per-PROJECT list of live impediments,
+  // injected here from the meta-DB (DATA, house rule 7). Deliberately NOT part of the manual or
+  // the project doc: those are TIMELESS, these lines are true NOW and should be false SOON. The
+  // render is null when the project has none, so a briefing for a healthy project is unchanged.
+  // Resolved live at briefing time so a line a manager added a minute ago is already in the very
+  // next briefing — there is no rebuild, no re-spawn, no cache to go stale.
+  const xellRow = await one(`SELECT project_id FROM xell WHERE id=$1`, [xellId]);
+  const conditions = await currentConditionsMarkdownForProject(xellRow?.project_id);
   // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +
   // "how you are running") and ABOVE the task — the fixed precedence in docs §4. core adds no new
   // TEXT (its content is the manual + rules, already here), so an unharnessed xell is unchanged.
@@ -1108,6 +1227,10 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
     '- Explore the codebase before designing: find the existing patterns and build on them.',
     '- When the job is done, stop. A human marks it done in the ZEEHIVE dashboard — never despawn',
     '  yourself, and never touch the xource (the read-only main repo).',
+    // CURRENT CONDITIONS — live impediments for THIS project, dated and visibly ephemeral, placed
+    // where they are read (above the persona and the task) rather than skimmed past. Null when the
+    // project has none — no empty section, no skim-past noise.
+    ...(conditions ? ['', conditions] : []),
     // HARNESS LAYER — the assigned persona/skills, below the law above and above the task below.
     ...(harnessBlock ? ['', harnessBlock] : []),
     '',
@@ -1180,6 +1303,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
     : await claimFirstReady(await readyXells(pid, { zeeType }));
   if (!xell) throw new Error('no ready xell available for headless spawn');
   if (!task) throw new Error('task (prompt) required for headless spawn');
+  // A QUARANTINED cage gets no new agent, whatever the surface that asked (ticket #81). This is the
+  // funnel every spawn passes through, so the refusal here is the one that actually holds; the
+  // explicit-id callers (a re-dispatch, the task poller, a swap) all land here and all get told why.
+  const quarantineRefusal = xellQuarantineRefusal(xell);
+  if (quarantineRefusal) throw new Error(quarantineRefusal);
 
   // A stale xell_id is the whole ballgame here. An explicit id resolved in an earlier turn can
   // point at a xell the reaper has since RETIRED — and a retired xell's worktree is deleted. We
@@ -1502,7 +1630,18 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 // No viewer: the session JSONL lives inside the container, so claude:// cannot attach. The
 // live feed is the stream-json event stream, re-broadcast per-zee on the SSE bus as
 // 'zee-output' and narrated into the Terminal under the `zee:<slug>` scope.
-async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude', providerTokenId = null }) {
+async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude', providerTokenId = null,
+                            // Ticket #50: after an auth-terminal death quarantines the account, the
+                            // catch below retries ONCE on a healthy sibling. This flag stops a
+                            // second 401 from looping — one failover, then the human notice.
+                            authFailoverAttempted = false } = {}) {
+  // A QUARANTINED cage gets no new agent, and this is the last door: spawnHeadless already refused,
+  // but the auth-failover retry (ticket #50) calls spawnCxell DIRECTLY from its own catch — and a
+  // failover after the SECOND death would otherwise feed the exact third agent the quarantine exists
+  // to stop. Refuse here, before anything is claimed or a container built (ticket #81).
+  const quarantineRefusal = xellQuarantineRefusal(xell);
+  if (quarantineRefusal) throw new Error(quarantineRefusal);
+
   // Which vendor CLI runs inside the cxell — claude, codex, or kimi (see lib/cxell-runtimes.js).
   // Resolved before anything is claimed so an unknown runtime fails the dispatch cleanly.
   const adapter = adapterFor(rt?.key);
@@ -1552,12 +1691,16 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       + `runs "${ranModel}", and that is what the zee is recorded as running`);
   }
   const zeeTitle = title || `xell : ${xell.slug}`;
+  // provider_token_id (migration 211): attribute this zee to the account it will run on, so a
+  // 401 can quarantine THAT row (not "whatever is freshest later") and per-account burn is
+  // answerable in SQL. Written at INSERT — before the cage is built — because a spawn that dies
+  // on auth never reaches a later UPDATE.
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
-                      model, permission_mode, cwd, title)
-     VALUES ($1,'headless-spawn',$2,'none','spawning','headless','cxell-cli',$3,'bypassPermissions',$4,$5)
+                      model, permission_mode, cwd, title, provider_token_id)
+     VALUES ($1,'headless-spawn',$2,'none','spawning','headless','cxell-cli',$3,'bypassPermissions',$4,$5,$6)
      RETURNING *`,
-    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle]);
+    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle, tokenId || null]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
@@ -1688,7 +1831,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       catch (e) { logline('cxell', `${name}: could not inject harness file ${f.relPath} (${String(e.message).slice(0, 100)})`); }
     }
     // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
-    // provider actually looks for. Generated, never written over a file the project itself committed.
+    // provider actually looks for. The row is the SOURCE (Option B, docs/entry-point-doc-source.md):
+    // the injector supersedes a tracked entry-point path the row owns — this repo's committed
+    // CLAUDE.md included — rather than skipping it.
     await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
@@ -1841,6 +1986,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  - `zee land`                 → collect your commits out of the cxell and run the gated push to main. HELD for a human. If main moved since your cage was cut, land self-heals by running a `zee sync` first.',
     '  - `zee land --withdraw`      → UN-ASK a landing you already raised (nothing lands, nothing is rejected, your commits are untouched). NEVER stack land requests: if you asked to land and are not done, WITHDRAW the open one first, then land again — a human must only ever have ONE card from you to decide.',
     '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',
+    '  - `zee ship --withdraw`      → UN-ASK a ship request before the deploy starts (nothing ships, nothing is rejected; the card leaves the human\'s screen). REFUSED once the deploy has started — that is `zee tend`.',
     '  - `zee hint-land [--reason "…"]` / `zee hint-ship [--reason "…"]` → NOT sure the job is done? Do NOT call land/ship. Hint instead: light the land?/ship? button on your hexagon for a human to decide (opens no gate, pushes nothing). `--clear` lowers it. Use this whenever you finish unsure, so you are never left hanging.',
     '  - `zee tend --reason "…"`    → raise "I need a human in the console" (blocks nothing, opens no gate); `zee tend --clear` (or any `zee working`) lowers it.',
     '  - `zee prod --reason "..."`  → ASK to be bound to the prod database (the WHOLE live db). Recorded only — a human confirms, then the cxell is re-sealed to reach prod. Until then you cannot.',
@@ -1933,13 +2079,40 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     const reason = `cxell spawn failed: ${String(err.message).slice(0, 300)}`;
     const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, scrubSecrets(reason).slice(0, 200)]);
     broadcast('zee', dead);
-    await releaseXell(xell.id);
     // A vendor CLI that died on startup is where a DEAD CREDENTIAL shows up (six zees, none of which
     // ever landed anything, and nobody was told which account). Nothing is resumable here — the cage
-    // has just been removed — but a terminal death still owes a human the account and the message.
-    await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug, reason: String(err.message),
-                          resumable: false, source: 'spawn' });
-    return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
+    // has just been removed — but a terminal auth death quarantines the account (so the next pick
+    // cannot be the same dead key) and, when a healthy sibling remains, fails the dispatch over
+    // ONCE onto it (ticket #50). Release the xell only when we are NOT about to retry.
+    const filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                        reason: String(err.message),
+                                        code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
+                                        resumable: false, source: 'spawn' });
+    // A death that CROSSED the quarantine threshold stops the failover too (ticket #81): the cage
+    // has now killed two agents in a row, and a third — even on a healthy sibling account — is the
+    // exact burn the quarantine exists to stop. The quarantine card tells the human what to do.
+    if (filed?.xell_quarantined) {
+      await releaseXell(xell.id);
+      return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason,
+               xell_quarantined: true, quarantined: !!filed?.quarantined,
+               no_sibling: !!filed?.noSibling };
+    }
+    if (filed?.kind === 'terminal' && filed?.signal === 'auth'
+        && filed.siblingId && !authFailoverAttempted) {
+      logline('intake', `${xell.slug}: auth-terminal on `
+        + `${accountLabel ? `"${accountLabel}"` : 'the account'} — failing over once to `
+        + `"${filed.siblingLabel || filed.siblingId}"`);
+      // Keep the xell claimed for the retry (it still is — we have not released it). The dead
+      // zee stays on the row as errored; the retry INSERTs a new zee attributed to the sibling.
+      return spawnCxell({
+        pid, xell, task, rt, model, m, title, headless, provider,
+        providerTokenId: filed.siblingId,
+        authFailoverAttempted: true,
+      });
+    }
+    await releaseXell(xell.id);
+    return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason,
+             quarantined: !!filed?.quarantined, no_sibling: !!filed?.noSibling };
   }
 
   // Start the harness conversation bridge (docs §7): if the assigned harness declares a mirror,
@@ -1953,7 +2126,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // Drive the rest in the background. The cxell container is KEPT after the turn (idle, sealed)
   // so its commits can be collected (lib/cxell.js exportCxellDiff) — the reaper owns teardown.
   handle.done
-    .then(async ({ result }) => {
+    .then(async ({ code, err, result }) => {
       // CXELLD is the priority for the burn tracker: capture the full usage object (tokens + $),
       // not just cost_usd. The cxell CLI's final result event carries usage.{input,output,
       // cache_read_input,cache_creation_input}_tokens alongside total_cost_usd.
@@ -1990,6 +2163,10 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
           [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, SPIN_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (repetition without progress)`);
+        // A spin end is a DELIBERATE non-death — the detector chose to stop the turn (repetition
+        // without progress), the zee row goes idle, the turn row says 'ended'. The cage demonstrably
+        // did not kill the agent, so the consecutive-death streak is honestly broken (ticket #81).
+        await resetXellConsecutiveDeaths(xell.id);
         return;
       }
       const errored = result?.is_error;
@@ -2015,10 +2192,15 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       logline('intake', `cxell zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})${b.metered ? '' : ' [usage unreported]'}`);
       // A turn that ended on a PROVIDER error did not end on a decision of this zee's, and until now
       // that was where the story stopped. The reviver classifies it: transient → resumed on a
-      // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js).
+      // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js). A
+      // HEALTHY end resets the xell's consecutive-death streak (ticket #81) — the cage demonstrably
+      // carried this agent through a full turn, so the run of deaths is honestly over.
       if (errored) {
         await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                              reason: String(result?.result || 'error'), source: 'turn' });
+                              reason: String(result?.result || 'error'),
+                              code, err, result, source: 'turn' });
+      } else {
+        await resetXellConsecutiveDeaths(xell.id);
       }
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
@@ -2050,6 +2232,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, SPIN_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (its exec died)`);
+        await resetXellConsecutiveDeaths(xell.id);
         return;
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
@@ -2057,8 +2240,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
       // The other half of the same question (see the resolve path above): a run that died on the way
       // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
+      // runZee's reject carries the exit code and a bounded stderr tail (cxell.js), which rides here
+      // so the row captures what the CLI said even when it printed no result event.
       await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                            reason: String(err.message), source: 'turn' });
+                            reason: String(err.message),
+                            code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
+                            source: 'turn' });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,

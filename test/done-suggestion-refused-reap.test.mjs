@@ -17,11 +17,14 @@
 //
 // WHAT THIS FENCES
 //   A. a refused reap does NOT consume the suggestion: it stays a card, carries the reason, and the
-//      manager gets a message;
+//      manager gets a message. And since ticket #75 the DECISION is not thrown away either — an
+//      approval the ACTIVE-zee guard refuses is HELD ('approved-held', decided_at/decided_by kept)
+//      and the reaper applies it the moment the turn ends;
 //   B. a zee that FINISHED and is sitting idle in an attached cxell is reapable — approving closes
 //      the xell (this is the case that failed five times);
 //   C. a genuinely MID-TURN zee (its own status says working) is STILL refused — the guard that
-//      house rule 2 was paid for is intact — and force:true still gets through it;
+//      house rule 2 was paid for is intact — the approval is HELD not applied, and force:true still
+//      gets through it deliberately;
 //   D. the refusal message names WHICH signal decided and when it last saw activity.
 //
 // Isolated throwaway project in the real meta DB; PROVISION_MODE=simulate so the reap retires rows
@@ -88,7 +91,7 @@ try {
   const { reapXell } = await import('../server/src/queenzee/reaper.js');
 
   const openFor = async (xellId) => (await client.query(
-    `SELECT * FROM done_suggestion WHERE target_xell_id=$1 AND status='pending' AND dismissed_at IS NULL`,
+    `SELECT * FROM done_suggestion WHERE target_xell_id=$1 AND status IN ('pending','approved-held') AND dismissed_at IS NULL`,
     [xellId])).rows;
   const xellStatus = async (id) => (await client.query(`SELECT status FROM xell WHERE id=$1`, [id])).rows[0].status;
 
@@ -116,11 +119,13 @@ try {
   await managers.inboxFor(mgr.id);  // drain, so the next read is only what THIS decision produced
 
   const decided = await managers.decideDoneSuggestion(sug.suggestion.id, 'approved', 'test@human');
-  ok(decided.ok === false && decided.refused === true,
-     'the human approves, the reap refuses — and the answer SAYS it did not happen');
+  ok(decided.ok === false && decided.refused === true && decided.held === true,
+     'the human approves, the reap refuses — and the answer SAYS it did not happen (and the decision is HELD)');
   const still = await openFor(wBusy.id);
   ok(still.length === 1 && still[0].id === sug.suggestion.id,
-     'the suggestion is STILL A CARD (back to pending, not stamped failed and hidden)');
+     'the suggestion is STILL A CARD (held as approved-held, not stamped failed and hidden)');
+  ok(still[0].status === 'approved-held' && still[0].decided_by === 'test@human',
+     '…the DECISION is kept — status approved-held, decided_by preserved (ticket #75, not discarded)');
   ok(/ACTIVE/.test(JSON.stringify(still[0]?.result || {})),
      'and it carries the refusal reason for the human to read');
   ok((await managers.listDoneSuggestions(PID)).some((r) => r.id === sug.suggestion.id),
@@ -167,6 +172,8 @@ try {
   const card = readFileSync('web/src/Manager.jsx', 'utf8');
   ok(/result\?\.refused/.test(card), 'DoneSuggestionCard reads the refusal off the suggestion it kept');
   ok(/r\?\.refused/.test(card), 'and an approval answered with refused:true is surfaced as an error, not a success');
+  ok(/!r\?\.held/.test(card), '…while a HELD refusal (approved-held, ticket #75) is not flashed as an error — '
+     + 'the card re-renders as "waiting for the turn to end"');
 
   console.log(fail ? `\n${fail} check(s) FAILED` : '\nall checks passed');
 } catch (err) {

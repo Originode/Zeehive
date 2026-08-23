@@ -77,17 +77,21 @@ export function statusFromHive(hiveStatusKey) {
   }
 }
 
-// The legal transitions out of a status. Three rules, and nothing else:
+// The legal transitions out of a status. Four rules, and nothing else:
 //   • anything may be CANCELLED (abandoning work is always allowed);
-//   • a TERMINAL status may only go back to 'queued' — reopening starts the flow again rather than
-//     dropping the item back into the middle of it, so "how did this get to review?" always has an
-//     answer in work_item_event;
+//   • a TERMINAL status may only reopen through 'queued' — except `done`, which may also go to
+//     'review': a landed card that needs an adversarial read ("landed, under review", ticket #56)
+//     is a legal place for the board to be, and it is the ONLY terminal→non-terminal edge on
+//     purpose. Reopening through queued/review starts the flow again rather than dropping the item
+//     back into the middle of it, so "how did this get to review?" always has an answer in
+//     work_item_event;
 //   • otherwise any non-terminal status may move to any other status. Work does not proceed in a
 //     line — a task goes working → blocked → working → review → blocked — and a state machine that
 //     pretends otherwise just teaches people to lie to it.
 export function nextStatuses(key) {
   if (!isWorkStatus(key)) return [];
-  if (isTerminal(key)) return key === 'cancelled' ? ['queued'] : ['queued', 'cancelled'];
+  if (key === 'done') return ['queued', 'review', 'cancelled'];
+  if (key === 'cancelled') return ['queued'];
   const rest = WORK_STATUS_KEYS.filter((k) => k !== key && k !== 'cancelled' && k !== 'done');
   return [...rest, 'done', 'cancelled'];
 }

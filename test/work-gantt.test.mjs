@@ -146,11 +146,13 @@ const ROWS = [
     actual_start: null, actual_end: null,
     waiting_start: '2026-08-03T09:00:00.000Z', waiting_end: '2026-08-10T09:00:00.000Z',
     deps: ['A1'], executions: [] },
-  // B1 — a leaf with slack, depending on A2
+  // B1 — a leaf with slack, depending on A2; its ACTUAL pair is INVERTED (end before start) — a
+  // bad derivation must be visible as the dashed `inverted` bar and a tooltip warning, not silent.
   { id: 'B1', parent_id: 'R', depth: 2, name: 'B1', kind: 'action', child_semantics: null,
     is_atom: true, critical: false, slack: '09:00:00', duration_hours: 1,
     planned_start: '2026-08-04T09:00:00.000Z', planned_end: '2026-08-04T10:00:00.000Z',
-    actual_start: null, actual_end: null, waiting_start: null, waiting_end: null,
+    actual_start: '2026-08-06T09:00:00.000Z', actual_end: '2026-08-04T10:00:00.000Z',
+    waiting_start: null, waiting_end: null,
     deps: ['A2'], executions: [] },
 ];
 
@@ -194,7 +196,9 @@ try {
   const actualBars = count(chart, /data-testid="work-gbar-actual"/g);
   const waitingBars = count(chart, /data-testid="work-gbar-waiting"/g);
   ok(bars === 4, `one PLAN bar per row (${bars} — R, A1, A2, B1)`);
-  ok(actualBars === 2, `one ACTUAL bar per row the record has dates for (${actualBars} — R rolled up, A1)`);
+  ok(actualBars === 3, `one ACTUAL bar per row the record has dates for (${actualBars} — R rolled up, A1, and B1's inverted pair)`);
+  ok(/work-gbar actual inverted/.test(chart),
+     'an inverted actual pair renders the ACTUAL bar with the `inverted` class — the dashed outline makes a bad derivation visible, not silent');
   ok(waitingBars === 2, `one WAITING bar per row under a held lease (${waitingBars} — R rolled up, A2)`);
   ok(/work-gsum/.test(chart), 'a container draws as a SUMMARY bracket, not a solid bar');
   ok(/work-gbar[^"]*crit/.test(chart), 'a critical planned bar carries the `crit` class');
@@ -208,6 +212,9 @@ try {
   ok(/2026-08-01 11:00 → 2026-08-01 14:00/.test(tip), 'the tooltip shows the planned window');
   ok(/2026-08-03 09:00 → 2026-08-10 09:00/.test(tip), 'the tooltip shows the waiting window');
   ok(/on the critical path/.test(tip), 'the tooltip says the row is on the critical path');
+  const invTip = renderToString(el(Tip, { row: ROWS[3], x: 10, y: 10 })).replace(/<!-- -->/g, '');
+  ok(/⚠ inverted/.test(invTip) && /before the recorded start/.test(invTip),
+     'the tooltip names an inverted actual pair — the impossible range is called out, not rendered as if it were real');
 
   // the WELD WATERFALL — click-through drill-down
   const rowWithExec = {

@@ -43,9 +43,13 @@ import { broadcast } from './events.js';
 // moment the xell was actually spoken for, instead of leaving it 'ready' through the rename.
 export async function claimReadyXell(xellId) {
   if (!xellId) return null;
+  // A QUARANTINED xell is not claimable, ever (ticket #81): the claim is the CAS every dispatch
+  // path funnels through, so refusing here is what makes "a quarantined cage gets no new agent" a
+  // fact rather than a list of callers that remembered to check. The callers that name an explicit
+  // id still re-read the row to say WHY (xellQuarantineRefusal); this is the hard guarantee.
   const row = await one(
     `UPDATE xell SET status='claimed', is_pooled=false
-       WHERE id=$1 AND status='ready' AND NOT is_production RETURNING *`, [xellId]);
+       WHERE id=$1 AND status='ready' AND NOT is_production AND quarantined_at IS NULL RETURNING *`, [xellId]);
   if (row) broadcast('xell', row);
   return row;
 }
@@ -71,6 +75,11 @@ export async function claimFirstReady(candidates = []) {
 // exclusive — from this moment no dispatch can claim the xell either.
 export async function takeReadyXellForSweep(scanned) {
   if (!scanned?.id) return null;
+  // A QUARANTINED xell is not swept (ticket #81), ever: reaping the cage is the human's EXPLICIT
+  // choice (the /xells/:id/reap arm of the rescue-or-reap decision), not a pool-sweep accident. The
+  // pool's own SELECTs already exclude quarantined xells (pool.js), but the sweep CAS is the hard
+  // guarantee — a future caller that forgets cannot tear a quarantined cage down.
+  if (scanned?.quarantined_at) return null;
   // Fail fast on a scan that did not select the columns the guard is made of. Defaulting a missing
   // worktree_path to NULL would make the take silently never match (a sweep that quietly stops
   // sweeping) — and forgetting the column in a new sweep's SELECT is the exact mistake this guard
@@ -82,6 +91,7 @@ export async function takeReadyXellForSweep(scanned) {
   return one(
     `UPDATE xell SET status='tearing-down'
        WHERE id=$1 AND status='ready' AND NOT is_production
+         AND quarantined_at IS NULL
          AND slug=$2 AND worktree_path IS NOT DISTINCT FROM $3 RETURNING *`,
     [scanned.id, scanned.slug, scanned.worktree_path ?? null]);
 }

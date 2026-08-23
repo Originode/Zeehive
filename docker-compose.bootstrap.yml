@@ -93,10 +93,17 @@ services:
       # wedged). Turn it on per-install once the project's dev tier is genuinely wired up.
       PROVISION_APP_TIER: ${PROVISION_APP_TIER:-false}
       # cxells (the zees' containers) are spawned from the published image and reach the
-      # queenzee by service name over zee-hive-net — no host networking assumptions, so this
-      # works the same on Docker Desktop (win/mac) and native Linux.
+      # queenzee at the STABLE address: host.docker.internal:4700 (the queenzee's published port
+      # on the host). This is the injected ZEEHIVE_API — it always resolves and only fails with a
+      # legible connection-refused while the queenzee is down, never the DNS ENOTFOUND that a
+      # service name gives while the container is being recreated (ticket #94). cxellRunArgs adds
+      # the host.docker.internal:host-gateway alias to every cage, so this is NOT a host-networking
+      # assumption — it works the same on Docker Desktop (win/mac) and native Linux. The compose
+      # service name stays as the EXPLICIT fallback (ZEEHIVE_API_FALLBACK), for a script that has
+      # to reach the queenzee when host publishing is unavailable.
       CXELL_IMAGE: ghcr.io/originode/zeehive-zee-agent:latest
-      CXELL_API_BASE: http://zeehive_server:4700
+      CXELL_API_BASE: http://host.docker.internal:4700
+      CXELL_API_FALLBACK: http://zeehive_server:4700
       ZEEHIVE_CXELL_SSH: network
     # host-gateway: a containerized queenzee reaches host-published services (e.g. the shared dev
     # database port) at host.docker.internal:<port>. Docker Desktop adds that name automatically;

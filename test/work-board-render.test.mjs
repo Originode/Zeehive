@@ -197,6 +197,84 @@ try {
   } catch (e) { ok(false, `a row tail renders without throwing — ${e.message}`); }
   ok(/work-tail/.test(tailHtml), 'an expanded row renders its tail (the per-lane append drop targets)');
 
+  // ── per-status-column HIDE ───────────────────────────────────────────────────────────────────
+  // A hidden column stops rendering that lane's work-node CARDS (leaf pack + leaf band) and its
+  // drop targets (tail + pack lane), and every swimlane ROW band at every depth shows ONE summary
+  // card in that column instead: the count of every leaf under that row with that status (the
+  // recursive leafLaneCounts shape), opening the row's drawer on click.
+  const hideWorking = new Set(['working']);
+
+  let hiddenRowHtml = '';
+  try {
+    hiddenRowHtml = renderToStaticMarkup(React.createElement(mod.RowBand, {
+      node: forest[0].children[0], depth: 1, collapsed: false, columns: mColumns, statuses: mStatuses,
+      hiddenCols: hideWorking, onToggle: () => {}, onOpen: () => {},
+    }));
+  } catch (e) { ok(false, `a row band with a hidden column renders without throwing — ${e.message}`); }
+  ok(hiddenRowHtml.includes('work-col-summary'), 'a hidden column shows ONE summary card in the row band');
+  ok(hiddenRowHtml.includes('>1<') && hiddenRowHtml.includes('working'),
+     '…carrying the recursive count of that row\'s leaves with the hidden status');
+
+  let hiddenCollapsedHtml = '';
+  try {
+    hiddenCollapsedHtml = renderToStaticMarkup(React.createElement(mod.RowBand, {
+      node: forest[0].children[0], depth: 1, collapsed: true, columns: mColumns, statuses: mStatuses,
+      hiddenCols: hideWorking, onToggle: () => {}, onOpen: () => {},
+    }));
+  } catch (e) { ok(false, `a collapsed row with a hidden column renders without throwing — ${e.message}`); }
+  ok(hiddenCollapsedHtml.includes('work-col-summary'),
+     '…and the summary card is what a COLLAPSED row shows for the hidden column too');
+  ok(hiddenCollapsedHtml.includes('queued'),
+     '…while the shown column still renders its collapsed count text');
+
+  let hiddenPackHtml = '';
+  try {
+    hiddenPackHtml = renderToStaticMarkup(React.createElement(mod.LeafPack, {
+      node: forest[0].children[0], depth: 2, columns: mColumns, statuses: mStatuses,
+      index: idx, dragId: null, dropAt: null, hiddenCols: hideWorking,
+      onOpen: () => {}, onCardKey: () => {},
+      onDragStart: () => {}, onDragEnd: () => {}, allowCard: () => {}, allowPackLane: () => {},
+      onDrop: () => {}, halfOf: () => 0, packIndex: () => 0,
+    }));
+  } catch (e) { ok(false, `a leaf pack with a hidden column renders without throwing — ${e.message}`); }
+  ok(hiddenPackHtml.includes('Leaf one') && !hiddenPackHtml.includes('Leaf two'),
+     'a leaf pack stops rendering the cards of a hidden column');
+
+  let hiddenLeafHtml = '';
+  try {
+    hiddenLeafHtml = renderToStaticMarkup(React.createElement(mod.LeafBand, {
+      card: { id: 'l2', title: 'Leaf two', kind: 'task', status: 'working' }, depth: 2,
+      columns: mColumns, statuses: mStatuses, hiddenCols: hideWorking,
+      onOpen: () => {}, onKey: () => {},
+      onDragStart: () => {}, onDragEnd: () => {}, onDragOver: () => {}, onDrop: () => {},
+    }));
+  } catch (e) { ok(false, `a leaf in a hidden column renders without throwing — ${e.message}`); }
+  ok(!hiddenLeafHtml.includes('Leaf two') && !hiddenLeafHtml.includes('work-card'),
+     'a leaf whose status column is hidden renders no card at all');
+
+  // The tail's hidden lane is not a drop target: it neither advertises an empty lane (the "—"
+  // marker) nor carries a drag/drop handler. A shown empty lane still advertises itself.
+  const empties = (html) => (html.match(/work-row-empty/g) || []).length;
+  const tailCols = [
+    { key: 'queued', label: 'queued', items: [] },
+    { key: 'working', label: 'working', items: [] },
+    { key: 'review', label: 'review', items: [] },
+  ];
+  let shownTail3 = '', hiddenTail3 = '';
+  try {
+    shownTail3 = renderToStaticMarkup(React.createElement(mod.RowTail, {
+      node: forest[0].children[0], depth: 1, columns: tailCols, index: idx, dropAt: null,
+      onDragOver: () => {}, onDrop: () => {},
+    }));
+    hiddenTail3 = renderToStaticMarkup(React.createElement(mod.RowTail, {
+      node: forest[0].children[0], depth: 1, columns: tailCols, index: idx, dropAt: null,
+      hiddenCols: new Set(['review']), onDragOver: () => {}, onDrop: () => {},
+    }));
+  } catch (e) { ok(false, `a row tail with a hidden column renders without throwing — ${e.message}`); }
+  ok(empties(shownTail3) === 1, 'a tail advertises an empty SHOWN lane with the empty marker');
+  ok(empties(hiddenTail3) === 0 && hiddenTail3.includes('work-row-lane is-hidden'),
+     '…and a hidden lane drops the marker and is marked is-hidden (no drop target)');
+
   // ── the shared bits, including the formatter a refactor deleted ─────────────────────────────
   ok(typeof mod.bits.fmtWhen === 'function',
      'bits.jsx exports fmtWhen (the item drawer\'s history calls it — it threw when it did not exist)');

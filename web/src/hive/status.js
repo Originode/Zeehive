@@ -43,6 +43,10 @@ export const HIVE_COLORS = {
   // hive with something wrong in it.
   'occ-paused':       '#8b93a1',   // grey — interrupted by a human; nothing to decide, nothing wrong
   // ── hot: something irreversible is being touched ────────────────────────────
+  // QUARANTINED (ticket #81): the cage killed N consecutive zees and is FROZEN — no agent until a
+  // human decides. Deep rose, hotter than tend/env (a decision is REQUIRED, not a courtesy) and one
+  // step below the irreversible-reds: nothing is being touched this second, the xell is stopped.
+  'occ-quarantined':  '#d6457a',   // deep rose — quarantined; a human must choose rescue or reap
   'occ-landHint':     '#ef8f6a',   // soft red-orange — land looks ready (a softer ask)
   'occ-shipHint':     '#f2a06a',   // soft orange — ship looks ready
   'live-protected':   '#f0913b',   // orange — production, shields up
@@ -73,6 +77,7 @@ export const HIVE_HEAT = {
   'occ-doneSuggest':  0.30,
   'occ-landHolding':  0.34,
   'occ-paused':       0.10,        // coldest of the occupied keys: deliberately stopped, so it recedes
+  'occ-quarantined':  0.95,        // hotter than tend/env — a human MUST decide (rescue or reap)
   'occ-landHint':     0.80,
   'occ-shipHint':     0.82,
   'live-protected':   0.86,
@@ -108,6 +113,7 @@ export const HIVE_LABELS = {
   'occ-doneRequest':  'done?',
   'occ-doneSuggest':  'done?',
   'occ-done':         'done',
+  'occ-quarantined':  'quarantined',
   'live-protected':   'protected',
   'live-unprotected': 'unprotected',
 };

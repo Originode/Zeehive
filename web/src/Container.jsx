@@ -182,11 +182,17 @@ function tooltip(c, buildable, busy) {
   const built = c.last_build_commit
     ? `\nlast build: ${c.last_build_commit}${c.hot_build ? ' (hot)' : ''}${c.last_built_at ? ' · ' + new Date(c.last_built_at).toLocaleString() : ''}`
     : (buildable ? '\nnever built — click the hammer to build' : '');
+  // Ticket #173: a failed build's reason lives on the row (last_build_error), not only in the
+  // log ring. Show it on the chip when the container is down so a human sees why without opening
+  // the terminal.
+  const fail = (c.health === 'down' && c.last_build_error)
+    ? `\nbuild failed: ${String(c.last_build_error).split('\n').filter(Boolean).slice(-3).join(' · ')}`
+    : '';
   const bh = buildHost(c);
   const host = bh
     ? (bh.split ? `\ncompiles on ${bh.build} → runs on ${bh.run}` : (bh.run ? `\nbuilds & runs on ${bh.run}` : ''))
     : '';
-  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${host}`
+  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${fail}${host}`
     + `${dbTooltip(c)}${driftText(c)}${dataText(c)}${instancesText(c)}`;
 }
 

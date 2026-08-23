@@ -120,13 +120,20 @@ ok(!/Nothing else on the network resolves/.test(intake),
 ok(/Egress itself is open/.test(intake) && /prod databases are what is/.test(intake),
    '…and says what is true instead, in the same words as the manual');
 
-section('116 re-syncs project_doc.body from the corrected CLAUDE.md');
-const sync = join(ROOT, 'db', 'migrations', '116_project_doc_sync_claude_md.sql');
-ok(existsSync(sync), 'the sync migration is in the ledger (the row generates AGENTS.md and 17 others)');
-if (existsSync(sync)) {
-  const body = /\$doc\$([\s\S]*)\$doc\$/.exec(readFileSync(sync, 'utf8'))?.[1];
-  ok(body?.trim() === claudeMd.trim(),
-     'what it embeds IS the committed CLAUDE.md — regenerate with scripts/sync-project-doc.mjs if this fails');
+section('the sync migrations embed the CLAUDE.md that was current when they shipped');
+// Option B (docs/entry-point-doc-source.md) made the ROW the source and the committed file an
+// artefact, so a sync migration is no longer the standing repair — but the ones that shipped under
+// Option A are still in the ledger and must still be truthful about what they embedded.
+for (const n of ['116', '195']) {
+  const sync = join(ROOT, 'db', 'migrations', `${n}_project_doc_sync_claude_md.sql`);
+  ok(existsSync(sync), `the ${n} sync migration is in the ledger (the row generates AGENTS.md and 17 others)`);
+  if (existsSync(sync)) {
+    const body = /\$doc\$([\s\S]*)\$doc\$/.exec(readFileSync(sync, 'utf8'))?.[1];
+    // The embedded body was correct at the time it shipped; the committed file has moved since, so an
+    // exact match is NOT the contract any more — the false containment claim must simply not be in it.
+    ok(body && !body.includes('subject under test and can never touch the real fleet'),
+       `the ${n} sync migration does not embed the false containment claim`);
+  }
 }
 
 console.log(fail ? `\n${fail} FAILURE(S)` : '\nall good');

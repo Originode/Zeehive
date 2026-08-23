@@ -18,7 +18,7 @@
 // the same way, so a prompt that hands the zee an image path can actually Read it. Work products
 // stay in the container until collected (exportCxellDiff) — landing them is the human-gated step.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -34,6 +34,7 @@ import { prepUserScript, prepRootScript, parsePrepSteps, summarizePrepSteps,
          hasAptStep, normalizeSpawnPrep, preppedImageTag, preppedDockerfile,
          templateHash, bakesImage } from './spawn-prep.js';
 import { classifyMergeOutput } from '../queenzee/xellgit.js';
+import { clearStaleIndexLock } from './index-lock.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
 // ghcr — matching the CXELL_IMAGE the self-ship scripts already honor for their rebuild.
@@ -329,8 +330,9 @@ export async function stopCxell({ ctx = 'default', slug, timeoutMs = 60000 }) {
 // not. The script is idempotent and re-reads what is already on disk.
 //
 // ⚠ NO ENV IS PASSED, and that is not an oversight. cxell-sshd.sh OVERWRITES /etc/environment
-// whenever CXELL_ENV is set, and openCxellSsh always sets it (it appends ZEEHIVE_API
-// unconditionally) — so calling openCxellSsh with no credentials to re-open a door would replace a
+// whenever CXELL_ENV is set, and openCxellSsh always sets it (it appends ZEEHIVE_API and
+// ZEEHIVE_API_FALLBACK unconditionally) — so calling openCxellSsh with no credentials to re-open
+// a door would replace a
 // live cage's provider token and identity token with a one-line file, and the zee would come back
 // unable to authenticate to anything. The restart path has nothing new to write: every line is
 // already in the container's own /etc/environment.
@@ -552,11 +554,17 @@ export async function syncCxellWithXource({ ctx = 'default', slug, worktree, ref
 // exactly why the dashboard's diff hexagon showed 0/0 for every working cxell zee. Read the numbers
 // from the cxell instead.
 //
-// The cxell clone is a bundle of the branch only: it carries the branch history (including `base`,
-// the provisioning commit) but NOT the source ref (`master` isn't there). So "what would land" is
-// measured against `base` — everything the zee added since it was spun up, committed OR not (a plain
-// `git diff <base>` spans working tree vs base, so uncommitted work counts too). `behind` (how far
-// the source moved since the fork) isn't knowable in the cxell; the caller fills it in from the host.
+// The SOURCE diff is measured from the FORK POINT off the source — merge-base(origin/main, HEAD) once
+// a sync has delivered origin/main, else merge-base(base, HEAD) — NOT from the recorded `base`
+// (head_commit). A cxell clone is a bundle of the branch only, so before the first sync the fork
+// point IS the provisioning `base`; but once deliverXourceIntoCxell has fetched the source as
+// refs/remotes/origin/main and syncCxellWithXource has MERGED it into the branch, HEAD is a MERGE
+// commit that already contains the source and head_commit is updated to that merged HEAD. Diffing it
+// then reads only the uncommitted delta — the committed work vanishes and the "source diff" becomes
+// the zee's own-commit diff (the reported symptom). merge-base(source, HEAD) is where the branch left
+// the trunk, so diffing against it yields precisely what the branch adds — committed or not — i.e.
+// what would land, the same base the host worktreeDiff uses. `behind` (how far the source moved since
+// the fork) isn't knowable in the cxell; the caller fills it in from the host.
 //
 // One docker exec runs every git query and prints five newline-separated fields (echo "$(...)" keeps
 // an empty shortstat as a blank line, so the field positions never shift). Returns null if the cxell
@@ -602,33 +610,80 @@ export async function writeCxellEnvironment({ ctx = 'default', slug, text, timeo
   return { ok: r.verdict === 'WROTE', path: '/etc/environment' };
 }
 
-export async function cxellDiff({ ctx = 'default', slug, base }) {
-  if (!base) return null;
-  const b = String(base).replace(/[^0-9a-fA-F]/g, '');
-  if (!b) return null;
-  // "ahead" is the count of the zee's UNLANDED commits. Measure it against origin/main WHEN THAT REF
-  // EXISTS in the cxell (delivered by deliverXourceIntoCxell) — because commits the zee already landed
-  // are on main, so counting from the frozen provisioning base kept them showing as unlanded forever
-  // (six xells read ↑1–↑4 with every commit already on main). Fall back to the base only until the
-  // first sync delivers a live origin/main. The shortstat still measures the working diff vs base.
-  const script = [
-    'cd /work/repo || exit 3',
-    'echo "$(git rev-parse HEAD 2>/dev/null)"',
+// The shell fragment that computes $SRC — the base for a cxell's SOURCE diff (shortstat and patch).
+// The source diff must measure everything the xell adds over its FORK POINT off the source —
+// merge-base of the source ref and HEAD — NOT against the recorded head_commit: after a sync/land
+// head_commit IS the merged HEAD that already contains the source, so diffing it shows only the
+// uncommitted delta (the reported symptom "xell diffs show against the xell's own commit"). When
+// refs/remotes/origin/main exists (delivered by deliverXourceIntoCxell) the fork point is
+// merge-base(origin/main, HEAD) — the sync merged the source in, so that IS the source tip and the
+// diff excludes the source. Before the first sync there is no origin/main, so the fork point is
+// merge-base(base, HEAD), which is the provisioning base while the branch still descends from it.
+//
+// If git cannot resolve a base, $SRC falls back to HEAD — and the empty source diff that reads is
+// NOT interchangeable with "resolved and empty": for a gate like xellGate, an unresolvable base is
+// "I could not read it", which must refuse, never approve. So the script RECORDS the decision: an
+// EMPTY $SRC means merge-base FAILED (the recorded base was rewritten away, or the source ref was
+// never delivered) — the caller must know that HEAD was a fallback, not the fork point. Exported
+// (like syncMergeScript) so a test can run it against a real throwaway repo without docker.
+export function cxellSourceBase(base) {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  return [
     'OM="$(git rev-parse --verify -q refs/remotes/origin/main || true)"',
+    `if [ -n "$OM" ]; then SRC="$(git merge-base refs/remotes/origin/main HEAD 2>/dev/null)"; `
+      + `else SRC="$(git merge-base ${b} HEAD 2>/dev/null)"; fi`,
+    // Did the fork point actually resolve? An empty $SRC means merge-base FAILED (the recorded base
+    // was rewritten away, or the source ref was never delivered) — $SRC then falls back to HEAD, and
+    // the empty source diff that reads is "could not be measured", NOT "resolved and empty": a gate
+    // must refuse on it, never approve. So this fragment records SRC_OK=yes/no as a variable; the
+    // CALL SITE encodes it (cxellDiffScript prints a field, cxellPatchBody picks BASE:unresolved),
+    // because an echo here would shift cxellDiffScript's newline-separated field positions. SRC_OK is
+    // `yes` whenever a REAL fork point exists — a brand-new branch still descends from its base, so
+    // merge-base(base, HEAD) resolves and the diff correctly reads empty. (This is why the check is
+    // "did merge-base succeed", not "is $SRC a valid object": after the HEAD fallback, HEAD IS valid.)
+    'if [ -z "$SRC" ]; then SRC=HEAD; SRC_OK=no; else SRC_OK=yes; fi',
+  ].join('; ');
+}
+
+// The shell script cxellDiff runs INSIDE the cage. `repoDir` is the cxell's clone (default
+// /work/repo); `base` is the recorded head_commit (the provisioning base, or the merged HEAD after a
+// sync/land). Exported so a test can run the exact script against a real throwaway repo without
+// docker, and so the fork-point fix is pinned by a test rather than by a number.
+export function cxellDiffScript(base, repoDir = '/work/repo') {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  return [
+    `cd ${repoDir} || exit 3`,
+    'echo "$(git rev-parse HEAD 2>/dev/null)"',
+    cxellSourceBase(b),
+    // "ahead" is the count of the zee's UNLANDED commits. Measure it against origin/main WHEN THAT REF
+    // EXISTS in the cxell (delivered by deliverXourceIntoCxell) — because commits the zee already
+    // landed are on main, so counting from the frozen provisioning base kept them showing as unlanded
+    // forever (six xells read ↑1–↑4 with every commit already on main). Fall back to the base only
+    // until the first sync delivers a live origin/main. $OM is set by cxellSourceBase above.
     `if [ -n "$OM" ]; then echo "$(git rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null)"; `
       + `else echo "$(git rev-list --count ${b}..HEAD 2>/dev/null)"; fi`,
-    `echo "$(git diff --shortstat ${b} 2>/dev/null)"`,
+    // The source shortstat measures the WORKING TREE vs the fork point: everything the zee added,
+    // committed or not. `git diff <commit>` spans the tree, so uncommitted work counts too.
+    'echo "$(git diff --shortstat "$SRC" 2>/dev/null)"',
+    // The own diff is worktree vs HEAD — only what is not checkpointed yet.
     'echo "$(git diff --shortstat HEAD 2>/dev/null)"',
     'echo "$(git status --porcelain 2>/dev/null | wc -l)"',
+    // SRC_OK = did the fork point really resolve (yes) or did $SRC fall back to HEAD (no).
+    'echo "$SRC_OK"',
   ].join('\n');
-  let out;
-  try {
-    const r = await dk(ctx, ['exec', cxellName(slug), 'bash', '-lc', script], { timeoutMs: 8000 });
-    out = r.out;
-  } catch {
-    return null;
-  }
-  const [head, ahead, src, own, dirty] = String(out).split('\n');
+}
+
+// Parse cxellDiff's six newline-separated fields. Exported so a test can assert the numbers the
+// script produced against a real repo, without docker.
+//
+// `unresolved` is the sixth field: whether the fork point could not be resolved ($SRC_OK=no — the
+// recorded base was rewritten away, or the source ref was never delivered) and $SRC fell back to
+// HEAD. The diff numbers read 0 files in that case — which is NOT "resolved and empty". A consumer
+// like xellGate must treat `unresolved` as "could not be measured" and refuse, never approve. A
+// missing sixth field (legacy output) defaults to resolved → `unresolved:false`, so an old 5-line
+// read still parses as before.
+export function parseCxellDiff(out) {
+  const [head, ahead, src, own, dirty, srcOk] = String(out).split('\n');
   const num = (s, re) => +((s || '').match(re)?.[1] || 0);
   return {
     head: head?.trim() || null,
@@ -637,6 +692,7 @@ export async function cxellDiff({ ctx = 'default', slug, base }) {
     insertions: num(src, /(\d+) insertions?/),
     deletions: num(src, /(\d+) deletions?/),
     dirty: +String(dirty || '').trim() || 0,
+    unresolved: String(srcOk).trim() === 'no',
     own: {
       files: num(own, /(\d+) files? changed/),
       insertions: num(own, /(\d+) insertions?/),
@@ -645,30 +701,73 @@ export async function cxellDiff({ ctx = 'default', slug, base }) {
   };
 }
 
+export async function cxellDiff({ ctx = 'default', slug, base }) {
+  if (!base) return null;
+  const b = String(base).replace(/[^0-9a-fA-F]/g, '');
+  if (!b) return null;
+  let out;
+  try {
+    const r = await dk(ctx, ['exec', cxellName(slug), 'bash', '-lc', cxellDiffScript(base)], { timeoutMs: 8000 });
+    out = r.out;
+  } catch {
+    return null;
+  }
+  return parseCxellDiff(out);
+}
+
+// The shell body cxellPatch runs INSIDE the cage. Echoes `BASE:<sha>` — the diff base actually used
+// (the fork point for 'source', HEAD for 'own') — as its FIRST line, then the patch, then any
+// untracked files. `repoDir` is a parameter (like syncMergeScript) so a test can run the real body
+// against a real throwaway repo without docker.
+export function cxellPatchBody(base, kind = 'source', repoDir = '/work/repo') {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  const untracked = "git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do "
+    + 'git --no-pager diff --no-color --no-index -- /dev/null "$f"; done';
+  if (kind === 'own') {
+    return [
+      `cd ${repoDir} || exit 3`,
+      'echo "BASE:$(git rev-parse HEAD 2>/dev/null)"',
+      'git --no-pager diff --no-color -M HEAD',
+      untracked,
+    ].join('; ');
+  }
+  return [
+    `cd ${repoDir} || exit 3`,
+    // `BASE:<sha>` names the base actually used — but when the fork point could not be resolved
+    // ($SRC_OK=no — the recorded base was rewritten away, or the source ref was never delivered),
+    // name it `BASE:unresolved` instead of lying with a HEAD sha that reads as a real fork point. A
+    // consumer must never mistake a failed resolution for "resolved and empty".
+    `${cxellSourceBase(b)}; if [ "$SRC_OK" = yes ]; then echo "BASE:$SRC"; `
+      + 'else echo "BASE:unresolved"; fi',
+    'git --no-pager diff --no-color -M "$SRC"',
+    untracked,
+  ].join('; ');
+}
+
 // The PATCH behind cxellDiff's numbers — the same read, one level deeper, for the console's diff
 // viewer. cxellDiff answers "how much", this answers "what": the actual lines, read from inside the
 // cage where a cxell zee's work lives until it lands.
 //
-//   kind 'source' → `git diff <base>`: everything the zee added since it was spun up, committed or
-//                   not (a plain diff against a commit spans the working tree, so uncommitted counts).
+//   kind 'source' → `git diff <fork point>`: everything the zee adds over its fork point off the
+//                   source, committed or not (a plain diff against a commit spans the working tree,
+//                   so uncommitted counts). The fork point is merge-base(origin/main, HEAD) once a
+//                   sync has delivered origin/main — NOT the recorded head_commit, which after a
+//                   sync IS the merged HEAD and would read only the uncommitted delta.
 //   kind 'own'    → `git diff HEAD`: only what is not checkpointed yet.
 //
 // Untracked files are appended as `--no-index` patches: `git diff` cannot see a file git has never
 // been told about, and a zee that has just written five new files and not committed is exactly when
 // a human opens this. The whole pipeline is capped with `head -c` INSIDE the container, so a runaway
 // diff never crosses the docker boundary; the cap is reported, not hidden. Returns null when the
-// cxell is unreachable (the caller then falls back to the host worktree), never throws.
+// cxell is unreachable (the caller then falls back to the host worktree), never throws. The return
+// carries `base` (the diff base actually used — the fork point for 'source', HEAD for 'own') so the
+// caller can report it truthfully.
 export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source', maxBytes = 4_000_000 }) {
+  if (kind !== 'own' && !base) return null;
   const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
-  const target = kind === 'own' ? 'HEAD' : b;
-  if (!target) return null;
+  if (kind !== 'own' && !b) return null;
   const name = cxellName(slug);
-  const body = [
-    'cd /work/repo || exit 3',
-    `git --no-pager diff --no-color -M ${target}`,
-    "git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do "
-      + 'git --no-pager diff --no-color --no-index -- /dev/null "$f"; done',
-  ].join('; ');
+  const body = cxellPatchBody(base, kind);
   let out, head = null;
   try {
     const r = await dk(ctx, ['exec', name, 'bash', '-lc',
@@ -681,7 +780,17 @@ export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source',
     return null;
   }
   const text = String(out || '');
-  return { text, head, capped: text.length >= (Number(maxBytes) || 4_000_000) };
+  // The first line is `BASE:<sha>` — the base the diff was actually measured against. Strip it
+  // before the caller parses the patch; the cap is judged on the WHOLE output, base line included.
+  let baseUsed = null;
+  let bodyText = text;
+  if (text.startsWith('BASE:')) {
+    const nl = text.indexOf('\n');
+    const line = nl >= 0 ? text.slice(0, nl) : text;
+    baseUsed = line.slice(5).trim() || null;
+    bodyText = nl >= 0 ? text.slice(nl + 1) : '';
+  }
+  return { text: bodyText, base: baseUsed, head, capped: text.length >= (Number(maxBytes) || 4_000_000) };
 }
 
 // Create (or recreate) the xell's cxell container on its own bridge network. Labeled so
@@ -695,6 +804,13 @@ export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source',
 export function cxellRunArgs({ name, net, port, img, xellId, prep = null }) {
   return ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
     '-p', `127.0.0.1:${port}:22`,
+    // The stable API address from a cage: host.docker.internal:4700 (the queenzee's published
+    // port on the host) is the injected ZEEHIVE_API — it always resolves and only ever fails
+    // with a legible ECONNREFUSED while the queenzee is down, never a DNS ENOTFOUND that reads
+    // as "the fleet is gone". Docker Desktop adds this name automatically; native Linux needs
+    // the explicit host-gateway alias, exactly like the web container's extra_hosts. Without it
+    // the CLI's own default and the injected address both die on native Linux cages.
+    '--add-host', 'host.docker.internal:host-gateway',
     // ONE npm cache for the whole fleet: without it every cxell re-downloads the same tarballs
     // into its own empty ~/.npm, which is the repetition ticket #7 is about. Empty when disabled.
     // The project's SPAWN TEMPLATE (migration 121) decides the mode, and whether an apt archive
@@ -1064,6 +1180,10 @@ export async function openCxellSsh({ ctx, name, publicKey, agentEnv = {}, xellTo
   // Where the `zee` CLI finds the queenzee. Explicit (not the CLI's baked default) so a
   // containerized queenzee can re-aim every cxell by config alone (CXELL_API_BASE).
   envLines.push(`ZEEHIVE_API=${config.cxellApiBase}`);
+  // The SECOND name a script (or the CLI) can try when the primary does not resolve — the
+  // compose-network name the queenzee used to inject. host.docker.internal is the stable one;
+  // this is the "the first name is not the only name" fallback (ticket #94).
+  envLines.push(`ZEEHIVE_API_FALLBACK=${config.cxellApiFallback}`);
   if (envLines.length) env.push('-e', `CXELL_ENV=${envLines.join('\n')}`);
   const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cxell-sshd.sh']);
   return r.out.trim();
@@ -1487,6 +1607,7 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
     // the firewall already allows the queenzee host:port.
     ...(xellToken ? ['-e', `ZEEHIVE_XELL_TOKEN=${xellToken}`] : []),
     '-e', `ZEEHIVE_API=${config.cxellApiBase}`,   // same reason as openCxellSsh's CXELL_ENV line
+    '-e', `ZEEHIVE_API_FALLBACK=${config.cxellApiFallback}`,   // the second name (ticket #94)
     name, 'bash', '-lc',
     `cd /work/repo && ${adapter.execCmd({ model })}`];
   const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...cmd];
@@ -1516,8 +1637,16 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
       // event instead of a bare transport error
       try { parser.close(code, err.trim().split('\n').slice(-3).join(' ').slice(0, 400)); }
       catch (e) { logline('cxell', `${adapter.key} parser close threw: ${e.message}`); }
-      if (result) resolve({ code, result });
-      else reject(new Error(`cxell ${adapter.bin} exited ${code} with no result event: ${err.slice(0, 400)}`));
+      // The bounded stderr tail rides the resolve so the death classifier and the zee row can see
+      // what the CLI said when the result event alone says nothing (the card's exit-code/stderr
+      // capture). The reject below does the same through `e.code` / `e.errTail`.
+      if (result) resolve({ code, result, err: err.slice(-2000) });
+      else {
+        const e = new Error(`cxell ${adapter.bin} exited ${code} with no result event: ${err.slice(0, 400)}`);
+        e.code = code;
+        e.errTail = err.slice(-2000);
+        reject(e);
+      }
     });
   });
   p.stdin.write(adapter.stdinPayload ? adapter.stdinPayload(prompt) : prompt);
@@ -1539,32 +1668,9 @@ export async function exportCxellDiff({ ctx, name, toDir }) {
   return out;
 }
 
-// A git index.lock older than this is STALE — no live git op holds one this long (a lock lives for
-// the duration of a single index-touching command: merge/stash/commit/…, seconds at most). A
-// crashed or killed process leaves one behind forever, and every later index-touching command then
-// dies with "Unable to create '.../index.lock': File exists". The 5-minute margin is generous
-// enough that a genuinely live op is never mistaken for a stale lock.
-const STALE_INDEX_LOCK_MS = 5 * 60 * 1000;
-
-// If a STALE index.lock exists in the worktree admin dir (for a linked worktree that is
-// <repo>/.git/worktrees/<name>, which is exactly where every `git -C <worktree>` index-touching
-// command looks for it), remove it and log the FULL path so `zee ops --alerts` finally names the
-// file. Returns true when a lock was removed. A FRESH lock is NEVER deleted — a live git process
-// may be holding it; the caller then fails exactly as today.
-function clearStaleIndexLock(adminDir, slug) {
-  const lockPath = join(adminDir, 'index.lock');
-  let st;
-  try { st = statSync(lockPath); } catch { return false; }
-  if (Date.now() - st.mtimeMs < STALE_INDEX_LOCK_MS) return false;
-  try {
-    rmSync(lockPath, { force: true });
-    logline('cxell', `${slug}: cleared a STALE index.lock at ${lockPath} `
-      + `(${Math.round((Date.now() - st.mtimeMs) / 1000)}s old) so the collect could retry`);
-    return true;
-  } catch {
-    return false;
-  }
-}
+// The stale-index.lock safety rule (threshold + clear-if-stale) is shared with the catch-up path
+// in xellgit.js — it lives in lib/index-lock.js, once, so the two can never drift on "when is it
+// safe to delete a lock". clearStaleIndexLock is imported at the top of this module.
 
 // COLLECT the cxell's commits onto its HOST worktree so they can be landed through the normal gate.
 // This is the missing piece for a cxell zee: its work is committed INSIDE the container, but the
@@ -2021,19 +2127,39 @@ export async function writeFileIntoCxellIfChanged({ ctx = 'default', slug, relPa
   return { changed: r.verdict === 'WROTE', path: full, rel: safe, exit_code: r.code };
 }
 
-// Write a GENERATED file into a cxell — but never over a git-TRACKED path.
+// Write a GENERATED file into a cxell — over a git-tracked path ONLY when the caller says the path is
+// one the meta-DB owns (project_doc rows / harness files), and never over an unrelated tracked one.
 //
 // This is the injector for the project entry-point docs (lib/project-docs.js): markdown the meta-DB
 // owns and the queenzee materializes into a xell, exactly like the harness files. The difference is
-// WHERE they land — a repo-relative path like AGENTS.md, which the project itself may already have
-// committed. Writing over that would replace the project's own instructions with an operator's, dirty
-// the worktree of every xell, and put a file nobody wrote into a landing diff for a human to approve.
+// WHERE they land — a repo-relative path like CLAUDE.md/AGENTS.md, which the project itself may have
+// committed. Writing over that used to be refused outright (house rule 11), which is exactly why the
+// generated docs were ALWAYS skipped in this repo: CLAUDE.md is committed, so the row's text never
+// landed. Option B (docs/entry-point-doc-source.md) reverses that: the ROW is the single source and
+// the committed file is the generated copy, so a tracked entry-point path the meta-DB owns is now
+// superseded — written over, git-excluded, and skip-worktree'd so it can never dirty a landing diff.
 //
-// So git decides, inside the cage, in the same exec that would do the writing: tracked → nothing is
-// written and the caller is told why; untracked → written AND added to .git/info/exclude, so the
-// artefact can never travel into a commit either. The payload is buffered to a temp file first so the
-// decision cannot half-happen (and so a skip does not break the pipe mid-write).
-export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000 }) {
+// An UNRELATED tracked path (a file no project_doc row claims — README.md, a project's own source)
+// stays protected exactly as before: writing over that would still replace the project's own work with
+// an operator's. The caller owns the exemption by passing `overwriteTracked:true`; default is the old
+// refusal, so no caller silently gains clobber power.
+//
+// So git decides, inside the cage, in the same exec that would do the writing:
+//   tracked + !overwriteTracked → nothing is written, caller is told why (TRACKED);
+//   tracked +  overwriteTracked → written, added to .git/info/exclude, and skip-worktree so the
+//                                 superseded committed copy can never surface in a diff (WROTE_TRACKED);
+//   untracked                   → written AND added to .git/info/exclude (WROTE, unchanged).
+//
+// Why skip-worktree on a tracked path AND the exclude line? The exclude line is what keeps a FRESH
+// write from showing up; skip-worktree is what keeps the SUPERSEDED index entry from showing up as a
+// deletion the moment a landing diff or `git add -A` runs. `git rm --cached` would also silence it but
+// rewrites the index in a way that makes a later `zee sync` merge against the file noisier; the
+// skip-bit is the lighter touch and it is what keeps the xell's working tree honest for the zee.
+//
+// The payload is buffered to a temp file first so the decision cannot half-happen (and so a skip does
+// not break the pipe mid-write).
+export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000,
+                                                   overwriteTracked = false } = {}) {
   const name = cxellName(slug);
   const safe = String(relPath).replace(/\\/g, '/').split('/')
     .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
@@ -2045,22 +2171,39 @@ export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPat
     `P=${sq(safe)}`,
     'tmp="$(mktemp)"',
     'cat > "$tmp"',
-    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
+    'T=0',
+    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then T=1; fi',
+    // OVERWRITE_TRACKED is injected by THIS docker exec (-e below) from the caller's flag — never
+    // read from the cage's own env. A zee cannot widen its own doc writes; the default when the flag
+    // is absent (or a caller forgets to pass it) is 0, i.e. the old protected behaviour.
+    'if [ "$T" = 1 ] && [ "${OVERWRITE_TRACKED:-0}" != 1 ]; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
     'mkdir -p "$(dirname "$P")"',
     'mv "$tmp" "$P"',
     'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
-    'echo WROTE',
+    // skip-worktree: the file was tracked and is now superseded — without this, the index entry would
+    // read as a staged DELETION in every landing diff (`git add -A` sweeps it in). The skip-bit keeps
+    // the superseded committed copy invisible while leaving the index entry in place for `zee sync`.
+    'if [ "$T" = 1 ]; then git update-index --skip-worktree -- "$P" >/dev/null 2>&1 || true; echo WROTE_TRACKED; else echo WROTE; fi',
   ].join('\n');
   // Through dkVerdict, like every other exec that states its own outcome. This site is where the
   // verdict was read as `String(await dk(...))` — '[object Object]', matching nothing — so every doc
   // the container really DID write was reported as skipped: the write worked and the report lied. The
   // helper hands back a STRING there is no object to stringify by accident.
-  const r = await dkVerdict(ctx, ['exec', '-i', name, 'bash', '-lc', script],
-                            { markers: ['WROTE', 'TRACKED'], label: `${name}: ${safe}`,
+  const args = ['exec', '-i', name, 'bash', '-lc', script];
+  // The -e goes into the docker exec, so the SCRIPT is one text for both modes — the caller's flag
+  // only decides which value the exec injects. This keeps the guard-testable script (test
+  // project-docs.test.mjs §3 reads it out of the source) identical for protected and supersede runs.
+  args.splice(2, 0, '-e', `OVERWRITE_TRACKED=${overwriteTracked ? '1' : '0'}`);
+  const r = await dkVerdict(ctx, args,
+                            { markers: ['WROTE', 'WROTE_TRACKED', 'TRACKED'], label: `${name}: ${safe}`,
                               input: String(text ?? ''), timeoutMs });
   if (r.verdict === 'TRACKED') {
     return { written: false, skipped: 'tracked', rel: safe,
-      reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
+      reason: `${safe} is tracked by git in this xell and no project doc row owns it — the project's own committed copy is left alone` };
+  }
+  if (r.verdict === 'WROTE_TRACKED') {
+    return { written: true, superseded: true, rel: safe, path: `/work/repo/${safe}`,
+      reason: `${safe} was committed in this repo; the meta-DB row now owns it, so the committed copy is superseded and git-excluded` };
   }
   if (r.verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
   // No verdict AND a failed exec: the container never got to speak (no such container, the script died
