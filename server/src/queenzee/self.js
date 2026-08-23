@@ -1663,6 +1663,14 @@ export async function selfBuild(xell, { role = null, hot = false } = {}) {
   try { started = await buildXell(xell.id, { hot, role }); }
   catch (e) { return { ok: false, error: e.message, collected }; }
 
+  // buildXell catches per-container refusals into {error} so one bad container can't block its
+  // siblings — but when EVERY target refused to start (the production ship-only gate), nothing
+  // started and this is a FAILURE, not an ok:true "started" answer. Surface it loudly so `zee build`
+  // exits non-zero instead of printing a JSON with ok:true and a buried error.
+  if (Array.isArray(started) && started.length && started.every((s) => s && s.error)) {
+    return { ok: false, error: started.map((s) => s.error).join('; '), collected };
+  }
+
   const roleLabel = role || 'server + webapp';
   const from = collected?.collected ? `collected HEAD ${String(collected.head).slice(0, 8)}` : 'your worktree';
   return {

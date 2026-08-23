@@ -32,6 +32,78 @@ export function formatBuildFailure(err, fallback = 'see docker output') {
   return text.length > 1500 ? text.slice(-1500) : text;
 }
 
+// ── BUILD-FAILURE CLASSIFIER — turn a failed build's stderr into INFRA | CODE (ticket "make zee
+// build return actionable failures"). The raw docker tail STAYS in last_build_error (the evidence
+// is never replaced); this decides whether retrying can EVER help, so `zee build --wait` can tell a
+// zee "not your code — file a ticket and stop" instead of sending it into a retry loop (the
+// mardale-prod address-pool exhaustion, ticket #178, was exactly that: the zee's image built fine,
+// the HOST could not create a network, and nothing told it the failure was not its code).
+//
+// PURE — no I/O. The queenzee calls it at failure time to store last_build_error_class on the row;
+// getBuildStatus returns it and a pre-computed next step. Exported for tests. Matches against the
+// real text the build path actually produces (docker stderr, the compose-file missing sentence from
+// build-container.sh, the compile errors from vite/webpack/tsc) — not a vocabulary invented for the
+// classifier. Modeled on lib/ship-failure.js (classifyShipFailure).
+
+export const BUILD_FAILURE_CLASSES = ['INFRA', 'CODE'];
+
+// Order matters: INFRA is checked first (host/daemon/network/context problems are never the zee's
+// code), everything else defaults to CODE (a failed build is usually the worktree, and it is the
+// safe default: we must never wrongly tell a zee "not your code").
+const INFRA_PATTERNS = [
+  // docker network/address exhaustion (the mardale-prod incident, ticket #178).
+  { test: (s) => /all predefined address pools have been fully subnetted|address pool.*(?:exhausted|fully subnetted)/i.test(s) },
+  // the daemon itself is gone / unreachable.
+  { test: (s) => /cannot connect to the docker daemon|error during connect|is the docker daemon running|docker daemon is (?:not|unreachable|unavailable)|daemon (?:not found|unreachable|unavailable)/i.test(s) },
+  // a docker CONTEXT that does not exist / cannot be resolved.
+  { test: (s) => /context .* (?:not found|does not exist|missing)|unable to resolve docker endpoint|no such context/i.test(s) },
+  // host resource exhaustion — retrying on the same host cannot fix disk/memory/inode pressure.
+  { test: (s) => /no space left on device|ENOSPC|device or resource busy|too many open files|address already in use|resource (?:temporarily )?unavailable|out of (?:memory|disk space)/i.test(s) },
+  // network/dns/transport — a registry or host that cannot be reached from where the build runs.
+  { test: (s) => /network .* (?:not found|is unreachable|unreachable)|connect: network is unreachable|no such host|getaddrinfo|name or service not known|connection (?:refused|reset|timed out)|i\/o timeout|context deadline exceeded|dial tcp|failed to (?:push|pull).*(?:timeout|network|tls)|x509:|tls handshake/i.test(s) },
+  // registry/image-access refusals — credentials/rate-limits/access, not the zee's code.
+  { test: (s) => /pull access denied|unauthorized|authentication required|toomanyrequests|denied: requested access|manifest unknown|no matching manifest|unexpected status from GET request/i.test(s) },
+  // the docker daemon answered with a server-side error (status codes are only meaningful near an
+  // HTTP status — a bare "502" in a log line is not an infra verdict).
+  { test: (s) => /error response from daemon|server error|internal server error|bad gateway|service unavailable|(?:status|HTTP)[ :]50[23]/i.test(s) },
+];
+
+// The docker address-pool exhaustion from the mardale-prod incident (ticket #178), detected
+// separately so the INFRA next-step can name the existing ticket instead of telling a zee to file a
+// duplicate.
+export function isAddressPoolExhaustion(err) {
+  return /all predefined address pools have been fully subnetted/i.test(String(err ?? ''));
+}
+
+export function classifyBuildFailure(err) {
+  const text = String(err ?? '').trim();
+  if (!text) return null;
+  return INFRA_PATTERNS.some((r) => r.test(text)) ? 'INFRA' : 'CODE';
+}
+
+// The exact next step for a classified failure — what a zee should DO, not just what happened. The
+// server computes it once (here) so getBuildStatus carries it and `zee build --wait`/--watch and the
+// host xell-build.mjs print the same sentence; the record and the report cannot disagree.
+export function buildFailureNextStep(cls, err, container = null) {
+  const text = String(err ?? '').trim();
+  if (cls === 'INFRA') {
+    const ctxs = [];
+    if (container?.build_ctx && container?.docker_ctx && container.build_ctx !== container.docker_ctx) {
+      ctxs.push(`compiles on ${container.build_ctx}`);
+      ctxs.push(`runs on ${container.docker_ctx}`);
+    } else if (container?.docker_ctx) {
+      ctxs.push(`docker context ${container.docker_ctx}`);
+    }
+    const where = ctxs.length ? `Where: ${ctxs.join(', ')}.` : '';
+    const ticket = isAddressPoolExhaustion(text)
+      ? 'This is docker address-pool exhaustion on the host — already ticketed #178. Retrying will not help; file nothing new, and wait for the pool to free up (or be enlarged).'
+      : 'Retrying will not help. File a ticket for the infra team with the docker line below, and STOP the retry loop.';
+    return `INFRA — NOT YOUR CODE. This build failed on the host/daemon/network, not on your change. ${where} ${ticket}`.trim();
+  }
+  // CODE (default): the error text IS the actionable part.
+  return 'CODE — this looks like a problem in YOUR worktree (compile/test/compose). Fix the error below and rebuild.';
+}
+
 // The registry a split build hands its image through: the project's own, else the global default.
 // null when neither is set → split builds are simply unavailable (validated where build_ctx is set).
 async function registryFor(projectId) {
@@ -119,9 +191,22 @@ export async function setXellBuildCtx(xellId, buildCtx) {
 // buildCtx: undefined → leave the container's stored build context as-is; a string/null → set it
 // first (one-shot "build on X now"). A value equal to the run context, or empty, resets to NULL.
 export async function buildContainer(containerId, { hot = false, buildCtx } = {}) {
-  let c = await one(`SELECT * FROM container WHERE id=$1`, [containerId]);
+  let c = await one(
+    `SELECT c.*, x.is_production AS owner_is_production
+       FROM container c LEFT JOIN xell x ON x.id = c.owner_xell_id
+      WHERE c.id = $1`, [containerId]);
   if (!c) throw new Error('container not found');
   if (!BUILDABLE.has(c.role)) throw new Error(`role '${c.role}' is not buildable (only server/webapp)`);
+  // PRODUCTION IS SHIP-ONLY — a prod-tier container, or one owned by a production xell, must not be
+  // (re)built by a zee action at all; only the ship gate may rebuild/redeploy it. A server-side
+  // guard (not a UI one), the same shape as decommissionContainer's prod refusal: a UI-only guard
+  // is bypassed by any direct API call.
+  if (c.tier === 'prod' || c.owner_is_production) {
+    throw new Error(
+      `${c.name} is a PRODUCTION container — it is ship-only. \`zee build\` cannot (re)build or redeploy a `
+      + 'production container; only the ship gate (`zee ship`, after the work is landed on main) may '
+      + 'rebuild/redeploy it.');
+  }
   if (!c.owner_xell_id) throw new Error('not a per-xell container');
   if (c.health === 'building') throw new Error(`${c.name} is already building`);
   const xell = await one(`SELECT slug, worktree_path, project_id FROM xell WHERE id=$1`, [c.owner_xell_id]);
@@ -189,14 +274,16 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded });
     const ok = !!json && json.ok !== false;
     const failReason = ok ? null : formatBuildFailure(err);
+    const failureClass = ok ? null : classifyBuildFailure(failReason);
     const row = await one(
       `UPDATE container
           SET health = $2::container_health, hot_build = $3,
               last_build_commit = COALESCE($4, last_build_commit),
               last_built_at = CASE WHEN $5 THEN now() ELSE last_built_at END,
-              last_build_error = $6
+              last_build_error = $6,
+              last_build_error_class = $7
         WHERE id=$1 RETURNING *`,
-      [containerId, ok ? 'up' : 'down', !!hot && ok, json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason]);
+      [containerId, ok ? 'up' : 'down', !!hot && ok, json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason, failureClass]);
     broadcast('container', row);
     logline('build', ok
       ? `${hot ? 'HOT ' : ''}build OK: ${c.name} @ ${json?.head} (${json?.method})`
@@ -210,11 +297,12 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     // Land it on a terminal state and say so, rather than leave a permanent lie on the chip.
     // Persist the thrown message too — the catch used to mark down with NO reason on the row.
     const failReason = formatBuildFailure(e?.message || e, 'build errored');
+    const failureClass = classifyBuildFailure(failReason);
     try {
       const row = await one(
-        `UPDATE container SET health='down', last_build_error=$2
+        `UPDATE container SET health='down', last_build_error=$2, last_build_error_class=$3
           WHERE id=$1 AND health='building' RETURNING *`,
-        [containerId, failReason]);
+        [containerId, failReason, failureClass]);
       if (row) broadcast('container', row);
     } catch { /* the DB is what failed — the boot-time recoverOrphanBuilds() is the backstop */ }
     logline('build', `build ERRORED: ${c.name} — ${failReason} (marked down; rebuild when ready)`);
@@ -272,14 +360,16 @@ async function runProcessRoleStart(c, xell, project, startCmd, mode = MODE) {
   const ok = !!json && json.ok !== false;
   const failReason = ok ? null : formatBuildFailure(
     err || json?.method, 'see .zeehive log');
+  const failureClass = ok ? null : classifyBuildFailure(failReason);
   const row = await one(
     `UPDATE container
         SET health = $2::container_health, hot_build = false,
             last_build_commit = COALESCE($3, last_build_commit),
             last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END,
-            last_build_error = $5
+            last_build_error = $5,
+            last_build_error_class = $6
       WHERE id=$1 RETURNING *`,
-    [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason]);
+    [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok, failReason, failureClass]);
   broadcast('container', row);
   logline('build', ok
     ? `process UP: ${c.name} @ ${json?.head} (${json?.method})`
@@ -310,11 +400,12 @@ function startProcessRole(c, xell, project) {
         // can move the row off 'building', so it must always land somewhere terminal. Persist the
         // thrown message — same contract as the docker catch (ticket #173).
         const failReason = formatBuildFailure(e?.message || e, 'process start errored');
+        const failureClass = classifyBuildFailure(failReason);
         try {
           const row = await one(
-            `UPDATE container SET health='down', last_build_error=$2
+            `UPDATE container SET health='down', last_build_error=$2, last_build_error_class=$3
               WHERE id=$1 AND health='building' RETURNING *`,
-            [c.id, failReason]);
+            [c.id, failReason, failureClass]);
           if (row) broadcast('container', row);
         } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
         logline('build', `process start ERRORED: ${c.name} — ${failReason} (marked down; hammer again when ready)`);
@@ -372,10 +463,11 @@ export async function restartProcessRoleTier(containerId, { mode = MODE } = {}) 
     // Same stranded-'building' guard as the build path: the row must never sit 'building' with no
     // process behind it. Land on 'down' with the reason, so the failure is visible, not stuck.
     const failReason = formatBuildFailure(e?.message || e, 'env reload restart errored');
+    const failureClass = classifyBuildFailure(failReason);
     try {
       const row = await one(
-        `UPDATE container SET health='down', last_build_error=$2 WHERE id=$1 AND health='building' RETURNING *`,
-        [c.id, failReason]);
+        `UPDATE container SET health='down', last_build_error=$2, last_build_error_class=$3 WHERE id=$1 AND health='building' RETURNING *`,
+        [c.id, failReason, failureClass]);
       if (row) broadcast('container', row);
     } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
     logline('build', `env reload restart ERRORED: ${c.name} — ${failReason} (marked down)`);
@@ -402,9 +494,11 @@ export async function getBuildStatus(xellId) {
   if (!xell) throw new Error('xell not found');
   const head = xell.worktree_path ? headCommit(xell.worktree_path, 'HEAD') : null;
 
+  // c.* (not an explicit column list) so a read path never crashes on a schema the migration has
+  // not yet reached — last_build_error_class (233) rides along when present, and its absence is
+  // handled (buildFailureNextStep defaults to CODE).
   const cs = await q(
-    `SELECT c.id, c.name, c.role, c.health, c.last_build_commit, c.last_built_at, c.hot_build,
-            c.last_build_error, c.docker_ctx, c.build_ctx, c.project_id, c.url, c.host, c.host_port
+    `SELECT c.*
        FROM container c WHERE c.owner_xell_id=$1 AND c.role = ANY($2) ORDER BY c.role`,
     [xellId, [...BUILDABLE]]);
 
@@ -454,6 +548,12 @@ export async function getBuildStatus(xellId) {
       published_url: publishedUrl(c),
       published_health,
       boot_log_tail,
+      // The classified cause (INFRA | CODE, migration 233) and the exact next step, so
+      // `zee build --wait`/--watch and the host xell-build.mjs print WHAT TO DO, not just the tail.
+      last_build_error_class: c.last_build_error_class || null,
+      last_build_error_next_step: c.last_build_error
+        ? buildFailureNextStep(c.last_build_error_class, c.last_build_error, c)
+        : null,
       // A HOT build re-used the old image, so its recorded commit does NOT mean the code is live.
       // serving_head also requires the published port to answer — not just a health row.
       serving_head: !!head && !c.hot_build && health === 'up' && published_health === 'up'
