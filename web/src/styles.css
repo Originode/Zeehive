@@ -3521,7 +3521,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }
 
 /* ════════════════════════════════════════════════════════════════════════════════
-   MOBILE CHAT UI (/m?project=…) — web/src/MobileChat.jsx
+   MOBILE CHAT UI (/m/<project>/…) — web/src/MobileChat.jsx
    A phone-first sibling of the console. Every class is prefixed .mob- so it can never
    collide with the console's classes. It owns the FULL screen: no width cap, no centering —
    a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with

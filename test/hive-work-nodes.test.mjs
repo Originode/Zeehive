@@ -70,7 +70,11 @@ ok(/hx && !xellOf\(hx\.id\)\?\.hex_kind/.test(hive),
 
 // ── 3. the App levels: projects on load, node context, provisioned at root ────
 console.log('\nApp composes the level and carries the context');
-ok(/useState\('projects'\)/.test(app), "the console OPENS on the top level — every project's root work_node");
+// The level the console opens on now comes from the ADDRESS (web/src/route.js): a bare `/` is still
+// the top level — every project's root work_node — and `/<project>/<child>/…` opens INSIDE, which is
+// the whole point of the path URL. So the assertion is on the fallback, not on a bare literal.
+ok(/useState\(initialUrl\.current\.project \? 'nodes' : 'projects'\)/.test(app),
+   "the console OPENS on the top level — every project's root work_node — unless the URL names one");
 ok(/hex_kind: 'project'/.test(app) && /hex_kind: 'worknode'/.test(app),
    'App synthesises the two cell kinds for the canvas');
 ok(/parent_id === ctxItemId/.test(app), "a level's cells are the CONTEXT node's children");

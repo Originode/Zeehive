@@ -257,6 +257,10 @@ export default function App() {
   // become a node. Also re-armed by popstate (Back/Forward) and by a project switch.
   const pendingNodes = useRef(initialUrl.current.nodes);
   const [workItems, setWorkItems] = useState([]);    // the selected project's plan (flat, from /work-items)
+  // Bumped every time the plan is LOADED, including when it comes back empty. The URL resolution
+  // below waits on this rather than on `workItems.length`: a project with no work items would
+  // otherwise leave the address's segments pending forever, and the URL never normalised.
+  const [workRev, setWorkRev] = useState(0);
   const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
@@ -408,6 +412,10 @@ export default function App() {
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
   useEffect(() => { projectsRef.current = projects; }, [projects]);
+  // …and the plan, for the same reason: Back/Forward must resolve the address's node segments
+  // against the CURRENT plan from inside a listener that is not re-bound on every refetch.
+  const workItemsRef = useRef([]);
+  useEffect(() => { workItemsRef.current = workItems; }, [workItems]);
   const applyFleet = useCallback((f) => {
     if (f && (!projectIdRef.current || f.project?.id === projectIdRef.current)) setFleet(f);
   }, []);
@@ -427,6 +435,7 @@ export default function App() {
       // stale-guard, same rule as loadAll: never paint the previous project's plan
       if (!projectIdRef.current || projectIdRef.current === pid) {
         setWorkItems(Array.isArray(items) ? items : []);
+        setWorkRev((n) => n + 1);   // the plan LOADED — even if it came back empty (see workRev)
       }
     } catch { /* keep last */ }
   }, []);
@@ -750,30 +759,41 @@ export default function App() {
     // Unresolved segments are still in flight (the plan has not loaded) — leave the address alone
     // rather than truncating a deep link the moment it is opened.
     if (pendingNodes.current.length && hiveMode === 'nodes') return;
+    // We have now computed the address of what is really on screen, so the normalising write is
+    // SPENT — whether or not it had anything to write. Flagging it only on an actual write was a
+    // bug the browser found: open a deep link, where the address ALREADY matches, and the first
+    // real navigation would still replaceState — no history entry, and Back left the console.
+    const first = !urlNormalised.current;
+    urlNormalised.current = true;
     const here = window.location.pathname + window.location.search;
     if (here === want) return;
     try {
-      if (urlNormalised.current) window.history.pushState(null, '', want);
-      else window.history.replaceState(null, '', want);
+      if (first) window.history.replaceState(null, '', want);
+      else window.history.pushState(null, '', want);
     } catch { /* history unavailable — non-fatal */ }
-    urlNormalised.current = true;
   }, [projects, projectId, hiveMode, nodePath, workItems]);
 
-  // URL → STATE, for Back/Forward only. Re-arms the same pending-slug resolution the first paint
-  // uses, so stepping back into a deep level works even when that project's plan must reload.
+  // URL → STATE, for Back/Forward only.
+  //   • back into ANOTHER project → arm the segments and let the pending-slug resolution below run
+  //     when that project's plan lands (the same path the first paint takes);
+  //   • back into another LEVEL of the project already loaded → resolve at once from the plan we are
+  //     holding. Waiting for a reload that will never come is what would freeze the address here.
   useEffect(() => {
     const onPop = () => {
       const at = parsePath(window.location.pathname);
       const p = findProject(projectsRef.current, at.project);
-      pendingNodes.current = at.nodes;
       setHiveMode(at.project ? 'nodes' : 'projects');
-      if (!at.nodes.length) setNodePath([]);
+      setExpandedId(null);
       if (p && p.id !== projectId) {
+        pendingNodes.current = at.nodes;
+        setNodePath([]);
         setProjectId(p.id);
         localStorage.setItem(PROJECT_KEY, p.id);
         setWorkItems([]);
+        return;
       }
-      setExpandedId(null);
+      pendingNodes.current = [];
+      setNodePath(resolveNodes(workItemsRef.current, at.nodes).nodes);
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -782,12 +802,14 @@ export default function App() {
   // The plan has arrived — turn the address's slugs into the nodePath they name. A segment that no
   // longer resolves (the node was deleted, or renamed since the link was made) lands on the longest
   // valid prefix, and the effect above then rewrites the address to what is actually on screen.
+  // Keyed on workRev, not on the array: a project whose plan comes back EMPTY must still clear the
+  // pending segments, or the address would stay frozen on a level that does not exist.
   useEffect(() => {
-    if (!pendingNodes.current.length || !workItems.length) return;
-    const { nodes } = resolveNodes(workItems, pendingNodes.current);
+    if (!workRev || !pendingNodes.current.length) return;
+    const { nodes } = resolveNodes(workItemsRef.current, pendingNodes.current);
     pendingNodes.current = [];
     setNodePath(nodes);
-  }, [workItems]);
+  }, [workRev]);
 
   // (re)load the selected project's data + subscribe to its live stream. Re-runs when the
   // selected project changes (projectId may be null on first paint → server uses the default).
