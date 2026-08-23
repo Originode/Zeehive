@@ -24,7 +24,7 @@ import { predecessorActionDigest } from '../lib/predecessor-digest.js';
 // is already in flight) instead of blindly marking 'working' over a live session (TKT-114-B).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText, turnBudgetWarningMessage } from '../lib/turn-ledger.js';
-import { tokenForSpawn } from '../lib/provider-tokens.js';
+import { tokenForSpawn, scrubSecrets } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
 import { broadcast } from '../lib/events.js';
 import { fleetPaused, PAUSED_REASON, noteHeldNudge } from '../lib/fleet-pause.js';
@@ -974,8 +974,11 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
         // The log line must tell the SAME truth the row does: a dead turn is filed as a death (the
         // revive ladder decides the retry), never as "cxell may be down; no retry" — a GATEWAY
         // refusal is our door, not the cage, and the ladder retries even that.
-        logline('nudge', `${zee.slug}: nudge exec could not run (${String(e.message).slice(0, 160)}) — `
-          + (death ? `filing the death (${death.message.slice(0, 140)})` : 'no death signal; ending the turn'));
+        // The vendor's stderr tail can ECHO A TOKEN back ("your api key: sk-ant-… is invalid") or a
+        // token-bearing base-url (/x/<xellToken>/…), so both interpolations go through the same
+        // scrubSecrets revive.js uses before the reason reaches the row (finding [10]).
+        logline('nudge', `${zee.slug}: nudge exec could not run (${scrubSecrets(String(e.message).slice(0, 160))}) — `
+          + (death ? `filing the death (${scrubSecrets(death.message.slice(0, 140))})` : 'no death signal; ending the turn'));
         // Put the row back where it was rather than leaving a zee 'working' on a turn that never
         // started — a stuck 'working' is the same lie as a stuck 'idle', and it also blocks a reap.
         markZeeTurn(zee.id, zee.status === 'working' ? 'working' : 'idle',
