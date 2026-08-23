@@ -48,6 +48,10 @@ let mockServer = null, gwServer = null;
 // The mock upstream — speaks the Anthropic dialect (non-streaming JSON; ChatAnthropic's default).
 // Records every request body so the test can assert what the second turn carried.
 const mockRequests = [];
+// Count ONLY the model calls (POST /v1/messages) — the gateway fires a background GET /user/balance
+// probe after each deepseek call, which also lands on the mock and would otherwise break the
+// "exactly one request" assertions (the balance probe is not a model call).
+const modelCalls = () => mockRequests.filter((r) => r.url === '/v1/messages');
 function startMockUpstream() {
   return new Promise((resolve) => {
     mockServer = http.createServer((req, res) => {
@@ -85,6 +89,13 @@ function startMockUpstream() {
 function startGateway() {
   return new Promise((resolve, reject) => {
     gwServer = http.createServer((req, res) => {
+      // The connectivity probe gatewayEnv mints VERIFY against (TKT-179): chatModelConfig now
+      // PROVES the gateway by hitting /api/hello before minting, so the mock must answer it 200
+      // like the real gateway's index.js mount (gatewayApp.get('/api/hello', gatewayHello)).
+      if (req.url === '/api/hello') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+      }
       let body = '';
       req.on('data', (d) => (body += d));
       req.on('end', () => {
@@ -150,7 +161,7 @@ try {
     apiKey: DEEPSEEK_KEY, xellToken,
   });
   eq(messageText(r1.content), 'hello from mock', 'turn 1 got the mock response through the gateway');
-  ok(mockRequests.length === 1, 'the mock upstream received exactly one request (turn 1)');
+  ok(modelCalls().length === 1, 'the mock upstream received exactly one request (turn 1)');
   const gwRows1 = await requestsForXell(xellId);
   ok(gwRows1.length >= 1, 'the gateway recorded the langchain call in llm_gateway_request');
   eq(gwRows1[0]?.provider, 'deepseek', 'the recorded request is attributed to deepseek');
@@ -172,14 +183,14 @@ try {
   turn2 = await one(
     `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, status, model)
      VALUES ($1,$2,$3,'spawn','started',$4) RETURNING id`, [zee2.id, xellId, projectId, MODEL]);
-  const before = mockRequests.length;
+  const before = modelCalls().length;
   const r2 = await runLangchainTurn({
     xell: { id: xellId }, task: 'second question', provider: 'deepseek', model: MODEL,
     apiKey: DEEPSEEK_KEY, xellToken,
   });
   eq(messageText(r2.content), 'hello from mock', 'turn 2 got the mock response through the gateway');
-  ok(mockRequests.length === before + 1, 'the mock upstream received exactly one request (turn 2)');
-  const req2 = mockRequests[mockRequests.length - 1];
+  ok(modelCalls().length === before + 1, 'the mock upstream received exactly one request (turn 2)');
+  const req2 = modelCalls()[modelCalls().length - 1];
   const roles2 = (req2.body.messages || []).map((m) => m.role);
   ok(roles2.includes('user') && roles2.includes('assistant') && roles2.includes('user'),
     `turn 2's model call carried the FULL prior history (roles: ${roles2.join(',')})`);
@@ -203,13 +214,13 @@ try {
   await q(`UPDATE zee SET status='stopped' WHERE id=$1`, [zee2.id]);
   const rt = await one(`SELECT * FROM agent_runtime WHERE key='langchain-stateful'`);
   ok(!!rt && rt.driver === 'langchain', 'the langchain-stateful runtime row exists with driver=langchain');
-  const beforeSpawn = mockRequests.length;
+  const beforeSpawn = modelCalls().length;
   const spawnOut = await spawnLangchainZee({
     pid: projectId, xell: await one(`SELECT * FROM xell WHERE id=$1`, [xellId]),
     task: 'spawn path question', rt, model: MODEL, provider: 'deepseek',
   });
   ok(spawnOut.ok === true, `spawnLangchainZee returned ok (${JSON.stringify(spawnOut).slice(0, 120)})`);
-  ok(mockRequests.length === beforeSpawn + 1, 'the spawn path made exactly one model call through the gateway');
+  ok(modelCalls().length === beforeSpawn + 1, 'the spawn path made exactly one model call through the gateway');
   const spawnZee = await one(`SELECT * FROM zee WHERE id=$1`, [spawnOut.zee_id]);
   eq(spawnZee.status, 'idle', 'the spawned zee ended idle (a completed turn)');
   eq(spawnZee.entrypoint, 'langchain', 'the spawned zee is entrypoint=langchain');
