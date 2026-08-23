@@ -89,10 +89,13 @@ for (const [msg, kind, signal] of [
   ok(r.kind === kind && r.signal === signal,
      `${kind}/${signal}: ${JSON.stringify(msg.slice(0, 52))} → ${r.kind}/${r.signal}`);
 }
-// The rewritten message names the GATEWAY and the address it tried — never the vendor's sentence alone.
+// The rewritten message names the GATEWAY and the address it tried — never the vendor's sentence
+// alone. It says what is TRUE from inside a cage ("could not reach"), never an accusation the
+// gateway is down: an addressless transport failure can be the cage's own network, and the two are
+// indistinguishable from in here (S1).
 const gwMsg = classifyTurnDeath('API Error: connect ECONNREFUSED host.docker.internal:4701', gwCtx);
-ok(gwMsg.message === 'zeehive gateway unreachable at http://host.docker.internal:4701 (ECONNREFUSED)',
-   `the message is rewritten to name the gateway + address (${JSON.stringify(gwMsg.message)})`);
+ok(gwMsg.message === 'could not reach the zeehive gateway at http://host.docker.internal:4701 (ECONNREFUSED)',
+   `the message is rewritten to say what is TRUE and name the gateway + address (${JSON.stringify(gwMsg.message)})`);
 // Without the gateway context, the SAME transport failure stays the generic 'closed' (the vendor's
 // name) — a non-cxell caller, or a death that never names our address, is not OURS to rename.
 ok(classifyTurnDeath('API Error: connect ECONNREFUSED api.anthropic.com:443').signal === 'closed',
@@ -107,6 +110,28 @@ const upstream = classifyTurnDeath('gateway upstream unreachable: connect ECONNR
 ok(upstream.kind === 'transient' && upstream.signal !== 'gateway-unreachable',
    'a genuine vendor outage through the gateway is NOT named OURS — the gateway itself answered '
    + `(got ${upstream.kind}/${upstream.signal})`);
+// The gateway's own 502 body is PROOF THE GATEWAY ANSWERED even when the err names NO address —
+// "socket hang up", "read ECONNRESET", "write EPIPE" carry no host, so the old address-free rescue
+// (messageNamesAnyAddress) could not tell them apart from OUR door being closed. The marker prefix
+// is that proof: it is UPSTREAM/vendor, never ours, whether or not an address is named (B2).
+for (const msg of [
+  'gateway upstream unreachable: socket hang up',
+  'gateway upstream unreachable: read ECONNRESET',
+  'gateway upstream unreachable: write EPIPE',
+]) {
+  const r = classifyTurnDeath(msg, gwCtx);
+  ok(r.kind === 'transient' && r.signal !== 'gateway-unreachable',
+     `an ADDRESSLESS gateway 502 is still UPSTREAM, never ours: ${JSON.stringify(msg)} → ${r.kind}/${r.signal}`);
+}
+// A DEAD CREDENTIAL whose sentence also carries a transport word is TERMINAL, never a transient
+// gateway-unreachable — terminal is asked FIRST, and the two classifiers agree (B1).
+const classifyStopReason = (await import('../server/src/lib/delivery-telemetry.js')).classifyStopReason;
+for (const msg of ['API Error: 401 invalid_api_key - fetch failed', '401 unauthorized: network error']) {
+  const td = classifyTurnDeath(msg, gwCtx);
+  const dt = classifyStopReason(msg);
+  ok(td.kind === 'terminal' && td.signal === 'auth' && dt === 'terminal',
+     `a dead credential + a transport word is TERMINAL in BOTH classifiers — never a transient gateway death: ${JSON.stringify(msg)} → ${td.kind}/${td.signal} (delivery-telemetry: ${dt})`);
+}
 // The layered classifier carries the gateway context into the stderr tail.
 ok(classifyTurnDeathEx({ message: 'error', err: 'API Error: Unable to connect to API (ConnectionRefused)', gateway: gwCtx }).signal === 'gateway-unreachable',
    'classifyTurnDeathEx layers the gateway context onto the stderr tail');
@@ -224,9 +249,9 @@ try {
   const rg = await row(zg.id);
   ok(rg.revive_class === 'transient' && rg.revive_signal === 'gateway-unreachable',
      'the zee row records the gateway signal — "how often does the fleet die on the gateway?" is one GROUP BY');
-  ok(/^zeehive gateway unreachable at http:\/\/host\.docker\.internal:4701/.test(rg.last_stop_reason || ''),
+  ok(/^could not reach the zeehive gateway at http:\/\/host\.docker\.internal:4701/.test(rg.last_stop_reason || ''),
      `the stop_reason names the GATEWAY and the address — never the vendor's sentence alone (${JSON.stringify((rg.last_stop_reason || '').slice(0, 80))}…)`);
-  ok((notedg.message || '').includes('zeehive gateway unreachable at'),
+  ok((notedg.message || '').includes('could not reach the zeehive gateway at'),
      'noteTurnDeath returns the rewritten message so the turn ledger closes with the gateway\'s name');
 
   // ── D. the BACKFILL re-classifies existing unknown rows from their last_stop_reason ───────────

@@ -1,3 +1,9 @@
+// A dependency-free leaf, the same shape as lib/zee-turn.js — EXCEPT for ONE imported constant:
+// the gateway's own 502 upstream marker (lib/gateway-upstream.js, a zero-import leaf), so a message
+// the gateway itself produced is never claimed as OUR outage (B2). Everything else about the gateway
+// context is passed in by the caller, exactly as the header below documents.
+import { GATEWAY_UPSTREAM_UNREACHABLE_PREFIX } from './gateway-upstream.js';
+
 // WHY DID THIS TURN DIE — and does the zee deserve to be revived, or a human?
 //
 // A dependency-free leaf, the same shape as lib/zee-turn.js: two questions decided in a table so
@@ -92,10 +98,11 @@ const RULES = [
 // through a WORKING gateway surfaces as the gateway's own 502 "gateway upstream unreachable",
 // which matches the generic '5xx' rule — never this one.
 //
-// The classifier stays dependency-free: it does not import gateway.js. The CALLER passes the
-// gateway context — the addresses our cages are given (gatewayBaseUrl()'s host:port, or the
-// fallback's) and whether ALL of this zee's AI traffic crosses our gateway (a cxell CLI's does,
-// so even a transport failure that prints NO address is against our gateway).
+// The classifier stays dependency-free: the only thing it imports is the gateway's own 502
+// upstream marker (lib/gateway-upstream.js, a zero-import leaf). Everything else about the gateway
+// context comes from the CALLER — the addresses our cages are given (gatewayBaseUrl()'s host:port,
+// or the fallback's) and whether ALL of this zee's AI traffic crosses our gateway (a cxell CLI's
+// does, so even a transport failure that prints NO address is against our gateway).
 export const GATEWAY_UNREACHABLE_DEATH = Object.freeze({ kind: 'transient', signal: 'gateway-unreachable' });
 
 // The transport-failure markers that can be OURS: the node connect errors (ECONNREFUSED,
@@ -144,7 +151,7 @@ function gatewayDeath(address, text) {
   return {
     kind: GATEWAY_UNREACHABLE_DEATH.kind,
     signal: GATEWAY_UNREACHABLE_DEATH.signal,
-    message: `zeehive gateway unreachable at ${address} (${code})`,
+    message: `could not reach the zeehive gateway at ${address} (${code})`,
   };
 }
 
@@ -159,7 +166,14 @@ function gatewayDeath(address, text) {
 // named OURS, however loudly the vendor's error reads.
 export function classifyGatewayUnreachable(message, { gatewayAddresses = [], allTrafficIsGateway = false } = {}) {
   const text = String(message ?? '').trim();
-  if (!text || !GATEWAY_TRANSPORT_RE.test(text)) return null;
+  if (!text) return null;
+  // The gateway's OWN 502 body ("gateway upstream unreachable: <err>") is PROOF THE GATEWAY
+  // ANSWERED — it produced an HTTP 502 before the upstream failed. Whatever the err says (even an
+  // addressless "socket hang up" / "read ECONNRESET" / "write EPIPE"), the failure is UPSTREAM —
+  // the vendor — never OUR door, so it is never named OURS. The marker is the constant the
+  // gateway's own error path writes (lib/gateway-upstream.js), so the two can never drift.
+  if (text.startsWith(GATEWAY_UPSTREAM_UNREACHABLE_PREFIX)) return null;
+  if (!GATEWAY_TRANSPORT_RE.test(text)) return null;
   const addr = gatewayTokens(gatewayAddresses);
   const address = mentionedGatewayAddress(text, addr);
   if (address) return gatewayDeath(address, text);
@@ -209,22 +223,36 @@ export const CAGE_RESTART_DEATH = Object.freeze({ kind: 'transient', signal: 'ca
 const TRANSIENT_CAUSE = {
   [HOST_RESTART_DEATH.signal]: 'the zeehive machine restarted under this turn',
   [CAGE_RESTART_DEATH.signal]: 'a human restarted this zee\'s cxell under this turn',
-  [GATEWAY_UNREACHABLE_DEATH.signal]: 'the zeehive gateway was unreachable at the address this cage was given',
+  [GATEWAY_UNREACHABLE_DEATH.signal]: 'could not reach the zeehive gateway at the address this cage was given',
 };
 
 // Classify the sentence a dead turn left behind (zee.last_stop_reason, a CLI's final result text, a
 // docker exec's stderr). Never throws; an empty message is UNKNOWN, not an error.
 // `ctx` (optional) is the gateway context passed by a caller that knows our gateway addresses
 // ({ gatewayAddresses, allTrafficIsGateway }) — a transport failure against OUR gateway is then
-// named OURS before the generic 'closed' rule gets to name it after the provider.
+// named OURS after the terminal rules, before the generic 'closed' rule gets to name it after the
+// provider.
 // → { kind: 'transient' | 'terminal' | 'unknown' | 'none', signal, message }
 export function classifyTurnDeath(text, ctx = {}) {
   const message = String(text ?? '').trim();
   if (!message) return { kind: 'unknown', signal: null, message: '' };
   if (NON_DEATH_RE.test(message)) return { kind: 'none', signal: NON_DEATH_SIGNAL, message };
+  // TERMINAL is asked FIRST — the ordering this file's header documents, and the reason it matters:
+  // a dead credential's sentence often carries a transport word TOO ("API Error: 401
+  // invalid_api_key - fetch failed", "401 unauthorized: network error"). The broad gateway
+  // transport regex would match those and file the death transient/gateway-unreachable, putting the
+  // zee on the 5/15/45 revive ladder instead of raising a human. Terminal rules win, always.
+  for (const r of RULES) {
+    if (r.kind === 'terminal' && r.test.test(message)) return { kind: r.kind, signal: r.signal, message };
+  }
+  // A transport failure against OUR gateway is named OURS — but only after no terminal rule
+  // matched. It still runs before the generic 'closed' transient rule, so our door is not named
+  // after the vendor either.
   const gatewayDeath = classifyGatewayUnreachable(message, ctx);
   if (gatewayDeath) return gatewayDeath;
-  for (const r of RULES) if (r.test.test(message)) return { kind: r.kind, signal: r.signal, message };
+  for (const r of RULES) {
+    if (r.kind !== 'terminal' && r.test.test(message)) return { kind: r.kind, signal: r.signal, message };
+  }
   return { kind: 'unknown', signal: null, message };
 }
 
