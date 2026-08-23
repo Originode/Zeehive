@@ -9,6 +9,9 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          routePrompt, deployRouter, redeployRouter,
          squashHelps, squashOffer } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
+// the ONE place the gateway-health state becomes words ("gateway unreachable at <addr>") — same
+// vocabulary in every surface, tested in plain node (web/src/gatewayHealth.js)
+import { gatewayHealthWord } from './gatewayHealth.js';
 import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
@@ -1480,6 +1483,20 @@ export default function App() {
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
+        {/* GATEWAY REACHABILITY at the address cages are actually given — a WORD, never a shade, and
+            the address is named when it is down. This is the surface that says "the port cages point
+            at is closed" instead of making it look like every provider is down. It rides the same
+            fleet poll as everything else here (getFleet → gateway_health, the cached verdict of the
+            health-monitor's best-effort probe) — no extra request, and a probe failure never fails
+            this render (gatewayHealthWord handles unknown/missing state, the chip just says so). */}
+        {fleet.gateway_health && (() => {
+          const gw = gatewayHealthWord(fleet.gateway_health);
+          return (
+            <span className={`gateway-health ${gw.kind}`} data-testid="gateway-health" title={gw.why}>
+              {' · '}{gw.chip}
+            </span>
+          );
+        })()}
         {/* FLEET-CUMULATIVE BURN — spend only (tokens + $). Remaining provider quotas are the
             SEPARATE "limits" chip below — deliberately not mixed, so the two questions stay clear. */}
         {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0

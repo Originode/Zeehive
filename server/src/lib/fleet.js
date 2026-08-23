@@ -18,6 +18,7 @@ import { listCredentialInjectRequests } from './credential-inject.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
+import { gatewayHealth } from '../queenzee/gateway-health.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -829,6 +830,10 @@ export async function getFleet(projectId) {
     pause,
     // Per-project pause state (migration 101) — alongside the fleet-wide `pause` above.
     project_pause: projPause,
+    // GATEWAY REACHABILITY at the address cages are actually given — the cached verdict of the
+    // health-monitor's best-effort probe (queenzee/gateway-health.js). Read from the cache, never
+    // a fetch here: a probe failure must never fail the fleet read or a page render.
+    gateway_health: gatewayHealth(),
   };
 }
 

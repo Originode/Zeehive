@@ -189,10 +189,11 @@ manager's specialist is on no roster and *should* carry this project's lore.
 
 ### 3.1b Project entry-point docs (migrations 081, 083)
 The same rule, one level out: a project's agent-facing instructions are a `project_doc` row, generated
-into each xell on the same trigger. The injector asks git inside the cage and **refuses to write over a
-tracked path** — a project that committed its own entry point keeps it — and git-excludes what it does
-write, so a generated doc can never dirty a worktree or reach a landing diff. Authored in the
-project's **Docs** tab (`lib/project-docs.js`).
+into each xell on the same trigger. The row is the SINGLE source (Option B,
+`docs/entry-point-doc-source.md`): the injector asks git inside the cage, supersedes a tracked
+entry-point path the row OWNS (writes over it, git-excludes it, skip-worktrees it — so a generated
+doc can never dirty a worktree or reach a landing diff) and still refuses an unrelated tracked path.
+Authored in the project's **Docs** tab (`lib/project-docs.js`).
 
 **The row is the CONTENTS, not a file** (083). 081 had one row per path, so an operator who wanted
 Claude Code *and* Codex *and* Cursor to read the same thing pasted it into three rows and watched them

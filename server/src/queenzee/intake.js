@@ -34,6 +34,7 @@ import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
 import { turnStopReason } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText, recordFeedEvent } from '../lib/turn-ledger.js';
 import { gatewayEnv } from '../lib/gateway.js';
+import { GATEWAY_UNREACHABLE_DEATH } from '../lib/turn-death.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
@@ -1045,9 +1046,16 @@ export async function setZeeMode(zeeId, permissionMode) {
 // Best-effort: no live cxell → nothing to do; NEVER throws.
 // GENERATE this project's entry-point docs (AGENTS.md/CLAUDE.md …) into a cxell. Same trigger as the
 // harness files — a zee being assigned — because they answer the same question for a zee arriving with
-// no context: what is this project and how do I work in it. Never overwrites a git-tracked path
-// (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
-// and a zee never received is exactly the silence this whole mechanism exists to remove.
+// no context: what is this project and how do I work in it.
+//
+// The meta-DB row is the SOURCE of truth (docs/entry-point-doc-source.md, Option B) — every xell gets
+// the generated file at deployment, including at a path the repo has committed (this repo's CLAUDE.md
+// is exactly that). So the injector is called with overwriteTracked:true for these entry-point paths:
+// the paths are ones project_doc rows own, and lib/cxell.js then writes over the committed copy,
+// git-excludes it and skip-worktrees it. An UNRELATED tracked path (a file no row claims) stays
+// protected — the same lib/cxell.js decision, with the caller's flag defaulting to false there.
+// Every outcome is logged: a doc an operator wrote and a zee never received is exactly the silence
+// this whole mechanism exists to remove.
 export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
   // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
   // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
@@ -1058,7 +1066,7 @@ export async function injectProjectDocsIntoXell({ ctx = 'default', slug, project
   const skipped = [];
   for (const f of files) {
     try {
-      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text });
+      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text, overwriteTracked: true });
       if (r.written) written++; else skipped.push(r.reason || `${f.relPath} not written`);
     } catch (e) {
       failed++;
@@ -1824,7 +1832,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       catch (e) { logline('cxell', `${name}: could not inject harness file ${f.relPath} (${String(e.message).slice(0, 100)})`); }
     }
     // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
-    // provider actually looks for. Generated, never written over a file the project itself committed.
+    // provider actually looks for. The row is the SOURCE (Option B, docs/entry-point-doc-source.md):
+    // the injector supersedes a tracked entry-point path the row owns — this repo's committed
+    // CLAUDE.md included — rather than skipping it.
     await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
@@ -1868,8 +1878,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // adapter's own base URL (the adapter.env baseUrl above is the provider's real URL; the gateway
     // replaces it). The token stays the provider key (adapter.env's token) — unchanged credential
     // model, the identity travels in the URL.
-    const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
-    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
+    const gwEnv = await gatewayEnv({ xellToken, provider: adapter.provider });
+    // Log HOST:PORT only — the full env value carries the xell identity token in its PATH
+    // (/x/<token>/<provider>), and no token ever goes in a logline. `new URL().host` is host:port.
+    const gwBase = gwEnv.ANTHROPIC_BASE_URL
+      ? (() => { try { return new URL(gwEnv.ANTHROPIC_BASE_URL).host; } catch { return '(unknown host)'; } })()
+      : '(off)';
+    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwBase})`);
     await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
                          agentEnv: { ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
@@ -2048,8 +2063,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
-                          extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
+  const handle = await runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
+                                extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.
@@ -2186,17 +2201,21 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js). A
       // HEALTHY end resets the xell's consecutive-death streak (ticket #81) — the cage demonstrably
       // carried this agent through a full turn, so the run of deaths is honestly over.
+      // A GATEWAY death returns the rewritten stop_reason ('zeehive gateway unreachable at …'), which
+      // is what the TURN LEDGER should close with — the one line a human reads to find out what died.
+      let filed = null;
       if (errored) {
-        await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                              reason: String(result?.result || 'error'),
-                              code, err, result, source: 'turn' });
+        filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                      reason: String(result?.result || 'error'),
+                                      code, err, result, source: 'turn' });
       } else {
         await resetXellConsecutiveDeaths(xell.id);
       }
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
         status: errored ? 'errored' : 'ended',
-        burn: b, stopReason: stop,
+        burn: b,
+        stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal ? filed.message : stop,
         summary: lastAssistantText(result),
         meta: { errored },
       });
@@ -2228,15 +2247,18 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
       logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
-      await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
       // The other half of the same question (see the resolve path above): a run that died on the way
       // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
       // runZee's reject carries the exit code and a bounded stderr tail (cxell.js), which rides here
-      // so the row captures what the CLI said even when it printed no result event.
-      await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                            reason: String(err.message),
-                            code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
-                            source: 'turn' });
+      // so the row captures what the CLI said even when it printed no result event. FILED BEFORE the
+      // ledger closes so a gateway death's rewritten stop_reason is what the turn row closes with.
+      const filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                          reason: String(err.message),
+                                          code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
+                                          source: 'turn' });
+      await endTurn(turn?.id, { status: 'errored', burn: null,
+                                stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal
+                                  ? filed.message : scrubSecrets(String(err.message)).slice(0, 200) });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,

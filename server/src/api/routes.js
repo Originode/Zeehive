@@ -546,8 +546,9 @@ router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
 // ── PROJECT ENTRY-POINT DOCS (the instructions a zee reads first) ────────────
 // The CONTENTS are owned by the meta-DB and one file per AI provider is GENERATED into each xell when
 // a zee is assigned (lib/project-docs.js). The console's Docs tab is the whole authoring surface; the
-// injector refuses to write over a path the project has committed, so an operator cannot silently
-// replace a repo's own instructions.
+// row is the single source (Option B, docs/entry-point-doc-source.md), so the injector supersedes a
+// tracked entry-point path the row owns rather than skipping it — but an unrelated tracked path is
+// still protected, so an operator still cannot silently replace a repo's own work.
 //
 // The catalogue is served rather than duplicated in web/: the filenames are a moving vendor fact
 // (lib/agent-docs.js), and a hard-coded copy in the console would be a second source of truth for

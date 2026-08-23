@@ -64,6 +64,7 @@ function startMockUpstream() {
       req.on('end', () => {
         let j = {};
         try { j = JSON.parse(body || '{}'); } catch { /* not json */ }
+        j.__path = req.url;   // the deepseek balance probe (GET /user/balance) interleaves with the model calls
         requests.push(j);
         const hasToolResult = (j.messages || []).some((m) =>
           Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result'));
@@ -94,6 +95,13 @@ function startMockUpstream() {
 function startGateway() {
   return new Promise((resolve, reject) => {
     gwServer = http.createServer((req, res) => {
+      // The connectivity probe the gateway mints VERIFY against (TKT-179): gatewayEnv now PROVES
+      // the address by hitting /api/hello before minting, so the mock must answer it 200 like the
+      // real gateway's index.js mount (gatewayApp.get('/api/hello', gatewayHello)).
+      if (req.url === '/api/hello') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+      }
       let body = '';
       req.on('data', (d) => (body += d));
       req.on('end', () => {
@@ -184,8 +192,11 @@ try {
   eq(res.toolCalls[0].name, 'working', 'the requested tool is `working`');
   eq(res.toolCalls[0].args?.note, 'starting the tool loop', 'the model passed the note arg');
   ok(res.capped === false, 'the loop was NOT capped (it finished naturally)');
-  // The mock's second request must have carried the tool_result (the queenzee's handler output).
-  const secondReq = mock.requests[1];
+  // The mock's second model call must have carried the tool_result (the queenzee's handler output).
+  // NOT requests[1]: the gateway fires a background /user/balance probe after each deepseek call,
+  // so requests[1] can be that probe — find the second /v1/messages POST instead.
+  const modelCalls = mock.requests.filter((r) => r?.__path === '/v1/messages');
+  const secondReq = modelCalls[1];
   const toolResultBlock = secondReq?.messages?.find((m) =>
     Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result'))?.content;
   ok(!!toolResultBlock, 'the model\'s second call carried the tool_result block');

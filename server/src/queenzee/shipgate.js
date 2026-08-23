@@ -20,8 +20,9 @@ import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations, pendingBootMigrations } from './shipmigrate.js';
 import { runShipPreflight, noteShipPreflight } from './ship-preflight.js';
-import { computeShipPayload, shipAutoApproveVerdict } from './ship-payload.js';
+import { computeShipPayload, shipAutoApproveVerdict, deployedCommitForTarget } from './ship-payload.js';
 import { classifyShipFailure } from '../lib/ship-failure.js';
+import { shipDirectionVerdict, SHIP_BEHIND_LIVE_CAUSE } from '../lib/ship-direction.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { setShipRefusal, clearShipRefusal } from '../lib/status.js';
@@ -793,6 +794,68 @@ export async function runShip(shipId, { mode = MODE } = {}) {
   }
 }
 
+// ── the direction guard: gather the facts, then decide ────────────────────────
+// Is `a` an ancestor of `b`? THREE answers, and the third is the reason this is not lib/git.js's
+// isAncestor: that one returns false when it cannot tell (fine for "is this xell shipped?"), and a
+// guard that reads "unreadable" as "not behind" would wave through the exact deploy it exists to
+// stop — while one that read it as "behind" would make prod unshippable on a git hiccup. So:
+// exit 0 → true, exit 1 → false, anything else (128 = a sha that does not resolve, git missing,
+// timeout) → null = UNKNOWN, which the verdict turns into "do not refuse", said out loud.
+function ancestryOf(repoRoot, a, b) {
+  if (!repoRoot || !a || !b) return null;
+  const r = spawnSync('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', a, b],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
+  return null;
+}
+
+// What production is running for this ship's target, and which way this ship would move it.
+// `deployedLookup` is a DI seam so the incident can be replayed against a real git repo with no
+// database (test/ship-not-backwards.test.mjs). Never throws: an unreadable ledger is 'unknown'.
+export async function resolveShipDirection(project, ship, site = null,
+                                           { deployedLookup = deployedCommitForTarget } = {}) {
+  const target = ship?.commit || null;
+  let deployed = null;
+  try {
+    const row = await deployedLookup(project.id,
+      { siteId: site?.id ?? ship?.site_id ?? null, excludeShipId: ship?.id || null });
+    deployed = row?.commit || null;
+  } catch (e) {
+    // The ledger read FAILED — that is not "nothing has shipped". Say which it is, and do not refuse
+    // (a refusal must be definite); the log line is the record that the guard could not run.
+    logline('ship', `direction guard: could not read the ship ledger (${e.message}) — direction UNCHECKED`);
+    return { allowed: true, direction: 'unknown', target, deployed: null, behind: null,
+      reason: `could not read the ship ledger (${e.message}) — the backwards-ship guard did not run` };
+  }
+  const isAnc = target && deployed ? ancestryOf(project.repo_root, target, deployed) : null;
+  const behind = isAnc === true ? gitCount(project.repo_root, `${target}..${deployed}`) : null;
+  return shipDirectionVerdict({ target, deployed, isAncestor: isAnc, behind });
+}
+
+// Fail a ship BEFORE the deploy did anything — the guard's refusal path. It mirrors the tail of
+// runShipBody (terminal row + classified cause, riders resolved, the site's countdown started, the
+// pad kicked) because a refusal must leave exactly the same, fully-released state a failed build
+// does: the one thing worse than a backwards ship is a guard that wedges the prod lock.
+async function failShipUpfront(ship, xell, project, lockKey, reason, cause) {
+  const results = [{ role: 'direction-guard', ok: false, method: 'refused', error: reason, log: reason }];
+  const done = await one(
+    `UPDATE ship_request SET status='failed', finished_at=now(), containers=$2::jsonb, error=$3,
+                            failure_cause=$4, failure_line=$5
+       WHERE id=$1 RETURNING *`,
+    [ship.id, JSON.stringify(results), reason.slice(0, 1500), cause, reason.slice(0, 300)]);
+  if (done) broadcast('ship', done);
+  logline('ship', `ship ${String(ship.commit || '').slice(0, 8)} REFUSED for ${xell?.slug || 'unknown'}: ${reason}`);
+  await resolveBundleRiders(ship.id, false, ship.commit, { cause, line: reason.slice(0, 300) }).catch(() => {});
+  const lock = await one(
+    `UPDATE deploy_lock SET phase='failed', auto_release_at = now() + ($3 || ' seconds')::interval
+       WHERE project_id=$1 AND container=$2 AND ship_id=$4 RETURNING *`,
+    [project.id, lockKey, String(AUTO_RELEASE_SEC), ship.id]);
+  if (lock) broadcast('xell', { id: xell.id });
+  notifyShipDone({ project, xell, ok: false, request: done, seconds: AUTO_RELEASE_SEC });
+  setImmediate(() => processPad(project.id).catch(() => {}));
+}
+
 // Exported for the ship-withdraw race test — the rest of the codebase calls runShip only, and
 // nothing else should call runShipBody directly; it expects runShip to have taken the lock already.
 export async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
@@ -814,6 +877,20 @@ export async function runShipBody(ship, xell, project, site, lockKey, mode = MOD
     return;
   }
   broadcast('ship', shipping);
+
+  // THE DIRECTION GUARD — a ship may never roll PRODUCTION BACKWARDS (see lib/ship-direction.js for
+  // the incident this replays). It is asked HERE, at EXECUTION time, and that placement is the whole
+  // point: a target is resolved once at REQUEST time and the world keeps moving between the two —
+  // the ship that reverted prod on 2026-08-23 sat 49 minutes waiting for a human while two NEWER
+  // ships completed. Nothing before this line has touched production: the row is 'shipping' and the
+  // lock is held, but no migration has run and no image has been built, so refusing here leaves prod
+  // exactly as it was.
+  const direction = await resolveShipDirection(project, shipping, site);
+  if (!direction.allowed) {
+    await failShipUpfront(shipping, xell, project, lockKey, direction.reason, SHIP_BEHIND_LIVE_CAUSE);
+    return;
+  }
+  if (direction.direction !== 'forward') logline('ship', `ship direction: ${direction.reason}`);
 
   // Honeycomb: queenzee → PRODUCTION while the deploy runs. The ask was xell→queenzee (x2q at
   // request time); the act is the reverse direction onto the production hexagon — that is the

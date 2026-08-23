@@ -1910,8 +1910,9 @@ function SiteEditor({ site, run, busy }) {
 // four files and watches them drift.
 //
 // The three things it has to SAY, because they are the three ways an operator gets surprised:
-// a generated file is never written over a path the project has committed (git decides, in the cage),
-// it is git-excluded there (so fleet-wide instructions never appear in a landing diff), and every
+// this text is the SOURCE and the files in a workspace are artefacts of it — a tracked entry-point
+// path the row owns is SUPERSEDED (git-excluded + skip-worktree, so it never appears in a landing
+// diff), an unrelated tracked path is still protected (the repo's own file wins there), and every
 // generated file carries a stamp plus THAT xell's own stack inventory — which is why the copy in a
 // workspace is never quite what was typed here.
 export function ProjectDocsSection({ project, run, busy }) {
@@ -1930,13 +1931,14 @@ export function ProjectDocsSection({ project, run, busy }) {
     <div className="setup-sec" data-testid="project-docs-section">
       <h3>Docs <span className="pc">(the project's instructions for AI agents — written ONCE here, generated as each provider's entry-point file in every xell)</span></h3>
       <div className="pc">
-        What you type below is the <b>source of truth</b>. ZEEHIVE generates one file per provider from
-        it — <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>GEMINI.md</code>, … — each stamped as
-        generated, each ending with <b>that xell's own stack</b> (its containers, ports, database and
-        build verbs), and each added to the xell's git excludes so it never lands in a diff. If the
-        project has <b>committed</b> a file at one of those paths, the repo's own copy wins and nothing
-        is written there. Saving also regenerates them in the xells of any zees <b>already running</b>,
-        so a fix does not wait for the next dispatch.
+        What you type below is the <b>single source of truth</b>. ZEEHIVE generates one file per
+        provider from it — <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>GEMINI.md</code>, … —
+        each stamped as generated, each ending with <b>that xell's own stack</b> (its containers, ports,
+        database and build verbs), and each added to the xell's git excludes so it never lands in a
+        diff. If the project has <b>committed</b> a file at one of those paths, the generated copy
+        supersedes it in every xell — the row is the source, the committed file is the artefact. A
+        file <b>no row claims</b> is left alone. Saving also regenerates the files in the xells of any
+        zees <b>already running</b>, so a fix does not wait for the next dispatch.
       </div>
       {(docs || []).map((d) => (
         <ProjectDocEditor key={d.id} doc={d} targets={targets} run={wrapped} busy={busy} />

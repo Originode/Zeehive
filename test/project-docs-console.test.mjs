@@ -13,8 +13,9 @@
 //   1. the CONTENTS come first — a body textarea, and no path box on a provider-backed doc;
 //   2. the PROVIDERS are a checklist of real filenames with who reads each one, and the surface says
 //      which files this text currently generates;
-//   3. the SURPRISES are stated where the operator is: a committed file wins, the generated copy is
-//      git-excluded, it carries the xell's own stack, and saving reaches zees already running.
+//   3. the SURPRISES are stated where the operator is: the row is the single source and supersedes a
+//      tracked entry-point path the row owns, an unrelated tracked file is left alone, the generated
+//      copy is git-excluded, it carries the xell's own stack, and saving reaches zees already running.
 // Plus the seam: the catalogue is FETCHED (never hard-coded in web/), and every path the console
 // suggests is one the server's own registry actually knows — a filename that exists only in the
 // console is a file no agent ever opens.
@@ -132,7 +133,8 @@ const section = renderToStaticMarkup(React.createElement(ProjectDocsSection, {
 for (const [re, what] of [
   [/source of truth/i, 'that what they type IS the source'],
   [/one file per provider/i, 'that one file per provider is generated from it'],
-  [/committed/i, "that a file the project committed wins over the generated one"],
+  [/supersedes|committed/i, "that a tracked entry-point path the row owns is superseded (the row is the source)"],
+  [/no row claims|left alone/i, "that an unrelated tracked file is still protected"],
   [/git excludes/i, 'that the generated copy never lands in a diff'],
   [/that xell's own stack|that xell&#x27;s own stack/i, "that each file carries that xell's own stack"],
   [/already running/i, 'and that saving reaches zees already at work'],
