@@ -33,7 +33,7 @@ import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
-import { parseGatewayPath, normalizeUsage, gatewayEnv, gatewayEnvForBase, recordRequest, completeRequest,
+import { parseGatewayPath, normalizeUsage, gatewayEnvForBase, recordRequest, completeRequest,
          requestsForXell, gatewayHello, usageFromStream, modelFromStream, providerUpstreamUrl,
          joinUpstreamPath, zeeTurnForXell, modelPrice, costOf, extractRateLimit,
          classifyResponseText } from '../server/src/lib/gateway.js';
