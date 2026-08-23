@@ -43,7 +43,7 @@ import { recordEvent, setTend } from '../lib/status.js';
 import { xellPaused } from '../lib/fleet-pause.js';
 import { classifyTurnDeath, classifyTurnDeathEx, decideRevive, MAX_REVIVE_ATTEMPTS, REVIVE_BACKOFF_MIN,
          HOST_RESTART_DEATH, CAGE_RESTART_DEATH, GATEWAY_UNREACHABLE_DEATH } from '../lib/turn-death.js';
-import { GATEWAY_PORT, gatewayBaseUrl } from '../lib/gateway.js';
+import { GATEWAY_PORT, gatewayBaseUrl, invalidateGatewayProbe } from '../lib/gateway.js';
 import { providerForRuntimeKey } from '../lib/cxell-runtimes.js';
 import { raiseAuthDeathRequest, injectedRevivePrompt, scrubSecrets } from '../lib/credential-inject.js';
 import { quarantineOnAuthDeath } from '../lib/account-quarantine.js';
@@ -160,6 +160,13 @@ export async function noteTurnDeath({ zeeId, xellId, slug = null, reason = '', r
     // (ECONNREFUSED)' — not "three providers are down".
     const notADeath = death.kind === 'none';
     const isGatewayDeath = !deathOverride && death.signal === GATEWAY_UNREACHABLE_DEATH.signal;
+    // A GATEWAY death means the address this cage was given just failed a REAL dispatch/turn — the
+    // probe's cached OK verdict (TTL 30s) is now a lie, and the next mint would hand the NEXT cage
+    // the same dead address for up to 30 more seconds (TKT-179, bounded). Invalidate the OK verdict
+    // here, where the failure is ALREADY classified — no second classifier — so the next mint
+    // re-probes. The addresses are the candidates this cage was given (primary + fallback); deleting
+    // a cache entry that does not exist is a no-op.
+    if (isGatewayDeath) for (const a of gatewayCtx.gatewayAddresses) invalidateGatewayProbe(a);
     const effectiveReason = isGatewayDeath ? death.message : String(reason || '');
     const errTail = String(err || '').trim().split('\n').slice(-5).join('\n').slice(0, 500) || null;
     const scrubbedResult = result ? JSON.parse(scrubSecrets(JSON.stringify(result))) : null;

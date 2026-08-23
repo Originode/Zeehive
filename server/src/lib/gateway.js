@@ -1041,8 +1041,8 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 }
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayFallbackBaseUrl, probeGatewayBase,
-                 _resetGatewayProbeCache, chooseGatewayBaseUrl, verifyGatewayReachable,
-                 gatewayProxy, gatewayHello, requestsForXell,
+                 invalidateGatewayProbe, _resetGatewayProbeCache, chooseGatewayBaseUrl,
+                 verifyGatewayReachable, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
                  classifyResponseText,
                  extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
@@ -1162,6 +1162,16 @@ export async function probeGatewayBase(baseUrl) {
   probeInFlight.set(baseUrl, started);
   started.finally(() => probeInFlight.delete(baseUrl));
   return started;
+}
+
+// A gateway that DIED right after a good probe would keep being minted for the OK verdict's whole
+// TTL (30s) — the TKT-179 failure, bounded. When a REAL dispatch/turn fails against a minted base
+// (classified gateway-unreachable by the turn-death path), the cached OK verdict is invalidated so
+// the NEXT mint re-probes instead of trusting a stale all-clear. No-op for an unknown address.
+export function invalidateGatewayProbe(baseUrl) {
+  if (!baseUrl) return;
+  probeCache.delete(baseUrl);
+  probeInFlight.delete(baseUrl);
 }
 
 // ── the gateway base-url CHOICE ───────────────────────────────────────────────────────────────
