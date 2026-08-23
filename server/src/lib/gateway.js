@@ -1159,6 +1159,11 @@ export async function probeGatewayBase(baseUrl) {
 // neither answers, REFUSE with a named sentence quoting both addresses — never a cage full of
 // vendor-branded ConnectionRefused (TKT-179: one unpublished port failed every provider for 13h).
 let loggedEqualFallback = false;
+// The fallback address we last SAID we were probing — so the "primary unreachable" line is a
+// STATE CHANGE, not a 30s tick. The health monitor (queenzee/gateway-health.js) calls this every
+// ~30s; a primary that stays down while the fallback answers must not print the same line forever.
+// null = never logged (or the primary has answered since — a fresh episode is loud again).
+let lastFallbackProbeLogged = null;
 
 export async function chooseGatewayBaseUrl() {
   const primary = gatewayBaseUrl();
@@ -1169,9 +1174,16 @@ export async function chooseGatewayBaseUrl() {
       + 'An install that sets no CXELL_API_FALLBACK has only ONE name to try; if that port is unpublished '
       + 'every gateway mint will refuse loudly.');
   }
-  if (await probeGatewayBase(primary)) return primary;
-  logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  if (await probeGatewayBase(primary)) {
+    lastFallbackProbeLogged = null;   // the primary answered — a later fallback is a NEW episode, say it loud
+    return primary;
+  }
+  if (lastFallbackProbeLogged !== fallback) {
+    lastFallbackProbeLogged = fallback;
+    logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  }
   if (await probeGatewayBase(fallback)) return fallback;
+  lastFallbackProbeLogged = null;     // both refused — the throw below is the loud word; a recovery is a new episode
   throw new Error(
     `LLM gateway unreachable: neither ${primary} nor ${fallback} answers /api/hello. `
     + 'The queenzee refuses to hand a cage a gateway address it cannot reach itself. '
