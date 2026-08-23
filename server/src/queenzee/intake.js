@@ -34,6 +34,7 @@ import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
 import { turnStopReason } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText, recordFeedEvent } from '../lib/turn-ledger.js';
 import { gatewayEnv } from '../lib/gateway.js';
+import { GATEWAY_UNREACHABLE_DEATH } from '../lib/turn-death.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
@@ -2195,17 +2196,21 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js). A
       // HEALTHY end resets the xell's consecutive-death streak (ticket #81) — the cage demonstrably
       // carried this agent through a full turn, so the run of deaths is honestly over.
+      // A GATEWAY death returns the rewritten stop_reason ('zeehive gateway unreachable at …'), which
+      // is what the TURN LEDGER should close with — the one line a human reads to find out what died.
+      let filed = null;
       if (errored) {
-        await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                              reason: String(result?.result || 'error'),
-                              code, err, result, source: 'turn' });
+        filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                      reason: String(result?.result || 'error'),
+                                      code, err, result, source: 'turn' });
       } else {
         await resetXellConsecutiveDeaths(xell.id);
       }
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
         status: errored ? 'errored' : 'ended',
-        burn: b, stopReason: stop,
+        burn: b,
+        stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal ? filed.message : stop,
         summary: lastAssistantText(result),
         meta: { errored },
       });
@@ -2237,15 +2242,18 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
       logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
-      await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
       // The other half of the same question (see the resolve path above): a run that died on the way
       // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
       // runZee's reject carries the exit code and a bounded stderr tail (cxell.js), which rides here
-      // so the row captures what the CLI said even when it printed no result event.
-      await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                            reason: String(err.message),
-                            code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
-                            source: 'turn' });
+      // so the row captures what the CLI said even when it printed no result event. FILED BEFORE the
+      // ledger closes so a gateway death's rewritten stop_reason is what the turn row closes with.
+      const filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                          reason: String(err.message),
+                                          code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
+                                          source: 'turn' });
+      await endTurn(turn?.id, { status: 'errored', burn: null,
+                                stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal
+                                  ? filed.message : scrubSecrets(String(err.message)).slice(0, 200) });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,

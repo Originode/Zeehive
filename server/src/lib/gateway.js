@@ -58,6 +58,7 @@ import { tokenForSpawn, PROVIDERS } from './provider-tokens.js';
 // gateway only calls a handful of named functions, it does not own the capture logic.
 import { BODY_CAP, gatewayBodyCaptureEnabled, secretValuesForProject, captureRequestText,
          scrubBodyText, persistBodies } from './gateway-bodies.js';
+import { GATEWAY_UPSTREAM_UNREACHABLE_PREFIX } from './gateway-upstream.js';
 
 // The gateway's own port. The queenzee API stays on PORT; the gateway is a SEPARATE listener so
 // it can never shadow API routes (/v1/messages is not an API route, but keeping the two doors
@@ -988,7 +989,7 @@ export async function gatewayProxy(req, res) {
   });
   proxyReq.on('error', (e) => {
     if (!res.headersSent) {
-      res.status(502).json({ error: `gateway upstream unreachable: ${e.message}` });
+      res.status(502).json({ error: `${GATEWAY_UPSTREAM_UNREACHABLE_PREFIX}: ${e.message}` });
     } else { try { res.destroy(); } catch { /* already gone */ } }
     completeRequest(rowId, { status: 502, error: e.message, durationMs: Date.now() - t0 });
     // The request body is already captured (it was read before the forward); persist it with
@@ -1040,8 +1041,8 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 }
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayFallbackBaseUrl, probeGatewayBase,
-                 _resetGatewayProbeCache, chooseGatewayBaseUrl, verifyGatewayReachable,
-                 gatewayProxy, gatewayHello, requestsForXell,
+                 invalidateGatewayProbe, _resetGatewayProbeCache, chooseGatewayBaseUrl,
+                 verifyGatewayReachable, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
                  classifyResponseText,
                  extractRateLimit, extractDeepseekBalance, recordAccountUsageLimit,
@@ -1120,12 +1121,18 @@ const PROBE_TIMEOUT_MS = Number(process.env.GATEWAY_PROBE_TIMEOUT_MS || 2000);
 const PROBE_TTL_OK_MS = Number(process.env.GATEWAY_PROBE_TTL_OK_MS || 30000);
 const PROBE_TTL_FAIL_MS = Number(process.env.GATEWAY_PROBE_TTL_FAIL_MS || 3000);
 const probeCache = new Map();   // baseUrl → { ok, at }
+// Single-flight: a COLD cache (or one whose TTL just expired) can be hit by N concurrent dispatches
+// at once — a fleet of spawns arriving together all fired their own probe, N requests against an
+// already-suspect port (TKT-179). The first caller starts the probe; the rest await the same
+// in-flight promise instead of each firing one. The slot is deleted when the probe settles.
+const probeInFlight = new Map();   // baseUrl → Promise<boolean>
 
 // TEST-ONLY: clear the probe verdict cache (+ the once-only "no second name" warning). The
 // standalone choose/refuse test drives the same module across scenarios (primary → fallback →
 // both dead) and needs one scenario's cached verdict to not leak into the next.
 export function _resetGatewayProbeCache() {
   probeCache.clear();
+  probeInFlight.clear();
   loggedEqualFallback = false;
 }
 
@@ -1134,20 +1141,37 @@ export async function probeGatewayBase(baseUrl) {
   const cached = probeCache.get(baseUrl);
   const ttl = cached ? (cached.ok ? PROBE_TTL_OK_MS : PROBE_TTL_FAIL_MS) : 0;
   if (cached && Date.now() - cached.at < ttl) return cached.ok;
-  let verdict = false;
-  try {
-    const res = await fetch(`${baseUrl}/api/hello`, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    // ANY HTTP answer (any status) is proof the port resolves and a server listens — a 404 from
-    // the compose-name /api/hello is reachable (measured). Only the connection-failure family
-    // (refused / ENOTFOUND / timeout) fails the probe.
-    verdict = true;
-  } catch { /* connection refused / timeout / DNS — verdict stays false */ }
-  probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
-  return verdict;
+  const inFlight = probeInFlight.get(baseUrl);
+  if (inFlight) return inFlight;
+  const started = (async () => {
+    let verdict = false;
+    try {
+      const res = await fetch(`${baseUrl}/api/hello`, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      });
+      // ANY HTTP answer (any status) is proof the port resolves and a server listens — a 404 from
+      // the compose-name /api/hello is reachable (measured). Only the connection-failure family
+      // (refused / ENOTFOUND / timeout) fails the probe.
+      verdict = true;
+    } catch { /* connection refused / timeout / DNS — verdict stays false */ }
+    probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
+    return verdict;
+  })();
+  probeInFlight.set(baseUrl, started);
+  started.finally(() => probeInFlight.delete(baseUrl));
+  return started;
+}
+
+// A gateway that DIED right after a good probe would keep being minted for the OK verdict's whole
+// TTL (30s) — the TKT-179 failure, bounded. When a REAL dispatch/turn fails against a minted base
+// (classified gateway-unreachable by the turn-death path), the cached OK verdict is invalidated so
+// the NEXT mint re-probes instead of trusting a stale all-clear. No-op for an unknown address.
+export function invalidateGatewayProbe(baseUrl) {
+  if (!baseUrl) return;
+  probeCache.delete(baseUrl);
+  probeInFlight.delete(baseUrl);
 }
 
 // ── the gateway base-url CHOICE ───────────────────────────────────────────────────────────────
@@ -1158,6 +1182,11 @@ export async function probeGatewayBase(baseUrl) {
 // neither answers, REFUSE with a named sentence quoting both addresses — never a cage full of
 // vendor-branded ConnectionRefused (TKT-179: one unpublished port failed every provider for 13h).
 let loggedEqualFallback = false;
+// The fallback address we last SAID we were probing — so the "primary unreachable" line is a
+// STATE CHANGE, not a 30s tick. The health monitor (queenzee/gateway-health.js) calls this every
+// ~30s; a primary that stays down while the fallback answers must not print the same line forever.
+// null = never logged (or the primary has answered since — a fresh episode is loud again).
+let lastFallbackProbeLogged = null;
 
 export async function chooseGatewayBaseUrl() {
   const primary = gatewayBaseUrl();
@@ -1168,9 +1197,16 @@ export async function chooseGatewayBaseUrl() {
       + 'An install that sets no CXELL_API_FALLBACK has only ONE name to try; if that port is unpublished '
       + 'every gateway mint will refuse loudly.');
   }
-  if (await probeGatewayBase(primary)) return primary;
-  logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  if (await probeGatewayBase(primary)) {
+    lastFallbackProbeLogged = null;   // the primary answered — a later fallback is a NEW episode, say it loud
+    return primary;
+  }
+  if (lastFallbackProbeLogged !== fallback) {
+    lastFallbackProbeLogged = fallback;
+    logline('gateway', `gateway primary ${primary} unreachable — probing fallback ${fallback}`);
+  }
   if (await probeGatewayBase(fallback)) return fallback;
+  lastFallbackProbeLogged = null;     // both refused — the throw below is the loud word; a recovery is a new episode
   throw new Error(
     `LLM gateway unreachable: neither ${primary} nor ${fallback} answers /api/hello. `
     + 'The queenzee refuses to hand a cage a gateway address it cannot reach itself. '
