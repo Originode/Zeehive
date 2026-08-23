@@ -1,6 +1,6 @@
 // SHIP-FAILURE-CLASSIFIER test — the pure half of ticket #58: a failed ship's raw output is
-// classified into a small stable cause vocabulary (image-pull, npm-install, migration-refused,
-// health-check, disk, other) plus the ONE line that identifies it. The raw log STAYS on the row
+// classified into a small stable cause vocabulary (ship-behind-live, image-pull, npm-install,
+// migration-refused, health-check, disk, other) plus the ONE line that identifies it. The raw log STAYS on the row
 // (error / containers are never replaced); this is the one-line diagnosis beside it.
 //
 // The fixture text is REAL text the deploy path produces — the refusal sentences from
@@ -15,7 +15,9 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 
 // ── 1. the vocabulary itself ───────────────────────────────────────────────────
 console.log('── the cause vocabulary ──');
-ok(Array.isArray(SHIP_FAILURE_CAUSES) && SHIP_FAILURE_CAUSES.length === 6, 'exactly six causes');
+ok(Array.isArray(SHIP_FAILURE_CAUSES) && SHIP_FAILURE_CAUSES.length === 7, 'exactly seven causes');
+ok(SHIP_FAILURE_CAUSES.includes('ship-behind-live'),
+   'the direction guard refusal is in the vocabulary (a ship_request row can carry it)');
 ok(SHIP_FAILURE_CAUSES.includes('other'), 'the catch-all is the last resort');
 ok([...SHIP_FAILURE_CAUSES].sort().join(',') === SHIP_FAILURE_CAUSES.slice().sort().join(','),
    'the vocabulary is stable (a sorted copy equals itself)');

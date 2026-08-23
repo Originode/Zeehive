@@ -35,6 +35,29 @@ function rangeCommits(repoRoot, from, to) {
   });
 }
 
+// The completed ships for one target (project + site), newest FIRST. The single definition of "what
+// production has been given", shared by the payload's "before" (which then picks the newest ANCESTOR
+// of the ship being described) and by the direction guard's "what is live NOW" (which must take the
+// newest row, ancestor or not — that difference IS the backwards ship). One query so the two
+// readers can never disagree about what a completed ship is.
+function shippedHistory(projectId, siteId, excludeId, limit = 20) {
+  return q(
+    `SELECT id, commit, finished_at FROM ship_request
+      WHERE project_id=$1 AND status='shipped' AND site_id IS NOT DISTINCT FROM $2 AND id <> $3
+      ORDER BY finished_at DESC NULLS LAST LIMIT $4`,
+    [projectId, siteId || null, excludeId || null, limit]);
+}
+
+// WHAT PRODUCTION IS RUNNING for a target: the most recently COMPLETED ship for the same project +
+// site, whatever its ancestry. Returns { id, commit, finished_at } or null when nothing has ever
+// shipped there. THROWS on a db failure — the direction guard turns that into "unknown" itself, and
+// a swallowed error here would read as "nothing is live", which is the one answer that must never be
+// invented (it would wave a backwards ship straight through).
+export async function deployedCommitForTarget(projectId, { siteId = null, excludeShipId = null } = {}) {
+  const rows = await shippedHistory(projectId, siteId, excludeShipId, 1);
+  return rows[0] || null;
+}
+
 // The last ship that actually COMPLETED for the same target (project + site), excluding this one.
 // Ships are serialized per site by the prod lock, so the latest completed ship is almost always
 // the right "before"; the ancestry check guards the odd orderings (a deferred ship re-aimed past a
@@ -44,11 +67,7 @@ function rangeCommits(repoRoot, from, to) {
 // The caller verifies the repo is READABLE before trusting a null here: an unreadable repo must
 // degrade (ok:false), never read as "first ship".
 async function lastShippedForTarget(project, req, { limit = 20 } = {}) {
-  const rows = await q(
-    `SELECT id, commit, finished_at FROM ship_request
-      WHERE project_id=$1 AND status='shipped' AND site_id IS NOT DISTINCT FROM $2 AND id <> $3
-      ORDER BY finished_at DESC NULLS LAST LIMIT $4`,
-    [project.id, req.site_id || null, req.id, limit]);
+  const rows = await shippedHistory(project.id, req.site_id || null, req.id, limit);
   for (const r of rows) {
     // isAncestor(a, b) is true for a === b too, so a re-ship of the same sha correctly reads as
     // "nothing new since prod already runs this exact commit".
