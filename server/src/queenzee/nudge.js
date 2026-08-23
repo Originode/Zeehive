@@ -961,22 +961,26 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
       // firing onFail (a stale landing raises a TEND from there) and filing a turn death that never
       // happened. It answers for the EXEC only.
       }, async (e) => {
-        logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`);
         // The exec that REJECTED may still have said what it did: dk() attaches both streams to
         // `err.dk`, so the same one parser reads the same final result event off it (resultFrom).
         // Two things then follow, and neither used to happen on this path:
         //   • a turn that SPOKE before the exec died spent tokens, and they are charged — "the exec
         //     exited non-zero" is not "nothing ran". Nothing at all on the streams still books zero.
-        //   • a resume that died on a 429 is a turn DEATH, not an unreachable cage, and belongs on
-        //     the revive ladder rather than in a log line.
+        //   • a resume that died on a 429 (or on a GATEWAY refusal) is a turn DEATH, not an
+        //     unreachable cage, and belongs on the revive ladder rather than in a log line.
         const dk = e?.dk || { code: 1, err: e?.message || '' };
         const result = resultFrom(adapter, dk);
+        const death = resumeTurnDeath({ ...dk, result });
+        // The log line must tell the SAME truth the row does: a dead turn is filed as a death (the
+        // revive ladder decides the retry), never as "cxell may be down; no retry" — a GATEWAY
+        // refusal is our door, not the cage, and the ladder retries even that.
+        logline('nudge', `${zee.slug}: nudge exec could not run (${String(e.message).slice(0, 160)}) — `
+          + (death ? `filing the death (${death.message.slice(0, 140)})` : 'no death signal; ending the turn'));
         // Put the row back where it was rather than leaving a zee 'working' on a turn that never
         // started — a stuck 'working' is the same lie as a stuck 'idle', and it also blocks a reap.
         markZeeTurn(zee.id, zee.status === 'working' ? 'working' : 'idle',
                     `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
                     usageFrom(result)).catch(() => {});
-        const death = resumeTurnDeath({ ...dk, result });
         // PER-TURN LEDGER: close the failed resume — errored if it died on a provider/infra error,
         // else just 'ended' (the exec never started, but the row must not sit 'started' forever).
         await endTurn(turn?.id, {
