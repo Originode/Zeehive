@@ -97,10 +97,8 @@ function gatewayContextFor(zee) {
   if (primary) addresses.push(primary);
   const fallback = process.env.CXELL_API_FALLBACK || '';
   if (fallback && fallback !== process.env.CXELL_API_BASE) {
-    try {
-      const host = String(fallback).replace(/:\d+$/, '');
-      if (host) addresses.push(`${host}:${GATEWAY_PORT}`);
-    } catch { /* a malformed fallback — nothing to name */ }
+    const host = String(fallback).replace(/:\d+$/, '');
+    if (host) addresses.push(`${host}:${GATEWAY_PORT}`);
   }
   return {
     gatewayAddresses: [...new Set(addresses.filter(Boolean))],
