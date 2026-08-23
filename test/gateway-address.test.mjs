@@ -243,6 +243,55 @@ try {
   eq(warnsAfter.length, 0, 'an IDENTIFIED gateway logs NO unidentified warning');
   await close(realGw);
 
+  console.log('\n── 11. IN-FLIGHT INVALIDATION — a probe already in flight when the gateway dies cannot re-stamp the cache ──');
+  // The sequential case (section 9) proves an invalidate forces a re-probe. THIS is the race the
+  // sequential case cannot see: a probe P1 was ALREADY in flight when the gateway died (its
+  // /api/hello succeeded, its /_gw/health was still pending). invalidateGatewayProbe deletes the
+  // in-flight slot, so a fresh probe P2 starts and records FAIL — then P1 settles and would write
+  // its stale OK over that fresh FAIL, re-opening the TKT-179 30s window under concurrency. The
+  // fix is an epoch counter: a probe only writes the cache if no invalidate fired while it was in
+  // flight. This test holds /_gw/health open to pin P1 in flight, invalidates, releases P1 (it
+  // settles OK), then makes /api/hello fail at the socket — and asserts the next probeGatewayBase
+  // does NOT serve P1's stale OK.
+  _resetGatewayProbeCache();
+  let helloHits = 0;
+  let failHellos = false;
+  let releaseHealth = null;
+  let healthArrived;
+  const healthArrivedP = new Promise((r) => { healthArrived = r; });
+  const racing = http.createServer((req, res) => {
+    if (req.url === '/api/hello') {
+      helloHits++;
+      if (failHellos) { req.socket.destroy(); return; }   // connection-failure family — the dead shape
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+    } else if (req.url === '/_gw/health') {
+      healthArrived();
+      releaseHealth = () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"error":"not the gateway"}');
+      };   // HOLD — do not respond until released
+    } else {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":"not the gateway"}');
+    }
+  });
+  servers.push(racing);
+  const RC = await new Promise((resolve) => racing.listen(0, '127.0.0.1', () => resolve(racing.address().port)));
+  process.env.CXELL_API_BASE = `http://127.0.0.1:${RC}`;
+  process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;
+  process.env.GATEWAY_PORT = String(RC);
+  const rcBase = `http://127.0.0.1:${RC}`;
+  const p1 = probeGatewayBase(rcBase);          // answers /api/hello (verdict=true), hangs on /_gw/health
+  await healthArrivedP;                          // P1 is now in flight, awaiting the held identification probe
+  invalidateGatewayProbe(rcBase);                // the gateway dies UNDER the in-flight probe
+  releaseHealth();                               // let P1 settle — its verdict is already true (stale)
+  eq(await p1, true, 'the in-flight probe settles true (it saw /api/hello before the death)');
+  failHellos = true;                             // the gateway is now dead
+  eq(await probeGatewayBase(rcBase), false, 'the next probe does NOT serve the stale OK — it fires a fresh probe and sees the death');
+  eq(helloHits, 2, 'the fresh probe actually fired (2 hello hits) — not served from the stale cache');
+  await close(racing);
+
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
   for (const s of servers) { try { s.close(); } catch { /* already closed */ } }

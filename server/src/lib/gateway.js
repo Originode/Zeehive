@@ -1138,6 +1138,12 @@ const probeCache = new Map();   // baseUrl → { ok, identified, at }
 // already-suspect port (TKT-179). The first caller starts the probe; the rest await the same
 // in-flight promise instead of each firing one. The slot is deleted when the probe settles.
 const probeInFlight = new Map();   // baseUrl → Promise<boolean>
+// Epoch per baseUrl: invalidateGatewayProbe bumps it, and a probe captures the epoch when it
+// STARTS. On settle it writes the cache ONLY if its epoch is still current — so a probe that was
+// already in flight when the gateway died (its /api/hello succeeded, its /_gw/health was still
+// pending) cannot stamp a stale OK over the fresh post-death FAIL. The stale probe still returns
+// its verdict to its OWN caller; it just no longer owns the cache (the TKT-179 30s window).
+const probeEpoch = new Map();   // baseUrl → number
 // The once-per-process "answered but did not identify as our gateway" warning — one line per
 // address, however many mints hit it.
 const loggedUnidentified = new Set();
@@ -1148,6 +1154,7 @@ const loggedUnidentified = new Set();
 export function _resetGatewayProbeCache() {
   probeCache.clear();
   probeInFlight.clear();
+  probeEpoch.clear();
   loggedUnidentified.clear();
   loggedEqualFallback = false;
 }
@@ -1159,6 +1166,7 @@ export async function probeGatewayBase(baseUrl) {
   if (cached && Date.now() - cached.at < ttl) return cached.ok;
   const inFlight = probeInFlight.get(baseUrl);
   if (inFlight) return inFlight;
+  const epoch = probeEpoch.get(baseUrl) || 0;
   const started = (async () => {
     let verdict = false;
     let identified = false;
@@ -1186,11 +1194,21 @@ export async function probeGatewayBase(baseUrl) {
         identified = !!(body && body.service === 'zeehive-llm-gateway');
       } catch { /* identification failure stays unidentified — reachability already decided */ }
     } catch { /* connection refused / timeout / DNS — verdict stays false */ }
-    probeCache.set(baseUrl, { ok: verdict, identified, at: Date.now() });
+    // Write the cache ONLY if this probe is still the CURRENT epoch. An invalidate that fired
+    // WHILE this probe was in flight means the gateway died under it — its verdict is stale and
+    // must not overwrite the fresh post-death one (TKT-179). The result still returns to the
+    // caller that awaited THIS probe; it just no longer stamps the cache.
+    if ((probeEpoch.get(baseUrl) || 0) === epoch) {
+      probeCache.set(baseUrl, { ok: verdict, identified, at: Date.now() });
+    }
     return verdict;
   })();
   probeInFlight.set(baseUrl, started);
-  started.finally(() => probeInFlight.delete(baseUrl));
+  started.finally(() => {
+    // Conditional: an invalidate (or a concurrent probe) may have replaced our slot — never delete
+    // a NEWER probe's in-flight entry from an older probe's finally.
+    if (probeInFlight.get(baseUrl) === started) probeInFlight.delete(baseUrl);
+  });
   return started;
 }
 
@@ -1221,6 +1239,10 @@ export function invalidateGatewayProbe(baseUrl) {
   if (!baseUrl) return;
   probeCache.delete(baseUrl);
   probeInFlight.delete(baseUrl);
+  // Bump the epoch so a probe ALREADY IN FLIGHT when the gateway died cannot write its stale
+  // verdict when it settles — the next mint must see the fresh post-death truth, not a 30s-old
+  // OK (TKT-179). Never blocks: a death path must not wait on the in-flight probe.
+  probeEpoch.set(baseUrl, (probeEpoch.get(baseUrl) || 0) + 1);
 }
 
 // ── the gateway base-url CHOICE ───────────────────────────────────────────────────────────────
