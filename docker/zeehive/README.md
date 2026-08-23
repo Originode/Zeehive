@@ -47,7 +47,9 @@ New Project → Clone from GitHub. Staged, each step reversible:
    (`zeehive_ssh`) and prod dumps (`zeehive_backups`); `REPOS_DIR=/repos` makes clones land on
    the repos volume; `ZEEHIVE_CXELL_SSH=network` makes the queenzee SSH to cxells by container
    name over `zee-hive-net` (the human's `127.0.0.1:<port>` door is unchanged); cxells get
-   `ZEEHIVE_API` injected from `CXELL_API_BASE`. Container self-ship is
+   `ZEEHIVE_API` injected from `CXELL_API_BASE` (the STABLE host.docker.internal:4700 — the
+   compose service name FLAPS during a container recreate, ticket #94) plus `ZEEHIVE_API_FALLBACK`
+   from `CXELL_API_FALLBACK` as the second name a script or the CLI can try. Container self-ship is
    `scripts/self-ship-container.sh` (sync → build → sibling `docker:cli` recreate) — selected
    per-site via the container row's `build_script`, so host and container eras coexist as data.
    ⚠ **Harness FILES are not in the image** (and must not be): `harnesses/<key>/` is read from the

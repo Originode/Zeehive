@@ -19,6 +19,9 @@ import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations, pendingBootMigrations } from './shipmigrate.js';
+import { runShipPreflight, noteShipPreflight } from './ship-preflight.js';
+import { computeShipPayload, shipAutoApproveVerdict } from './ship-payload.js';
+import { classifyShipFailure } from '../lib/ship-failure.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { setShipRefusal, clearShipRefusal } from '../lib/status.js';
@@ -116,15 +119,73 @@ async function resolveShipCommit(project, shipSite, main) {
   // (ticket #12). Best-effort and never throws: an unreadable ledger becomes {ok:false} on the
   // card — "unknown", which is the honest answer — not a silent zero.
   const boot = await pendingBootMigrations(project, commit, shipSite);
-  return { commit, migrations: mig.pending || [], bootMigrations: boot };
+  // pendingMigrations() failing at request time used to become `migrations: []` and the card said
+  // "none" — the error is carried to the row now (migrations_error) so the card can say UNKNOWN,
+  // the same rule the boot-time set already followed (ticket #58).
+  return { commit, migrations: mig.pending || [], bootMigrations: boot,
+           migrationsError: mig.ok ? null : mig.error };
+}
+
+// Is the diff between what prod currently RUNS and this ship's candidate commit docs-only?
+// The auto-approve policy uses this so a docs-only landing does not restart the live
+// orchestrator for a payload that is not even in the prod images (neither Dockerfile.server
+// nor Dockerfile.web copies docs/). A human can still ship such a request manually — this
+// only stops POLICY from auto-approving it.
+//
+// THE DIRECTION OF SAFETY. The dangerous failure is NOT a needless restart, it is a REAL
+// change misread as docs-only and never deployed. So this predicate is conservative in one
+// direction only:
+//   - SKIP (return true) only when the changed-path set is non-empty AND every path in it is
+//     under docs/. A docs-only restart is cheap; an undeployed fix is not.
+//   - Every uncomputable case — no deployed sha yet, containers at DIFFERENT deployed shas, a
+//     git failure/timeout, an empty result — returns false, so the existing auto-approve runs
+//     unchanged. Do NOT "simplify" this into a symmetric check.
+//
+// THIS IS A BEST-EFFORT OPTIMISATION, NOT A BOUNDARY. "The auto-approve skips a docs-only
+// diff" is only true when the diff can be computed AND resolves cleanly to docs-only. When it
+// cannot be computed, the skip does NOT apply and the ship AUTO-APPROVES — a docs-only diff
+// CAN still auto-deploy in those cases. Nothing here can refuse or delay a ship that would
+// otherwise go: the worst failure of this predicate is the one deploy it was meant to avoid,
+// and that failure is exactly today's behaviour. If this ever needs to be a hard guarantee,
+// that is a different design (e.g. refusing docs-only ships outright), not a tightening here.
+async function docsOnlySinceDeployed(project, commit, { targets = SHIPPABLE } = {}) {
+  try {
+    const deployed = await q(
+      `SELECT DISTINCT c.last_build_commit FROM container c
+        WHERE c.project_id=$1 AND c.tier='prod' AND c.role = ANY($2)
+          AND c.build_script IS NOT NULL AND c.last_build_commit IS NOT NULL`,
+      [project.id, targets]);
+    // no deployed sha yet → cannot know what changed → do NOT skip
+    if (!deployed.length) return false;
+    // containers at different deployed shas → the diff is ambiguous → do NOT skip
+    if (deployed.length > 1) return false;
+
+    const from = deployed[0].last_build_commit;
+    const r = spawnSync('git', ['-C', project.repo_root, 'diff', '--name-only', '-z', from, commit],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+    // git failed / timed out → cannot know → do NOT skip
+    if (r.status !== 0) return false;
+    const paths = r.stdout.split('\0').filter(Boolean);
+    // empty diff (deployed == candidate) → nothing to skip on → do NOT skip
+    if (!paths.length) return false;
+    return paths.every((p) => p === 'docs' || p.startsWith('docs/'));
+  } catch {
+    // the DB query itself failed (e.g. a connection drop between the row insert above and this
+    // read) → cannot know what changed → do NOT skip. Same conservative direction as every other
+    // uncomputable case: fall through to the existing auto-approve rather than throwing, so a
+    // transient failure can never wedge a request into a state the gate did not intend.
+    return false;
+  }
 }
 
 // ── the zee's only prod verb ─────────────────────────────────────────────────
 // skipDb: the zee scoped this ship to CODE ONLY — runShip will NOT apply pending migration/ops
 // files (recorded on the row; the human approves the scope with the click, the results show the
 // skip). dbNote: the zee's drift diagnosis from the /ooney schema gate, shown on the card.
+// preflightDocker: DI seam for the pre-flight probes — the docker adapter the pre-flight uses
+// (defaults to the real one; tests inject a stub or a throwing adapter). null → the default.
 export async function requestShip({ xellId, zeeId = null, reason = null, targets = null, site = null,
-                                    skipDb = false, dbNote = null }) {
+                                    skipDb = false, dbNote = null, preflightDocker = null }) {
   // Which roles to rebuild — the zee names them (/ooney webapp|server|both). Silently dropping an
   // unknown role would ship less than the zee asked for and report success, so validate loudly.
   const t = (Array.isArray(targets) && targets.length ? targets : SHIPPABLE).map(String);
@@ -188,17 +249,17 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // whose integration truth is remote (ship_ref like 'origin/main') gets that remote fetched
   // FIRST so the human approves the sha that is actually current, not a stale mirror. What schema
   // rides along is decided NOW too, so the human approves code and migrations as one thing.
-  let commit, migrations, bootMigrations;
-  try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, shipSite, main)); }
+  let commit, migrations, bootMigrations, migrationsError;
+  try { ({ commit, migrations, bootMigrations, migrationsError } = await resolveShipCommit(project, shipSite, main)); }
   catch (e) { return refuse(e.message); }
   let row;
   try {
     row = await one(
       `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
-                                 skip_migrations, db_note, boot_migrations)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb) RETURNING *`,
+                                 skip_migrations, db_note, boot_migrations, migrations_error)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
       [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(migrations), shipSite?.id || null,
-       !!skipDb, dbNote, JSON.stringify(bootMigrations)]);
+       !!skipDb, dbNote, JSON.stringify(bootMigrations), migrationsError]);
   } catch (e) {
     // ship_request_open_uq (one open ship per xell) — two asks raced, or a row appeared between the
     // check above and here. The zee's ask IS satisfied by the winner, so hand that back rather than
@@ -212,17 +273,75 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   }
   // The ask is now a row a human can see, so any earlier refusal on this xell is history.
   await clearShipRefusal(xellId, { zeeId });
+
+  // PRE-FLIGHT (ticket #58) — the deploy's preconditions, checked and recorded at REQUEST time so
+  // the card shows "cannot ship, because X" BEFORE a human spends attention approving it. Runs the
+  // SAME guards the deploy path walks (shipmigrate's prod-db identity check, the build inventory,
+  // the docker contexts), READ-ONLY. Never blocks the ask: a probe that cannot run reports
+  // 'unknown' — a verdict, not a crash — and the row is created either way. Only a DEFINITE miss
+  // stops the auto-approve policy below (the whole point is to not deploy against a known-missing
+  // prerequisite); an 'unknown' pre-flight still rides the card, and the deploy's own guard remains
+  // the backstop.
+  const preflight = await runShipPreflight(project, shipSite, commit, t,
+    { docker: preflightDocker ?? undefined, skipDb: !!skipDb, mode: MODE });
+  try { await noteShipPreflight(row.id, preflight); } catch (e) { logline('ship', `preflight note failed for ${row.id}: ${e.message}`); }
+  row = await one(`SELECT * FROM ship_request WHERE id=$1`, [row.id]);
+
   broadcast('ship', row);
   // the honeycomb's xell→queenzee line: this xell raised a ship request
-  activity('x2q', xellId, 'ship');
+  activity('x2q', xellId, 'ship', project.id);
 
   // Operator policy: auto-approve ships for this project → the queenzee approves and deploys with
   // no human in the loop. Still goes through the SAME decideShip → runShip path (lock, build from
   // main, countdown) — nothing about the deploy itself is bypassed, only the human decision. The
   // landed-work refusal above still applies, so an unlanded ship is refused even under auto-approve.
+  //
+  // Two deliberate exceptions, both said out loud and both leaving the request PENDING for a human
+  // who can still ship manually — policy declines, the human path stays:
+  //   • docs-only — if the diff from what prod already RUNS to this candidate touches only docs/**,
+  //     the auto-approve does NOT fire: the prod images do not copy docs/, so the ship would only
+  //     restart the live orchestrator for nothing.
+  //   • unread commits (ticket #79) — a ship may auto-approve only if every commit it carries has a
+  //     recorded review verdict (ticket #56) or a human approves it explicitly. The payload names
+  //     the commits; the gate holds when any has NO review, and it holds HARD when the review record
+  //     cannot be read — unmeasurable must never mean "all reviewed". The card renders which commits
+  //     are unread and by whom they were landed, so the human sees exactly what needs reading.
   if (project.auto_approve_ship) {
+    if (preflight.status === 'missing') {
+      // A DEFINITE missing prerequisite is exactly what the pre-flight exists to catch — auto-
+      // approving would queue a deploy that the deploy path itself refuses (assertProdDbTarget /
+      // the empty build inventory). Hold it for a human who can read "cannot ship, because X".
+      logline('ship', `auto-ship HELD for ${xell.slug} @ ${String(commit).slice(0, 8)}`
+        + `${shipSite ? ` → site ${shipSite.key}` : ''} — pre-flight found a missing prerequisite: `
+        + preflight.error);
+      return { ok: true, request: row,
+        note: 'auto-ship held — the pre-flight found a missing prerequisite, so policy will not deploy '
+          + `it: ${preflight.error}. A human can still ship it manually once the reason is fixed.` };
+    }
+    if (await docsOnlySinceDeployed(project, commit, { targets: t })) {
+      logline('ship', `auto-ship SKIPPED for ${xell.slug} @ ${String(commit).slice(0, 8)}`
+        + `${shipSite ? ` → site ${shipSite.key}` : ''} — the diff from the deployed build touches `
+        + `only docs/**, which neither prod image copies; the request is left pending for a human to `
+        + `ship manually`);
+      return { ok: true, request: row,
+        note: 'auto-ship skipped — the diff since the deployed build touches only docs/**, which the '
+          + 'prod images do not copy, so this ship would only restart prod with no code change. The '
+          + 'request is left pending for a human to ship manually.' };
+    }
+    // THE REVIEW GATE (ticket #79). computeShipPayload NEVER throws (it degrades), and the verdict
+    // is a pure function of the payload, so the one thing that can go wrong here is the payload
+    // being unreadable — which is exactly the inverse failure this gate must refuse on.
+    const payload = await computeShipPayload(project, row);
+    const verdict = shipAutoApproveVerdict(payload);
+    if (!verdict.allowed) {
+      logline('ship', `auto-ship HELD for ${xell.slug} @ ${String(commit).slice(0, 8)}`
+        + `${shipSite ? ` → site ${shipSite.key}` : ''} — ${verdict.reason}`);
+      return { ok: true, request: row,
+        note: `auto-ship held — ${verdict.reason}` };
+    }
     logline('ship', `AUTO-APPROVING ship from ${xell.slug} @ ${String(commit).slice(0, 8)}`
-      + `${shipSite ? ` → site ${shipSite.key}` : ''} — auto-approve policy (no human review)`);
+      + `${shipSite ? ` → site ${shipSite.key}` : ''} — auto-approve policy (no human review)`
+      + (payload?.summary?.unread === 0 ? ' — every carried commit has a recorded review' : ''));
     const approved = await decideShip(row.id, 'approved', 'auto-approve@policy');
     return { ok: true, request: approved, note: 'auto-approved by policy — deploying' };
   }
@@ -295,15 +414,15 @@ export async function resumeShip(id, by = 'human@console') {
     return { ok: false, reason: state.reason, request: deferred };
   }
 
-  let commit, migrations, bootMigrations;
-  try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, site, main)); }
+  let commit, migrations, bootMigrations, migrationsError;
+  try { ({ commit, migrations, bootMigrations, migrationsError } = await resolveShipCommit(project, site, main)); }
   catch (e) { return { ok: false, reason: e.message, request: deferred }; }
 
   const row = await one(
     `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, commit=$2, migrations=$3::jsonb, boot_migrations=$4::jsonb,
-            requested_at=now()
+            migrations_error=$5, requested_at=now()
        WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
-    [id, commit, JSON.stringify(migrations), JSON.stringify(bootMigrations)]);
+    [id, commit, JSON.stringify(migrations), JSON.stringify(bootMigrations), migrationsError]);
   if (!row) throw new Error('ship request changed underneath the resume — reload and try again');
   broadcast('ship', row);
   logline('ship', `RESUMED ship for ${xell?.slug || deferred.xell_id} by ${by} @ ${String(commit).slice(0, 8)}`
@@ -362,8 +481,8 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
     const site = landed[0].site_id
       ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [landed[0].site_id])
       : await resolveShipSite(projectId, null);
-    let commit, migrations, bootMigrations;
-    try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, site, main)); }
+    let commit, migrations, bootMigrations, migrationsError;
+    try { ({ commit, migrations, bootMigrations, migrationsError } = await resolveShipCommit(project, site, main)); }
     catch (e) { skipped.push({ slug: `site ${site?.key || 'default'}`, reason: e.message }); continue; }
 
     const [carrier, ...riders] = landed;
@@ -376,9 +495,10 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
     // xell's landed work, because they all resolve to this same main tip.
     const c = await one(
       `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, bundled_into=NULL,
-              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4, boot_migrations=$5::jsonb
+              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4, boot_migrations=$5::jsonb,
+              migrations_error=$6
          WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
-      [carrier.id, commit, JSON.stringify(migrations), reason, JSON.stringify(bootMigrations)]);
+      [carrier.id, commit, JSON.stringify(migrations), reason, JSON.stringify(bootMigrations), migrationsError]);
     if (!c) { skipped.push({ slug: carrier.xell_slug, reason: 'changed underneath the bundle' }); continue; }
     broadcast('ship', c);
 
@@ -411,18 +531,19 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
 // work is in the main tip the carrier built, so a shipped carrier ships them and a failed carrier
 // fails them — from the single real deploy, no rider ever builds on its own. Shared by the normal
 // success/fail path and the crash path so a carrier that dies mid-run still frees its riders.
-async function resolveBundleRiders(carrierId, ok, commit) {
+async function resolveBundleRiders(carrierId, ok, commit, classified = { cause: null, line: null }) {
   const riders = await q(
     `UPDATE ship_request
         SET status=$2, finished_at=now(), deferred_at=NULL, deferred_by=NULL,
             decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'bundle@queenzee'),
-            containers=$3::jsonb, error=$4
+            containers=$3::jsonb, error=$4, failure_cause=$5, failure_line=$6
       WHERE bundled_into=$1 AND status='pending' RETURNING *`,
     [carrierId, ok ? 'shipped' : 'failed',
       JSON.stringify([{ role: 'bundle', ok, method: 'bundled',
         log: `rode a bundled ship built from main @ ${String(commit).slice(0, 8)} — this xell's landed `
           + `work is included in that single deploy` }]),
-      ok ? null : `bundle carrier ${String(commit).slice(0, 8)} failed`]);
+      ok ? null : `bundle carrier ${String(commit).slice(0, 8)} failed`,
+      ok ? null : classified.cause, ok ? null : classified.line]);
   for (const r of riders) broadcast('ship', r);
   if (riders.length) {
     logline('ship', `bundle: ${riders.length} folded ship(s) resolved → ${ok ? 'shipped' : 'failed'}`
@@ -431,13 +552,79 @@ async function resolveBundleRiders(carrierId, ok, commit) {
   return riders.length;
 }
 
+// ── the ZEE's own retraction — `zee ship --withdraw` ───────────────────────────
+// The symmetric half of `zee land --withdraw`: a zee that raises a ship and immediately learns the
+// deploy is bigger than described (it would carry other xells' migrations, prod is fragile, the ask
+// was wrong anyway) can UN-ASK it before the deploy starts. It deploys nothing, reverts nothing,
+// rejects nothing — the card leaves the human's screen and the row records who un-asked it and why.
+//
+// PENDING and APPROVED are both withdrawable, and that second one is deliberate: a ship approval
+// only QUEUES the deploy (the landing pad FIFO / the prod lock can hold an approved ship for a long
+// while), and an auto-approve project flips a fresh ask to 'approved' within milliseconds — the
+// very shape of "immediately learned it was wrong". The human's approval stays on the row; the zee
+// retracting its own ask before anything starts is not a decision the zee is overturning. SHIPPING
+// is the IN-FLIGHT state (started_at set, the build running) — that is the "deploy has started"
+// boundary, and a withdraw racing it is exactly the failure this verb exists to avoid.
+//
+// The check is ATOMIC in the UPDATE: `WHERE status IN ('pending','approved') AND NOT EXISTS
+// (deploy_lock …)` refuses the moment the queenzee has grabbed the prod lock for this ship, and
+// runShipBody's flip to 'shipping' is itself conditional on status='approved', so a withdraw that
+// lands between runShip's read and its lock-acquire stops the deploy before it starts rather than
+// racing it. Terminal rows (shipped/failed/rejected) are history and history is not editable.
+export async function withdrawShipRequest(id, by = 'zee', reason = null) {
+  const row = await one(`SELECT * FROM ship_request WHERE id=$1`, [id]);
+  if (!row) throw new Error('no such ship request');
+  // The deploy has STARTED when either the row is 'shipping' (the build is running) or the
+  // queenzee has taken this ship's prod lock (the window between lock-acquire and the status flip).
+  const started = row.status === 'shipping'
+    || !!(await one(`SELECT 1 FROM deploy_lock WHERE ship_id=$1 AND phase='shipping'`, [id]));
+  if (started) {
+    throw new Error(`that ship has already STARTED — the deploy is running (${row.status === 'shipping'
+      ? `status='shipping' since ${row.started_at}` : 'the prod lock is taken'}). Withdraw is refused; `
+      + 'if it must be stopped, `zee tend --reason "…"` now so a human sees prod is mid-deploy');
+  }
+  if (row.status !== 'pending' && row.status !== 'approved') {
+    throw new Error(`that ship is '${row.status}', not pending or approved — there is nothing open to withdraw`);
+  }
+  const out = await one(
+    `UPDATE ship_request SET status='withdrawn', withdrawn_at=now(), withdrawn_by=$2, withdraw_reason=$3
+       WHERE id=$1 AND status IN ('pending','approved')
+         AND NOT EXISTS (SELECT 1 FROM deploy_lock WHERE ship_id=$1 AND phase='shipping')
+       RETURNING *`,
+    [id, by, reason ? String(reason).slice(0, 2000) : null]);
+  if (!out) throw new Error('no such pending/approved ship request (the deploy started or the row changed underneath you)');
+  broadcast('ship', out);
+  logline('shipgate',
+    `WITHDRAWN ship ${String(out.commit || '').slice(0, 8) || '(no commit)'} by ${by}`
+    + `${reason ? ` — ${String(reason).slice(0, 120)}` : ''} (the zee un-asked it; no human decision was made)`
+    + (row.status === 'approved' ? ' — it had been APPROVED, but the deploy had not started' : ''));
+  return out;
+}
+
 export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
-  return q(
-    `SELECT s.*, x.slug AS xell_slug, ds.key AS site_key FROM ship_request s
+  // The reviews (224) carried on this ship's commit — so the human approving a deploy sees whether
+  // the code being shipped was READ, and by whom. A record, never a gate: nothing here waits on it.
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  const rows = await q(
+    `SELECT s.*, x.slug AS xell_slug, ds.key AS site_key,
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = s.commit) AS reviews
+       FROM ship_request s
        JOIN xell x ON x.id = s.xell_id
        LEFT JOIN deploy_site ds ON ds.id = s.site_id
        WHERE s.project_id=$1 ${where} ORDER BY s.requested_at DESC LIMIT 50`, [projectId]);
+  // THE PAYLOAD (ticket #65) — the commits between the last shipped sha for this ship's target and
+  // the one being deployed, each with who landed it. ADVISORY: computeShipPayload never throws, and
+  // a payload that cannot be read rides as { ok:false } so the card says so in words — it can never
+  // block or refuse a ship.
+  if (project) {
+    for (const s of rows) s.payload = await computeShipPayload(project, s);
+  }
+  return rows;
 }
 
 export async function shipStatus(xellId) {
@@ -585,17 +772,20 @@ export async function runShip(shipId, { mode = MODE } = {}) {
     await runShipBody(ship, xell, project, site, lockKey, mode);
   } catch (e) {
     try {
+      const crashErr = `ship machinery crashed mid-run: ${String(e.message || e).slice(0, 1400)}`;
+      const classified = classifyShipFailure({ error: crashErr });
       const done = await one(
-        `UPDATE ship_request SET status='failed', finished_at=now(), error=$2
+        `UPDATE ship_request SET status='failed', finished_at=now(), error=$2,
+                                failure_cause=$3, failure_line=$4
            WHERE id=$1 AND status IN ('approved','shipping') RETURNING *`,
-        [ship.id, `ship machinery crashed mid-run: ${String(e.message || e).slice(0, 1400)}`]);
+        [ship.id, crashErr, classified.cause, classified.line]);
       if (done) broadcast('ship', done);
       await q(
         `UPDATE deploy_lock SET phase='failed', auto_release_at=COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
           WHERE ship_id=$1 AND held=false`, [ship.id, String(AUTO_RELEASE_SEC)]);
       broadcast('xell', { id: xell.id });
       // A crashed carrier fails its riders too — never leave them stranded pointing at a dead ship.
-      await resolveBundleRiders(ship.id, false, ship.commit).catch(() => {});
+      await resolveBundleRiders(ship.id, false, ship.commit, classified).catch(() => {});
       logline('ship', `ship ${String(ship.commit).slice(0, 8)} CRASHED mid-run — marked failed, ${lockKey} countdown started: ${e.message}`);
     } catch { /* the DB is what failed — the tick() stranded sweep is the backstop */ }
   } finally {
@@ -603,9 +793,26 @@ export async function runShip(shipId, { mode = MODE } = {}) {
   }
 }
 
-async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
+// Exported for the ship-withdraw race test — the rest of the codebase calls runShip only, and
+// nothing else should call runShipBody directly; it expects runShip to have taken the lock already.
+export async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
+  // The flip to 'shipping' is ATOMIC on status='approved' (221/222 — `zee ship --withdraw`): runShip
+  // read the row as approved and took the lock, but the zee may have withdrawn it in that window. If
+  // so this UPDATE matches nothing and the deploy MUST NOT proceed — release the lock and leave the
+  // withdrawn row exactly as the zee left it. A withdraw that races a running deploy is the exact
+  // failure the withdraw verb exists to avoid, and without this guard runShipBody would flip a
+  // withdrawn row straight to 'shipping' and deploy a ship the zee just un-asked.
   const shipping = await one(
-    `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
+    `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 AND status='approved' RETURNING *`, [ship.id]);
+  if (!shipping) {
+    const cur = await one(`SELECT status FROM ship_request WHERE id=$1`, [ship.id]).catch(() => null);
+    await q(
+      `UPDATE deploy_lock SET phase='released', auto_release_at=now() WHERE ship_id=$1 AND held=false`, [ship.id]);
+    broadcast('xell', { id: xell.id });
+    logline('ship', `ship ${String(ship.commit || '').slice(0, 8)} NOT deployed — it was withdrawn before it started`
+      + ` (status=${cur?.status || 'gone'}); ${lockKey} lock released`);
+    return;
+  }
   broadcast('ship', shipping);
 
   // Honeycomb: queenzee → PRODUCTION while the deploy runs. The ask was xell→queenzee (x2q at
@@ -614,7 +821,7 @@ async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   const prods = await q(
     `SELECT id FROM xell WHERE project_id=$1 AND is_production AND status <> 'retired'`,
     [project.id]);
-  for (const p of prods) activity('q2x', p.id, 'ship');
+  for (const p of prods) activity('q2x', p.id, 'ship', project.id);
 
   // Production's BUILD SOURCE is local main — not the xell's worktree, and not the xource
   // checkout's wandering HEAD (which is what this actually built until 2026-07-16). origin is a
@@ -749,18 +956,24 @@ async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   // Build logs are arbitrary bytes and ride along in `results`; postgres jsonb REJECTS the
   // escaped-NUL sequence (backslash-u-0000), so one NUL anywhere in a build's output would throw
   // HERE — at the exact statement whose failure used to strand the ship at 'shipping'.
+  // The raw log is never replaced; a failure ALSO gets a classified cause + the one identifying
+  // line (ticket #58) so the card can say WHY instead of handing out a 400-character tail to scroll.
+  const failErr = ok ? null : (results.find((r) => !r.ok)?.error || 'ship failed').slice(0, 1500);
+  const classified = ok ? { cause: null, line: null }
+    : classifyShipFailure({ error: failErr, containers: results });
   const done = await one(
-    `UPDATE ship_request SET status=$2, finished_at=now(), containers=$3::jsonb, error=$4
+    `UPDATE ship_request SET status=$2, finished_at=now(), containers=$3::jsonb, error=$4,
+                            failure_cause=$5, failure_line=$6
        WHERE id=$1 RETURNING *`,
     [ship.id, ok ? 'shipped' : 'failed', JSON.stringify(results).replaceAll('\\u0000', ''),
-      ok ? null : (results.find((r) => !r.ok)?.error || 'ship failed').slice(0, 1500)]);
+      failErr, classified.cause, classified.line]);
   broadcast('ship', done);
   logline('ship', ok
     ? `SHIPPED ${String(ship.commit).slice(0, 8)} to prod from ${xell.slug} (${mode})`
     : `ship FAILED for ${xell.slug}: ${done.error}`);
 
   // If this ship was a BUNDLE carrier, resolve its riders now — one deploy, one verdict for all.
-  await resolveBundleRiders(ship.id, ok, ship.commit);
+  await resolveBundleRiders(ship.id, ok, ship.commit, classified);
 
   // Countdown starts either way: a failed ship must not sit on prod forever either.
   const lock = await one(
@@ -948,17 +1161,19 @@ async function recoverStrandedShip(ship, why) {
   }
   // COALESCE the decider fields: a normally-approved ship already has them, but the
   // ship_decided_has_decider CHECK requires them on any terminal status, so recovery must
-  // never produce a row that cannot land.
+  // never produce a row that cannot land. A recovered FAILURE also gets the classified cause
+  // (a stranded ship failed its health probe → health-check), same contract as runShipBody.
+  const failErr = allUp ? null : `${why}; targets not verifiably up — re-request`;
+  const classified = allUp ? { cause: null, line: null } : classifyShipFailure({ error: failErr });
   const done = await one(
-    `UPDATE ship_request SET status=$2, finished_at=now(), error=$3,
+    `UPDATE ship_request SET status=$2, finished_at=now(), error=$3, failure_cause=$4, failure_line=$5,
             decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'recovery@queenzee')
       WHERE id=$1 AND status='shipping' RETURNING *`,
-    [ship.id, allUp ? 'shipped' : 'failed',
-      allUp ? null : `${why}; targets not verifiably up — re-request`]);
+    [ship.id, allUp ? 'shipped' : 'failed', failErr, classified.cause, classified.line]);
   if (!done) return;   // someone else landed it between our SELECT and now — nothing to recover
   broadcast('ship', done);
   // A recovered carrier resolves its riders to the same verdict — they never outlive their carrier.
-  await resolveBundleRiders(ship.id, done.status === 'shipped', ship.commit).catch(() => {});
+  await resolveBundleRiders(ship.id, done.status === 'shipped', ship.commit, classified).catch(() => {});
   logline('ship', `recovered stranded ship ${String(ship.commit).slice(0, 8)} → ${done.status}`
     + (allUp ? ' (health check passed — the self-ship pattern)' : ` (${done.error})`));
   // start the countdown on its lock if the dying process never did

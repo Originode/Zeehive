@@ -257,7 +257,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
     broadcast('land', row);
     await syncXellAfterLand(xell?.id, newSha);
     // the honeycomb's xell→queenzee line: this xell pushed a land request
-    activity('x2q', xell?.id, 'land');
+    activity('x2q', xell?.id, 'land', projectId);
     logline('landgate',
       `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
       + `${xell?.slug || 'unknown'} (auto-approve policy, no human review)`);
@@ -287,7 +287,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
       [projectId, xell.id, ref, oldSha || null, newSha,
         JSON.stringify(commits), stat ? JSON.stringify(stat) : null, occupant.id]);
     broadcast('land', held);
-    activity('x2q', xell?.id, 'land');
+    activity('x2q', xell?.id, 'land', projectId);
     const position = await holdingPosition(held);
     logline('landgate',
       `HOLDING ${ref.replace('refs/heads/', '')} → ${newSha.slice(0, 8)} on ${project.name} — ${xell.slug} is `
@@ -304,7 +304,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
 
   broadcast('land', row);
   // the honeycomb's xell→queenzee line: this xell pushed a land request
-  activity('x2q', xell?.id, 'land');
+  activity('x2q', xell?.id, 'land', projectId);
   logline('landgate',
     `HELD ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
     + `${xell?.slug || 'unknown'} awaiting human verification`);
@@ -686,8 +686,15 @@ export async function listLandRequests(projectId, { open = true } = {}) {
   // Open view: undecided or still-working rows a human has NOT dismissed. A dismissed approval
   // keeps being retried by the reaper — it just stops being shown.
   const where = open ? `AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL` : '';
+  // The reviews (224) carried on this landing's sha — so a human approving a landing knows whether
+  // anyone READ the diff, and who. A record, never a gate: nothing here waits on a review.
   return q(
-    `SELECT lr.*, x.slug AS xell_slug
+    `SELECT lr.*, x.slug AS xell_slug,
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = lr.new_sha) AS reviews
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
        WHERE lr.project_id = $1 ${where}
        ORDER BY lr.requested_at DESC LIMIT 50`, [projectId]);
@@ -915,6 +922,10 @@ export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } 
   // there is no re-entrancy; it still fires reference-transaction, whose non-ff guard is the
   // backstop, and we only reach here on a proven fast-forward anyway. The old-value arg makes it a
   // compare-and-swap: if the ref moved since ffState read it, this fails instead of clobbering.
+  //
+  // The hook now retries with backoff before that fail-closed, so a busy (not gone) queenzee
+  // answers before the push is declined. update-ref remains the primary land path so the
+  // server-initiated land never re-enters the hook at all.
   let u, now;
   try {
     u = spawnSync('git', ['-C', project.repo_root, 'update-ref', row.ref, row.new_sha, tip],

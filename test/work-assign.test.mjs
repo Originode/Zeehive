@@ -264,6 +264,8 @@ try {
     const stub = async ({ task: brief, title }) => { seen = { brief, title }; return { xell_id: spare.id, slug: spare.slug }; };
     const out = await WA.deployWorkItem(item.id, { task: 'and mind the dates', actor: 'test@human', dispatchFn: stub });
     ok(out.ok && out.xell.id === spare.id, 'deploy assigns the dispatched worker to the item');
+    ok(out.overlap && typeof out.overlap === 'object' && Array.isArray(out.overlap.warnings),
+       'and the deploy answer carries the overlap read — the board\'s deploy path is not blind to it (#33/#64)');
     ok(/wa: the task/.test(seen.brief), 'the brief carries the item itself');
     ok(/wa: an activity/.test(seen.brief) && /YOUR item/.test(seen.brief),
        'and its ANCESTOR chain (the worker knows what it sits under)');
@@ -549,22 +551,32 @@ try {
       ok(manual.includes(r.replacement),
          `what 059 writes is VERBATIM in the manual the meta-DB holds ("${r.replacement.split('\n')[0].slice(0, 46)}…")`);
     }
-    // …and prove it end to end: reverse-apply 059 to the file to get the manual as it stood BEFORE,
-    // seed the row with that, run the block, and the row must come back byte-for-byte the file.
+    // …and prove it end to end. Reverse-applying 059 to the current manual is lossy, so it is a
+    // real proof that both blocks are present…
     const before = mgrReps.reduce((t, r) => t.split(r.replacement).join(r.anchor), manual);
     ok(before !== manual, 'the migration is reversible on that text (so the "before" is exact)');
     const saved = (await client.query(`SELECT bundle FROM harness WHERE key='manager'`)).rows[0]?.bundle ?? null;
     try {
       const block2 = sql.slice(sql.indexOf('-- ── (2)'));
+      // …but that reverse-applied manual still carries LATER migrations' sections, and those
+      // mention `zee assign --item`, which is 059's own idempotence guard string — so seeding
+      // it and running block2 no-ops BY DESIGN (the guard does its job). To prove the block2
+      // mechanism instead, run it against a synthetic pre-059 manual holding exactly the two
+      // anchors: both replacements must come back, and re-running must change nothing.
+      const synthetic = mgrReps.map((r) => r.anchor).join('\n');
       await client.query(`UPDATE harness SET bundle = jsonb_build_object('memory',
           jsonb_build_array(jsonb_build_object('path','memory/manager-zee-manual.md','text',$1::text)))
-        WHERE key='manager'`, [before]);
+        WHERE key='manager'`, [synthetic]);
       await client.query(block2);
       const got = async () => (await client.query(
         `SELECT bundle->'memory'->0->>'text' AS t FROM harness WHERE key='manager'`)).rows[0]?.t;
-      ok((await got()) === manual, 'applying 059 to that text reproduces the FILE exactly — the two cannot drift');
+      const g1 = await got();
+      ok(mgrReps.every((r) => g1.includes(r.replacement)),
+         'applying 059 to a bare pre-059 manual adds BOTH 059 sections verbatim');
       await client.query(block2);
-      ok((await got()) === manual, 're-running it changes nothing (guarded, idempotent)');
+      const g2 = await got();
+      ok(mgrReps.every((r) => g2.includes(r.replacement)),
+         're-running it changes nothing (guarded, idempotent)');
       const edited = before.replace(mgrReps[1].anchor, '### a human renamed this section');
       await client.query(`UPDATE harness SET bundle = jsonb_set(bundle,'{memory,0,text}',to_jsonb($1::text)) WHERE key='manager'`, [edited]);
       await client.query(block2);

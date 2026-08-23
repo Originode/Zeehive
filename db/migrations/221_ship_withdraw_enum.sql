@@ -1,0 +1,18 @@
+-- WITHDRAWING A SHIP — the half of the ship gate the ZEE never had.
+--
+-- Every other ask a zee raises can be lowered by the zee that raised it: `zee tend --clear`,
+-- `zee hint-ship --clear`, `zee done --clear` — and, since 061, a LAND REQUEST with
+-- `zee land --withdraw`. A SHIP REQUEST could not. Once a zee asked to deploy, the only exits were
+-- a human's Approve/Reject/Defer — so a zee that raised a ship and immediately learned the deploy
+-- was bigger than described (it would carry other xells' migrations, prod was fragile, the ask was
+-- wrong anyway) could only wait for a human to decide, or raise a `tend` and hope.
+--
+-- So: 'withdrawn' — the zee's own retraction. Terminal, never a decision (no human read it, nobody
+-- approved or refused anything), and it drops the row out of every OPEN list by construction:
+-- fleet.js, listShipRequests, the landing pad and the hive's ship_pending all filter on
+-- status IN ('pending','approved','shipping').
+--
+-- ALONE IN THIS FILE ON PURPOSE: postgres refuses to USE a new enum value in the same transaction
+-- that adds it, and the migration runner wraps each file in one. The columns and the CHECK that
+-- reference 'withdrawn' therefore live in 222.
+ALTER TYPE ship_status ADD VALUE IF NOT EXISTS 'withdrawn';

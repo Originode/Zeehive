@@ -813,7 +813,10 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .mx-head.off { opacity: .45; }
 .mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
-.mx-name { display: flex; align-items: center; gap: 6px; }
+/* The header packs up to six items (name, ＋prod, conn, build-ready, bootstrap, ✕) into a
+   minmax(120px,1fr) column — they must WRAP: unwrapped nowrap buttons cannot shrink, and the
+   overflow paints straight over the neighbouring machine's column. */
+.mx-name { display: flex; align-items: center; gap: 3px 6px; flex-wrap: wrap; }
 .mx-name b { font-size: 13px; }
 /* the per-machine connection probe (Deploy tab) — one button that is also the verdict */
 .mx-conn { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
@@ -860,6 +863,43 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-schema-err { color: #ffcf9e; margin-top: 2px; }
 .ship-schema-files { margin: 3px 0 0; padding-left: 18px; color: var(--text); }
 .ship-schema-files code { font-size: 11px; }
+/* the deploy's pre-conditions as probed at request time (ticket #58) */
+.ship-preflight { margin: 5px 0 0; font-size: 12px; }
+.ship-preflight .k { color: var(--muted); }
+.ship-preflight.ok { color: var(--ready, #7bc86c); }
+.ship-preflight.unknown { color: #ffcf9e; }
+.ship-preflight.bad { color: #ffb4a2; background: rgba(217,85,59,.12);
+  border: 1px solid rgba(217,85,59,.4); border-radius: 5px; padding: 5px 7px; }
+.ship-preflight-head { font-weight: 600; margin-bottom: 2px; }
+.ship-preflight-fail { margin-top: 2px; }
+.ship-preflight-fail b { color: #ffb4a2; }
+.ship-preflight-unknown { margin-top: 3px; color: #ffcf9e; font-size: 11px; }
+.ship-preflight-err { margin-top: 4px; color: var(--muted); font-size: 11px; }
+/* the classified cause beside a failed ship's raw log (ticket #58) */
+.ship-cause { margin: 5px 0 0; font-size: 12.5px; color: var(--error); font-weight: 600; }
+.ship-cause-line { font-weight: 400; color: #ffb4a2; }
+/* THE PAYLOAD — the commits this ship carries between the last shipped sha for the target and the
+   one being deployed (ticket #65). Same "honesty is the gate" family as the schema block above. */
+.ship-payload { margin: 6px 0 0; font-size: 12px; line-height: 1.5; border-left: 2px solid var(--line);
+  padding-left: 9px; }
+.ship-payload .k { color: var(--muted); }
+.ship-payload-unknown { color: #ffcf9e; }
+.ship-payload-note { color: var(--muted); }
+.ship-payload-summary { margin-bottom: 2px; }
+.ship-payload-commits { margin: 3px 0 0; padding-left: 16px; color: var(--text); }
+.ship-payload-commit { font-size: 11.5px; }
+.ship-payload-commit code { font-size: 11px; }
+.ship-payload-commit.unattributed { color: var(--muted); }
+.ship-payload-when { color: var(--muted); }
+.ship-payload-work { color: #ffcf9e; }
+/* The review gate (ticket #79): the card says WHICH carried commits are unread, and by whom. */
+.ship-payload-gate { font-weight: 600; margin-left: 4px; color: #e5a50a; }
+.ship-payload-gate.unknown { color: #ffcf9e; }
+.ship-payload-gate.ok { color: var(--up, #2ecc71); font-weight: 400; }
+.ship-payload-review-badge { font-size: 10.5px; margin-left: 6px; padding: 0 6px; border-radius: 8px;
+  border: 1px solid var(--line); }
+.ship-payload-review-badge.unread { color: #e5a50a; border-color: #e5a50a; }
+.ship-payload-review-badge.unknown { color: #ffcf9e; border-color: #ffcf9e; }
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
 /* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */
@@ -1301,6 +1341,16 @@ a.cbox:hover { border-color: var(--accent); }
 .land-what { font-size: 14px; flex: 1; min-width: 0; }
 .land-meta { color: var(--muted); font-size: 12px;
   font-family: 'Cascadia Code', 'Consolas', monospace; }
+/* ── REVIEW CHIPS (ticket #56) ──────────────────────────────────────────────
+   Who READ the diff being landed/shipped, and what they concluded. A record, not a gate —
+   rendered quietly, never blocking the decision. Green for a clean review, amber when changes
+   were required. */
+.land-reviews { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 6px 0 2px; }
+.review-chip { font-size: 11.5px; padding: 2px 7px; border-radius: 10px;
+  background: var(--panel, rgba(0,0,0,.35)); border: 1px solid var(--line); color: var(--text);
+  cursor: help; white-space: nowrap; }
+.review-chip.review-clean { border-color: var(--up, #2ecc71); color: var(--up, #2ecc71); }
+.review-chip.review-changes_required { border-color: #e5a50a; color: #e5a50a; }
 .land-stat { color: var(--muted); font-size: 13px; font-weight: 600; margin: 6px 0 4px; }
 .land-stat .ins { color: var(--up); }
 .land-stat .del { color: var(--error); }
@@ -1339,6 +1389,10 @@ a.cbox:hover { border-color: var(--accent); }
 .land-approve:hover:not(:disabled) { background: rgba(53,196,107,.12); }
 .land-reject { border-color: var(--error) !important; color: var(--error) !important; }
 .land-reject:hover:not(:disabled) { background: rgba(229,85,78,.12); }
+/* "Close it anyway" on a HELD done approval (ticket #75): still the approve action, but it tears a
+   live turn down NOW, so it is amber — a deliberate override, not the normal green. */
+.land-force { border-color: var(--building, #e0a53b) !important; color: var(--building, #e0a53b) !important; font-weight: 600; }
+.land-force:hover:not(:disabled) { background: rgba(224,165,59,.12); }
 /* Withdraw sits left of Reject and stays MUTED on purpose: it decides nothing (no rejection, no
    landing, the sha is not burned), so it must not read as a verdict competing with the two that are. */
 .land-withdraw { border-color: var(--line) !important; color: var(--muted) !important; margin-right: auto; }
@@ -2687,6 +2741,11 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   background: var(--panel2); border-right: 1px solid var(--line); border-radius: 10px 0 0 0; }
 .work-mhead .work-col-h { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line);
   border-bottom: 0; background: var(--panel); }
+.work-col-actions { display: inline-flex; align-items: center; gap: 6px; }
+.work-col-hide { flex: 0 0 auto; background: none; border: 0; color: var(--accent); cursor: pointer;
+  font-size: 11px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
+.work-col-hide:hover { color: var(--text); background: var(--panel2); }
+.work-col-hide.off { color: var(--muted); opacity: .7; }
 .work-mbody { display: flex; flex-direction: column; border: 1px solid var(--line);
   border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden; }
 
@@ -2709,6 +2768,20 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-row-count { color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
   display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
 .work-row-count b { color: var(--text); font-size: 13px; }
+
+/* a HIDDEN column's per-row summary card: one per swimlane row band at every depth, reading as a
+   count of every leaf under that row with that status. A button so it opens the row's drawer like
+   the row title does. */
+.work-col-summary { display: inline-flex; align-items: baseline; gap: 5px; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 5px 9px; color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
+  white-space: nowrap; max-width: 100%; }
+.work-col-summary b { color: var(--text); font-size: 14px; line-height: 1; }
+.work-col-summary:hover { border-color: var(--accent); }
+
+/* the leaf-pack / leaf / tail lanes of a hidden column: no cards, no drop targets — a quiet empty
+   strip that keeps the matrix columns aligned. */
+.work-row-lane.is-hidden { background: color-mix(in srgb, var(--muted) 3%, transparent); }
 
 /* a COLLAPSED row still occupies its full-width lane strip; tint the ONE lane that is its own
    status so where the row stands reads at a glance. The tint is `--st` — the same status colour

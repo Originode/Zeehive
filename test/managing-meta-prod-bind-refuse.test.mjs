@@ -124,6 +124,37 @@ try {
   ok(normal.ok === true && normal.request?.status === 'pending',
      `ordinary project still gets a pending request (ok=${normal.ok}, status=${normal.request?.status})`);
 
+  // ── FAIL-CLOSED: identity UNMEASURABLE but host:port+dbname names the same database ─────────
+  // The regression this pins: the new identity check needs live connections, and any failure
+  // (restart window, DNS flap, query error) returns null. Old sameDatabase() was a PURE string
+  // function and REFUSED on a string match; collapsing null to "not the meta-DB" would PERMIT a
+  // writable bind to the orchestrator's own database — the exact outcome these guards exist to
+  // prevent. A prod DSN with a NON-EXISTENT ROLE on the SAME host:port+dbname is the unmeasurable
+  // twin of config.databaseUrl: the string comparison (which ignores the username) says "same",
+  // the identity check cannot connect. The guard must still refuse.
+  console.log('fail-closed: unmeasurable but string-identical prod DSN is STILL refused');
+  const unmeasurableMeta = config.databaseUrl.replace(/^postgres(ql)?:\/\/[^@]+@/, `$1://definitely_no_such_role_zz@`);
+  const unmeasurableDsn = new URL(unmeasurableMeta.replace(/^postgres(ql)?:/, 'http:'));
+  const metaDsn = new URL(config.databaseUrl.replace(/^postgres(ql)?:/, 'http:'));
+  ok(unmeasurableDsn.hostname === metaDsn.hostname && unmeasurableDsn.port === metaDsn.port
+     && unmeasurableDsn.pathname === metaDsn.pathname,
+     `the unmeasurable twin shares host:port+dbname (${unmeasurableDsn.hostname}:${unmeasurableDsn.port}${unmeasurableDsn.pathname})`);
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, unmeasurableMeta]);
+  const unmeasIsMeta = await projectProdIsManagingMeta(pid);
+  ok(unmeasIsMeta.isMeta === true,
+     'isMeta=true when the DSN is unmeasurable but host:port+dbname matches the meta-DB (fail-closed, not fail-open)');
+  const xell3 = await one(
+    `INSERT INTO xell (project_id, xource_id, slug, branch, worktree_path, status, is_pooled, db_coupling)
+       VALUES ($1,$2,$3,$4,$5,'working',false,'db-shared-dev') RETURNING *`,
+    [pid, xource.id, `worker3-${tag}`, `spinoff/worker3-${tag}`, join(root, 'wt3')]);
+  mkdirSync(join(root, 'wt3'));
+  const unmeasAsked = await selfProdRequest(xell3, { reason: 'the meta-DB is briefly unreachable' });
+  ok(unmeasAsked.ok === false && unmeasAsked.status === 'refused',
+     `zee prod is REFUSED even though the identity could not be measured (ok=${unmeasAsked.ok}, status=${unmeasAsked.status})`);
+  ok(/REFUSING to bind/.test(unmeasAsked.error || ''),
+     `error still carries the §6.2 refusal [${(unmeasAsked.error || '').slice(0, 80)}]`);
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('FATAL', e);

@@ -239,6 +239,36 @@ export async function unassignWorkItem(id, { actor = 'human@console', reason = n
 // Pure and exported so it can be read (and tested) without dispatching anything. The whole reason
 // deploy exists rather than "dispatch, then assign by hand": everything the item already knows —
 // where it sits, what ticket it came from, when it is due — reaches the worker automatically.
+// The brief a deploy (or its preflight) is built from — the full item plus its ticket's BODY, which
+// getWorkItem deliberately leaves off the card's shape (the worker needs the ticket's actual words).
+// One copy of the "fetch the body, then assemble" shape, so the overlap check — which runs against
+// the brief — always reads exactly what the worker would be briefed on, and the board's read-only
+// preflight can never drift from the deploy.
+async function itemBrief(full, extra) {
+  const ticket = full.ticket
+    ? { ...full.ticket, body: (await one(`SELECT body FROM ticket WHERE id=$1`, [full.ticket.id]))?.body || null }
+    : null;
+  return { ticket, brief: briefForWorkItem({ item: full, ancestors: full.ancestors || [], ticket, extra }) };
+}
+
+// ── the OVERLAP read for a work item (#33/#64) ───────────────────────────────
+// The board's deploy dialog preflights with this: read-only, no side effects, and it exists so a
+// human sees the answer BEFORE they press "deploy a worker" rather than in the receipt afterwards.
+// It builds the same brief the deploy would and keys it on the ITEM itself — the strongest key,
+// which is what makes the landed-warning half (#64) speak (briefForWorkItem writes the ticket as a
+// bare "(#64)" that the brief reader deliberately ignores). Advisory by construction, exactly like
+// the dispatch preflight (/xell/dispatch/overlap): a failure inside it degrades to "no warnings"
+// and never throws, because a coordination hint must never stand between a human and a dispatch.
+export async function getWorkItemOverlap(id, { task = null } = {}) {
+  const full = await getWorkItem(id);
+  if (!full) throw missing(`no work item ${id}`);
+  const { brief } = await itemBrief(full, task);
+  const { overlapForBrief, overlapNote } = await import('../lib/work-overlap.js');
+  const checked = await overlapForBrief({ projectId: full.project_id, brief, workItemId: full.id });
+  const note = overlapNote(checked);
+  return note ? { ...checked, note } : checked;
+}
+
 export function briefForWorkItem({ item, ancestors = [], ticket = null, extra = null }) {
   const lines = [];
   lines.push(`# ${item.title}`);
@@ -343,10 +373,21 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
   // without the ticket's actual words is exactly the context a worker then has to go and ask for,
   // so it is fetched here, once, and only when there is a ticket at all.
   const full = await getWorkItem(id);
-  const ticket = full.ticket
-    ? { ...full.ticket, body: (await one(`SELECT body FROM ticket WHERE id=$1`, [full.ticket.id]))?.body || null }
-    : null;
-  const brief = briefForWorkItem({ item: full, ancestors: full.ancestors || [], ticket, extra: task });
+  const { ticket, brief } = await itemBrief(full, task);
+
+  // IS SOMEBODY ALREADY IN THIS WORK? (#33/#64) — the BOARD's deploy path. A human deploying from
+  // the console (POST /work-items/:id/deploy) goes through dispatchXell, which never checked; a
+  // manager deploying goes through selfDispatch, which does. This makes EVERY deploy carry the same
+  // facts in its answer. Read BEFORE the spawn so the answer describes the fleet as it was when the
+  // decision was made — and best-effort: overlapForBrief never throws, a failure inside it degrades
+  // to fewer warnings, never to a deploy that did not happen. Advisory by construction: nothing
+  // below branches on it. (For the manager path this is a SECOND read — selfDispatch computes its
+  // own — which is harmless: a deploy is rare, and the overlap scan is budgeted and capped.)
+  const { overlapForBrief, overlapNote } = await import('../lib/work-overlap.js');
+  const checked = await overlapForBrief({ projectId: full.project_id, brief, workItemId: full.id,
+                                          excludeXellId: managerXellId || null });
+  const note = overlapNote(checked);
+  const overlap = note ? { ...checked, note } : checked;
 
   // WHO dispatches decides which guards apply — and both are existing paths, imported lazily because
   // intake/self reach back into provisioning (a top-level import here would make lib ↔ queenzee circular).
@@ -389,10 +430,11 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
   logline('work', `deployed ${out.slug || newXellId} onto work item "${full.title}" (by ${actor})`);
   return {
     ok: true, item: assigned.item, xell: { id: newXellId, slug: out.slug || assigned.xell.slug },
-    dispatch: out, brief,
+    dispatch: out, brief, overlap,
     message: `Deployed ${out.slug || newXellId} onto "${full.title}". It was briefed from the item itself `
       + `(${(full.ancestors || []).length} ancestor(s)${ticket ? ', its ticket' : ''})`
-      + `${task ? ' plus your extra instructions' : ''}. The board follows it from here.`,
+      + `${task ? ' plus your extra instructions' : ''}. The board follows it from here.`
+      + (note ? `\n\n${note}` : ''),
   };
 }
 

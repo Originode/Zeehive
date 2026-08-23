@@ -441,6 +441,15 @@ export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${d
 export const previewProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}/preview`, 'GET');
 export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
 
+// ── CURRENT CONDITIONS — the short, dated, per-PROJECT list of live impediments injected into
+// every briefing (ticket #67). The console is the HUMAN's editor; a manager edits the same list
+// with `zee conditions --add/--remove`. Each line is dated and trivially deletable — there is
+// deliberately no archive, because a condition that stops being true should be GONE. ──
+export const getProjectConditions = (projectId) => fetch(`/api/projects/${projectId}/conditions`).then((r) => (r.ok ? r.json() : []));
+export const addProjectCondition = (projectId, body, actor) => siteCall(`/api/projects/${projectId}/conditions`, 'POST', { body, actor });
+export const updateProjectCondition = (condId, body, actor) => siteCall(`/api/project-conditions/${condId}`, 'PUT', { body, actor });
+export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditions/${condId}`, 'DELETE');
+
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
 export const updateEnvironment = (envId, body) => siteCall(`/api/environments/${envId}`, 'PATCH', body);
@@ -874,23 +883,9 @@ export async function getAdbDevices(machineId, projectId = null) {
   const r = await fetch(`/api/machines/${machineId}/adb-devices${projectId ? `?project=${encodeURIComponent(projectId)}` : ''}`);
   return jsonOrThrow(r, 'list adb devices');
 }
-// Attach a device to a named xell by id (the dashboard's "attach device"). kind overrides the
-// project's manifest default (emulator | physical).
-export async function attachXellDevice(xellId, kind = null) {
-  const r = await fetch(`/api/xells/${xellId}/device`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(kind ? { kind } : {}),
-  });
-  return jsonOrThrow(r, 'attach device');
-}
-// Detach (emulator: stop+remove; physical: unlink) the device attached to a xell.
-export async function detachXellDevice(xellId) {
-  const r = await fetch(`/api/xells/${xellId}/device`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ action: 'detach' }),
-  });
-  return jsonOrThrow(r, 'detach device');
-}
+// Attach/detach XellCard's device-slot — the only callers of these wrappers — was deleted
+// (TKT-29-3AB6). The server routes they hit (/api/xells/:id/device) stay; the wrappers had no
+// remaining consumer.
 
 // Build every buildable (server + webapp) container of a xell.
 export async function buildXell(xellId, hot = false) {
@@ -927,13 +922,8 @@ export async function setZeeMode(zeeId, permission_mode) {
   return data;
 }
 
-// Open a xell's worktree folder in the host file manager (Explorer on Windows).
-export async function revealWorktree(xellId) {
-  const r = await fetch(`/api/xells/${xellId}/reveal`, { method: 'POST' });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || `open failed (${r.status})`);
-  return data;
-}
+// revealWorktree — the only caller was XellCard's deleted "open folder" action (TKT-29-3AB6).
+// The server route it hit (/api/xells/:id/reveal) stays.
 
 // How many ready (pre-warmed) xells queenzee keeps for this project (pool_config.target_ready).
 export async function setPoolTarget(target_ready, projectId) {

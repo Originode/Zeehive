@@ -266,6 +266,15 @@ async function recoverOne(row, { reason, mode, force = false, by = 'the queenzee
   // no session to resume, a paused fleet, a spent ladder…) — this loop holds no revive policy.
   const filed = await noteTurnDeath({ zeeId: row.zee_id, xellId: row.xell_id, slug,
                                       reason: deathReason, source: death.signal, death });
+  // A death that QUARANTINED the cage stops the resume too (ticket #81): this restart is exactly a
+  // recovery path, and a quarantined cage gets no new turn until a human decides. The ladder entry
+  // stays on the zee (the schedule is the "rescue the branch" arm) but the ladder refuses a
+  // quarantined xell the same way reviveTick now does, so nothing resumes by accident.
+  if (filed?.xell_quarantined) {
+    logline('cxell-recover', `${slug}: cage is back, but the death QUARANTINED the xell after `
+      + `consecutive turn deaths — the turn is NOT resumed; a human must decide (rescue or reap)`);
+    return { slug, verdict: 'restarted', resumed: false, xell_quarantined: true };
+  }
   // 5. THE RESUME, for the manual path only. The sweep leaves the ladder to do it (5 minutes is
   //    nothing to a machine that just rebooted, and a fleet coming back all at once should not
   //    resume every zee it owns in the same second) — but a human standing at the console who just

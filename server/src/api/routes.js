@@ -10,7 +10,7 @@ import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
-import { bus, broadcast } from '../lib/events.js';
+import { bus, broadcast, activityFanout } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
@@ -20,6 +20,8 @@ import { dispatchOptions } from '../lib/dispatch-options.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
          previewProjectDoc } from '../lib/project-docs.js';
+import { listProjectConditions, addProjectCondition, updateProjectConditionScoped,
+         removeProjectConditionScoped } from '../lib/current-conditions.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, setBackupPaused, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -35,6 +37,7 @@ import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAd
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell, purgeDevXells } from '../queenzee/reaper.js';
+import { clearXellQuarantine } from '../lib/xell-quarantine.js';
 import { attachXellDb, dbAccessForCwd, DB_MODES } from '../lib/xell-db.js';
 import { attachProdStack, detachProdStack, prodStackStatus } from '../lib/xell-prod.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
@@ -75,14 +78,14 @@ import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrat
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
-import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
+import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdrawShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
          selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
-         selfSay, selfReport, selfInbox, selfA2ASend,
+         selfSay, selfReport, selfInbox, selfReview, selfA2ASend,
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
@@ -116,9 +119,9 @@ import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
          raiseRotationRequest } from '../lib/credential-inject.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
-import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
+import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor, getWorkItemOverlap } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
-         selfWorkItem } from '../queenzee/self.js';
+         selfWorkItem, selfConditions, selfStandingOrders, selfScratchpad } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
@@ -552,12 +555,12 @@ router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
 // them — stale the first time one is renamed.
 router.get('/agent-doc-targets', (_req, res) => res.json(targetCatalogue()));
 router.get('/projects/:id/docs', async (req, res) => {
-  try { res.json(await listProjectDocs(req.params.id)); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try { res.json(await listProjectDocs(await resolveProjectParam(req.params.id))); }
+  catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
 });
 router.post('/projects/:id/docs', async (req, res) => {
-  try { res.json(await createProjectDoc(req.params.id, req.body || {})); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try { res.json(await createProjectDoc(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
 });
 router.put('/project-docs/:docId', async (req, res) => {
   try { res.json(await updateProjectDoc(req.params.docId, req.body || {})); }
@@ -573,8 +576,180 @@ router.delete('/project-docs/:docId', async (req, res) => {
   try { res.json(await deleteProjectDoc(req.params.docId)); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
+// ── CURRENT CONDITIONS — the short, dated, per-PROJECT list of live impediments injected into
+// every briefing (ticket #67). The console is the HUMAN's authoring surface; a manager edits the
+// same list through `zee conditions --add/--remove` (see the /xell/self/conditions routes). Each
+// line is DATA (house rule 7): it lives here in the meta-DB, is resolved live at briefing time,
+// and is trivially deletable — there is deliberately no archive, because a condition that stops
+// being true should be GONE, not hidden. ──
+//
+// A WRITE to a condition reaches EVERY briefing in the project, so "who may write" is really "who
+// may edit every other zee's instructions". The zee-facing wall is the /xell/self route (token →
+// requireManager). THIS surface is the console: /api has NO router-level authentication at all
+// (index.js mounts `app.use('/api', router)` bare), so a request that sends no token — or a token
+// that does not resolve to a xell — is NOT refused here. refuseWorkerZeeToken below is therefore a
+// PARTIAL wall: it refuses a worker zee that VOLUNTEERS its token, and nothing else. Closing the
+// unauthenticated write path is an authentication decision about the whole /api surface — an open
+// HUMAN card (492743d2), not this route's to settle. The honest contract is: this guard narrows the
+// reach of an identified worker; it does not make the console route safe.
+async function refuseWorkerZeeToken(req) {
+  const auth = req.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
+  // PARTIAL WALL — see the block comment above. /api has no auth, so a request with NO token, or
+  // with a token that does not resolve, passes here. Card 492743d2 is the open human decision that
+  // would actually close the unauthenticated path; this guard only refuses an IDENTIFIED worker.
+  if (!token) return null;
+  const xell = await xellForToken(token);
+  if (!xell) return null;
+  if (xell.zee_type !== 'manager') {
+    return { ok: false, status: 'refused',
+      error: 'writing a current condition is MANAGER-only (it reaches every briefing in the '
+        + 'project). A zee edits the list with `zee conditions` — which enforces the same wall '
+        + 'server-side — or a human edits it in the console.' };
+  }
+  return null;
+}
+router.get('/projects/:id/conditions', async (req, res) => {
+  try { res.json(await listProjectConditions(await resolveProjectParam(req.params.id))); }
+  catch (e) { res.status(projectErrorStatus(e)).json({ error: e.message }); }
+});
+router.post('/projects/:id/conditions', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const r = await addProjectCondition(await resolveProjectParam(req.params.id),
+      req.body?.body || null, { actor: req.body?.actor || 'human' });
+    if (!r.ok) return res.status(400).json(r);
+    res.status(201).json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.put('/project-conditions/:condId', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    // The console route has no caller-scoped project (it is a human's dashboard), so the condition's
+    // own project is the scope — updateProjectConditionScoped then refuses a mismatch BY NAME, the
+    // same rule the scoped remove enforces (an id is not an authorisation).
+    const cond = await one(`SELECT project_id FROM project_condition WHERE id=$1`, [req.params.condId]);
+    if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
+    const r = await updateProjectConditionScoped(req.params.condId, cond.project_id,
+      req.body?.body || null, { actor: req.body?.actor || 'human' });
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.delete('/project-conditions/:condId', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    // Same scoping rule as PUT: the condition's own project is the scope, so the scoped remove
+    // refuses a foreign row by name (an id is not an authorisation).
+    const cond = await one(`SELECT project_id FROM project_condition WHERE id=$1`, [req.params.condId]);
+    if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
+    const r = await removeProjectConditionScoped(req.params.condId, cond.project_id);
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
+// sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same
+// rules: a worker xell has no standing orders (it does not dispatch), the text is bounded (SHORT by
+// design), and it never widens a worker — it is appended to the brief at dispatch time. These routes
+// carry the same PARTIAL worker-token wall as the conditions routes (refuseWorkerZeeToken above): /api
+// has no router-level auth, so this narrows an identified worker and nothing else (card 492743d2).
+async function refuseWorkerZeeTokenForStandingOrders(req) {
+  const auth = req.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
+  if (!token) return null;
+  const xell = await xellForToken(token);
+  if (!xell) return null;
+  if (xell.zee_type !== 'manager') {
+    return { ok: false, status: 'refused',
+      error: 'setting standing orders is MANAGER-only (they reach every brief a manager dispatches). '
+        + 'A manager sets its own with `zee standing-orders`; a human sets them in the console.' };
+  }
+  return null;
+}
+// Read a xell's standing orders (any xell — a worker's is null, a manager's is its block).
+router.get('/xells/:id/standing-orders', async (req, res) => {
+  try {
+    const x = await one(`SELECT id, zee_type, slug, standing_orders, standing_orders_updated_at, standing_orders_updated_by
+                           FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    res.json({ ok: true, xell: x.slug, zee_type: x.zee_type,
+               standing_orders: x.standing_orders, length: x.standing_orders ? x.standing_orders.length : 0,
+               updated_at: x.standing_orders_updated_at, updated_by: x.standing_orders_updated_by });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// Set a manager xell's standing orders (human). A worker target is refused — only a manager
+// dispatches, so only a manager's standing orders mean anything.
+router.put('/xells/:id/standing-orders', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeTokenForStandingOrders(req);
+    if (g) return res.status(403).json(g);
+    const { STANDING_ORDERS_MAX } = await import('../lib/standing-orders.js');
+    const x = await one(`SELECT id, slug, zee_type FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    if (x.zee_type !== 'manager') {
+      return res.status(400).json({ ok: false, error: `${x.slug} is a ${x.zee_type} xell — standing orders `
+        + 'belong to a MANAGER (the xell that dispatches). A worker receives them appended to its brief; '
+        + 'it does not author them.' });
+    }
+    const body = String(req.body?.text || '').trim();
+    if (!body) {
+      return res.status(400).json({ ok: false, error: 'standing orders text is required — to clear them, DELETE this route.' });
+    }
+    if (body.length > STANDING_ORDERS_MAX) {
+      return res.status(400).json({ ok: false, error: `standing orders are limited to ${STANDING_ORDERS_MAX} characters — `
+        + `${body.length} is a second manual, not a short block.` });
+    }
+    const r = await one(
+      `UPDATE xell SET standing_orders=$2, standing_orders_updated_at=now(), standing_orders_updated_by=$3
+        WHERE id=$1 RETURNING standing_orders, standing_orders_updated_at, standing_orders_updated_by`,
+      [x.id, body, req.body?.actor || 'human@console']);
+    broadcast('xell', { id: x.id });
+    res.json({ ok: true, xell: x.slug, ...r, length: r.standing_orders.length,
+               message: `Set — every brief ${x.slug} dispatches now carries this block verbatim.` });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// Clear a manager xell's standing orders (human) — trivial on purpose, like a condition delete.
+router.delete('/xells/:id/standing-orders', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeTokenForStandingOrders(req);
+    if (g) return res.status(403).json(g);
+    const x = await one(`SELECT id, slug, zee_type FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    if (x.zee_type !== 'manager') {
+      return res.status(400).json({ ok: false, error: `${x.slug} is a ${x.zee_type} xell — only a manager has standing orders.` });
+    }
+    await one(`UPDATE xell SET standing_orders=NULL, standing_orders_updated_at=now(), standing_orders_updated_by=$2
+                WHERE id=$1 RETURNING id`, [x.id, req.body?.actor || 'human@console']);
+    broadcast('xell', { id: x.id });
+    res.json({ ok: true, xell: x.slug, standing_orders: null,
+               message: `Cleared — ${x.slug}'s dispatches are back to no standing-orders block.` });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── SCRATCHPAD for a xell (ticket #66) — the HUMAN's read surface. A zee writes its OWN through
+// `zee scratchpad`; this route lets a human in the console read ANY xell's scratchpad (a manager
+// reads a crew xell's through `zee scratchpad --xell <slug>`). Read-only by design: the scratchpad
+// is the zee's own thinking, never something a human edits. Same shape as the standing-orders read.
+router.get('/xells/:id/scratchpad', async (req, res) => {
+  try {
+    const x = await one(`SELECT id, slug, scratchpad, scratchpad_updated_at, scratchpad_updated_by
+                           FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    res.json({ ok: true, xell: x.slug,
+               scratchpad: x.scratchpad, length: x.scratchpad ? x.scratchpad.length : 0,
+               updated_at: x.scratchpad_updated_at, updated_by: x.scratchpad_updated_by });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-router.get('/projects/:id/sites', async (req, res) => res.json(await listSites(req.params.id)));
+router.get('/projects/:id/sites', async (req, res) => {
+  try { res.json(await listSites(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
+});
 // ── WireGuard mesh — the human's door onto the ZEEHIVE network ───────────────────────────────
 // Decision 5.4 (docs/common-xell-network-plan.md): ZEEHIVE operates a WG server; a human (or
 // another machine) downloads a ready .conf and joins the tunnel. These are HUMAN surface routes
@@ -604,8 +779,8 @@ router.patch('/projects/:id/wireguard/endpoint', async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/projects/:id/sites', async (req, res) => {
-  try { res.json(await createSite(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await createSite(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.patch('/sites/:id', async (req, res) => {
   try { res.json(await updateSite(req.params.id, req.body || {})); }
@@ -636,8 +811,8 @@ router.post('/sites/:id/adopt', async (req, res) => {
 // one provider type (036): POST adds one, DELETE …/account/:accountId removes one; the PUT
 // keeps its legacy replace-in-place semantics for single-account types (github, scripts).
 router.get('/projects/:id/tokens', async (req, res) => {
-  try { res.json(await listProviderTokens(req.params.id)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await listProviderTokens(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 // HOW MUCH OF EACH PROVIDER ACCOUNT'S USAGE LIMIT IS STILL AVAILABLE — project-scoped,
 // account-grained, never per-xell. Same data as fleet.provider_limits; a dedicated route so
@@ -648,17 +823,18 @@ router.get('/projects/:id/provider-limits', async (req, res) => {
 });
 router.post('/projects/:id/tokens', async (req, res) => {
   try {
-    const out = await addProviderToken(req.params.id, req.body?.provider, req.body?.token, req.body?.label);
+    const projectId = await resolveProjectParam(req.params.id);
+    const out = await addProviderToken(projectId, req.body?.provider, req.body?.token, req.body?.label);
     // A human connected an account → if live cages for this provider predate the new key, raise a
     // rotation request for a human to approve (the queenzee performs the injection on approval).
-    await raiseRotationRequest({ projectId: req.params.id, provider: req.body?.provider })
+    await raiseRotationRequest({ projectId, provider: req.body?.provider })
       .catch(() => {});   // a failed trigger must never fail the token save
     res.json(out);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.delete('/projects/:id/tokens/account/:accountId', async (req, res) => {
-  try { res.json(await deleteProviderAccount(req.params.id, req.params.accountId)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await deleteProviderAccount(await resolveProjectParam(req.params.id), req.params.accountId)); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 // SET one provider's spend-alert threshold (migration 206) — a customizable USD amount per
 // provider, applied per xell by the fleet read model: when a xell's gateway-ledger spend on
@@ -675,9 +851,9 @@ router.put('/projects/:id/provider-alerts/:provider', async (req, res) => {
 // still be deleted. Same shape as the fleet/project/xell pause routes.
 router.post('/projects/:id/tokens/account/:accountId/pause', async (req, res) => {
   try {
-    res.json(await setProviderAccountPaused(req.params.id, req.params.accountId, true,
+    res.json(await setProviderAccountPaused(await resolveProjectParam(req.params.id), req.params.accountId, true,
       { by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.post('/projects/:id/tokens/account/:accountId/resume', async (req, res) => {
   try {
@@ -742,12 +918,12 @@ router.post('/xells/:id/env', async (req, res) => {
 // server through emitXellEnv (into a xell's own .zeehive.env) and the human export below. Mirrors
 // the provider-tokens + sites route shapes.
 router.get('/projects/:id/environments', async (req, res) => {
-  try { res.json(await listEnvironments(req.params.id)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await listEnvironments(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.post('/projects/:id/environments', async (req, res) => {
-  try { res.json(await createEnvironment(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await createEnvironment(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.get('/environments/diff', async (req, res) => {
   try { res.json(await diffEnvironments(req.query.a, req.query.b)); }
@@ -818,6 +994,13 @@ router.get('/xells/:id/env/export', async (req, res) => {
 async function resolveProjectParam(id) {
   return resolveProjectId({ project: id });
 }
+// A project NAME that matches nothing is a 404 — the caller addressed a project that does not
+// exist, and UnknownProject's message names which projects do — not the route's ordinary 400 for
+// a malformed body. The name-vs-uuid sweep routes use this so an unknown name is never a postgres
+// `invalid input syntax for type uuid` (that is the defect the sweep removes) and never a 500.
+function projectErrorStatus(err, fallback = 400) {
+  return err?.code === 'UNKNOWN_PROJECT' ? 404 : fallback;
+}
 router.get('/projects/:id/manifest', async (req, res) => {
   try { res.json(await getProjectManifest(await resolveProjectParam(req.params.id))); }
   catch (err) { res.status(404).json({ error: err.message }); }
@@ -880,8 +1063,8 @@ router.post('/projects/:id/manifest/compose-apply', async (req, res) => {
 router.post('/projects/probe', (req, res) => res.json(probeRepo(req.body?.repo_root)));
 // The readiness checklist: which gates pass, can it provision, can it SHIP.
 router.get('/projects/:id/readiness', async (req, res) => {
-  try { res.json(await projectReadiness(req.params.id)); }
-  catch (err) { res.status(404).json({ error: err.message }); }
+  try { res.json(await projectReadiness(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err, 404)).json({ error: err.message }); }
 });
 // Machine × project BUILD-READINESS (ticket #173): for every machine of this project, can a
 // build actually work there? Read-only probe — same docker facts verifyRequires uses, plus the
@@ -906,16 +1089,22 @@ router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // The dev spawn template: what a new xell gets by default (couplings, runtime, pool size).
-router.get('/projects/:id/pool-config', async (req, res) => res.json(await getPoolConfig(req.params.id)));
+router.get('/projects/:id/pool-config', async (req, res) => {
+  try { res.json(await getPoolConfig(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
+});
 router.patch('/projects/:id/pool-config', async (req, res) => {
-  try { res.json(await updatePoolConfig(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await updatePoolConfig(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 // Shared-container inventory (prod containers included — a ship needs at least one shippable).
-router.get('/projects/:id/containers', async (req, res) => res.json(await listSharedContainers(req.params.id)));
+router.get('/projects/:id/containers', async (req, res) => {
+  try { res.json(await listSharedContainers(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
+});
 router.post('/projects/:id/containers', async (req, res) => {
-  try { res.json(await createSharedContainer(req.params.id, req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try { res.json(await createSharedContainer(await resolveProjectParam(req.params.id), req.body || {})); }
+  catch (err) { res.status(projectErrorStatus(err)).json({ error: err.message }); }
 });
 router.patch('/containers/:id', async (req, res) => {
   try { res.json(await updateSharedContainer(req.params.id, req.body || {})); }
@@ -1497,6 +1686,19 @@ router.post('/xells/:id/reap', requireQueenzeeLoops, async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── lift a quarantine (ticket #81: the RESCUE arm) ────────────────────────────
+// A quarantined xell is refused every agent until a human decides between rescuing the branch
+// and reaping the cage. Reap is the existing /xells/:id/reap above; THIS is the rescue — it
+// clears the quarantine (consecutive_deaths, quarantined_at, quarantine_deaths,
+// quarantine_reason) so a fresh agent may be dispatched into the same worktree. Deliberately
+// does NOT need queenzee loops: the stamp is a plain row update, and a console can only reach
+// here through the running API. Clearing is idempotent (clearing an un-quarantined xell is a
+// no-op), so the route never 409s — a human re-clicking a stale button should not be punished.
+router.post('/xells/:id/unquarantine', async (req, res) => {
+  try { res.json(await clearXellQuarantine(req.params.id, { by: req.body?.by || 'human@console' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // DANGER ZONE — purge ALL non-production xells in a project, mid-work and all (project setup →
 // Danger tab, behind a typed confirmation). Prod is never a candidate (reaper excludes+refuses it).
 router.post('/projects/:id/purge-dev', requireQueenzeeLoops, async (req, res) => {
@@ -1716,6 +1918,15 @@ router.post('/xell/self/ship', async (req, res) => {
     res.json(await selfShip(x, { targets: req.body?.targets || null, reason: req.body?.reason || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// UN-ASK a held ship (`zee ship --withdraw`): the zee lowers its OWN pending/approved ship request
+// before the deploy starts. The symmetric verb to `zee land --withdraw` — nothing ships, nothing is
+// rejected, nothing is reverted; the card leaves the human's screen and the row records the
+// withdrawal in the ship ledger. REFUSED once the deploy has started (status='shipping').
+router.post('/xell/self/ship/withdraw', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWithdrawShip(x, { reason: req.body?.reason || null, request: req.body?.request || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // ASK to bind this xell to the prod stack — recorded only; a human confirms, then the queenzee binds.
 router.post('/xell/self/prod-request', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
@@ -1911,6 +2122,16 @@ router.post('/xell/self/say', async (req, res) => {
 router.post('/xell/self/report', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfReport(x, { message: req.body?.message, kind: req.body?.kind || 'report' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// `zee review --of <sha>` — RECORD a review of a landed diff (ticket #56): reviewer, verdict,
+// findings count, report. A first-class record, NOT a gate — nothing on the land/ship path waits
+// on it. The landing/ship cards surface it so an unreviewed change ships only as a knowing choice.
+router.post('/xell/self/review', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfReview(x, {
+      commit: req.body?.commit, verdict: req.body?.verdict,
+      findings_count: req.body?.findings_count, report: req.body?.report })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // `zee a2a <card-url> --message "…"` — send an A2A SendMessage to an EXTERNAL agent card URL,
@@ -2854,6 +3075,20 @@ router.post('/work-items/:id/deploy', async (req, res) => {
       managerXellId: b.manager_xell_id || null }));
   } catch (err) { assignErr(res, err); }
 });
+// IS SOMEBODY ALREADY IN THIS WORK? — the board's DEPLOY preflight (the work-item mirror of
+// /xell/dispatch/overlap). Read-only, no side effects, and it exists so a human sees the answer
+// BEFORE they press "deploy a worker" rather than in the receipt afterwards. It builds the same
+// brief the deploy would and keys it on the item itself (the landed-warning half reads the tracker
+// link), and a failure inside it answers "no warnings" rather than an error — because a
+// coordination hint must never stand between a human and a dispatch.
+router.post('/work-items/:id/deploy/overlap', async (req, res) => {
+  try {
+    res.json(await getWorkItemOverlap(req.params.id, { task: req.body?.task || null }));
+  } catch (err) {
+    res.json({ warnings: [], note: null, checked: { xells: 0, paths: [], tickets: [], landings: 0 },
+              degraded: [`overlap check unavailable: ${err.message}`] });
+  }
+});
 // Which xells could take this item — so the console offers a picker instead of asking a human to
 // paste a uuid (the ready pool + live workers with no open item, in this project only).
 router.get('/work-items/:id/candidates', async (req, res) => {
@@ -2861,6 +3096,62 @@ router.get('/work-items/:id/candidates', async (req, res) => {
   catch (err) { assignErr(res, err); }
 });
 
+// ── CURRENT CONDITIONS (`zee conditions`) — the short, dated, per-PROJECT list of live
+// impediments injected into every briefing (ticket #67). READ is every zee's; WRITE (--add /
+// --remove) is MANAGER-only, scoped to the caller's own project by its token — the same wall as
+// `zee work --new`. A worker that tries to write is told what it is, not 404'd.
+router.get('/xell/self/conditions', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfConditions(x, {})); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/conditions', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const r = await selfConditions(x, { action: b.action || null, body: b.body || null, id: b.id || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// ── STANDING ORDERS (`zee standing-orders`) — the manager's crew discipline, appended VERBATIM to
+// every brief it dispatches (ticket #74). READ and WRITE are MANAGER-only (a worker RECEIVES them
+// appended to its brief; it never sets them) — the same `requireManager` wall as `zee conditions`.
+router.get('/xell/self/standing-orders', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfStandingOrders(x, { action: 'read' })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/standing-orders', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const r = await selfStandingOrders(x, { action: b.action || null, text: b.text || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// ── SCRATCHPAD (`zee scratchpad`) — EVERY zee's per-xell working note that outlives the cage
+// (ticket #66). A zee reads/writes/clears its OWN (token-scoped — a worker can never name another
+// xell); a MANAGER reads a crew xell's with `--xell <slug>` (scoped by workerOf to its own crew);
+// a human reads any xell's via GET /xells/:id/scratchpad.
+router.get('/xell/self/scratchpad', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const r = await selfScratchpad(x, { action: 'read', xellSlug: req.query.xell || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/scratchpad', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const r = await selfScratchpad(x, { action: b.action || null, text: b.text || null, xellSlug: b.xell || null });
+    if (r.ok === false && r.status === 'refused') return res.status(403).json(r);
+    if (r.ok === false) return res.status(400).json(r);
+    res.json(r); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
 // ── WORK TRACKER: the cxell verbs (`zee work` · `zee assign` · `zee item`) ────
 // Token-scoped, exactly like every other /xell/self/ verb: a MANAGER sees and moves its own project's
 // plan, a WORKER sees and reports on the ONE item it is assigned to. The scope is resolved in the
@@ -3066,10 +3357,13 @@ router.get('/stream', async (req, res) => {
     res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
   }
 
-  const onEvent = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
+  const send = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
+  // Project-scope + cap the queenzee-activity fan-out per connection (activityFanout); every
+  // other event type rides through unchanged.
+  const { onEvent, close } = activityFanout(req.query.project || null, send);
   bus.on('event', onEvent);
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);
-  req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
+  req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); close(); });
 });
 
 // ── XELL WEBAPP REVIEW — /xell-web/<slug>/* (compatibility redirect) ──────────────────────────

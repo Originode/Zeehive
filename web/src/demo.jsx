@@ -19,9 +19,12 @@ const commits = Array.from({ length: 12 }, (_, i) => ({
 commits[2].parents = ['h3', 'h5'];          // a merge → a second lane, to show the weave
 
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff'];
-// nine xells on distinct heads (prods on h0,h2; the manager on h1 and its reaped worker on h8 — a husk
-// needs a dot of its OWN or the "a husk lends nothing" story lands on the manager's dot; the router on h7)
-const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3', 'h1', 'h8', 'h7'];
+// nine xells on heads (prods on h0,h2; the manager on h1 and its reaped worker on h8 — a husk
+// needs a dot of its OWN or the "a husk lends nothing" story lands on the manager's dot; the router on h7).
+// calm-ridge (x2) and bold-harbor (x3) SHARE h4 on purpose: their wires leave the same commit dot and
+// thread the same corridor, so the honeycomb shows the collapsed lane — ONE dashed line alternating
+// their two trace colours — instead of two parallel channels.
+const BASES = ['h0', 'h2', 'h4', 'h4', 'h9', 'h3', 'h1', 'h8', 'h7'];
 const NAMES = ['swift-atlas', 'sunny-ember', 'calm-ridge', 'bold-harbor', 'lucid-fern', 'brave-quill'];
 
 const xells = NAMES.map((slug, i) => ({

@@ -17,6 +17,7 @@ import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
+import { computeShipPayload } from '../queenzee/ship-payload.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -160,9 +161,11 @@ async function fetchXellRows(pid) {
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('shiphint-request','shiphint-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'shiphint-request' AS ship_hint,
-            -- A MANAGER zee suggested this xell is finished: a held decision, raised by another
-            -- agent rather than by this xell's own zee, and it must be visible or a manager's
-            -- suggestion is as invisible as the prod-bind ask used to be.
+            -- A MANAGER zee suggested this xell is finished: a decision raised by another agent rather
+            -- than by this xell's own zee, and it must be visible or a manager's suggestion is as
+            -- invisible as the prod-bind ask used to be. Only 'pending' shows the 'done?' hexagon —
+            -- an 'approved-held' card (ticket #75) is a decision ALREADY made, waiting only for the
+            -- turn to end, and stays visible through listDoneSuggestions with its own banner instead.
             EXISTS(SELECT 1 FROM done_suggestion ds WHERE ds.target_xell_id = x.id
                      AND ds.status = 'pending' AND ds.dismissed_at IS NULL) AS done_suggested,
             -- the manager this xell reports to (its slug, for the card/hexagon)
@@ -282,7 +285,8 @@ export function containerShellCmd(project, c) {
 async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false } = {}) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id, c.isolation,
-            c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
+            c.hot_build, c.last_build_commit, c.last_built_at, c.last_build_error,
+            c.busy_since, c.busy_op,
             c.docker_ctx, c.build_ctx, c.host, c.host_port, c.conn_ref,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
             (SELECT ox.worktree_path FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_worktree,
@@ -540,7 +544,7 @@ export async function getFleet(projectId) {
   // grouped container inventory
   const containers = await q(
     `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host, c.host_port, c.conn_ref, c.health,
-            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
+            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at, c.last_build_error,
             c.docker_ctx, c.build_ctx,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
             (SELECT ox.worktree_path FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_worktree,
@@ -655,7 +659,14 @@ export async function getFleet(projectId) {
                   AND (o.requested_at, o.id) < (lr.requested_at, lr.id)) AS runway_occupant,
             (SELECT count(*)::int FROM land_request h
                WHERE lr.kind = 'push' AND h.project_id = lr.project_id AND h.ref = lr.ref
-                 AND h.kind = 'push' AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders
+                 AND h.kind = 'push' AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders,
+            -- Who READ this landing's diff (224) — so approving a landing knows whether a review
+            -- exists and what it concluded. A record, never a gate: nothing here waits on it.
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = lr.new_sha) AS reviews
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
        WHERE lr.project_id = $1 AND lr.status IN ('pending','approved')
        ORDER BY lr.requested_at DESC`, [pid]);
@@ -672,12 +683,22 @@ export async function getFleet(projectId) {
   // instant the build ended took its result — and its build log — with it, so the human's only
   // view of a just-shipped (or just-failed) deploy was gone before they could read it.
   const shipping = await q(
-    `SELECT s.*, x.slug AS xell_slug FROM ship_request s JOIN xell x ON x.id = s.xell_id
+    `SELECT s.*, x.slug AS xell_slug,
+            (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                     'reviewer', rv.reviewer, 'verdict', rv.verdict::text,
+                     'findings_count', rv.findings_count, 'report', rv.report,
+                     'created_at', rv.created_at) ORDER BY rv.created_at DESC), '[]'::jsonb)
+               FROM review rv WHERE rv.commit_sha = s.commit) AS reviews
+       FROM ship_request s JOIN xell x ON x.id = s.xell_id
        WHERE s.project_id = $1 AND s.dismissed_at IS NULL
          AND (s.status IN ('pending','approved','shipping')
           OR (s.status IN ('shipped','failed')
               AND COALESCE(s.finished_at, s.decided_at) > now() - interval '15 minutes'))
        ORDER BY s.requested_at DESC`, [pid]);
+  // THE PAYLOAD (ticket #65) — what each open/fresh ship actually carries, named commit by commit
+  // with who landed each. ADVISORY: computeShipPayload never throws, so a payload that cannot be
+  // read rides as { ok:false } on the card in words and never blocks the ask or the approval.
+  for (const s of shipping) s.payload = await computeShipPayload(project, s);
   const prodLock = await one(
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
        WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);

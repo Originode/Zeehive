@@ -601,16 +601,23 @@ export function seatXells(list, cols, { reserved = new Set(), pinned = {} } = {}
 }
 
 // Connector wires thread the corridors BETWEEN hexes, so the honeycomb is drawn spaced: each hex is
-// shrunk inside its (gapless) layout cell to open a gap wide enough for the traces that must pass —
-// sized by the grid dimension a wire fans across (columns in portrait, rows in landscape). The
-// routing lattice (<Connectors>) still uses the full CELL size so it stays connected; only the drawn
-// hex shrinks. WIRE_PITCH is the on-screen width one trace needs (stroke + clearance).
+// shrunk inside its (gapless) layout cell just enough to open a SINGLE-LANE corridor. Traces no
+// longer split into parallel channels (Connectors collapses shared corridors into one dashed
+// alternating-colour line), so the gap no longer grows with the number of traces — a hex keeps
+// (nearly) its full cell size whatever the fleet. The routing lattice (<Connectors>) still uses
+// the full CELL size so it stays connected; only the drawn hex shrinks. WIRE_PITCH is the on-screen
+// width one trace needs (stroke + clearance).
 const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, harnessPosRef, onGeometry, onAction, onContainerMenu,
                                     hoverRef, setHover, subscribeHover, redrawKey, showHarness = true,
                                     queenzeeActivity = [], shipping = [], onQueenzeeTerminal, onQueenzeeLogs,
+                                    // The queenzee node's TERMINAL availability, resolved by App.jsx:
+                                    // 'ready' (a prod server shell can open) | 'down' (prod server exists
+                                    // but the shell would fail — surface it) | 'none' (no prod server —
+                                    // the node is explicitly disabled, never a silent dead click).
+                                    qzTerminalStatus = 'ready',
                                     // ── the WORK-NODE hierarchy (App's hive levels) ──────────────
                                     // The list is not only xells any more: a cell whose `hex_kind` is
                                     // 'project' is a top-level work_node (a project), and 'worknode'
@@ -731,11 +738,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // grid must size for xells + the node or the last xell would overflow the pane.
     const lay = layoutHoneycomb(list.length + 1, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
     const cellSize = lay.size;                    // gapless layout cell → the routing lattice
-    // corridor gap: room for `count` traces to pass (cols in portrait, rows in landscape). Shrink the
-    // drawn hex within its cell to open it, but keep enough hex to stay legible.
-    const portrait = orientation === 'portrait';
-    const count = Math.max(1, portrait ? lay.cols : lay.rows);
-    const gap = count * WIRE_PITCH;
+    // corridor gap: a FIXED single-lane gap — the honeycomb no longer sizes itself by the number of
+    // traces that must pass (the wire overlay collapsed parallel lanes into one dashed alternating-
+    // colour line). Shrink the drawn hex within its cell just enough to open that one corridor, but
+    // keep enough hex to stay legible.
+    const gap = WIRE_PITCH;
     const drawSize = Math.max(cellSize * 0.5, cellSize - gap / SQRT3);   // shrink to open the gap
     const originX = pad, originY = pad;
     // SEATING (see seatXells): managers first, each with its crew in the free cells nearest to it,
@@ -928,8 +935,16 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // centre is what the activity arrows below originate from / point at.
     const [qzCx, qzCy] = cellCenter(0, 0, cellSize, originX, originY);
     const qzHover = pointInHex(hoverWorldRef.current.x, hoverWorldRef.current.y, qzCx, qzCy, drawSize);
+    // A bloom petal lands on this cell when the expanded xell sits adjacent to (0,0) — the petal
+    // is drawn first (see the flower block above), so WITHOUT extra treatment the node's dark hex
+    // would read as buried in the petal's dark panel. `qzOverlapped` lifts the node with a bright
+    // halo so it stays visible while the flower is open; the flower keeps CLICK precedence (the
+    // onPointerUp expanded branch checks hitFlower before hitQueenzee — see the test).
+    const qzOverlapped = !!(expanded && cells[expanded.id]
+      && cellNeighbors(cells[expanded.id][0], cells[expanded.id][1])
+        .some(([r, c]) => r === 0 && c === 0));
     const qzLogsRect = drawQueenzeeNode(ctx, qzCx, qzCy, drawSize, {
-      hover: qzHover, logo: getImg(QZ_LOGO),
+      hover: qzHover, logo: getImg(QZ_LOGO), terminal: qzTerminalStatus, overlapped: qzOverlapped,
     });
     geomRef.current.queenzee = { cx: qzCx, cy: qzCy, size: drawSize };
     geomRef.current.queenzeeLogs = qzLogsRect;
@@ -1306,7 +1321,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
           else showXellTooltip(xellOf(hx.id), e);
         } else {
           const qz = hitQueenzee(wx, wy);
-          if (qz) { cursor = 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
+          // a 'none' terminal is an explicitly disabled node: the hex click does nothing, so the
+          // cursor reads 'default' rather than promising an action — the logs button still answers
+          // 'pointer' above via hitQueenzeeLogs.
+          if (qz) { cursor = qzTerminalStatus === 'none' ? 'default' : 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
           else {
             // no hex or queenzee under the cursor → a harness badge lights up its consumer xells
             const hb = hitHarness(wx, wy);
@@ -1580,14 +1598,23 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
           </div>
         );
       })()}
-      {/* The QUEENZEE node's right-click menu — logs + terminal, the two surfaces this node owns. */}
+      {/* The QUEENZEE node's right-click menu — logs + terminal, the two surfaces this node owns.
+          The terminal item is disabled (and says why) when there is no prod server container to
+          shell into — never a dead item that silently does nothing. */}
       {ctxQueenzee && (
         <div className="ctxmenu hive-queenzee-ctx" style={{ left: ctxQueenzee.x, top: ctxQueenzee.y }} role="menu"
              onClick={(e) => e.stopPropagation()}
              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}>
           <div className="ctxhead">⌂ QUEENZEE <span className="ctxsub">· the orchestrator's host</span></div>
           <button role="menuitem" onClick={() => { setCtxQueenzee(null); onQueenzeeLogs?.(); }}>▚ logs</button>
-          <button role="menuitem" onClick={() => { setCtxQueenzee(null); onQueenzeeTerminal?.(); }}>⌨ terminal</button>
+          <button role="menuitem"
+                  disabled={qzTerminalStatus === 'none'}
+                  title={qzTerminalStatus === 'none' ? 'no prod server container to shell into'
+                    : qzTerminalStatus === 'down' ? 'prod server is down — the shell will report it' : undefined}
+                  onClick={() => { setCtxQueenzee(null); onQueenzeeTerminal?.(); }}>
+            ⌨ terminal{qzTerminalStatus === 'none' ? ' (no prod server)'
+              : qzTerminalStatus === 'down' ? ' (server down)' : ''}
+          </button>
         </div>
       )}
       {(!xells || xells.length === 0) && (
@@ -2502,19 +2529,46 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
 // flower's buttons, so a click opens the queenzee activity log). Returns the logs button's world
 // rect. `logo` is a preloaded HTMLImageElement of the brand mark (same getImg path harness
 // avatars use); when it is not yet loaded the ⌂ glyph stands in so the node never draws empty.
-export function drawQueenzeeNode(ctx, cx, cy, size, { hover = false, logo = null } = {}) {
+//
+// `terminal` is the node's TERMINAL availability ('ready' | 'down' | 'none'). When it is not
+// 'ready' the node is drawn with an explicit disabled state — a muted hex plus a "no terminal" /
+// "server down" tag under the label — so the absence of a shell is visible BEFORE the click,
+// never a silent dead click. 'down' (a prod server exists but the shell would fail) keeps the
+// amber tint and says "server down" to surface the fault rather than masking it as "no terminal".
+// `overlapped` is true when an expanded xell's bloom petal sits on this cell: the petal draws
+// first, so a bright halo is added to lift the node above the petal's dark panel.
+export function drawQueenzeeNode(ctx, cx, cy, size, { hover = false, logo = null, terminal = 'ready', overlapped = false } = {}) {
   const s = size;
+  const disabled = terminal !== 'ready';
+  const down = terminal === 'down';
   ctx.save();
+  // A bloom petal on this cell is drawn first and would bury the node's dark hex in its dark
+  // panel — a bright halo ring around the hex keeps the node readable as a distinct element. The
+  // flower keeps CLICK precedence; this is purely visual lift.
+  if (overlapped && !disabled) {
+    ctx.beginPath();
+    hexPath(ctx, cx, cy, s + 4);
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = withAlpha(QZ.stroke, 0.9);
+    ctx.shadowColor = QZ.stroke;
+    ctx.shadowBlur = 16;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
   hexPath(ctx, cx, cy, s);
   const g = ctx.createLinearGradient(cx, cy - s, cx, cy + s);
-  g.addColorStop(0, hover ? '#2e2009' : QZ.fill);
-  g.addColorStop(1, '#120d05');
+  g.addColorStop(0, disabled
+    ? (down ? '#261d10' : '#1d1a16')
+    : (hover ? '#2e2009' : QZ.fill));
+  g.addColorStop(1, disabled ? '#0e0c09' : '#120d05');
   ctx.fillStyle = g;
   ctx.fill();
   ctx.lineWidth = hover ? 2.6 : 1.6;
-  ctx.strokeStyle = QZ.stroke;
-  ctx.shadowColor = QZ.stroke;
-  ctx.shadowBlur = hover ? 20 : 9;
+  ctx.strokeStyle = disabled
+    ? withAlpha(down ? '#d09a3a' : QZ.stroke, 0.35)
+    : QZ.stroke;
+  ctx.shadowColor = disabled ? 'transparent' : QZ.stroke;
+  ctx.shadowBlur = disabled ? 0 : (hover ? 20 : 9);
   ctx.stroke();
   ctx.shadowBlur = 0;
 
@@ -2535,16 +2589,27 @@ export function drawQueenzeeNode(ctx, cx, cy, size, { hover = false, logo = null
     ctx.beginPath();
     ctx.arc(cx, logoCy, logoR, 0, Math.PI * 2);
     ctx.lineWidth = 1.4;
-    ctx.strokeStyle = withAlpha(QZ.stroke, hover ? 0.95 : 0.7);
+    ctx.strokeStyle = disabled
+      ? withAlpha(QZ.stroke, 0.35)
+      : withAlpha(QZ.stroke, hover ? 0.95 : 0.7);
     ctx.stroke();
   } else {
-    ctx.fillStyle = QZ.text;
+    ctx.fillStyle = disabled ? withAlpha(QZ.text, 0.5) : QZ.text;
     ctx.font = `600 ${Math.max(9, size * 0.16)}px 'Segoe UI', sans-serif`;
     ctx.fillText('⌂', cx, logoCy);
   }
-  ctx.fillStyle = QZ.text;
+  ctx.fillStyle = disabled ? withAlpha(QZ.text, 0.65) : QZ.text;
   ctx.font = `700 ${Math.max(7, size * 0.115)}px 'Segoe UI', sans-serif`;
   ctx.fillText('QUEENZEE', cx, cy + size * 0.18);
+
+  // the TERMINAL-state tag: explicit "no terminal" / "server down" so a missing or dead prod
+  // server is visible BEFORE the click, never a silent dead click. 'down' keeps the amber tint
+  // (a real fault to surface — the bridge will say "not running"), 'none' is genuinely disabled.
+  if (terminal !== 'ready') {
+    ctx.font = `600 ${Math.max(6.5, size * 0.08)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = down ? withAlpha('#e8b34b', 0.95) : withAlpha(COL.muted, 0.9);
+    ctx.fillText(down ? 'server down' : 'no terminal', cx, cy + size * 0.38);
+  }
 
   // the "▚ logs" button — the SAME shape as a flower action button so a human who knows one
   // recognises the other. Returns its rect for hit-testing.

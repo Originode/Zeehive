@@ -62,8 +62,9 @@ ok(/\\x1b\[2m/.test(receipt), 'printed dim, so a receipt is never mistaken for s
 
 console.log('\n── the console hands the terminal the xell it needs ──');
 ok((app.match(/<ZeeTerminal /g) || []).length === (app.match(/xellId=\{/g) || []).length
-   && /xellId=\{termXell\.id\}/.test(app) && /xellId=\{x\.id\}/.test(app),
-   'both ZeeTerminal call sites (the flower and the card) pass xellId — otherwise the button is dark');
+   && /xellId=\{termXell\.id\}/.test(app),
+   'every ZeeTerminal call site passes xellId — otherwise the 💬 talk button is dark '
+   + '(the xell CARD that used to carry a second call site was deleted, TKT-29-3AB6)');
 
 console.log('\n── the stylesheet backs the two states ──');
 ok(/\.term-x\.talk\b/.test(css), '.term-x.talk is styled as a labelled button, not a bare glyph');

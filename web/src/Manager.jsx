@@ -79,13 +79,16 @@ export function DoneSuggestionCard({ req, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const target = req.live_target_slug || req.target_slug || 'that xell';
-  // A PREVIOUS approval the queenzee could not carry out (managers.js refuseApproval): the card came
-  // back to pending carrying its reason, so show the reason on it. Without this the human re-clicks
-  // an approval that already failed once and is told nothing about why.
+  // A HELD approval: the human (or the auto-done policy) approved, the reap refused because the xell
+  // was mid-turn, and the decision is being held until the turn ends (managers.js refuseApproval,
+  // ticket #75). The reaper closes the xell automatically; "Close it anyway" is the deliberate force.
+  const held = req.status === 'approved-held' || req.result?.held === true;
+  // A PREVIOUS approval the queenzee could not carry out: the reason it stayed open, for both the
+  // pending (refused) and approved-held (held) shapes of this card.
   const refused = req.result?.refused ? req.result : null;
 
-  const decide = async (decision) => {
-    if (decision === 'approve') {
+  const decide = async (decision, force = false) => {
+    if (decision === 'approve' && !force) {
       // Typed, not clicked. Confirming marks the task done and tears the cxell down (its commits are
       // collected first) — there is no undo, and the agent on the other side may still have work
       // only on its branch. A manager proposing this does not make it true.
@@ -98,13 +101,29 @@ export function DoneSuggestionCard({ req, onDone }) {
         + 'A manager can only suggest this — you are the one deciding.\n\nType DONE to confirm.',
         { okLabel: 'Mark done', variant: 'danger', placeholder: 'DONE' });
       if (String(typed || '').trim().toUpperCase() !== 'DONE') return;
+    } else if (decision === 'approve' && force) {
+      // FORCE is the deliberate "close it anyway": the xell is mid-turn (or the reap is otherwise
+      // blocked), and closing it KILLS the live agent and deletes its worktree. Typed, and stronger.
+      const typed = await showPrompt(
+        `CLOSE ${target} ANYWAY, on ${req.live_manager_slug || req.manager_slug || 'a manager'}'s suggestion?\n\n`
+        + (held
+          ? `A previous approval is being HELD because the xell is mid-turn — it would close itself when the turn ends. `
+            + `"Close it anyway" tears it down NOW, killing the agent mid-task.\n\n`
+          : '')
+        + 'This REAPS the xell immediately — its cxell is torn down, its worktree and branch are removed '
+        + '(commits are collected first). Anything it has NOT landed lives only on its branch.\n\n'
+        + 'Type CLOSE to force it.',
+        { okLabel: 'Close it anyway', variant: 'danger', placeholder: 'CLOSE' });
+      if (String(typed || '').trim().toUpperCase() !== 'CLOSE') return;
     }
     setBusy(true); setErr(null);
     try {
-      const r = await decideDoneSuggestion(req.id, decision);
-      // REFUSED is not decided: the server put the suggestion back to pending with its reason, so the
-      // card is still here — say why, rather than letting a refusal read as a successful close.
-      if (r?.refused || r?.status === 'failed') {
+      const r = await decideDoneSuggestion(req.id, decision, 'human@console', force);
+      // REFUSED is not decided: the server held the suggestion (or put it back to pending) with its
+      // reason, so the card is still here — say why, rather than letting a refusal read as a close.
+      // A HELD refusal (r.held) is not an error to flash: the decision was recorded as approved-held
+      // and onDone() re-renders the card as "waiting for the turn to end".
+      if ((r?.refused && !r?.held) || r?.status === 'failed') {
         setErr(r.error || r.result?.error || r.result?.reap?.error || 'the queenzee could not close that xell');
       }
       onDone?.();
@@ -131,24 +150,41 @@ export function DoneSuggestionCard({ req, onDone }) {
         {req.target_status ? ` · currently ${req.target_status}` : ''}
       </div>
       {req.reason && <div className="prod-ask-reason">“{req.reason}”</div>}
-      {refused && (
+      {refused && !held && (
         <div className="land-err">
           ⚠ approved {ago(refused.at)} by {refused.by || 'a human'} — <b>not closed</b>: {refused.error}
         </div>
       )}
+      {held && (
+        <div className="land-err">
+          <b>Approved — waiting for the turn to end.</b>{' '}
+          {refused ? `${refused.error} ` : ''}
+          The xell will close automatically the moment it does; you can also close it now.
+        </div>
+      )}
       <div className="prod-ask-note">
-        Approving marks the task done and reaps the xell (commits collected first). Check its diff
-        before you do: unlanded commits live only on its branch. Reject leaves it working, and its
-        manager is told.
+        {held
+          ? 'The decision is already made and the reaper is applying it. "Close it anyway" tears the xell down NOW, mid-turn, and is a deliberate act.'
+          : 'Approving marks the task done and reaps the xell (commits collected first). Check its diff '
+            + 'before you do: unlanded commits live only on its branch. Reject leaves it working, and its '
+            + 'manager is told.'}
       </div>
       {err && <div className="land-err">{err}</div>}
       <div className="land-actions">
         <button className="land-reject" disabled={busy} onClick={dismiss} title="Hide this suggestion without deciding">Dismiss</button>
-        <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>
-        <button className="land-approve" disabled={busy} onClick={() => decide('approve')}
-                title="Mark this xell done and tear it down">
-          {busy ? '…' : 'Mark done'}
-        </button>
+        {!held && <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>}
+        {held && (
+          <button className="land-approve land-force" disabled={busy} onClick={() => decide('approve', true)}
+                  title="Tear the xell down NOW, even though its turn is still in flight">
+            {busy ? '…' : 'Close it anyway'}
+          </button>
+        )}
+        {!held && (
+          <button className="land-approve" disabled={busy} onClick={() => decide('approve')}
+                  title="Mark this xell done and tear it down">
+            {busy ? '…' : 'Mark done'}
+          </button>
+        )}
       </div>
     </div>
   );

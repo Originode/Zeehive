@@ -9,10 +9,12 @@
 //      it. The dots are now rows — hovering one lights that worker's hexagon, its wire and its commit
 //      dot (the machinery from #24/#25, reached from here), and clicking one opens its own bloom. The
 //      dots were also a COLOUR-ONLY signal, so a hovered one now says the worker's NAME.
-//   2. THE DOM CARD/CHIP ROWS — the fleet's only non-canvas view. A list is a different projection: it
-//      has no focus, it is scanned, and "whose crew?" is asked of every row at once. So the cue there
-//      is a PERSISTENT WORD (⬡ crew of wise-cove / ⬢ 3 crew), not a transient highlight — which also
-//      means it can never be mistaken for the row being selected.
+//   2. THE DOM CHIP ROW — the "waiting on you" bar, the fleet's only non-canvas view. A list is a
+//      different projection: it has no focus, it is scanned, and "whose crew?" is asked of every row
+//      at once. So the cue there is a PERSISTENT WORD (⬡ crew of wise-cove / ⬢ 3 crew), not a
+//      transient highlight — which also means it can never be mistaken for the row being selected.
+//      (The xell CARD that #28 also cued was deleted with the rest of XellCard — TKT-29-3AB6 — so the
+//      chip on the bar is the one DOM surface left, and that is all this test claims.)
 //
 // Same rule as everywhere: hive/crew.js, live crew only, no new grouping. Exercised the way each
 // surface is drawn — the canvas facet PAINTED into a recording 2D context, the chip RENDERED with
@@ -191,8 +193,8 @@ ok(!/relationTag|isManagerXell/.test(src.app.split('function App()')[1] || src.a
 ok(/const crewOfFleet = crewLinks\(xells\)/.test(src.app),
    'App computes the grouping ONCE per render and hands it down (not once per row)');
 ok(/links=\{crewOfFleet\}/.test(src.app), 'to the "waiting on you" chips');
-ok(/<CrewChip x=\{x\} links=\{links\} \/>/.test(src.app) && /<CrewChip x=\{w\.x\} links=\{links\} \/>/.test(src.app),
-   'and BOTH DOM surfaces render the same component');
+ok(/<CrewChip x=\{w\.x\} links=\{links\} \/>/.test(src.app),
+   'the waiting-on-you bar renders the same chip — the xell card that used to carry one was deleted (TKT-29-3AB6)');
 ok(/\.crewchip \{/.test(src.css) && /border-left: 2px dashed/.test(src.css),
    'the chip is styled in the machine/env chips’ quiet language, with the relation dash on its edge');
 ok(/\.crewchip\[data-crew="manager"\] \{ border-left-style: solid/.test(src.css),

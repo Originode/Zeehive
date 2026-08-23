@@ -1,8 +1,8 @@
 import React, { useState, useCallback, useLayoutEffect, useEffect, useReducer } from 'react';
-import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells, assignLanes, offsetPolyline } from './hive/maze.js';
+import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells, sharedLaneDashes } from './hive/maze.js';
 import { crewLinks, relatedTo, focusIdOf, hexDim, REL_DASH_ATTR } from './hive/crew.js';
 
-const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
+const SHARED_DASH_LEN = 8;   // on-screen length of one colour's dash in a shared alternating-colour corridor
 
 // ── how a wire reads: focus / RELATED / receded / plain ───────────────────────
 // The honeycomb marks a manager's live crew (#24); this is the same mark one layer out. A crew
@@ -33,12 +33,28 @@ export function wireStyle({ hovered = false, related = null, dim = false, bloomD
 // One trace: the corridor path, its commit-dot end and its hexagon end. Exported so a test can render
 // the REAL element and read what it emitted (the SVG counterpart of painting into a recording 2D
 // context) instead of trusting the source to mean what it says.
+//
+// A trace may carry `segs` — the corridor path split into segments, each with its own dash treatment
+// (a shared corridor edge is dashed with the alternating-colour pattern; a solo edge is solid). With
+// `segs` present each segment is its own <path> so the SAME base path can be overlaid per colour with
+// a dash pattern covering only that colour's slots. Without `segs` (a plain single-path wire, as the
+// tests render) it draws exactly as it always did.
 export function Wire({ p, hovered = false, related = null, dim = false }) {
   const st = wireStyle({ hovered, related, dim, bloomDim: p.dim });
+  const segs = p.segs && p.segs.length ? p.segs : null;
   return (
     <g opacity={st.opacity} data-wire={p.id} data-rel={related || undefined}>
-      <path d={p.d} fill="none" stroke={p.color} strokeWidth={st.width} strokeDasharray={st.dash || undefined}
-            strokeLinejoin="round" strokeLinecap="round" />
+      {segs
+        ? segs.map((s, i) => (
+            <path key={i} d={s.d} fill="none" stroke={p.color} strokeWidth={st.width}
+                  strokeDasharray={s.dash || st.dash || undefined} strokeDashoffset={s.dashOffset || undefined}
+                  strokeLinejoin="round" strokeLinecap="round" />
+          ))
+        : (
+            <path d={p.d} fill="none" stroke={p.color} strokeWidth={st.width}
+                  strokeDasharray={st.dash || undefined}
+                  strokeLinejoin="round" strokeLinecap="round" />
+          )}
       <circle cx={p.x1} cy={p.y1} r={hovered ? 4 : 3} fill={p.color} />
       <rect x={p.x2 - 3.5} y={p.y2 - 3.5} width="7" height="7" rx="1.5"
             fill={p.color} stroke="var(--bg)" strokeWidth="1.5" />
@@ -165,8 +181,12 @@ export default function Connectors({ timeline, xells = [], layoutRef, version, h
       routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path, harnessAt, harnessCenter });
     }
 
-    // pass 2: where wires share a corridor, split them into parallel channels
-    const lanes = assignLanes(routed.filter((r) => r.pts && r.pts.length > 1), LANE_PITCH);
+    // pass 2: shared corridors collapse to ONE dashed line alternating the traces' colours. No
+    // parallel channels — the old assignLanes/offsetPolyline lane-split is gone. Each lattice edge
+    // is shared by whoever traverses it; a shared edge is drawn once per sharing trace, in that
+    // trace's own colour, with a dash pattern covering only its slot (N traces → dasharray
+    // [len,(N-1)*len], dashoffset i*len). A solo edge stays solid in its trace's colour.
+    const laneDashes = sharedLaneDashes(routed.filter((r) => r.pts && r.pts.length > 1), SHARED_DASH_LEN);
 
     const items = [];
     for (const r of routed) {
@@ -176,24 +196,51 @@ export default function Connectors({ timeline, xells = [], layoutRef, version, h
       // r.pts was already spliced through its harness cell in pass 1, so it threads the honeycomb
       // like the rest instead of a straight diagonal.
       if (r.pts && r.pts.length > 1) {
-        const off = lanes.get(r.id) || r.pts.slice(1).map(() => [0, 0]);
-        const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
-        // pin the shared through-vertex to the harness badge CENTRE so every consumer's trace visibly
-        // runs THROUGH the hexagon (and parallel consumers converge there — reading as one junction).
+        // the corridor path on the SINGLE centreline (no lane offset). Pin the shared through-vertex
+        // to the harness badge CENTRE so every consumer's trace visibly runs THROUGH the hexagon.
         // Interior vertices only — never move the entry lead-in or the xell endpoint.
+        const maze = r.pts.map((p) => [p.x, p.y]);
         if (r.harnessAt != null && r.harnessCenter && r.harnessAt > 0 && r.harnessAt < maze.length - 1) {
           maze[r.harnessAt] = r.harnessCenter;
         }
-        const e0 = maze[0];                                // offset entry point
+        const e0 = maze[0];                                // entry point
         const corner = portrait ? [dd.dx, e0[1]] : [e0[0], dd.dy];  // ⟂ off the spine, then 90° turn
         const poly = [[dd.dx, dd.dy], corner, ...maze];
-        d = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
+        // per-segment dash treatment: the lead-in (dot → corner → pts[0]) is solo/solid; each lattice
+        // edge inherits the shared-corridor dash (or stays solid). Consecutive segments with the SAME
+        // treatment merge into one <path> so the alternating dashes flow continuously.
+        const dashes = laneDashes.get(r.id) || [];
+        const segs = [];
+        let cur = null;
+        const flush = () => {
+          if (cur) {
+            segs.push({ d: 'M ' + cur.pts.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L '),
+              dash: cur.dash, dashOffset: cur.offset });
+            cur = null;
+          }
+        };
+        for (let i = 0; i < poly.length - 1; i++) {
+          let dash = null, offset = 0;
+          if (i >= 2) {
+            const s = dashes[i - 2];
+            if (s) { dash = s.dash; offset = s.offset; }
+          }
+          if (!cur || cur.dash !== dash || cur.offset !== offset) {
+            flush();
+            cur = { pts: [poly[i], poly[i + 1]], dash, offset };
+          } else {
+            cur.pts.push(poly[i + 1]);
+          }
+        }
+        flush();
         ex = maze[maze.length - 1][0]; ey = maze[maze.length - 1][1];
+        items.push({ id: r.id, base: dd.base, color: r.color, segs, x1: dd.dx, y1: dd.dy, x2: ex, y2: ey,
+          dim: expandedId && expandedId !== r.id });
       } else {
         d = `M ${f1(dd.dx)} ${f1(dd.dy)} L ${f1(ex)} ${f1(ey)}`;   // single-vertex / disconnected
+        items.push({ id: r.id, base: dd.base, color: r.color, d, x1: dd.dx, y1: dd.dy, x2: ex, y2: ey,
+          dim: expandedId && expandedId !== r.id });
       }
-      items.push({ id: r.id, base: dd.base, color: r.color, d, x1: dd.dx, y1: dd.dy, x2: ex, y2: ey,
-        dim: expandedId && expandedId !== r.id });
     }
     setPaths(items);
   }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(','), showHarness]);   // eslint-disable-line react-hooks/exhaustive-deps

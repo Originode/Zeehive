@@ -215,7 +215,7 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])
     .then((x) => x && broadcast('xell', x));
   // the honeycomb's queenzee→xell line: the queenzee is reaping/decommissioning this xell
-  activity('q2x', xellId, 'reap');
+  activity('q2x', xellId, 'reap', xell.project_id);
 
   // A db-clone xell owns a DATABASE inside the shared dev postgres (its db_instance row) — drop
   // it, or every retired schema-work xell leaks a full copy of dev into the container. Best-

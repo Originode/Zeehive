@@ -281,12 +281,20 @@ export async function xellPatch(xellId, { kind = 'source' } = {}) {
     if (p) {
       return { ...meta, ...payload({
         source: 'cxell',
-        base_ref: want === 'own' ? p.head || 'HEAD' : x.head_commit,
+        // p.base is the diff base actually used inside the cxell — the FORK POINT off the source
+        // (merge-base), not the recorded head_commit, which after a sync/land IS the merged HEAD and
+        // would read as the zee's own-commit diff. When the fork point could not be resolved the
+        // shell emits BASE:unresolved; report that truthfully instead of falling back to a HEAD sha
+        // that would read as a real fork point (the DiffViewer shows base only as a label, so a
+        // human sees "unresolved" and knows the read is not of a fork point).
+        base_ref: want === 'own' ? p.head || 'HEAD' : (p.base || x.head_commit),
         head_ref: p.head || null,
         label: `${x.slug} · in its cxell${want === 'own' ? ' · uncommitted' : ''}`,
         text: p.text, capped: p.capped,
         note: want === 'source'
-          ? 'read from inside the cxell — this is the zee\'s work, committed and not, since it was spun up'
+          ? (p.base === 'unresolved'
+              ? 'the fork point could not be resolved in this cxell (the recorded base was likely rewritten away) — this read is the uncommitted delta only'
+              : 'read from inside the cxell — the zee\'s work, committed and not, over its fork point off the source')
           : 'read from inside the cxell — work not yet checkpointed',
       }) };
     }

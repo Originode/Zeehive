@@ -63,15 +63,18 @@ and the web palette cannot drift:
   | from | legal next |
   |---|---|
   | any non-terminal (`queued` `assigned` `working` `blocked` `review` `shipping`) | every other non-terminal, plus `done`, plus `cancelled` |
-  | `done` | `queued`, `cancelled` |
+  | `done` | `queued`, `review`, `cancelled` |
   | `cancelled` | `queued` |
 
-  Anything may be **cancelled**. A **terminal** item reopens through `queued` rather than dropping
-  back into the middle of the flow, so "how did this reach review?" always has an answer in the
-  event log. Otherwise any non-terminal status may move to any other, because work really does go
-  working → blocked → working → review → blocked, and a state machine that pretends otherwise only
-  teaches people to lie to it. `canTransition(x, x)` is **true** — a no-op write is not illegal
-  (and `updateWorkItem` skips it entirely rather than writing a pointless event).
+  Anything may be **cancelled**. A **terminal** item reopens through `queued` — except `done`, which
+  may also go to `review`: a landed card that needs an adversarial read ("landed, under review",
+  ticket #56) is a legal place for the board to be, and it is the ONLY terminal→non-terminal edge on
+  purpose. Reopening starts the flow again rather than dropping the item back into the middle of it,
+  so "how did this reach review?" always has an answer in the event log. Otherwise any non-terminal
+  status may move to any other, because work really does go working → blocked → working → review →
+  blocked, and a state machine that pretends otherwise only teaches people to lie to it.
+  `canTransition(x, x)` is **true** — a no-op write is not illegal (and `updateWorkItem` skips it
+  entirely rather than writing a pointless event).
 
   **Read `next[]` from `GET /api/work-statuses`, never from this prose.** The endpoint is generated
   from the same table the server validates against; a sentence in a doc is not.
