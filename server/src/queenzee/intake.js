@@ -1879,7 +1879,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // replaces it). The token stays the provider key (adapter.env's token) — unchanged credential
     // model, the identity travels in the URL.
     const gwEnv = await gatewayEnv({ xellToken, provider: adapter.provider });
-    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
+    // Log HOST:PORT only — the full env value carries the xell identity token in its PATH
+    // (/x/<token>/<provider>), and no token ever goes in a logline. `new URL().host` is host:port.
+    const gwBase = gwEnv.ANTHROPIC_BASE_URL
+      ? (() => { try { return new URL(gwEnv.ANTHROPIC_BASE_URL).host; } catch { return '(unknown host)'; } })()
+      : '(off)';
+    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwBase})`);
     await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
                          agentEnv: { ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
