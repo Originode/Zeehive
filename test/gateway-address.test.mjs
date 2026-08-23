@@ -129,6 +129,42 @@ try {
   eq(fourEnv.ANTHROPIC_BASE_URL, `http://127.0.0.1:${Q}/x/tok/claude`, 'a 404-answering base is minted for the cage');
   await close(four.server);
 
+  console.log('\n── 8. SINGLE-FLIGHT — N concurrent cold-cache dispatches fire ONE probe, not N ──');
+  // A cold cache hit by a fleet of spawns at once used to fire one probe per dispatch — N HTTP
+  // requests against an already-suspect port (TKT-179). The probe now single-flights: the first
+  // caller starts it, the rest await the same in-flight promise. The mock DELAYS its answer so the
+  // window is real (without a delay the first fetch is still in flight when the second caller
+  // checks, but this makes the overlap deterministic).
+  _resetGatewayProbeCache();
+  const slowHits = { count: 0 };
+  const slow = http.createServer((req, res) => {
+    if (req.url === '/api/hello') {
+      slowHits.count++;
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true,"service":"zeehive-llm-gateway"}');
+      }, 100);
+    } else {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":"not the gateway"}');
+    }
+  });
+  servers.push(slow);
+  const S = await new Promise((resolve) => slow.listen(0, '127.0.0.1', () => resolve(slow.address().port)));
+  process.env.CXELL_API_BASE = `http://127.0.0.1:${S}`;
+  process.env.CXELL_API_FALLBACK = `http://127.0.0.1:4700`;
+  process.env.GATEWAY_PORT = String(S);
+  const verdicts = await Promise.all([
+    probeGatewayBase(`http://127.0.0.1:${S}`),
+    probeGatewayBase(`http://127.0.0.1:${S}`),
+    probeGatewayBase(`http://127.0.0.1:${S}`),
+    probeGatewayBase(`http://127.0.0.1:${S}`),
+    probeGatewayBase(`http://127.0.0.1:${S}`),
+  ]);
+  ok(verdicts.every((v) => v === true), 'all five concurrent callers get the SAME true verdict');
+  eq(slowHits.count, 1, 'one HTTP probe hit for five concurrent callers (single-flight)');
+  await close(slow);
+
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
   for (const s of servers) { try { s.close(); } catch { /* already closed */ } }

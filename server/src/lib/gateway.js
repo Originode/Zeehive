@@ -1121,12 +1121,18 @@ const PROBE_TIMEOUT_MS = Number(process.env.GATEWAY_PROBE_TIMEOUT_MS || 2000);
 const PROBE_TTL_OK_MS = Number(process.env.GATEWAY_PROBE_TTL_OK_MS || 30000);
 const PROBE_TTL_FAIL_MS = Number(process.env.GATEWAY_PROBE_TTL_FAIL_MS || 3000);
 const probeCache = new Map();   // baseUrl → { ok, at }
+// Single-flight: a COLD cache (or one whose TTL just expired) can be hit by N concurrent dispatches
+// at once — a fleet of spawns arriving together all fired their own probe, N requests against an
+// already-suspect port (TKT-179). The first caller starts the probe; the rest await the same
+// in-flight promise instead of each firing one. The slot is deleted when the probe settles.
+const probeInFlight = new Map();   // baseUrl → Promise<boolean>
 
 // TEST-ONLY: clear the probe verdict cache (+ the once-only "no second name" warning). The
 // standalone choose/refuse test drives the same module across scenarios (primary → fallback →
 // both dead) and needs one scenario's cached verdict to not leak into the next.
 export function _resetGatewayProbeCache() {
   probeCache.clear();
+  probeInFlight.clear();
   loggedEqualFallback = false;
 }
 
@@ -1135,20 +1141,27 @@ export async function probeGatewayBase(baseUrl) {
   const cached = probeCache.get(baseUrl);
   const ttl = cached ? (cached.ok ? PROBE_TTL_OK_MS : PROBE_TTL_FAIL_MS) : 0;
   if (cached && Date.now() - cached.at < ttl) return cached.ok;
-  let verdict = false;
-  try {
-    const res = await fetch(`${baseUrl}/api/hello`, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    // ANY HTTP answer (any status) is proof the port resolves and a server listens — a 404 from
-    // the compose-name /api/hello is reachable (measured). Only the connection-failure family
-    // (refused / ENOTFOUND / timeout) fails the probe.
-    verdict = true;
-  } catch { /* connection refused / timeout / DNS — verdict stays false */ }
-  probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
-  return verdict;
+  const inFlight = probeInFlight.get(baseUrl);
+  if (inFlight) return inFlight;
+  const started = (async () => {
+    let verdict = false;
+    try {
+      const res = await fetch(`${baseUrl}/api/hello`, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      });
+      // ANY HTTP answer (any status) is proof the port resolves and a server listens — a 404 from
+      // the compose-name /api/hello is reachable (measured). Only the connection-failure family
+      // (refused / ENOTFOUND / timeout) fails the probe.
+      verdict = true;
+    } catch { /* connection refused / timeout / DNS — verdict stays false */ }
+    probeCache.set(baseUrl, { ok: verdict, at: Date.now() });
+    return verdict;
+  })();
+  probeInFlight.set(baseUrl, started);
+  started.finally(() => probeInFlight.delete(baseUrl));
+  return started;
 }
 
 // ── the gateway base-url CHOICE ───────────────────────────────────────────────────────────────
