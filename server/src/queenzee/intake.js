@@ -2253,7 +2253,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
                                           source: 'turn' });
       await endTurn(turn?.id, { status: 'errored', burn: null,
                                 stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal
-                                  ? filed.message : String(err.message).slice(0, 200) });
+                                  ? filed.message : scrubSecrets(String(err.message)).slice(0, 200) });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,
