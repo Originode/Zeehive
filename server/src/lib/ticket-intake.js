@@ -36,6 +36,7 @@ import { createTicket, updateTicket, addComment, getTicket, listTickets, resolve
 import { addAttachment, addAttachments, listAttachments, attachmentLimits } from './ticket-attachments.js';
 import { bad, notFound, refuse } from './work-items.js';
 import { TICKET_KINDS, workLabel } from './work-status.js';
+import { config } from '../config.js';
 
 // The statuses an external reporter may set on its own ticket (rule 3). `queued` reopens a ticket
 // the fleet closed; `cancelled` withdraws one ("the customer sorted it themselves").
@@ -127,7 +128,14 @@ export async function externalCreateTicket(auth, body = {}) {
   if (externalRef) {
     const existing = await one(
       `SELECT id FROM ticket WHERE project_id=$1 AND external_ref=$2`, [auth.project.id, externalRef]);
-    if (existing) return { ...(await externalGetTicket(auth, existing.id)), deduped: true };
+    if (existing) {
+      return {
+        ...(await externalGetTicket(auth, existing.id)),
+        deduped: true,
+        // Observable: a retry did not wake anybody. Same shape as a fresh create — never silent.
+        notified: { managers: [], reason: 'deduped: already filed' },
+      };
+    }
   }
 
   if (input.kind && !TICKET_KINDS.includes(input.kind)) {
@@ -159,7 +167,13 @@ export async function externalCreateTicket(auth, body = {}) {
     if (err?.code === '23505' && externalRef) {
       const winner = await one(`SELECT id FROM ticket WHERE project_id=$1 AND external_ref=$2`,
                                [auth.project.id, externalRef]);
-      if (winner) return { ...(await externalGetTicket(auth, winner.id)), deduped: true };
+      if (winner) {
+        return {
+          ...(await externalGetTicket(auth, winner.id)),
+          deduped: true,
+          notified: { managers: [], reason: 'deduped: already filed' },
+        };
+      }
     }
     throw err;
   }
@@ -174,12 +188,16 @@ export async function externalCreateTicket(auth, body = {}) {
   // already hand one to a manager; an external POST used to insert the row and return, so the
   // fleet never learned it existed. Same door, same best-effort rule as selfTicketCreate: a dead
   // inbox must not fail the filing, and a deduped retry (returned above) must not re-notify.
-  await notifyProjectManagers(ticket.id, `api:${auth.key.label}`);
+  // `notified` is the observability contract: the caller must be able to tell whether anybody
+  // woke, or why not — a silent 201 is the same defect as a helpdesk sweep that reports healthy
+  // while filing into nobody.
+  const notified = await notifyProjectManagers(ticket.id, `api:${auth.key.label}`);
 
   const view = await externalGetTicket(auth, ticket.id);
   return {
     ...view,
     deduped: false,
+    notified,
     attachments_stored: stored.length,
     attachments_rejected: rejected.length ? rejected : undefined,
     note: externalRef ? undefined
@@ -190,16 +208,22 @@ export async function externalCreateTicket(auth, body = {}) {
 
 // Hand the freshly filed ticket to every deployed manager of its project. Reuses
 // ticketManagers + notifyManagerOfTicket (inbox always; typed into a live cxell when one exists).
-// Per-manager failures are swallowed — the ticket itself is the durable fact.
+// Per-manager failures are swallowed — the ticket itself is the durable fact. Returns the shape
+// the create answer surfaces as `notified`: slugs actually reached, or a reason when none were.
 async function notifyProjectManagers(ticketId, by) {
+  const reached = [];
   try {
     const { managers = [] } = (await ticketManagers(ticketId)) || {};
     for (const m of managers) {
       try {
         await notifyManagerOfTicket(ticketId, { xellId: m.xell_id, by });
+        reached.push(m.slug);
       } catch { /* that one manager is gone/asleep — the ticket itself stands */ }
     }
   } catch { /* the picker failing must not fail the filing either */ }
+  return reached.length
+    ? { managers: reached, reason: null }
+    : { managers: [], reason: 'no live manager in this project' };
 }
 
 export async function externalListTickets(auth, { status, kind, q: search, external_ref } = {}) {
@@ -321,9 +345,29 @@ export async function externalAttachments(auth, ref) {
 // most common integration mistake is a key pointed at the wrong project) and WHAT the API accepts,
 // generated from the same constants the server validates against. A client that reads its
 // vocabulary from here cannot drift from the server; one that reads it from a doc will.
+//
+// `base_url` is the address a DEPLOYED project should send these requests to — config.extApiBase,
+// the one operator-settable answer (EXT_API_BASE, else derived from DEV_HOST_IP). It is null when
+// no externally-reachable address is configured, and `base_url_note` says what null means so an
+// integrator is never left guessing. This is the self-describing fix for TKT-184: the old default
+// (cxellApiBase → http://host.docker.internal:4700) meant "the docker host I am running on", which
+// for a deployed project is ITS OWN host, where no queenzee listens. Surfaced in BOTH whoami and
+// the keyless /limits so a caller can resolve the address before it holds a key — never a silent
+// host.docker.internal default.
+export function externalReachability() {
+  return {
+    base_url: config.extApiBase,
+    base_url_note: config.extApiBase
+      ? 'The base URL a DEPLOYED project sends /api/ext/v1 requests to. Set on the server via EXT_API_BASE (or derived from DEV_HOST_IP).'
+      : 'No externally-reachable address is configured for this API (EXT_API_BASE is unset on the server). '
+        + 'An integration that cannot reach this server must run on the queenzee host, or the operator must set EXT_API_BASE.',
+  };
+}
+
 export function externalMeta(auth) {
   return {
     ok: true,
+    ...externalReachability(),
     project: { id: auth.project.id, name: auth.project.name },
     key: { label: auth.key.label, hint: auth.key.hint, scopes: auth.key.scopes },
     ticket_kinds: TICKET_KINDS,

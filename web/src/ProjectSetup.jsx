@@ -20,6 +20,7 @@ import {
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
   getWireguard, mintWireguardPeer, setWireguardEndpoint,
   getProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
+  getExtV1Info,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -2623,8 +2624,10 @@ function ApiKeysSection({ project, run, busy }) {
   const [label, setLabel] = useState('');
   const [minted, setMinted] = useState(null);   // the plaintext, shown once
   const [copied, setCopied] = useState(false);
+  const [ext, setExt] = useState(null);          // { base_url, base_url_note } — the address a deployed project POSTs to
   const load = useCallback(() => getProjectApiKeys(project.id).then(setKeys).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { getExtV1Info().then(setExt).catch(() => {}); }, []);
 
   const mint = () => run(async () => {
     const out = await createProjectApiKey(project.id, label.trim());
@@ -2657,6 +2660,18 @@ function ApiKeysSection({ project, run, busy }) {
         A key names one project and nothing else: the caller never sends a project id, so it cannot
         reach another board. Tickets filed through it are ordinary tickets — break them down and
         assign zees exactly as usual.
+      </div>
+
+      <div className="pc" style={{ marginBottom: 8 }}>
+        <b>The address a deployed project uses:</b>{' '}
+        {ext?.base_url ? (
+          <span className="mono">{ext.base_url}</span>
+        ) : (
+          <span className="gate g-warn">not configured — no externally-reachable address</span>
+        )}{' '}
+        <button type="button" className="ghost" onClick={() => navigator.clipboard?.writeText(ext?.base_url || '')}
+                title="Copy the base URL">⧉ copy</button>
+        {ext?.base_url_note ? <div className="pc">{ext.base_url_note}</div> : null}
       </div>
 
       {minted && (

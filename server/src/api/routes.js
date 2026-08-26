@@ -110,7 +110,8 @@ import { listProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deletePro
 import { listAttachments, getAttachment, addAttachment, deleteAttachment,
          attachmentLimits } from '../lib/ticket-attachments.js';
 import { externalCreateTicket, externalListTickets, externalGetTicket, externalUpdateTicket,
-         externalComment, externalAttach, externalAttachments, externalMeta } from '../lib/ticket-intake.js';
+         externalComment, externalAttach, externalAttachments, externalMeta,
+         externalReachability } from '../lib/ticket-intake.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
 import { xourceState, cleanXourceNow, commitXourceStaged, commitXourceDirty, stashXource, listXourceCleanRequests,
@@ -2916,7 +2917,14 @@ router.get('/ext/v1/tickets/:ref/attachments/:attachmentId', async (req, res) =>
 
 // The attachment limits, without a key — the one thing an integrator needs BEFORE it has one, so a
 // build script can check a file size without holding a credential. No project, no ticket, no data.
-router.get('/ext/v1/limits', (_req, res) => res.json({ ok: true, attachments: attachmentLimits() }));
+// It also carries the externally-reachable base_url (config.extApiBase), so a build script can
+// resolve the address it should POST to without holding a key either — the reachability probe
+// named in docs/ticketing-api.md.
+router.get('/ext/v1/limits', (_req, res) => res.json({
+  ok: true,
+  ...externalReachability(),
+  attachments: attachmentLimits(),
+}));
 
 // ── reflections (the ledger) ─────────────────────────────────────────────────
 //
