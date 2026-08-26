@@ -20,8 +20,17 @@
 //      B4 read-back: the second worker reads the transcript and sees the founder's post; the
 //         read bumps last_read_at (the receipt), so the unread count goes to 0.
 //      B5 list: the founder sees the room with the member count and the unread hint.
-//      B6 scoping: a xell of ANOTHER project cannot attend by the code (project-scoped, DR-2).
+//      B6 scoping: a xell of ANOTHER project cannot attend by the code (project-scoped, DR-2)
+//         WHEN THERE IS NO INVITE — the default refusal sentence is unchanged.
 //      B7 attend-by-full-uuid: the code's full uuid also resolves the room.
+//
+//   C. CROSS-PROJECT INVITE (DR-5) — the widening by explicit consent:
+//      C1 founder invites project B → a zee of B attends, reads transcript, says; founder is in
+//         the delivery fan-out.
+//      C2 a zee of project C (not invited) still gets today's refusal (the assertion that matters).
+//      C3 a non-founder member cannot invite.
+//      C4 invite withdrawn → B can no longer attend or say; member row + transcript survive;
+//         inviting the room's own project is a no-op.
 //
 // The project is deleted in a finally, whatever happens (house rule: tests clean up what they
 // create). The sandbox is the sanctioned verification path — the assigned shared dev db refused
@@ -62,14 +71,16 @@ if (!url) {
 } else {
   console.log('\n── B. the room lifecycle against DATABASE_URL ──');
   const { q, one } = await import('../server/src/db/pool.js');
-  const { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } =
+  const { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor, inviteToMeet } =
     await import('../server/src/lib/a2a-meet.js');
 
   const tag = `a2am-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`;
   let projectId = null;
+  let projectBId = null;
+  let projectCId = null;
   try {
     const proj = await one(
-      `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'main') RETURNING id`,
+      `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'main') RETURNING id, name`,
       [`zt-${tag}`, `/tmp/${tag}`]);
     projectId = proj.id;
     const xource = await one(
@@ -135,10 +146,11 @@ if (!url) {
     eq(founderList[0].member_count, 2, 'B5: the member count is there');
     eq(founderList[0].message_count, 1, 'B5: the message count is there');
 
-    // B6. scoping — another project's xell cannot attend by the code (DR-2).
+    // B6. scoping — another project's xell cannot attend by the code with NO invite (DR-2 default).
     const otherProj = await one(
-      `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'main') RETURNING id`,
+      `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'main') RETURNING id, name`,
       [`zt-${tag}-other`, `/tmp/${tag}-other`]);
+    projectBId = otherProj.id;
     const otherXource = await one(
       `INSERT INTO xource (project_id, ref, head_commit) VALUES ($1,'main','deadbeef') RETURNING id`,
       [otherProj.id]);
@@ -148,7 +160,9 @@ if (!url) {
       [otherProj.id, otherXource.id, `${tag}-outsider`]);
     const cross = await attendMeet({ xell: outsider, code: created.code });
     ok(!cross.ok && /your project/i.test(cross.error || ''),
-       `B6: another project's zee cannot attend (${cross.error})`);
+       `B6: another project's zee cannot attend without invite (${cross.error})`);
+    ok(/project-scoped/i.test(cross.error || ''),
+       'B6: the refusal sentence still names project-scoping (byte-identical default)');
     const outsiderRows = await q(`SELECT * FROM a2a_meet_member WHERE meet_id=$1 AND xell_id=$2`, [roomId, outsider.id]);
     eq(outsiderRows.length, 0, 'B6: no membership row was written for the outsider');
 
@@ -156,8 +170,108 @@ if (!url) {
     const byUuid = await attendMeet({ xell: peer, code: roomId });
     ok(byUuid.ok && byUuid.meet_id === roomId, 'B7: a full uuid resolves the room');
 
-    console.log(`    (code=${created.code}, room=${roomId.slice(0, 8)}…, founder=${founder.slug}, peer=${peer.slug})`);
+    // ── C. CROSS-PROJECT INVITE (DR-5) ────────────────────────────────────────
+    console.log('\n── C. cross-project invite (DR-5) ──');
+
+    // C1. founder invites project B → guest attends, reads, says.
+    const invited = await inviteToMeet({ xell: founder, code: created.code, project: otherProj.name });
+    ok(invited.ok && invited.invited === true, `C1: founder invites project B (${otherProj.name})`);
+    eq(invited.project.id, otherProj.id, 'C1: invite targets project B');
+    const inviteRows = await q(`SELECT * FROM a2a_meet_invite WHERE meet_id=$1`, [roomId]);
+    eq(inviteRows.length, 1, 'C1: one invite row is the audit');
+    eq(inviteRows[0].project_id, otherProj.id, 'C1: …for project B');
+    eq(inviteRows[0].invited_by_xell_id, founder.id, 'C1: …by the founder');
+
+    const guestAttend = await attendMeet({ xell: outsider, code: created.code });
+    ok(guestAttend.ok && guestAttend.joined === true,
+       `C1: invited project's zee attends by code (${guestAttend.error || 'ok'})`);
+    const guestMember = await one(
+      `SELECT * FROM a2a_meet_member WHERE meet_id=$1 AND xell_id=$2`, [roomId, outsider.id]);
+    ok(!!guestMember, 'C1: guest member row exists (the audit)');
+
+    const guestTx = await transcriptFor(outsider, created.code);
+    ok(guestTx.ok && guestTx.messages.length >= 1, 'C1: guest reads the transcript');
+    eq(guestTx.messages[0].from, founder.slug, 'C1: …and sees the founder\'s earlier post');
+
+    const guestSaid = await sayToMeet({
+      xell: outsider, code: created.code, message: 'four questions from the other project',
+    });
+    ok(guestSaid.ok && guestSaid.posted === true, 'C1: guest posts to the room');
+    const guestMsg = await one(
+      `SELECT * FROM a2a_meet_message WHERE meet_id=$1 AND from_xell_id=$2`, [roomId, outsider.id]);
+    ok(!!guestMsg, 'C1: guest message row exists');
+    eq(guestMsg.project_id, projectId,
+       'C1: message.project_id is the ROOM\'s project (guest project does not leak onto the row)');
+    // Fan-out lists the other live members (founder + peer). Delivery may be dry-run in simulate
+    // mode; what we assert is that the attempt set includes the founder — the guest gained the
+    // room and only the room.
+    ok(Array.isArray(guestSaid.deliveries), 'C1: say returns a deliveries list (fan-out ran)');
+    ok(guestSaid.deliveries.some((d) => d.slug === founder.slug),
+       'C1: founder is in the fan-out (notified of the guest post)');
+
+    // C2. project C (not invited) still gets today's refusal — THE assertion that matters.
+    const projC = await one(
+      `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'main') RETURNING id, name`,
+      [`zt-${tag}-C`, `/tmp/${tag}-C`]);
+    projectCId = projC.id;
+    const xourceC = await one(
+      `INSERT INTO xource (project_id, ref, head_commit) VALUES ($1,'main','deadbeef') RETURNING id`,
+      [projC.id]);
+    const zeeC = await one(
+      `INSERT INTO xell (project_id, xource_id, slug, branch, status, zee_type, head_commit)
+         VALUES ($1,$2,$3,'spinoff/t','claimed','worker','abcdef1234567890') RETURNING *`,
+      [projC.id, xourceC.id, `${tag}-C`]);
+    const cRefuse = await attendMeet({ xell: zeeC, code: created.code });
+    ok(!cRefuse.ok && /your project/i.test(cRefuse.error || ''),
+       `C2: non-invited project C is refused (${cRefuse.error})`);
+    ok(/project-scoped/i.test(cRefuse.error || ''),
+       'C2: refusal sentence is unchanged (widening by consent, never a relaxation)');
+    const cMembers = await q(
+      `SELECT * FROM a2a_meet_member WHERE meet_id=$1 AND xell_id=$2`, [roomId, zeeC.id]);
+    eq(cMembers.length, 0, 'C2: no membership row for the non-invited project');
+
+    // C3. a non-founder member cannot invite.
+    const peerInvite = await inviteToMeet({ xell: peer, code: created.code, project: projC.name });
+    ok(!peerInvite.ok && /founder/i.test(peerInvite.error || ''),
+       `C3: non-founder cannot invite (${peerInvite.error})`);
+    const guestInvite = await inviteToMeet({ xell: outsider, code: created.code, project: projC.name });
+    ok(!guestInvite.ok && (/founder|your project/i.test(guestInvite.error || '')),
+       `C3: guest cannot invite either (${guestInvite.error})`);
+
+    // C4. withdraw → B can no longer attend or say; member + transcript survive; own-project no-op.
+    const ownNoop = await inviteToMeet({ xell: founder, code: created.code, project: proj.name });
+    ok(ownNoop.ok && ownNoop.noop === true, 'C4: inviting the room\'s own project is a no-op');
+    const beforeWithdrawMembers = await q(`SELECT * FROM a2a_meet_member WHERE meet_id=$1`, [roomId]);
+    const beforeWithdrawMsgs = await q(`SELECT * FROM a2a_meet_message WHERE meet_id=$1`, [roomId]);
+    const withdrawn = await inviteToMeet({
+      xell: founder, code: created.code, project: otherProj.name, remove: true,
+    });
+    ok(withdrawn.ok && withdrawn.removed === true, 'C4: founder withdraws project B\'s invite');
+    const inviteAfter = await q(
+      `SELECT * FROM a2a_meet_invite WHERE meet_id=$1 AND project_id=$2`, [roomId, otherProj.id]);
+    eq(inviteAfter.length, 0, 'C4: invite row is gone');
+    const membersAfter = await q(`SELECT * FROM a2a_meet_member WHERE meet_id=$1`, [roomId]);
+    eq(membersAfter.length, beforeWithdrawMembers.length,
+       'C4: member rows survive the withdraw (including the guest)');
+    const msgsAfter = await q(`SELECT * FROM a2a_meet_message WHERE meet_id=$1`, [roomId]);
+    eq(msgsAfter.length, beforeWithdrawMsgs.length, 'C4: transcript survives the withdraw');
+
+    const reAttend = await attendMeet({ xell: outsider, code: created.code });
+    ok(!reAttend.ok && /withdrawn|your project/i.test(reAttend.error || ''),
+       `C4: guest can no longer attend after withdraw (${reAttend.error})`);
+    const reSay = await sayToMeet({ xell: outsider, code: created.code, message: 'should fail' });
+    ok(!reSay.ok && /withdrawn|your project|not a member/i.test(reSay.error || ''),
+       `C4: guest can no longer say after withdraw (${reSay.error})`);
+    // Former member may still read the transcript (membership is the visibility boundary).
+    const stillRead = await transcriptFor(outsider, created.code);
+    ok(stillRead.ok, 'C4: former guest member can still read the surviving transcript');
+
+    console.log(`    (code=${created.code}, room=${roomId.slice(0, 8)}…, founder=${founder.slug}, peer=${peer.slug}, guest=${outsider.slug})`);
   } finally {
+    // Cascade from project deletes rooms/members/messages/invites for that project. Guest projects
+    // first so FK order does not matter; home project last.
+    if (projectCId) await q(`DELETE FROM project WHERE id=$1`, [projectCId]).catch(() => {});
+    if (projectBId) await q(`DELETE FROM project WHERE id=$1`, [projectBId]).catch(() => {});
     if (projectId) await q(`DELETE FROM project WHERE id=$1`, [projectId]).catch(() => {});
   }
 }
