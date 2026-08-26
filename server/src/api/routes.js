@@ -86,7 +86,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
          selfSay, selfReport, selfInbox, selfReview, selfA2ASend,
-         selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeet,
+         selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
          selfProviderEnv } from '../queenzee/self.js';
@@ -2145,7 +2145,8 @@ router.post('/xell/self/a2a', async (req, res) => {
 // `zee meet` — peer-to-peer GROUP CHAT rooms (docs/zee-meet-plan.md). The human directive: agents
 // talk to each other in a group chat via a zee meet verb — create shows a code, another zee
 // attends with it, and they talk. Token-scoped exactly like the other self verbs; any live zee may
-// create/attend/post (DR-2), and the room's membership set is the visibility boundary.
+// create/attend/post in its own project (DR-2); a founder may invite another whole project (DR-5);
+// the room's membership set is the visibility boundary.
 router.post('/xell/self/meet/create', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfMeetCreate(x, { title: req.body?.title })); }
@@ -2159,6 +2160,13 @@ router.post('/xell/self/meet/attend', async (req, res) => {
 router.post('/xell/self/meet/say', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfMeetSay(x, { code: req.body?.code, message: req.body?.message })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/meet/invite', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMeetInvite(x, {
+      code: req.body?.code, project: req.body?.project, remove: !!req.body?.remove,
+    })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.get('/xell/self/meet', async (req, res) => {

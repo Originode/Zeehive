@@ -588,8 +588,9 @@ function usage() {
   zee upload-conversation [--reason "…"]   UPLOAD this xell's conversation to the queenzee (archived; a manager can review it). NOT gated. Reads your own session transcript and stores it — the "upload conversations on done" harness setting does this automatically at \`zee done\`
   zee a2a <card-url> --message "..."   send an A2A SendMessage to an EXTERNAL agent's card URL — QUEENZEE-mediated (you never dial the external server) and RECORDED at the transport layer like the LLM gateway. NOT gated. The queenzee fetches the card, reads the JSON-RPC endpoint it declares, and POSTs the message; the answer is the external server's JSON-RPC result (or a clear refusal)
   zee meet create --title "..."        start a GROUP CHAT (a "meet") and print its code — the conversation link you hand to other zees. You are the founder and only member. NOT gated, recorded: the room is a first-class a2a_meet row, membership is the audit (docs/zee-meet-plan.md)
-  zee meet attend <code>               JOIN a room by the code a founder printed — idempotent (re-attending is a no-op). Any zee of your project may attend; the member row is the audit. Read what you missed with \`zee meet --transcript <code>\`
+  zee meet attend <code>               JOIN a room by the code a founder printed — idempotent (re-attending is a no-op). Any zee of your project may attend; a zee of an INVITED project may too (DR-5). The member row is the audit. Read what you missed with \`zee meet --transcript <code>\`
   zee meet say <code> --message "..."  POST to a room you are a member of; the transcript is the record and every live member is notified. Attend before you say — membership is the visibility boundary
+  zee meet invite <code> --project <name-or-id>   FOUNDER only: invite another whole PROJECT into this room so its zees can attend by code. \`--remove\` withdraws the invite (members + transcript stay; future attends/says stop). Inviting your own project is a no-op
   zee meet --list | zee meet --status  the rooms you are a member of, newest first, with per-room unread counts
   zee meet --transcript <code>         read one room's full transcript (marks it read); how a newly attended zee catches up
   zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
@@ -1027,11 +1028,10 @@ switch (cmd) {
   case 'meet': {
     // A2A MEET — peer-to-peer GROUP CHAT rooms (docs/zee-meet-plan.md). The human directive:
     // "initiate a zee meet → it shows a code → tell another zee to attend with the code → zees
-    // join and talk." Four subcommands, one verb: create (prints the code), attend <code>,
-    // say <code> --message, and the two read forms --list/--status and --transcript <code>.
-    // NOT gated: any live zee of your project may create/attend/post (DR-2), and the room's
-    // membership set is the visibility boundary. The transcript is the record; live members are
-    // notified (DR-3).
+    // join and talk." Subcommands: create (prints the code), attend <code>, say <code> --message,
+    // invite <code> --project (founder, DR-5), and the two read forms --list/--status and
+    // --transcript <code>. NOT gated; every act is recorded. Default is project-scoped (DR-2);
+    // a founder may invite another whole project (DR-5). Membership is the visibility boundary.
     const sub = positional();
     // The code is the positional AFTER the subcommand — NOT the first non-flag, which is the
     // subcommand itself (`meet say <code>` would otherwise take "say" as the code). --code /
@@ -1057,6 +1057,15 @@ switch (cmd) {
       if (!c) { console.error('meet say needs <code> — the room you are posting to (`zee meet --list` shows yours)'); process.exit(1); }
       if (!msg) { console.error('meet say needs --message "…" — what you want the room to hear'); process.exit(1); }
       out(await req('POST', '/api/xell/self/meet/say', { code: c, message: msg }));
+      break;
+    }
+    if (sub === 'invite') {
+      const c = code || flag('code');
+      const project = flag('project');
+      const remove = rest.includes('--remove');
+      if (!c) { console.error('meet invite needs <code> — the room you founded'); process.exit(1); }
+      if (!project) { console.error('meet invite needs --project <name-or-id> — the whole project to let into this room'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/meet/invite', { code: c, project, remove }));
       break;
     }
     if (rest.includes('--transcript') || flag('transcript')) {
