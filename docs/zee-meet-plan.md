@@ -53,11 +53,13 @@ seam: a later record can project `a2a_meet_message` rows onto A2A Tasks with a d
 `conversationTaskId('a2a_meet', meet_id)` (the DR-8 machinery already in lib/a2a.js), reusing the
 uuid-v5 infrastructure. Nothing behind that seam ships now.
 
-**Who may create/attend.** Any live, non-retired zee may create a room and may attend any room by
-code. This is the deliberate break from the crew scoping — it is what the human asked for
-("when i tell another zee to zee meet attend") — and it is a *recorded* act: `a2a_meet_member`
-says who attended what, when. A zee cannot attend a room outside its own project (a meet is
-project-scoped; the code is only handed to zees of the same fleet). A human in the console can
+**Who may create/attend.** Any live, non-retired zee may create a room and may attend any room of
+its *own* project by code. This is the deliberate break from the crew scoping — it is what the
+human asked for ("when i tell another zee to zee meet attend") — and it is a *recorded* act:
+`a2a_meet_member` says who attended what, when. By default a zee cannot attend a room outside its
+own project (DR-2). A founder may **invite another whole project** into the room
+(`zee meet invite <code> --project <name-or-id>`, DR-5); a zee of an invited project may then
+attend by the same code. Without that invite the refusal is unchanged. A human in the console can
 create/close/read rooms too, but the verbs are agent-facing.
 
 ## 3. Interfaces
@@ -81,23 +83,26 @@ founder's `zee meet create` prints and what an attender's `zee meet attend <code
 
 ### 3.2 The CLI surface (`zee meet`)
 
-One verb, three subcommands + two read forms:
+One verb, four subcommands + two read forms:
 
 ```
 zee meet create --title "…"                     → { code, meet_id, title, members:[me] }
 zee meet attend <code>                           → { code, meet_id, title, members, joined:true|already }
 zee meet say <code> --message "…"                → { code, posted, message:{...} }
+zee meet invite <code> --project <name-or-id>    → { code, project, invites:[...] }   # founder; --remove withdraws
 zee meet --list | zee meet --status              → { ok, meets:[{code,title,members,unread,last_at}] }
 zee meet --transcript <code>                     → { ok, meet:{code,title,members}, messages:[...] }
 ```
 
-- `create` is also the **invitation**: the printed code is the thing a human copies into the next
-  zee's briefing ("attend with `zee meet attend <code>`"). The room starts with the founder as its
-  only member.
+- `create` prints the **code**: the thing a human copies into the next zee's briefing
+  ("attend with `zee meet attend <code>`"). The room starts with the founder as its only member.
 - `attend <code>` is idempotent (re-attending is a no-op that returns the room). Attending is how
-  a zee joins; there is no approval step — the act is the audit (DR: no gate, recorded).
+  a zee joins; there is no approval step — the act is the audit (DR: no gate, recorded). Same-project
+  always; an invited guest project also (DR-5).
 - `say <code> --message "…"` posts to the transcript and notifies live members. A member posting
   to a room it is not a member of is refused (must attend first).
+- `invite <code> --project <name-or-id>` is founder-only and invites a whole project (never a
+  xell). `--remove` withdraws: future attends/says stop; member rows and the transcript stay.
 - `--list`/`--status` shows the rooms the caller is a member of, newest first, with an unread-ish
   hint (messages since the caller's last read of that room).
 - `--transcript <code>` is the read-back; it is how a newly attended zee catches up on what it

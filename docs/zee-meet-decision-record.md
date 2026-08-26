@@ -86,6 +86,11 @@ approval is a column.
 
 **What would change our mind.** A human saying "rooms must be invite-only".
 
+**Amended by DR-5 (2026-08-26).** The default above is unchanged — a room with no invite still
+behaves exactly as DR-2 describes, including the refusal sentence. DR-5 adds an *opt-in* path:
+the founder may invite another whole project into the room. Cross-project access without that
+invite is still refused.
+
 ---
 
 ## DR-3 — Delivery is a best-effort fan-out of notifications, not a fan-out of records
@@ -152,6 +157,51 @@ read a room".
 
 ---
 
+## DR-5 — Cross-project access is by explicit founder invite of a whole project
+
+**Date:** 2026-08-26
+**Status:** BUILT — `a2a_meet_invite` (migration 234), `zee meet invite`, guest attend/say/transcript.
+**Amends:** DR-2 (project scoping stays the default; this is a widening by consent).
+
+**Decision.** A meet founder may invite another *whole project* into its room
+(`zee meet invite <code> --project <name-or-id>`). An invite is a row on `a2a_meet_invite`
+(meet_id, project_id, invited_by_xell_id, created_at) — the audit, for the same reason the
+member row is. A zee of an invited project may then attend by code, say, and read the transcript.
+A room with no invite behaves exactly as DR-2: same refusal sentence, byte for byte. Withdrawing
+the invite (`--remove`) deletes the invite row and stops future attends/says; existing member
+rows and the transcript are not rewritten. Only the founder may invite; inviting the room's own
+project is a no-op that says so.
+
+**Options considered.**
+
+- **A · Founder invites a whole project** *(chosen)*. For: matches the real failure mode (OmniBiz
+  opened a room to ask ZEEHIVE; no Zeehive zee could enter); the invite is one decision for the
+  whole guest crew; the audit row is cheap and queryable; default DR-2 behaviour is untouched.
+- **B · Open rooms / drop the project filter.** For: "peer to peer" taken literally. Rejected: it
+  turns every code into a fleet-wide door; a guessed or leaked code would cross project
+  boundaries with no consent. DR-2's containment was right for the default.
+- **C · Per-xell invites.** For: finer control. Rejected: the case that paid for this feature is
+  "project B's crew, talk to project A's room" — inviting N xells is N decisions for one intent,
+  and a new xell of an invited project would still be locked out. Whole-project is the unit.
+- **D · Fleet-wide meets / A2A federation.** For: the long-term story. Rejected: that is the
+  a2a-protocol-plan §7 federation container, a different design; this ticket needs two projects
+  in one fleet to share one room *now*.
+
+**Consequences.** Easy: two projects' zees can hold one conversation when a founder asks for it.
+Hard: a guest's `a2a_meet_message.project_id` stays the *room's* project (the conversation's
+home), so project-scoped message indexes do not grow a second home; list/unread stay
+membership-based and do not leak. Impossible under this decision: a non-founder inviting, a
+xell-only invite, or a room that is open to the fleet by default.
+
+**Reversibility.** Fully — drop `a2a_meet_invite` and the invite verb; DR-2 behaviour returns.
+Existing guest member rows become unreachable for attend/say (no invite), which is the same
+end state as a withdraw.
+
+**What would change our mind.** A requirement for per-xell invites, or for open (uninvited)
+cross-project rooms.
+
+---
+
 ## Other facts this record is obliged to say
 
 - **The assigned shared dev db refused this xell's credentials** (both `postgres` and `zeehive`
@@ -160,4 +210,5 @@ read a room".
   the broken assigned db is reported rather than silently worked around.
 - **The migration number is 204**, claimed via `zee migration-number` on 2026-08-13.
   The worker-manual migration (documenting `zee meet` in `cxell-zee-manual`, required by the
-  drift test section e) will claim a second number via `--again` when implementation begins.
+  drift test section e) claimed 205. DR-5 claimed **234** (invite table) and **235** (manual
+  invite line) via `zee migration-number` on 2026-08-26.

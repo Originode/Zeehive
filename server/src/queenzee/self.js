@@ -67,8 +67,9 @@ import { uploadConversationArchive, conversationsForManager, harnessArchivalSett
 // The A2A outbound send (`zee a2a <card-url> --message "…"`, phase 4) — queenzee-mediated, recorded.
 import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
 // The A2A MEET group-chat rooms (`zee meet`, docs/zee-meet-plan.md) — the DB half lives here so
-// the self verbs below are thin. Any live zee of a project may create/attend a room by code.
-import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '../lib/a2a-meet.js';
+// the self verbs below are thin. Any live zee of a project may create/attend a room by code;
+// a founder may invite another whole project (DR-5).
+import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor, inviteToMeet } from '../lib/a2a-meet.js';
 // CURRENT CONDITIONS (ticket #67) — the short, dated, per-PROJECT list of live impediments
 // injected into every briefing. `zee conditions` is the read verb (every zee) and the manager's
 // write verb (--add / --remove). The lib owns the domain; this file adds the manager refusal.
@@ -2558,20 +2559,22 @@ export async function selfA2ASend(xell, { card_url = null, message = null } = {}
 
 // ── A2A MEET — group chat rooms (`zee meet`, docs/zee-meet-plan.md) ────────────
 // The human directive: "i want agents to be able to talk to each other via some sort of peer to
-// peer a2a chat session like a group chat via a zee meet verb… zees can join and talk." These four
+// peer a2a chat session like a group chat via a zee meet verb… zees can join and talk." These
 // verbs are the self half of that surface (the CLI + routes are thin wrappers). Any live zee of a
 // project may create a room (create), attend a room by the code a founder printed (attend), post to
-// a room it is a member of (say), and list/read its rooms (list/transcript). The design decisions
-// are recorded in docs/zee-meet-decision-record.md — the short version: a room is a first-class
-// store (DR-1), attendance is self-serve and recorded (DR-2), and a post is one transcript row plus
-// a best-effort delivery fan-out (DR-3).
+// a room it is a member of (say), and list/read its rooms (list/transcript). A founder may invite
+// another whole project into the room (invite, DR-5). The design decisions are recorded in
+// docs/zee-meet-decision-record.md — the short version: a room is a first-class store (DR-1),
+// attendance is self-serve and recorded (DR-2), a post is one transcript row plus a best-effort
+// delivery fan-out (DR-3), and cross-project access is by explicit founder invite only (DR-5).
 export async function selfMeetCreate(xell, { title = null } = {}) {
   const r = await createMeet({ xell, title });
   if (!r.ok) return { ok: false, error: r.error };
   return {
     ok: true, meet_id: r.room.id, code: r.code, title: r.room.title,
     members: [{ slug: xell.slug, role: 'founder' }],
-    message: `Created meet "${r.room.title}". Hand this code to the zees you want in: \`zee meet attend ${r.code}\``,
+    message: `Created meet "${r.room.title}". Hand this code to the zees you want in: \`zee meet attend ${r.code}\`. `
+      + `To let another project's zees in: \`zee meet invite ${r.code} --project <name>\`.`,
   };
 }
 
@@ -2594,6 +2597,17 @@ export async function selfMeetSay(xell, { code = null, message = null } = {}) {
     ok: true, posted: r.posted, code: r.code, meet_id: r.meet_id, message: r.message,
     deliveries: r.deliveries,
     message_text: `Posted to ${r.code}. ${r.deliveries.length} live member(s) notified; the rest catch up with \`zee meet --transcript\`.`,
+  };
+}
+
+export async function selfMeetInvite(xell, { code = null, project = null, remove = false } = {}) {
+  const r = await inviteToMeet({ xell, code, project, remove: !!remove });
+  if (!r.ok) return { ok: false, error: r.error, matches: r.matches };
+  return {
+    ok: true, code: r.code, meet_id: r.meet_id, project: r.project,
+    invited: r.invited || false, removed: r.removed || false, already: r.already || false,
+    noop: r.noop || false, invites: r.invites || [],
+    message: r.message,
   };
 }
 
