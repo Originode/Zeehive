@@ -185,7 +185,8 @@ The intended loop, for a project that has a helpdesk already:
 
 1. store the key as a secret in the deployed project (never in its repo);
 2. on a new helpdesk case, `POST /api/ext/v1/tickets` with the case id as `external_ref` and the
-   case URL as `external_url`, attaching whatever the customer sent;
+   case URL as `external_url`, attaching whatever the customer sent — the project's deployed
+   manager zees are notified on intake (inbox / live session), so the fleet learns it exists;
 3. on every later reply, `POST …/comments` (attachments ride along);
 4. poll `GET /api/ext/v1/tickets/:ref` — or the whole list — and mirror `status`, `status_label`
    and `work.items[].progress` back into the helpdesk;
@@ -196,11 +197,12 @@ a CI job that files a ticket when a smoke test fails.
 
 ## 7. What this deliberately does NOT do
 
-- **It does not notify a manager zee.** Handing a ticket to a manager types into a live agent
-  session (`POST /api/tickets/:id/notify`), and an external system must not be able to interrupt an
-  agent. A human (or a manager reading its own board) decides what to pick up.
 - **It does not assign, break down, or cast work.** Those are fleet verbs, and rule 3 is the same
-  argument.
+  argument. Filing through this door DOES notify the project's deployed manager zees (the same
+  `ticketManagers` + `notifyManagerOfTicket` path the console's Notify button and
+  `zee ticket --notify` use): the message lands in each manager's inbox, and is typed into a live
+  cxell session when one exists. A notification is not an order — nothing is assigned and no work
+  is cast. A deduped retry does not re-notify.
 - **It has no rate limiting of its own.** The key is the only gate today. If a key is abused,
   revoke it — and put a rate limit in front of the queenzee, where the rest of the ingress lives.
 - **It is not a webhook OUT.** An integration polls; nothing calls back into the deployed project.
@@ -209,9 +211,10 @@ a CI job that files a ticket when a smoke test fails.
 ## 8. Proving it
 
 `test/ticket-api-external.test.mjs` drives the whole surface over real HTTP against the real
-express router: minting and revoking keys, every refusal at the door, filing with evidence,
-idempotency, a byte-identical attachment round trip, monitoring by id/code/number, the update
-rules, cross-project isolation, and the console's view of the same rows.
+express router: minting and revoking keys, every refusal at the door, filing with evidence
+(and the manager-inbox notify that filing triggers), idempotency (including that a deduped
+retry does not re-notify), a byte-identical attachment round trip, monitoring by id/code/number,
+the update rules, cross-project isolation, and the console's view of the same rows.
 
 ```sh
 DATABASE_URL=… node test/ticket-api-external.test.mjs
