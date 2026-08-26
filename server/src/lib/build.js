@@ -19,6 +19,7 @@ import {
   processRoleReachableHost, processRolePublishedUrl,
   probePublishedRole, publishedUrl,
 } from '../queenzee/containers.js';
+import { assertSpinoffNotOnProdNetworks } from './spinoff-network-guard.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
@@ -216,7 +217,8 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   // row (stamped at provision), env-file convention on the project, and the ACTUAL allocated
   // host ports of both buildable roles (the compose file interpolates both, whichever we build).
   const project = await one(
-    `SELECT repo_root, env_file, manifest FROM project WHERE id=$1`, [xell.project_id]);
+    `SELECT repo_root, env_file, manifest, compose_prod, compose_spinoff FROM project WHERE id=$1`,
+    [xell.project_id]);
 
   // runner: process (spec §6.1) — there is no image and no compose; the hammer's verb here is
   // (re)START the role in its worktree. Build-context knobs are meaningless for a process.
@@ -233,6 +235,31 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     || project?.manifest?.tiers?.spinoff?.runner || null;
   const isProcessRow = !c.image_tag && !c.docker_ctx;
   if (isProcessRow || (runner === 'process' && !c.image_tag)) return startProcessRole(c, xell, project);
+
+  // SPINOFF MUST NOT JOIN A PROD NETWORK — before any docker work. A comment in a project's
+  // spinoff compose is advice; this is the enforcement (lib/spinoff-network-guard.js). Reads the
+  // worktree's spinoff compose + the project's prod compose (repo_root) and refuses on overlap.
+  {
+    const spinRel = c.compose_file
+      || project?.manifest?.tiers?.spinoff?.compose
+      || project?.compose_spinoff
+      || 'docker-compose.spinoff.yml';
+    const spinAbs = resolve(String(xell.worktree_path).replace(/\\/g, '/'), spinRel);
+    const prodRel = project?.manifest?.tiers?.prod?.compose || project?.compose_prod || null;
+    const prodAbs = prodRel && project?.repo_root
+      ? resolve(String(project.repo_root).replace(/\\/g, '/'), prodRel)
+      : null;
+    let spinYaml = null, prodYaml = null;
+    try { if (existsSync(spinAbs)) spinYaml = readFileSync(spinAbs, 'utf8'); } catch { /* absent → skip */ }
+    try { if (prodAbs && existsSync(prodAbs)) prodYaml = readFileSync(prodAbs, 'utf8'); } catch { /* absent → manifest-only */ }
+    if (spinYaml) {
+      assertSpinoffNotOnProdNetworks({
+        spinComposeYaml: spinYaml,
+        manifest: project?.manifest || null,
+        prodComposeYaml: prodYaml,
+      });
+    }
+  }
 
   if (buildCtx !== undefined) c = await setBuildCtxRow(c, buildCtx);
   // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
