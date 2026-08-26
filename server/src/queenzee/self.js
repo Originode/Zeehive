@@ -15,7 +15,8 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
+import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource,
+         refreshCxellOriginMain } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
@@ -55,6 +56,7 @@ import { startTurn, endTurn } from '../lib/turn-ledger.js';
 import { appendExecutionEvent } from '../lib/execution-events.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
+         invalidateCrewDiff,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
          NO_PUSH_REASON } from '../lib/managers.js';
 import { xellQuarantineRefusal } from '../lib/xell-quarantine.js';
@@ -463,6 +465,23 @@ export async function selfLand(xell) {
     : (healed && healed.state === 'merged' ? ` (after self-healing: merged current ${ref} into your cxell)` : '');
 
   if (push.landed) {
+    // TKT-185: the cage's origin/main is still the pre-land tip. Refresh it NOW (best-effort) so a
+    // manager's `zee zees` — or this zee's own next read — does not report the commits we just
+    // landed as still unlanded. nudgeXellAfterLand does the same on the human-approval path; this
+    // covers the already-approved re-push that lands without waiting on a nudge.
+    if (live && ref) {
+      try {
+        const r = await refreshCxellOriginMain({
+          ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref,
+        });
+        if (r?.refreshed) invalidateCrewDiff(xell.id);
+        else if (r && r.refreshed === false) {
+          logline('self', `${xell.slug}: post-land origin/main refresh skipped — ${r.reason || 'unknown'}`);
+        }
+      } catch (e) {
+        logline('self', `${xell.slug}: post-land origin/main refresh failed closed: ${String(e.message || e).slice(0, 200)}`);
+      }
+    }
     return {
       ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request: await landStatus(xell.id),
       message: withNote(`LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`),
@@ -709,6 +728,14 @@ async function selfHealSync(xell, ref) {
         [xell.id, xell.slug, `sync merge of ${ref} into the cxell`],
       ).catch((e) => logline('self', `could not record queenzee-sync door write: ${String(e.message).slice(0, 160)}`));
     }
+    // TKT-185: keep origin/main current after a sync so `zee zees` cannot cry wolf. sync already
+    // delivered the tip (deliverXourceIntoCxell); this is belt-and-suspenders and never throws.
+    try {
+      const r = await refreshCxellOriginMain({
+        ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref,
+      });
+      if (r?.refreshed) invalidateCrewDiff(xell.id);
+    } catch { /* never fail a sync on a refresh */ }
     return { ok: true, ...s };
   }
   if (s.state === 'conflict') {

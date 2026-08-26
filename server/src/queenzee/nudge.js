@@ -13,7 +13,9 @@
 // cxell is unreachable.
 import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
-import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
+import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell,
+         refreshCxellOriginMain } from '../lib/cxell.js';
+import { invalidateCrewDiff } from '../lib/managers.js';
 import { adapterFor, usageFrom, resultFrom } from '../lib/cxell-runtimes.js';
 import { decideMessageDelivery } from '../lib/zee-turn.js';
 import { resumeTurnDeath } from '../lib/turn-death.js';
@@ -499,6 +501,27 @@ export async function nudgeXellForStatus(xellId, { by = 'human' } = {}) {
 
 // Re-invoke the cxell zee that owns this xell, if one is live. NEVER throws.
 export async function nudgeXellAfterLand(xellId, { by = 'human', mode = PROVISION_MODE } = {}) {
+  // TKT-185: BEFORE resuming the worker, refresh the cage's origin/main to the xource tip that
+  // just received the land. Otherwise `zee zees` / cxellDiff still measure against the pre-land
+  // tip and every successful landing reads as phantom UNLANDED — the done-guard crying wolf.
+  // Best-effort and never throws: a dead cage must not block the resume that tells the zee it landed.
+  try {
+    const row = await one(
+      `SELECT x.slug, x.worktree_path, xo.ref AS xource_ref
+         FROM xell x LEFT JOIN xource xo ON xo.id = x.xource_id
+        WHERE x.id=$1`, [xellId]);
+    if (row?.slug && row?.xource_ref && row?.worktree_path) {
+      const r = await refreshCxellOriginMain({
+        ctx: 'default', slug: row.slug, worktree: row.worktree_path, ref: row.xource_ref,
+      });
+      if (r?.refreshed) invalidateCrewDiff(xellId);
+      else if (r && r.refreshed === false) {
+        logline('nudge', `${row.slug}: post-land origin/main refresh skipped — ${r.reason || 'unknown'}`);
+      }
+    }
+  } catch (e) {
+    logline('nudge', `post-land origin/main refresh failed closed: ${String(e.message || e).slice(0, 200)}`);
+  }
   return nudgeCxell(xellId, { by, mode, prompt: CONTINUE_PROMPT,
     why: 'landing approved', log: (slug, sid) => `${slug}: landing approved by ${by} — resuming cxell session ${sid} to continue` });
 }

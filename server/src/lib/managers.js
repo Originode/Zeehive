@@ -79,6 +79,14 @@ export function refuseForManager(xell, verb) {
 const CREW_DIFF_TTL_MS = 15_000;
 const crewDiffCache = new Map(); // xell id -> { at, val }
 
+// Drop a cached crew diff so the next `zee zees` re-reads the cage. Called after
+// refreshCxellOriginMain (TKT-185): the 15s TTL would otherwise keep serving the pre-land
+// "↑N unlanded" numbers even though origin/main is now current.
+export function invalidateCrewDiff(xellId) {
+  if (xellId) crewDiffCache.delete(xellId);
+  else crewDiffCache.clear();
+}
+
 async function crewDiff(row, branch) {
   const hit = crewDiffCache.get(row.id);
   if (hit && Date.now() - hit.at < CREW_DIFF_TTL_MS) return hit.val;
