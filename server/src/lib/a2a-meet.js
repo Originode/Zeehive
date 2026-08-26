@@ -24,7 +24,8 @@
 //     project into the room (DR-5); the invite row is the audit. Without an invite, a code from
 //     another project refuses with today's sentence — widening by explicit consent, never a
 //     relaxation. Withdrawing the invite stops future attends/says; member rows and the
-//     transcript stay.
+//     transcript stay. INVITING is founder-only; WITHDRAWING may also be done by a live manager
+//     of the host project so a founder reap cannot leave a permanent cross-project grant.
 import { q, one } from '../db/pool.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 import { logline } from './logbus.js';
@@ -329,17 +330,46 @@ async function resolveProjectRef(ref) {
   return rows[0];
 }
 
-async function founderRoomFor(xell, code) {
-  if (!code) return { ok: false, error: 'invite needs <code> — the room you founded (`zee meet --list` shows yours)' };
+// Gate for invite/withdraw. The room must be in the caller's project (a guest project's manager
+// cannot touch another project's room — meetForCode with their projectId returns null).
+//
+// Asymmetry (DR-5): WIDENING (invite) is founder-only. NARROWING (withdraw) may be done by the
+// founder OR by any live manager of the room's OWN (host) project — so an ordinary founder reap
+// cannot leave a permanent cross-project grant that nobody can revoke. "Live" = zee_type manager
+// and status not retired/tearing-down. If the host project has no live manager, a human in the
+// console is the answer (named in the DR; not widened to "any host zee").
+async function roomForInviteAct(xell, code, { remove = false } = {}) {
+  if (!code) {
+    return { ok: false, error: remove
+      ? 'invite --remove needs <code> — the room whose invite you are withdrawing'
+      : 'invite needs <code> — the room you founded (`zee meet --list` shows yours)' };
+  }
   const parsed = parseMeetCode(code);
   if (!parsed) return { ok: false, error: `"${code}" is not a meet code — expected <slug>/<token> or a full uuid` };
-  // Invites are a home-project act: the founder resolves the room in their own project only.
   const room = await meetForCode(parsed, { projectId: xell.project_id });
   if (!room) return { ok: false, error: SCOPED_REFUSAL(code) };
-  if (room.founder_xell_id !== xell.id) {
-    return { ok: false, error: `only the founder of "${meetCodeFor(room)}" may invite — you are not the founder` };
+
+  // A retired/torn-down xell cannot act even if it still matches founder_xell_id — resolveSelf
+  // already 409s them at the HTTP edge; mirror that here so a reap cannot be bypassed at the lib.
+  const live = xell.status !== 'retired'
+    && xell.status !== 'tearing-down'
+    && xell.status !== 'husk';
+  const isFounder = live && room.founder_xell_id && room.founder_xell_id === xell.id;
+  if (isFounder) return { ok: true, room, as: 'founder' };
+
+  if (remove) {
+    const liveHostManager = live
+      && xell.zee_type === 'manager'
+      && xell.project_id === room.project_id;
+    if (liveHostManager) return { ok: true, room, as: 'host-manager' };
+    return {
+      ok: false,
+      error: `only the founder of "${meetCodeFor(room)}" or a live manager of its project may withdraw an invite`
+        + (room.founder_xell_id ? '' : ' — the founding xell is gone'),
+    };
   }
-  return { ok: true, room };
+
+  return { ok: false, error: `only the founder of "${meetCodeFor(room)}" may invite — you are not the founder` };
 }
 
 export async function invitesFor(meetId) {
@@ -354,9 +384,9 @@ export async function invitesFor(meetId) {
 }
 
 export async function inviteToMeet({ xell, code = null, project = null, remove = false } = {}) {
-  const gate = await founderRoomFor(xell, code);
+  const gate = await roomForInviteAct(xell, code, { remove: !!remove });
   if (!gate.ok) return gate;
-  const { room } = gate;
+  const { room, as } = gate;
   if (!project) {
     return { ok: false, error: 'invite needs --project <name-or-id> — the whole project to let into this room' };
   }
@@ -389,9 +419,9 @@ export async function inviteToMeet({ xell, code = null, project = null, remove =
     const deleted = await one(
       `DELETE FROM a2a_meet_invite WHERE meet_id=$1 AND project_id=$2 RETURNING *`,
       [room.id, target.id]);
-    logline('meet', `${xell.slug} withdrew invite of project ${target.name} from meet ${meetCodeFor(room)}`);
+    logline('meet', `${xell.slug} (${as}) withdrew invite of project ${target.name} from meet ${meetCodeFor(room)}`);
     return {
-      ok: true, removed: !!deleted, code: meetCodeFor(room), meet_id: room.id,
+      ok: true, removed: !!deleted, code: meetCodeFor(room), meet_id: room.id, as,
       project: { id: target.id, name: target.name },
       message: deleted
         ? `Withdrew invite for "${target.name}" from ${meetCodeFor(room)}. Existing members and the transcript stay; their zees can no longer attend or post.`

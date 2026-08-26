@@ -31,6 +31,9 @@
 //      C3 a non-founder member cannot invite.
 //      C4 invite withdrawn → B can no longer attend or say; member row + transcript survive;
 //         inviting the room's own project is a no-op.
+//      C5 founder RETIRED → a live MANAGER of the HOST project can still withdraw; a non-manager
+//         of the host cannot; a manager of the GUEST project cannot. (The blocking review finding:
+//         founder-only withdraw left a permanent cross-project grant after ordinary reap.)
 //
 // The project is deleted in a finally, whatever happens (house rule: tests clean up what they
 // create). The sandbox is the sanctioned verification path — the assigned shared dev db refused
@@ -267,7 +270,72 @@ if (!url) {
     const stillRead = await transcriptFor(outsider, created.code);
     ok(stillRead.ok, 'C4: former guest member can still read the surviving transcript');
 
-    console.log(`    (code=${created.code}, room=${roomId.slice(0, 8)}…, founder=${founder.slug}, peer=${peer.slug}, guest=${outsider.slug})`);
+    // C5. founder RETIRED → host-project live manager may withdraw; host worker and guest
+    // manager may not. Re-invite first (C4 left the invite withdrawn).
+    console.log('\n── C5. founder retired — host manager may still withdraw (DR-5 asymmetry) ──');
+    const reInvited = await inviteToMeet({ xell: founder, code: created.code, project: otherProj.name });
+    ok(reInvited.ok && reInvited.invited === true, 'C5: founder re-invites project B for the retire case');
+
+    const hostMgr = await mkXell('host-mgr', 'manager');
+    const guestMgr = await one(
+      `INSERT INTO xell (project_id, xource_id, slug, branch, status, zee_type, head_commit)
+         VALUES ($1,$2,$3,'spinoff/t','claimed','manager','abcdef1234567890') RETURNING *`,
+      [otherProj.id, otherXource.id, `${tag}-guest-mgr`]);
+
+    // Non-manager of the host project cannot withdraw.
+    const peerWithdraw = await inviteToMeet({
+      xell: peer, code: created.code, project: otherProj.name, remove: true,
+    });
+    ok(!peerWithdraw.ok && /founder|manager/i.test(peerWithdraw.error || ''),
+       `C5: host non-manager cannot withdraw (${peerWithdraw.error})`);
+
+    // Manager of the GUEST project cannot withdraw (room is not in their project → scoped refusal,
+    // or if somehow resolved, still not host manager).
+    const guestMgrWithdraw = await inviteToMeet({
+      xell: guestMgr, code: created.code, project: otherProj.name, remove: true,
+    });
+    ok(!guestMgrWithdraw.ok,
+       `C5: guest-project manager cannot withdraw (${guestMgrWithdraw.error})`);
+    ok(/your project|founder|manager/i.test(guestMgrWithdraw.error || ''),
+       'C5: …refusal names project scope or founder/manager gate');
+
+    // Guest can still attend while invite stands (control: invite is live before retire+withdraw).
+    const guestStillIn = await attendMeet({ xell: outsider, code: created.code });
+    ok(guestStillIn.ok, 'C5: guest can still attend while invite is live (control)');
+
+    // Retire the founder — ordinary done/reap. founder_xell_id may stay pointing at the retired
+    // row (ON DELETE SET NULL only fires on DELETE); resolveSelf would 409 the founder. The
+    // host manager must still be able to narrow the boundary.
+    await q(`UPDATE xell SET status='retired' WHERE id=$1`, [founder.id]);
+    const retiredFounder = { ...founder, status: 'retired' };
+    const retiredInvite = await inviteToMeet({
+      xell: retiredFounder, code: created.code, project: otherProj.name,
+    });
+    ok(!retiredInvite.ok && /founder/i.test(retiredInvite.error || ''),
+       `C5: retired founder cannot invite (${retiredInvite.error})`);
+
+    const hostMgrWithdraw = await inviteToMeet({
+      xell: hostMgr, code: created.code, project: otherProj.name, remove: true,
+    });
+    ok(hostMgrWithdraw.ok && hostMgrWithdraw.removed === true,
+       `C5: live host-project manager withdraws after founder retire (${hostMgrWithdraw.error || 'ok'})`);
+    eq(hostMgrWithdraw.as, 'host-manager', 'C5: …acting as host-manager');
+    const inviteGone = await q(
+      `SELECT * FROM a2a_meet_invite WHERE meet_id=$1 AND project_id=$2`, [roomId, otherProj.id]);
+    eq(inviteGone.length, 0, 'C5: invite row is gone after host-manager withdraw');
+
+    const guestBlocked = await attendMeet({ xell: outsider, code: created.code });
+    ok(!guestBlocked.ok && /withdrawn|your project/i.test(guestBlocked.error || ''),
+       `C5: guest can no longer attend after host-manager withdraw (${guestBlocked.error})`);
+
+    // Host manager still cannot INVITE (widen stays founder-only).
+    const mgrInvite = await inviteToMeet({
+      xell: hostMgr, code: created.code, project: otherProj.name,
+    });
+    ok(!mgrInvite.ok && /founder/i.test(mgrInvite.error || ''),
+       `C5: host manager still cannot invite — widen stays founder-only (${mgrInvite.error})`);
+
+    console.log(`    (code=${created.code}, room=${roomId.slice(0, 8)}…, founder=${founder.slug}, peer=${peer.slug}, guest=${outsider.slug}, hostMgr=${hostMgr.slug})`);
   } finally {
     // Cascade from project deletes rooms/members/messages/invites for that project. Guest projects
     // first so FK order does not matter; home project last.
