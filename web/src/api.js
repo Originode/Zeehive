@@ -404,6 +404,13 @@ export const resumeProviderAccount = (projectId, accountId) =>
 export const setProviderAlertAmount = (projectId, provider, amount) =>
   siteCall(`/api/projects/${projectId}/provider-alerts/${provider}`, 'PUT',
     { amount: amount === '' || amount == null ? null : amount });
+// The EXTERNAL TICKETING API's self-describing read (migration 190, TKT-184): keyless, so a
+// build script — or the console's Ticketing API panel — can resolve the externally-reachable base
+// URL a DEPLOYED project should POST to without holding a credential. Carries the attachment
+// limits and `base_url` (config.extApiBase on the server). ─────────
+export const getExtV1Info = () =>
+  fetch('/api/ext/v1/limits').then((r) => (r.ok ? r.json() : { ok: false, base_url: null }));
+
 // ── project API keys — the credential a DEPLOYED project presents to /api/ext/v1 (migration 190).
 // The plaintext key comes back ONCE, on create; every later read carries key_hint alone, so the
 // console must show it at mint time or never (lib/project-api-keys.js). ─────────

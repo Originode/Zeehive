@@ -49,6 +49,11 @@ import pg from 'pg';
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
 process.env.TKB_NOTIFY = '0';              // no desk pings from a test
+// The operator-set externally-reachable address (docs/ticketing-api.md §0). Set BEFORE config is
+// imported so this suite proves the whole discovery path: server configured with EXT_API_BASE →
+// whoami and limits both answer with that base_url. The alternative default (unset → null, never
+// host.docker.internal) is asserted in cage-api-address.test.mjs.
+process.env.EXT_API_BASE = 'http://ext.example.test:4700';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -141,6 +146,9 @@ try {
      && who.body.attachments.max_attachment_bytes === 10 * 1024 * 1024
      && who.body.settable_statuses.join() === 'queued,cancelled',
      'whoami names the project the key files into, its scopes and the limits');
+  ok(who.body.base_url === process.env.EXT_API_BASE
+     && typeof who.body.base_url_note === 'string' && who.body.base_url_note.length > 0,
+     `whoami carries the operator-set base_url (${who.body.base_url}) — the address a deployed project should use`);
   const wrongScope = await call('/ext/v1/tickets', { method: 'POST', key: RKEY, body: { title: 'nope' } });
   ok(wrongScope.status === 403 && /tickets:write/.test(wrongScope.body.error),
      'a read-only key filing a ticket → 403 naming the missing scope');
@@ -151,6 +159,9 @@ try {
   const limits = await call('/ext/v1/limits');
   ok(limits.status === 200 && limits.body.attachments.content_types.includes('application/json'),
      'GET /ext/v1/limits answers without a key at all');
+  ok(limits.body.base_url === process.env.EXT_API_BASE
+     && limits.body.base_url === who.body.base_url,
+     'the keyless limits carries the same base_url as whoami — resolvable before a credential exists');
 
   // ── 3 + 5: filing, with the evidence ─────────────────────────────────────
   section('filing a ticket with its evidence');

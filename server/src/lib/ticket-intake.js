@@ -36,6 +36,7 @@ import { createTicket, updateTicket, addComment, getTicket, listTickets, resolve
 import { addAttachment, addAttachments, listAttachments, attachmentLimits } from './ticket-attachments.js';
 import { bad, notFound, refuse } from './work-items.js';
 import { TICKET_KINDS, workLabel } from './work-status.js';
+import { config } from '../config.js';
 
 // The statuses an external reporter may set on its own ticket (rule 3). `queued` reopens a ticket
 // the fleet closed; `cancelled` withdraws one ("the customer sorted it themselves").
@@ -321,9 +322,29 @@ export async function externalAttachments(auth, ref) {
 // most common integration mistake is a key pointed at the wrong project) and WHAT the API accepts,
 // generated from the same constants the server validates against. A client that reads its
 // vocabulary from here cannot drift from the server; one that reads it from a doc will.
+//
+// `base_url` is the address a DEPLOYED project should send these requests to — config.extApiBase,
+// the one operator-settable answer (EXT_API_BASE, else derived from DEV_HOST_IP). It is null when
+// no externally-reachable address is configured, and `base_url_note` says what null means so an
+// integrator is never left guessing. This is the self-describing fix for TKT-184: the old default
+// (cxellApiBase → http://host.docker.internal:4700) meant "the docker host I am running on", which
+// for a deployed project is ITS OWN host, where no queenzee listens. Surfaced in BOTH whoami and
+// the keyless /limits so a caller can resolve the address before it holds a key — never a silent
+// host.docker.internal default.
+export function externalReachability() {
+  return {
+    base_url: config.extApiBase,
+    base_url_note: config.extApiBase
+      ? 'The base URL a DEPLOYED project sends /api/ext/v1 requests to. Set on the server via EXT_API_BASE (or derived from DEV_HOST_IP).'
+      : 'No externally-reachable address is configured for this API (EXT_API_BASE is unset on the server). '
+        + 'An integration that cannot reach this server must run on the queenzee host, or the operator must set EXT_API_BASE.',
+  };
+}
+
 export function externalMeta(auth) {
   return {
     ok: true,
+    ...externalReachability(),
     project: { id: auth.project.id, name: auth.project.name },
     key: { label: auth.key.label, hint: auth.key.hint, scopes: auth.key.scopes },
     ticket_kinds: TICKET_KINDS,
