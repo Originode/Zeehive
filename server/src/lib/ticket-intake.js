@@ -32,7 +32,7 @@
 //    say goes in a comment, which is exactly where a conversation belongs.
 import { one } from '../db/pool.js';
 import { createTicket, updateTicket, addComment, getTicket, listTickets, resolveTicket,
-         ticketCode } from './tickets.js';
+         ticketCode, ticketManagers, notifyManagerOfTicket } from './tickets.js';
 import { addAttachment, addAttachments, listAttachments, attachmentLimits } from './ticket-attachments.js';
 import { bad, notFound, refuse } from './work-items.js';
 import { TICKET_KINDS, workLabel } from './work-status.js';
@@ -170,6 +170,12 @@ export async function externalCreateTicket(auth, body = {}) {
     uploadedBy: input.reporter || `api:${auth.key.label}`, source: `api:${auth.key.label}`,
   });
 
+  // A ticket that nobody reads is a ticket nobody acts on. The console and `zee ticket --notify`
+  // already hand one to a manager; an external POST used to insert the row and return, so the
+  // fleet never learned it existed. Same door, same best-effort rule as selfTicketCreate: a dead
+  // inbox must not fail the filing, and a deduped retry (returned above) must not re-notify.
+  await notifyProjectManagers(ticket.id, `api:${auth.key.label}`);
+
   const view = await externalGetTicket(auth, ticket.id);
   return {
     ...view,
@@ -180,6 +186,20 @@ export async function externalCreateTicket(auth, body = {}) {
       : 'No external_ref was sent, so this POST is NOT idempotent — a retry would file a second '
         + 'ticket. Send your own id as external_ref.',
   };
+}
+
+// Hand the freshly filed ticket to every deployed manager of its project. Reuses
+// ticketManagers + notifyManagerOfTicket (inbox always; typed into a live cxell when one exists).
+// Per-manager failures are swallowed — the ticket itself is the durable fact.
+async function notifyProjectManagers(ticketId, by) {
+  try {
+    const { managers = [] } = (await ticketManagers(ticketId)) || {};
+    for (const m of managers) {
+      try {
+        await notifyManagerOfTicket(ticketId, { xellId: m.xell_id, by });
+      } catch { /* that one manager is gone/asleep — the ticket itself stands */ }
+    }
+  } catch { /* the picker failing must not fail the filing either */ }
 }
 
 export async function externalListTickets(auth, { status, kind, q: search, external_ref } = {}) {
