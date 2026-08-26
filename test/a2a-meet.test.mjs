@@ -159,10 +159,12 @@ if (!url) {
          VALUES ($1,$2,$3,'spinoff/t','claimed','worker','abcdef1234567890') RETURNING *`,
       [otherProj.id, otherXource.id, `${tag}-outsider`]);
     const cross = await attendMeet({ xell: outsider, code: created.code });
-    ok(!cross.ok && /your project/i.test(cross.error || ''),
-       `B6: another project's zee cannot attend without invite (${cross.error})`);
-    ok(/project-scoped/i.test(cross.error || ''),
-       'B6: the refusal sentence still names project-scoping (byte-identical default)');
+    // Byte-for-byte the ORIGINAL DR-2 refusal (widening by consent must not change this sentence).
+    const ORIGINAL_SCOPED_REFUSAL =
+      `no meet "${created.code}" in your project — check the code, or have the founder re-print it. `
+      + 'A meet is project-scoped: you can only attend rooms your own project created.';
+    eq(cross.error, ORIGINAL_SCOPED_REFUSAL,
+       'B6: non-invited outsider gets the ORIGINAL refusal sentence, byte for byte');
     const outsiderRows = await q(`SELECT * FROM a2a_meet_member WHERE meet_id=$1 AND xell_id=$2`, [roomId, outsider.id]);
     eq(outsiderRows.length, 0, 'B6: no membership row was written for the outsider');
 
@@ -222,10 +224,9 @@ if (!url) {
          VALUES ($1,$2,$3,'spinoff/t','claimed','worker','abcdef1234567890') RETURNING *`,
       [projC.id, xourceC.id, `${tag}-C`]);
     const cRefuse = await attendMeet({ xell: zeeC, code: created.code });
-    ok(!cRefuse.ok && /your project/i.test(cRefuse.error || ''),
-       `C2: non-invited project C is refused (${cRefuse.error})`);
-    ok(/project-scoped/i.test(cRefuse.error || ''),
-       'C2: refusal sentence is unchanged (widening by consent, never a relaxation)');
+    // THE assertion that matters: non-invited project C gets the SAME original sentence, byte for byte.
+    eq(cRefuse.error, ORIGINAL_SCOPED_REFUSAL,
+       'C2: non-invited project C gets the ORIGINAL refusal sentence, byte for byte');
     const cMembers = await q(
       `SELECT * FROM a2a_meet_member WHERE meet_id=$1 AND xell_id=$2`, [roomId, zeeC.id]);
     eq(cMembers.length, 0, 'C2: no membership row for the non-invited project');
