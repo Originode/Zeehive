@@ -79,7 +79,7 @@ inside the key's project.
 |---|---|
 | `GET /api/ext/v1/whoami` | which project this key files into, its scopes, the vocabulary and the limits |
 | `GET /api/ext/v1/limits` | the attachment limits, **without a key** (a build script can check a file size before it holds a credential) |
-| `POST /api/ext/v1/tickets` | file one — `attachments[]` rides along |
+| `POST /api/ext/v1/tickets` | file one — `attachments[]` rides along; answer carries `notified` (which managers woke, or why none did) |
 | `GET /api/ext/v1/tickets` | list yours — `?status=` `?kind=` `?q=` `?external_ref=` |
 | `GET /api/ext/v1/tickets/:ref` | **monitor** one: status, comments, attachments, and what the fleet is doing |
 | `PATCH /api/ext/v1/tickets/:ref` | update what you reported (rule 3) |
@@ -118,8 +118,20 @@ curl -sX POST https://<queenzee>/api/ext/v1/tickets \
 { "code": "TKT-41-9c2b", "ref": "#41", "status": "queued", "priority": 1,
   "attachments": [ { "id": "…", "filename": "screenshot.png", "kind": "image", "sha256": "…",
                      "download_url": "/api/ext/v1/tickets/…/attachments/…" } ],
-  "work": { "items": [], "count": 0, "open": 0 }, "deduped": false }
+  "work": { "items": [], "count": 0, "open": 0 }, "deduped": false,
+  "notified": { "managers": ["omnibiz-mgr"], "reason": null } }
 ```
+
+`notified` is create-only (POST, including a deduped 200). It is the observability contract: the
+caller must be able to tell whether anybody woke.
+
+| | |
+|---|---|
+| `notified.managers` | slugs of the project's deployed managers that were actually reached (inbox always; typed into a live cxell when one exists) |
+| `notified.reason` | `null` when `managers` is non-empty; otherwise why none were — `"no live manager in this project"` on a fresh create, or `"deduped: already filed"` on a repeat (which never re-notifies) |
+
+A `201` with `"managers": []` and `"reason": "no live manager in this project"` is a ticket that
+exists and nobody knows about — treat it as a problem in the integrator, not as health.
 
 ### Monitor it
 
