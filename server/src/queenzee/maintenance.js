@@ -166,6 +166,21 @@ function execAsync(cmd, args, { timeout = 600000, onLine, signal } = {}) {
 // resolves with `cancelled: true` — the src (the dump) stops immediately, and the dst (the writer)
 // is torn down so it cannot finalize a truncated file as "ok".
 //
+// `stallTimeout` (optional, ms, default 0 = disabled): the "silent dead destination" watchdog. A
+// DESTINATION THAT DIES is handled by the close handlers below, but a destination that is STILL
+// ALIVE and simply never consumes stdin produces the same symptom with no exit to catch: node's
+// pipe backpressures, the source (pg_dump) blocks on a full OS pipe, and neither side ever closes —
+// the promise would sit until `timeout`, with NO output from either side to say why. That is the
+// live omnibiz failure ("streamed backup … failed (timed out): (no output)"): the destination
+// `docker run` never starts reading, pg_dump fills the pipe and blocks, and 30 minutes pass in
+// silence. While the pipe is active this watchdog watches for FLOW — the source's stdout data
+// (bytes actually crossing the pipe) and the destination's own stdout/stderr (a still-starting
+// writer printing pull/progress lines). If neither produces anything for `stallTimeout` ms while
+// BOTH processes are still running, the pipe is blocked: the destination is not consuming. It
+// SIGKILLs both sides and resolves with `stalled: true` so the caller can fail in ~seconds with a
+// diagnosable error instead of after the full transfer timeout. A healthy stream is never flagged:
+// as long as bytes are flowing OR the destination is printing progress, `lastFlow` keeps updating.
+//
 // WHY IT CANNOT HANG — the failure this function is built around. The data stream is
 // `src.stdout.pipe(dst.stdin)`, and node's pipe UNPIPES the source the moment the destination's
 // stdin errors (EPIPE — the destination process died). An unpiped source's stdout stops being read,
@@ -182,11 +197,13 @@ function execAsync(cmd, args, { timeout = 600000, onLine, signal } = {}) {
 // dst's stdin (idempotent when the pipe already did).
 // Exported for the regression test (test/exec-pipe-hang.test.mjs) which reproduces the orphan with
 // plain shell processes — no docker, no database.
-export function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
+export function execPipe(a, b, { timeout = 1800000, onLine, signal, stallTimeout = 0 } = {}) {
   return new Promise((resolveP) => {
     let dstOut = '', srcErr = '', dstErr = '', timedOut = false, cancelled = false, srcDone = false, dstDone = false;
     let bufSrcErr = '', bufDstOut = '', bufDstErr = '';
     let srcStatus = null, dstStatus = null, src, dst;
+    let lastFlow = Date.now(), bytesFlowed = 0, stalled = false;
+    let stallTimer = null;
     const killBoth = () => {
       try { src?.kill('SIGKILL'); } catch { /* gone */ }
       try { dst?.kill('SIGKILL'); } catch { /* gone */ }
@@ -194,14 +211,15 @@ export function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
     const finish = () => {
       if (!srcDone || !dstDone) return;
       clearTimeout(timer);
+      if (stallTimer) clearInterval(stallTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
-      resolveP({ srcStatus, dstStatus, dstStdout: dstOut, srcStderr: srcErr, dstStderr: dstErr, timedOut, cancelled });
+      resolveP({ srcStatus, dstStatus, dstStdout: dstOut, srcStderr: srcErr, dstStderr: dstErr, timedOut, cancelled, stalled, bytesFlowed });
     };
     try {
       src = spawn(a.cmd, a.args, { windowsHide: true });
       dst = spawn(b.cmd, b.args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (e) {
-      return resolveP({ srcStatus: -1, dstStatus: -1, dstStdout: '', srcStderr: String(e?.message || e), dstStderr: '', timedOut, cancelled });
+      return resolveP({ srcStatus: -1, dstStatus: -1, dstStdout: '', srcStderr: String(e?.message || e), dstStderr: '', timedOut, cancelled, stalled, bytesFlowed });
     }
     const onAbort = () => { cancelled = true; killBoth(); };
     if (signal) {
@@ -227,9 +245,26 @@ export function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
     // if pg_dump dies, tear down the writer so it can't finalize a truncated file as "ok"
     src.stdout?.on('error', () => { try { dst.stdin?.destroy(); } catch { /* gone */ } });
     dst.stdin?.on('error', () => { /* dst exited early; src close will surface the real status */ });
+    // The src's stdout is the DATA stream: when it flows, the pipe is alive (bytes crossing into the
+    // dst). The dst's own stdout/stderr count too — a writer still pulling its image or reporting
+    // progress is alive even before/while data flows. Anything else silent for `stallTimeout` while
+    // both processes are running means the destination is not consuming (see the stallTimeout note).
+    src.stdout?.on('data', (d) => { bytesFlowed += d.length; lastFlow = Date.now(); });
     src.stderr?.on('data', (d) => { srcErr += d; bufSrcErr = feedLines(d, bufSrcErr); });
-    dst.stdout?.on('data', (d) => { dstOut += d; bufDstOut = feedLines(d, bufDstOut); });
-    dst.stderr?.on('data', (d) => { dstErr += d; bufDstErr = feedLines(d, bufDstErr); });
+    dst.stdout?.on('data', (d) => { dstOut += d; lastFlow = Date.now(); bufDstOut = feedLines(d, bufDstOut); });
+    dst.stderr?.on('data', (d) => { dstErr += d; lastFlow = Date.now(); bufDstErr = feedLines(d, bufDstErr); });
+    if (stallTimeout > 0) {
+      // Check on a cadence small enough to catch a short test stall quickly, large enough not to
+      // wake for every chunk of a long healthy stream (a 1.2 GB dump streams for minutes).
+      const stallCheckMs = Math.max(1000, Math.min(5000, Math.floor(stallTimeout / 4)));
+      stallTimer = setInterval(() => {
+        if (srcDone || dstDone) return;               // one side ended — the close handlers own it now
+        if (Date.now() - lastFlow > stallTimeout) {   // no flow AND no dst output: the pipe is blocked
+          stalled = true;
+          killBoth();
+        }
+      }, stallCheckMs);
+    }
     src.on('error', (e) => { srcErr += String(e?.message || e); srcStatus = srcStatus ?? -1; srcDone = true; finish(); });
     dst.on('error', (e) => { dstErr += String(e?.message || e); dstStatus = dstStatus ?? -1; dstDone = true; finish(); });
     src.on('close', (code) => {
@@ -504,6 +539,17 @@ function backupDirFor(pool) {
 // A tiny image the destination context uses to WRITE the streamed bytes to its bind mount, and to
 // prune/read files there. `alpine` is ~5 MB and universally pullable.
 const STREAM_IMAGE = process.env.BACKUP_STREAM_IMAGE || 'alpine';
+// The stream's stall watchdog (passed to execPipe as stallTimeout for the network-destination
+// backup). A destination writer that never consumes stdin blocks the pipe with ZERO output on
+// either side — the live omnibiz "failed (timed out): (no output)" that burned the full 30-minute
+// pipe timeout on every retry. If no bytes cross the pipe AND the destination prints nothing for
+// this long, the writer is dead-in-the-water: fail fast and say which side was silent. 120s is
+// comfortably longer than any healthy pause (a pg_dump waits seconds between objects; a pulling
+// destination prints progress), short enough to cut a dead destination to ~2 minutes instead of 30.
+const STREAM_STALL_MS = (() => {
+  const v = Number(process.env.BACKUP_STALL_MS);
+  return Number.isFinite(v) && v > 0 ? v : 120000;
+})();
 // The image used to run `pg_restore --list` on the WRITTEN dump for the content check. We prefer
 // the SOURCE db container's own image (guaranteed to read an archive it produced), falling back to
 // a stock postgres so a private source tag that the destination can't pull still validates.
@@ -791,16 +837,29 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
           label: `${project.name} prod`, msg: 'Dumping database to remote host…', pct: 30, status: 'running',
         });
         const writer = `cat > '/out/${file}' && wc -c < '/out/${file}'`;
+        // stallTimeout = the "silent dead destination" watchdog. The live omnibiz failure was the
+        // destination `docker run` on the backup host never consuming stdin: pg_dump filled the pipe
+        // and blocked, the writer printed nothing, and execPipe sat until the 30-minute timeout —
+        // every attempt "(timed out): (no output)". Fail in two minutes instead, with a diagnostic.
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName] },
           { cmd: 'docker', args: ['--context', destCtx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'sh', '-c', writer] },
-          { timeout: 1800000, onLine: emitLog, signal: ac.signal });
+          { timeout: 1800000, onLine: emitLog, signal: ac.signal, stallTimeout: STREAM_STALL_MS });
         checkCancelled();   // a cancelled pipe resolves here — stop before validating a partial
         if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
           await removeRemoteFile(destCtx, dir, file);   // never leave a truncated partial behind
-          const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}, writer exit ${piped.dstStatus}`;
-          throw new Error(`streamed backup of ${container}/${dbName} → [${destCtx}] failed (${why}): `
-            + `${((piped.srcStderr || piped.dstStderr) || '(no output)').slice(-300)}`);
+          const why = piped.timedOut ? 'timed out'
+            : piped.stalled
+              ? `stalled — no data flowed for ${Math.round(STREAM_STALL_MS / 1000)}s after ${piped.bytesFlowed} bytes`
+              : `pg_dump exit ${piped.srcStatus}, writer exit ${piped.dstStatus}`;
+          const detail = piped.stalled
+            ? piped.bytesFlowed > 0
+              ? `the destination writer never consumed the ${piped.bytesFlowed} bytes pg_dump produced — is `
+                + `${STREAM_IMAGE} pullable on [${destCtx}] and is ${dir} a writable mount on it?`
+              : `neither side produced anything — the source (${container}/${dbName}) or the writer on `
+                + `[${destCtx}] failed to start`
+            : ((piped.srcStderr || piped.dstStderr) || '(no output)');
+          throw new Error(`streamed backup of ${container}/${dbName} → [${destCtx}] failed (${why}): ${detail.slice(-300)}`);
         }
         size = parseInt(String(piped.dstStdout).trim(), 10);
         if (!Number.isFinite(size)) throw new Error(`destination did not report a written size (got ${JSON.stringify(String(piped.dstStdout).slice(0, 80))})`);

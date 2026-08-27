@@ -73,6 +73,43 @@ try {
       `both sides exit 0 on success (srcStatus=${normal.value.srcStatus}, dstStatus=${normal.value.dstStatus})`);
     ok(String(normal.value.dstStdout).trim() === '792', `all 100 lines reached the destination (dstStdout=${JSON.stringify(normal.value.dstStdout.trim())})`);
   }
+
+  console.log('\n── the NEW failure: a destination that NEVER consumes (stays alive, silent) ──');
+  // The live omnibiz case: neither process dies. The destination `docker run` on the backup host
+  // never starts reading stdin; node's pipe backpressures, the source (pg_dump) blocks on a full OS
+  // pipe, and BOTH sides stay alive with no output. Before the stall watchdog this sat until the
+  // 30-minute timeout — every retry "(timed out): (no output)". The test's destination is `exec
+  // sleep` — alive, silent, never reading stdin — and the source writes forever. With stallTimeout
+  // 1500ms the pipe must settle on its own in ~2s, flagged stalled.
+  const deadDst = await race(execPipe(
+    { cmd: 'sh', args: ['-c', 'i=0; while true; do echo "data line $i — padding padding padding padding padding"; i=$((i+1)); done'] },
+    { cmd: 'sh', args: ['-c', 'exec sleep 60'] },   // alive, silent, NOT consuming stdin
+    { timeout: 30000, stallTimeout: 1500 },
+  ), 5000, 'execPipe');
+  ok(deadDst.winner === 'execPipe', `execPipe resolves when the destination silently stops consuming (got ${deadDst.winner} after 5s)`);
+  if (deadDst.winner === 'execPipe') {
+    ok(deadDst.value.stalled === true, `resolved with stalled=true (got ${JSON.stringify(deadDst.value.stalled)})`);
+    ok(deadDst.value.timedOut === false, 'stall resolves BEFORE the overall timeout (timedOut must stay false)');
+    ok(deadDst.value.srcStatus !== 0 && deadDst.value.dstStatus !== 0,
+      `the blocked source was torn down too (srcStatus=${deadDst.value.srcStatus}, dstStatus=${deadDst.value.dstStatus})`);
+    ok(Number.isFinite(deadDst.value.bytesFlowed), `bytesFlowed is reported for the diagnostic (got ${deadDst.value.bytesFlowed})`);
+  }
+
+  console.log('\n── a healthy stream with the stall watchdog armed is NOT false-stalled ──');
+  // The watchdog must not interrupt a working transfer: bytes flow continuously, so lastFlow keeps
+  // updating and stallTimeout never fires even though the transfer lasts longer than the timeout.
+  const healthyArmed = await race(execPipe(
+    { cmd: 'sh', args: ['-c', 'for i in $(seq 1 200); do echo "line $i — padding padding padding padding"; done'] },
+    { cmd: 'sh', args: ['-c', 'wc -c'] },
+    { timeout: 10000, stallTimeout: 1500 },
+  ), 5000, 'execPipe');
+  ok(healthyArmed.winner === 'execPipe' && healthyArmed.value.stalled !== true,
+    `healthy stream with stallTimeout armed completes cleanly (got ${healthyArmed.winner}, stalled=${healthyArmed.value.stalled})`);
+  if (healthyArmed.winner === 'execPipe' && healthyArmed.value.stalled !== true) {
+    ok(healthyArmed.value.srcStatus === 0 && healthyArmed.value.dstStatus === 0,
+      `both sides exit 0 (srcStatus=${healthyArmed.value.srcStatus}, dstStatus=${healthyArmed.value.dstStatus})`);
+    ok(String(healthyArmed.value.dstStdout).trim() === '8892', `all 200 lines reached the destination (dstStdout=${JSON.stringify(String(healthyArmed.value.dstStdout).trim())})`);
+  }
 } finally {
   // the source-first test leaves a file in /tmp; clean it up
   try {
