@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell,
-         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
+         reapXell, rescueXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          sendXellMessage,
          swapXellZee,
@@ -1143,6 +1143,28 @@ export default function App() {
     // the persona (and an optional brief); the server owns every refusal, so nothing is pre-checked
     // here beyond opening the right modal.
     if (kind === 'swap') { setSwapXell({ ...x, diff }); return; }
+    // 🛟 RESCUE — the RESCUE arm of the quarantine decision (ticket #81): clears the quarantine so a
+    // fresh agent can be dispatched into the same worktree/branch. The opposite of done/reap — the
+    // branch and its unlanded work are KEPT. Idempotent server-side, so a stale click is a no-op.
+    if (kind === 'rescue') {
+      if (!(await showConfirm(`Rescue ${x.slug}?\n\nClears its quarantine so a fresh agent can be `
+        + `dispatched into the same worktree and branch. Its unlanded work stays intact — this is the `
+        + `"rescue the branch" arm; done/cleanup is the "reap the cage" arm that deletes them.`,
+        { okLabel: 'Rescue' }))) return;
+      const id = `xrescue-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Rescuing ${x.slug}…` });
+      rescueXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Rescued ${x.slug}`, onRetry: null,
+          body: r?.cleared ? 'quarantine cleared — you can dispatch a fresh agent'
+            : 'was not quarantined — nothing to clear' });
+        else updateToast(id, { kind: 'error', title: 'Rescue refused', onRetry: null,
+          body: r?.error || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Rescue failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
     if (kind === 'push' || kind === 'land') {
       if (!(await showConfirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
