@@ -550,6 +550,35 @@ const STREAM_STALL_MS = (() => {
   const v = Number(process.env.BACKUP_STALL_MS);
   return Number.isFinite(v) && v > 0 ? v : 120000;
 })();
+// The stream's OVERALL timeout, sized from the SOURCE database's measured size (streamTimeoutFor).
+// The old fixed 30 minutes was calibrated for the 1-2 GB era; omnibiz has grown past what a full
+// dump can finish in that window — a ~5 GB database streaming at the observed ~1.5-3 MB/s needs
+// 30-60 minutes, and every retry was killed at the 30-minute mark with a 4.9-5.07 GB partial left
+// on the destination. The dump window is now estimated as size / a conservative floor rate, × a
+// safety margin, clamped to a floor (small DBs still get the old window) and a ceiling (a
+// slow-but-flowing transfer must still eventually die; the stall watchdog above already catches the
+// NOTHING-flows case in ~2 minutes no matter how large this window is). Env-overridable like the
+// stall watchdog, so an operator can widen the window without a code change.
+// The rate is deliberately conservative: at 1 MB/s the estimate already over-covers the observed
+// 1.5-3 MB/s, and the margin absorbs a busy-source slowdown on top of that.
+const STREAM_MIN_BYTES_PER_SEC = (() => {
+  const v = Number(process.env.BACKUP_MIN_RATE);
+  return Number.isFinite(v) && v > 0 ? v : 1024 * 1024;
+})();
+const STREAM_TIMEOUT_MARGIN = (() => {
+  const v = Number(process.env.BACKUP_TIMEOUT_MARGIN);
+  return Number.isFinite(v) && v > 0 ? v : 2;
+})();
+const STREAM_TIMEOUT_FLOOR_MS = 30 * 60 * 1000;        // never less than the old fixed window
+const STREAM_TIMEOUT_CEILING_MS = 3 * 60 * 60 * 1000;  // but never more than 3 hours
+
+// The dump window for a source of `dbBytes` bytes. A null/unknown size (the probe failed) gets the
+// floor — the dump still runs, just within the old fixed window. Exported for the regression test.
+export function streamTimeoutFor(dbBytes) {
+  if (!Number.isFinite(dbBytes) || dbBytes <= 0) return STREAM_TIMEOUT_FLOOR_MS;
+  const secs = (dbBytes / STREAM_MIN_BYTES_PER_SEC) * STREAM_TIMEOUT_MARGIN;
+  return Math.min(STREAM_TIMEOUT_CEILING_MS, Math.max(STREAM_TIMEOUT_FLOOR_MS, Math.round(secs * 1000)));
+}
 // The image used to run `pg_restore --list` on the WRITTEN dump for the content check. We prefer
 // the SOURCE db container's own image (guaranteed to read an archive it produced), falling back to
 // a stock postgres so a private source tag that the destination can't pull still validates.
@@ -784,6 +813,27 @@ export async function backupProd(projectId) {
 //      table locks, touches no heap, and runs AFTER pg_dump has already let go.
 //   3. It is never an exact count(*) here. Minutes of I/O on a 1.3 GB production database for a number
 //      that only has to be good enough for a trend is not a trade worth making.
+//
+// The SOURCE database's on-disk size, probed BEFORE the dump so the stream/dump window can be
+// sized to what the database has grown to (streamTimeoutFor). Same shape as the row-count probe
+// below: a `psql` read-only query on the source container — pg_database_size is a single catalog
+// read, no table locks, nothing on the heap. Advisory by contract: any failure (psql missing,
+// query error, cancelled) returns null and the caller falls back to the floor window. The backup
+// is the product; this probe only sizes its time budget.
+async function sourceDbSizeBytes(ctx, container, dbUser, dbName, signal) {
+  const r = await execAsync('docker',
+    ['--context', ctx, 'exec', container, 'psql', '-U', dbUser, '-d', dbName, '-tAq',
+      '-c', 'SELECT pg_database_size(current_database())'],
+    { timeout: 30000, signal });
+  const n = Number.parseInt(String(r.stdout || '').trim(), 10);
+  if (r.status !== 0 || !Number.isFinite(n)) {
+    logline('maint', `db-size probe of ${container}/${dbName} failed (exit ${r.status}) — the dump uses the floor window: `
+      + `${(r.stderr || '').trim().split('\n').pop()?.slice(0, 160)}`);
+    return null;
+  }
+  return n;
+}
+
 async function sourceRowCounts(ctx, container, dbUser, dbName, signal) {
   const r = await execAsync('docker',
     ['--context', ctx, 'exec', container, 'psql', '-U', dbUser, '-d', dbName, '-tAq', '-c', ROW_COUNT_SQL],
@@ -828,6 +878,16 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         label: `${project.name} prod`, msg: 'Starting dump…', pct: 5, status: 'running',
       });
 
+      // Size the dump's time budget from the SOURCE's actual size. The fixed 30-min window shipped
+      // for 1-2 GB databases; the omnibiz DB has grown past it (a ~5 GB dump at ~1.5-3 MB/s needs
+      // 30-60 min, and the fixed window killed every attempt mid-stream with a multi-GB partial).
+      // The probe is advisory — on any failure the floor window is used and the dump still runs.
+      const dbBytes = await sourceDbSizeBytes(srcCtx, container, dbUser, dbName, ac.signal);
+      const dumpWindow = streamTimeoutFor(dbBytes);
+      logline('maint', `backup of ${container}/${dbName}: source is `
+        + `${dbBytes == null ? 'size UNKNOWN' : `${(dbBytes / 1048576).toFixed(0)} MiB`} → dump window `
+        + `${Math.round(dumpWindow / 60000)} min (stall watchdog ${Math.round(STREAM_STALL_MS / 1000)}s)`);
+
       if (destCtx) {
         // ── NETWORK destination: STREAM src → dst, never staging the dump on the queenzee host ──
         // pg_dump writes to stdout; a throwaway container on the destination context reads stdin
@@ -844,11 +904,11 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName] },
           { cmd: 'docker', args: ['--context', destCtx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'sh', '-c', writer] },
-          { timeout: 1800000, onLine: emitLog, signal: ac.signal, stallTimeout: STREAM_STALL_MS });
+          { timeout: dumpWindow, onLine: emitLog, signal: ac.signal, stallTimeout: STREAM_STALL_MS });
         checkCancelled();   // a cancelled pipe resolves here — stop before validating a partial
         if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
           await removeRemoteFile(destCtx, dir, file);   // never leave a truncated partial behind
-          const why = piped.timedOut ? 'timed out'
+          const why = piped.timedOut ? `timed out after ${Math.round(dumpWindow / 60000)} min`
             : piped.stalled
               ? `stalled — no data flowed for ${Math.round(STREAM_STALL_MS / 1000)}s after ${piped.bytesFlowed} bytes`
               : `pg_dump exit ${piped.srcStatus}, writer exit ${piped.dstStatus}`;
@@ -900,7 +960,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         const cancelStop = async () => { if (ac.signal.aborted) { await rmTmp(); throw CANCELLED; } };
         const dump = await execAsync('docker',
           ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName, '-f', remoteTmp],
-          { timeout: 1200000, onLine: emitLog, signal: ac.signal });
+          { timeout: dumpWindow, onLine: emitLog, signal: ac.signal });
         await cancelStop();
         if (dump.status !== 0) {
           await rmTmp();
@@ -911,7 +971,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         const list = await execAsync('docker',
           ['--context', srcCtx, 'exec', container, 'pg_restore', '--list', remoteTmp], { timeout: 300000, onLine: emitLog, signal: ac.signal });
         await cancelStop();
-        const cp = await execAsync('docker', ['--context', srcCtx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: 1200000, signal: ac.signal });
+        const cp = await execAsync('docker', ['--context', srcCtx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: dumpWindow, signal: ac.signal });
         await rmTmp();   // WHATEVER the cp did — the tmp is cleaned even when it never made it out
         if (ac.signal.aborted) throw CANCELLED;   // tmp already cleaned; the outer catch removes the host partial
         if (cp.status !== 0) {
