@@ -78,8 +78,9 @@ ok(/useState\(initialUrl\.current\.project \? 'nodes' : 'projects'\)/.test(app),
 ok(/hex_kind: 'project'/.test(app) && /hex_kind: 'worknode'/.test(app),
    'App synthesises the two cell kinds for the canvas');
 ok(/parent_id === ctxItemId/.test(app), "a level's cells are the CONTEXT node's children");
-ok(/!openXellItem\.has\(x\.id\)/.test(app),
-   'provisioned / itemless xells sit at the level below the project (root level only)');
+ok(/openXellItem\.has\(x\.id\)/.test(app) && /itemReachable\(it,/.test(app),
+   'provisioned / itemless xells sit at the level below the project (root level only) — '
+   + 'and a xell on an UNREACHABLE node (terminal/missing parent) surfaces there too');
 ok(/hive-crumb/.test(app) && /\.hive-crumbs/.test(css), 'the level breadcrumb exists and is styled');
 ok(/parent_work_item: nodePath\[nodePath\.length - 1\]\.id/.test(app),
    'a prompt written inside a level rides with that node as parent_work_item');
