@@ -5,6 +5,11 @@
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+// The one async docker adapter (lib/build-readiness.js) — the ONLY sanctioned way this module
+// shells out to docker asynchronously. The TKT-85 port-allocation fix reads the daemon's bound
+// ports with it (never spawnSync on the event loop, and bounded); build-readiness.js imports
+// nothing from here, so there is no cycle.
+import { dockerAdapter } from './build-readiness.js';
 import { resolve, dirname } from 'node:path';
 import pg from 'pg';
 import { pool, q, one } from '../db/pool.js';
@@ -72,6 +77,71 @@ export function computePorts(slug, project = {}) {
     serverPort: (Number(project.port_server_base) || 3100) + slot,
     webPort: (Number(project.port_web_base) || 5200) + slot,
   };
+}
+
+// ── HOST-PORT ALLOCATION (TKT-85 family, provision-proof plan §4.5) ─────────────────────────────
+// The per-xell db host-port used to be a PURE FORMULA (base + slot). A pure formula cannot see the
+// two things that actually own host ports: the daemon's published ports (another xell's db, a human
+// postgres, a container from a different code path — everything `docker ps` shows) and the rows
+// OTHER xells recorded in the meta-DB (including a row that was never bound yet — a modeled
+// compose-era db — and a row on a daemon that is currently down). Two xells whose slugs hash to the
+// same slot collided silently: the second `docker run -p` died with "port is already allocated"
+// (and provisioning failed), or the compose-era path recorded a row whose port nobody could bind.
+//
+// So the slot is the STARTING guess; the actual port is the first free one walking UP from it,
+// checked against the UNION of (meta-DB recorded db host ports on this context) and (one bounded
+// `docker ps --format '{{.Ports}}'` read of the daemon's published ports). An unreachable daemon
+// DEGRADES to meta-DB-only allocation, logged, never a hang — and never a spawnSync on the event
+// loop. Every probe is bounded (a docker ps against a remote context is a network round-trip).
+
+// The host port of every published mapping in `docker ps --format '{{.Ports}}'` output. Pure —
+// entries look like `0.0.0.0:5503->5432/tcp, [::]:5503->5432/tcp`; exposed-but-unpublished ports
+// (bare `5432/tcp`) are not published bindings and never appear in {{.Ports}}.
+export function publishedPortsFromPs(output) {
+  const ports = new Set();
+  // One mapping per token. Tokens are separated by ',' within a container's line AND by the newline
+  // between containers (`docker ps --format '{{.Ports}}'` prints one line per container), so split
+  // on either. Each mapping looks like `0.0.0.0:5509->5432/tcp` or `[::]:5508->5432/tcp`; the host
+  // port is the digit run before `->`.
+  for (const token of String(output || '').split(/[,\s]+/)) {
+    const m = token.match(/:(\d+)->/);
+    if (m) ports.add(Number(m[1]));
+  }
+  return ports;
+}
+
+// The first free db host port for `slot` on `ctx`. Never throws: a read that cannot complete must
+// not fail a provision — the caller (docker run) remains the arbiter of a genuinely taken port.
+export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = null, skip = [], docker = dockerAdapter } = {}) {
+  const formula = Number(base) + slot;
+  const taken = new Set();
+  // Host ports this caller already FAILED to bind (the bind-refusal retry walks past them so the
+  // search makes forward progress even if the daemon read does not yet see the racer).
+  for (const p of skip) taken.add(Number(p));
+  // meta-DB recorded db host ports on THIS context — the other xells (modeled or live) this one
+  // would collide with even when the daemon is unreachable.
+  const recorded = await q(
+    `SELECT host_port FROM container WHERE role='db' AND docker_ctx=$1 AND host_port IS NOT NULL`, [ctx])
+    .catch(() => []);
+  for (const r of recorded) taken.add(Number(r.host_port));
+  // the daemon's published ports — the source of truth for what is actually bound. Bounded, async,
+  // and failure-tolerant: an unreachable daemon degrades to meta-DB-only (logged, never a hang).
+  const ps = await docker(ctx, ['ps', '--format', '{{.Ports}}'], { timeout: 4000 });
+  if (ps?.unknown) {
+    console.warn(`[provision] freeDbHostPort (${ctx}): ${ps.reason} — allocating from the meta-DB `
+      + `recorded db ports only; a daemon-side collision will surface as a bind refusal and retry`);
+  } else {
+    for (const p of publishedPortsFromPs(ps?.stdout)) taken.add(p);
+  }
+  // Walk up a bounded window from the formula slot. If every port in the window is claimed (a very
+  // full hive), fall back to the FORMULA port and let the bind refusal/retry below be the arbiter —
+  // a provision never fails on a crowded host by guessing a port the caller cannot use.
+  const window = Number(process.env.PORT_ALLOC_WINDOW) || 64;
+  for (let s = slot; s < slot + window; s++) {
+    const port = Number(base) + s;
+    if (!taken.has(port)) return port;
+  }
+  return formula;
 }
 
 // The harness-free projection (spec §3.4): a generated, gitignored env file in the worktree so
@@ -1090,19 +1160,46 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       const dbName = mdb.name || project.db_name || 'app';
       const dbUser = mdb.user || project.db_user || 'postgres';
       const dbPass = mdb.password || 'dev';
-      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      // ALLOCATE THE HOST PORT AGAINST REAL OWNERSHIP (TKT-85 family, plan §4.5): the slot formula
+      // is the STARTING guess; the actual port is the first free one walking up from it, checked
+      // against the union of the meta-DB's recorded db host ports on this context and one bounded
+      // `docker ps --format '{{.Ports}}'` read of the daemon (async — never spawnSync on the event
+      // loop). docker run below remains the arbiter of a genuinely taken port (a TOCTOU between the
+      // read and the run), which is why the bind is RETRIED on the next free slot instead of failing
+      // the attach. The stage-2 re-preflight is the safety net; this is the fix.
+      const dbBase = Number(spinTier.ports?.db?.base) || 5500;
+      let dbPort = await freeDbHostPort(devCtx, { base: dbBase, slot: ports.slot, projectId });
       const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
       if (mode === 'real') {
-        const run = spawnSync('docker',
-          ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
-           // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
-           // the published host port below is the HUMAN's door (psql from the host)
-           '--network', 'zee-hive-net',
-           '-p', `${dbPort}:5432`,
-           '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
-           '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
-           '--label', `zeehive.slug=${slug}`, dbImage],
-          { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+        const skipPorts = [];     // host ports this provision already failed to bind — walk past them
+        let run = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          run = spawnSync('docker',
+            ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
+             // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
+             // the published host port below is the HUMAN's door (psql from the host)
+             '--network', 'zee-hive-net',
+             '-p', `${dbPort}:5432`,
+             '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
+             '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
+             '--label', `zeehive.slug=${slug}`, dbImage],
+            { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+          if (run.status === 0) break;
+          const err = (run.stderr || '').slice(-300);
+          // A BIND REFUSAL is the collision the allocation raced: something bound the port between
+          // the ps read and this docker run. Retry on the next free slot — a fresh freeDbHostPort
+          // re-reads the daemon (now seeing the new binder) AND skips the port we just lost, so the
+          // walk makes forward progress. Anything else (image pull, daemon down) is a real failure
+          // and stays one.
+          if (/port is already allocated|address already in use|bind.*already/i.test(err)) {
+            console.warn(`[provision] ${slug}: db host port :${dbPort} refused at bind — retrying the `
+              + `next free slot (${err.trim().slice(0, 90)})`);
+            skipPorts.push(dbPort);
+            dbPort = await freeDbHostPort(devCtx, { base: dbBase, slot: ports.slot, projectId, skip: skipPorts });
+            continue;
+          }
+          break;
+        }
         if (run.status !== 0) {
           throw new Error(`per-xell db container ${nmDb.container} failed: ${(run.stderr || '').slice(-300)}`);
         }
@@ -1167,7 +1264,12 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       const mdb = project.manifest?.db || {};
       const dbName = mdb.name || project.db_name || 'app';
       const dbUser = mdb.user || project.db_user || 'postgres';
-      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      // ALLOCATE AGAINST REAL OWNERSHIP, same as the process twin (TKT-85, plan §4.5): there is no
+      // docker run here to catch a collision (compose binds at first build), so the ROW must record
+      // a port the daemon does not already own — otherwise the recorded conn_ref is a lie from the
+      // moment it is written and the compose stack fails to bind. The union check is the fix.
+      const dbPort = await freeDbHostPort(devCtx, { base: Number(spinTier.ports?.db?.base) || 5500,
+                                                    slot: ports.slot, projectId });
       const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
       const { rows: [dbc] } = await client.query(
         `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,compose_project,compose_file,owner_xell_id,site_id,health)
