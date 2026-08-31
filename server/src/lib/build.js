@@ -14,6 +14,7 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
+import { spinComposeDbPort } from './provision.js';
 import { npmCacheEnv } from '../lib/npm-cache.js';
 import {
   processRoleReachableHost, processRolePublishedUrl,
@@ -277,10 +278,14 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     SPINOFF_SLUG: xell.slug,
     SPINOFF_SERVER_PORT: portOf('server'),
     SPINOFF_WEB_PORT: portOf('webapp'),
-    // The GENERATED spinoff compose publishes a per-xell db on ${SPINOFF_DB_PORT} — the row's
-    // recorded port (provision stamped it) rides along like the server/web ones. NULL for
-    // projects with no per-xell db row; the compose default then applies.
-    SPINOFF_DB_PORT: portOf('db'),
+    // The GENERATED spinoff compose publishes a per-xell db on ${SPINOFF_DB_PORT}. A recorded db row
+    // (provision stamped it) rides along like the server/web ones. With NO per-xell db row
+    // (db-shared-dev coupling) the compose would fall back to its default 5500 — the one host port
+    // every OTHER row-less spin db also wants, so they collide cross-xell (TKT-85). spinComposeDbPort
+    // allocates against real ownership instead; any failure degrades to the old compose default.
+    SPINOFF_DB_PORT: await spinComposeDbPort({
+      recordedPort: portOf('db'), ctx: c.docker_ctx, slug: xell.slug, project,
+    }),
     // Split-build handoff (all no-ops when buildCtx === runCtx / no registry — see build-container.sh).
     BUILD_BUILD_CTX: target.buildCtx,
     BUILD_REGISTRY: target.registry,

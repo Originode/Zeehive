@@ -144,6 +144,20 @@ export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = n
   return formula;
 }
 
+// The host port for a xell's spin compose db service, as lib/build.js projects it into the build
+// env (SPINOFF_DB_PORT). A recorded per-xell db row (db-isolated coupling — provision stamped the
+// port) is authoritative, exactly like the server/web rows. With NO db row (db-shared-dev coupling)
+// the generated compose falls back to its DEFAULT 5500 — and 5500 is the one host port every other
+// row-less spin db also wants, so row-less xells collided cross-xell ("Bind for 0.0.0.0:5500 failed"
+// took a build down twice). So a row-less xell ALLOCATES like provision's per-xell db instead of
+// inheriting the default. Failure-tolerant: an allocation that blows up (daemon AND meta-DB both
+// gone) degrades to null = the compose default — the bind stays the arbiter, never a build blocker.
+export async function spinComposeDbPort({ recordedPort, ctx, slug, project = {}, docker = dockerAdapter }) {
+  if (recordedPort != null) return recordedPort;
+  const { slot } = computePorts(slug, project);
+  return freeDbHostPort(ctx, { slot, projectId: project?.id ?? null, docker }).catch(() => null);
+}
+
 // The harness-free projection (spec §3.4): a generated, gitignored env file in the worktree so
 // `docker compose --env-file .env --env-file .zeehive.env -f <spinoff compose> up` works with
 // ZEEHIVE stopped. Parameters ONLY — never secrets (those stay in the main checkout's .env).

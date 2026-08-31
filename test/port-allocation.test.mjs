@@ -15,18 +15,23 @@
 //   • a caller that already lost a bind (the retry) walks PAST the lost port (skip);
 //   • a fully-claimed window falls back to the formula port — a provision never FAILS on a crowded
 //     host by guessing; the bind refusal/retry is the arbiter.
+//   • spinComposeDbPort (the lib/build.js projection) — a ROW-LESS xell (db-shared-dev, no per-xell
+//     db row) must NOT inherit the compose default 5500: that is the one host port every other
+//     row-less spin db wants, so they collide cross-xell. A recorded row stays authoritative; a
+//     row-less xell allocates through the same real allocator (recorded ∪ daemon-bound), and an
+//     allocation that blows up degrades to null = the compose default, never a build blocker.
 //
 // PROVISION_MODE=simulate: allocation is read-only toward the meta-DB and the stubbed daemon — no
 // machine is touched.
 process.env.PROVISION_MODE = 'simulate';
 process.env.BUILD_MODE = 'simulate';
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { q, one, pool } from '../server/src/db/pool.js';
-import { publishedPortsFromPs, freeDbHostPort } from '../server/src/lib/provision.js';
+import { publishedPortsFromPs, freeDbHostPort, spinComposeDbPort } from '../server/src/lib/provision.js';
 
 let failures = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) failures++; };
@@ -106,6 +111,56 @@ try {
     ok(p7 === BASE + 40, `window 40–42 all taken → falls back to the formula :${BASE + 40} (got :${p7}) `
       + '— the caller (docker run) is the arbiter, never a guessed port');
   } finally { process.env.PORT_ALLOC_WINDOW = oldWin; }
+
+  // ── spinComposeDbPort (lib/build.js projection): a ROW-LESS xell's spin db must not inherit the
+  // compose default 5500 — that is the one host port every other row-less spin db also wants, so
+  // they collide cross-xell (the "Bind for 0.0.0.0:5500 failed" that took a build down twice). ──
+  console.log('\n── spinComposeDbPort: row-less xells allocate instead of the 5500 default ──');
+  const slotFor = (s, mod = 90) => {
+    const hex = createHash('md5').update(s).digest('hex').slice(0, 4);
+    return parseInt(hex, 16) % mod;
+  };
+  const daemonThrow = () => { throw new Error('docker blew up'); };
+  // Slots already recorded by the sections above (7, 8, 40–42) + the ones THIS section records.
+  const recSlots = new Set([7, 8, 40, 41, 42]);
+  const firstFreeAbove = (start) => { let s = start; while (recSlots.has(s)) s++; return s; };
+
+  // a RECORDED row is authoritative — no allocation read, even for a port that looks taken. It is
+  // ALSO a recorded db port the walkers below must respect (dead-daemon case), so track its slot.
+  const authPort = BASE + 70;
+  await rec(authPort);
+  recSlots.add(70);
+  const au = await spinComposeDbPort({ recordedPort: authPort, ctx: CTX, slug: 'ignored', project: { id: projId }, docker: daemonThrow });
+  ok(au === authPort, `a recorded db port rides along unchanged (:${authPort}), no allocation read (got :${au})`);
+
+  // row-less: the slot's own recorded port is skipped → the next free slot is allocated
+  const slugR = `portalloc-${tag}-rowless`;
+  const slotR = slotFor(slugR);
+  await rec(BASE + slotR);
+  recSlots.add(slotR);
+  const expR = firstFreeAbove(slotR + 1);
+  const rl1 = await spinComposeDbPort({ recordedPort: null, ctx: CTX, slug: slugR, project: { id: projId }, docker: daemonUp([]) });
+  ok(rl1 === BASE + expR, `row-less @ :${BASE + slotR} (recorded) → walks to :${BASE + expR} (got :${rl1}) `
+    + '— NOT the compose default 5500');
+
+  // row-less: a daemon-published port on the slot is skipped the same way
+  const slugD = `portalloc-${tag}-daemon`;
+  const slotD = slotFor(slugD);
+  const expD = firstFreeAbove(slotD + 1);
+  const rl2 = await spinComposeDbPort({ recordedPort: null, ctx: CTX, slug: slugD, project: { id: projId },
+    docker: daemonUp([`0.0.0.0:${BASE + slotD}->5432/tcp`]) });
+  ok(rl2 === BASE + expD, `row-less @ :${BASE + slotD} (daemon owns it) → :${BASE + expD} (got :${rl2})`);
+
+  // row-less with a DEAD daemon still allocates from the meta-DB only (never a hang, never the
+  // default): the slot itself is free in the meta-DB, so it is the answer even though the daemon
+  // is unreachable and even though that same slot was "owned" when the daemon answered above.
+  const expDead = firstFreeAbove(slotD);
+  const rl3 = await spinComposeDbPort({ recordedPort: null, ctx: CTX, slug: slugD, project: { id: projId }, docker: daemonDown });
+  ok(rl3 === BASE + expDead, `dead daemon → meta-DB-only allocation lands on :${BASE + expDead} (got :${rl3})`);
+
+  // an allocation that BLOWS UP degrades to null = the compose default — never a build blocker
+  const rl4 = await spinComposeDbPort({ recordedPort: null, ctx: CTX, slug: slugR, project: { id: projId }, docker: daemonThrow });
+  ok(rl4 === null, `allocator throw → null (compose default), never a build blocker (got ${rl4})`);
 } finally {
   await q(`DELETE FROM container WHERE project_id=$1`, [projId]).catch(() => {});
   await q(`DELETE FROM project WHERE id=$1`, [projId]).catch(() => {});
