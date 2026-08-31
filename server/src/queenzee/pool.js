@@ -46,6 +46,8 @@ import { serverRoleIsProcess } from '../lib/manifest.js';
 // project verdict into build_readiness_record so one recorded fact serves all N xells on a pair.
 import { proveXell, buildReadinessRecordFromProof } from '../lib/xell-proof.js';
 import { upsertBuildReadinessRecord, buildReadinessForProject } from '../lib/build-readiness.js';
+import { routeProofFailure } from '../lib/proof-routing.js';
+import { projectReadinessProof } from '../lib/proof-policy.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -82,14 +84,100 @@ async function machineForProof(key) {
   return one(`SELECT id FROM machine WHERE docker_ctx=$1 OR key=$1`, [key]).catch(() => null);
 }
 
+// ── PROOF-FAILED TEARDOWN BUDGET (§4.3/§4.6) ───────────────────────────────────────────────
+// Never more than N proof-failed decommissions per (machine, project) per hour — a persistent
+// fault must FLIP the record and STOP the fill (§4.6), not churn provision→fail→reap forever. In
+// memory: the pool is a single process, and a restart resetting the budget is an hour of calm the
+// fleet could use. Past the cap a pair goes on COOLDOWN for the rest of the hour: no more
+// decommissions AND no more provisioning (fillTrim consults the cooldown), so the CODE-under-
+// required case holds the gate (the pool neither reaps nor re-provisions a main that cannot
+// build) instead of either churning or piling unclaimable xells up to max_xells.
+const proofFailDecomms = new Map();           // `${machineKey}:${projectId}` → [timestamps of teardowns]
+const proofFailCooldownUntil = new Map();     // `${machineKey}:${projectId}` → ms epoch when the pair may fill again
+const PROOF_FAIL_DECOMM_CAP_PER_HOUR = Number(process.env.PROOF_FAIL_DECOMM_CAP_PER_HOUR) || 3;
+
+export function proofFailPairKey(machineKey, projectId) { return `${machineKey}:${projectId}`; }
+
+// The teardowns recorded for a pair in the last hour — pure over the map, exported for tests.
+export function proofFailDecommsInHour(pairKey, now = Date.now()) {
+  return (proofFailDecomms.get(pairKey) || []).filter((t) => now - t < 3600000);
+}
+
+// The pair's fill cooldown, if any (ms epoch until it lifts) — exported so fillTrim and tests
+// consult the same fact.
+export function proofFailCooldownFor(pairKey) {
+  const until = proofFailCooldownUntil.get(pairKey) || 0;
+  return until > Date.now() ? until : 0;
+}
+
+// Reset the budget — the pool's test seam (a fresh test wants a clean budget; a restart is the
+// production equivalent).
+export function resetProofFailBudget() {
+  proofFailDecomms.clear();
+  proofFailCooldownUntil.clear();
+}
+
+// Decommission ONE proof-failed POOLED xell, capped per (machine, project) per hour (§4.3, under
+// 'required' — a proof-failed xell is not stock, so the fill provisions a replacement). The cap is
+// counted on an ACTUAL reap (a sweep the CAS skipped — the xell was claimed, or is no longer ready —
+// consumed no slot and earns none). Past the cap the pair goes on cooldown (fillTrim stops
+// provisioning it), and the caller says so once. Returns the outcome for the pool line.
+export async function maybeDecommissionProofFailed(xell, machineKey, projectId, error,
+                                                   { decom = sweepDecommission } = {}) {
+  const pairKey = proofFailPairKey(machineKey, projectId);
+  const now = Date.now();
+  if (proofFailDecommsInHour(pairKey, now).length >= PROOF_FAIL_DECOMM_CAP_PER_HOUR) {
+    proofFailCooldownUntil.set(pairKey, now + 3600000);
+    return { decommissioned: false, cooledDown: true,
+             reason: `teardown cap (${PROOF_FAIL_DECOMM_CAP_PER_HOUR}/h) reached for `
+               + `(${machineKey}, project ${String(projectId).slice(0, 8)}) — pair on cooldown for an hour` };
+  }
+  const reason = `proof-failed: ${String(error || '').slice(0, 140)}`;
+  const res = await decom(
+    { id: xell.id, slug: xell.slug, worktree_path: xell.worktree_path },
+    reason,
+    { what: `decommissioning proof-failed pooled xell ${xell.slug} under 'required' (this xell is not stock)`,
+      verdict: reason, failLabel: 'PROOF' });
+  if (!res?.reaped) {
+    return { decommissioned: false, cooledDown: false,
+             reason: `sweep skipped for ${xell.slug}: ${res?.skipped || res?.error || '?'} — no slot consumed` };
+  }
+  const stamps = proofFailDecommsInHour(pairKey, now);
+  stamps.push(now);
+  proofFailDecomms.set(pairKey, stamps);
+  return { decommissioned: true, cooledDown: false,
+           reason: `${xell.slug} reaped (${stamps.length}/${PROOF_FAIL_DECOMM_CAP_PER_HOUR} this hour)` };
+}
+
 // Run one proof and persist the machine×project verdict (plan §4.4 + §4.6). Fire-and-forget from
-// maybeRunProofs (the machine stays busy until the whole thing — build + record — finishes).
+// maybeRunProofs (the machine stays busy until the whole thing — build + record + route + possibly
+// decommission — finishes).
 async function proveAndRecord(xellId, projectId, machineKey) {
   const verdict = await proveXell(xellId);
   const machine = await machineForProof(machineKey);
+  let rec = null;
+  let prevRec = null;
   if (machine && projectId) {
-    const rec = buildReadinessRecordFromProof(verdict);
+    prevRec = await one(
+      `SELECT status FROM build_readiness_record WHERE machine_id=$1 AND project_id=$2`,
+      [machine.id, projectId]).catch(() => null);
+    rec = buildReadinessRecordFromProof(verdict);
     if (rec) await upsertBuildReadinessRecord(machine.id, projectId, rec).catch(() => null);
+  }
+  // ROUTE THE FAILURE BY CLASS (§4.6) — after the record is persisted, BEFORE any decommission:
+  // the evidence must be recorded before the container disappears. A green proof routes nothing.
+  if (!verdict.ok) {
+    const xell = await one(
+      `SELECT id, slug, is_pooled, status, worktree_path FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+    const routed = await routeProofFailure({ xell, verdict, rec, prevRec, machine, projectId });
+    if (routed.class !== 'none') logline('proof', `routing for ${xell?.slug || xellId}: ${routed.class} — ${routed.reason}`);
+    // The §4.3 accounting, under 'required': a proof-failed xell is not stock — decommission it so
+    // the pool provisions a replacement — but capped per (machine, project) per hour.
+    if (xell && xell.is_pooled && xell.status === 'ready'
+        && (await projectReadinessProof(projectId)) === 'required') {
+      const d = await maybeDecommissionProofFailed(xell, machineKey, projectId, verdict.error);
+      logline('proof', `proof-failed teardown: ${d.decommissioned ? 'reaped' : d.cooledDown ? 'cooldown' : 'skipped'} — ${d.reason}`);
+    }
   }
   return verdict;
 }
@@ -338,6 +426,34 @@ async function reconcileProject(projectId, target) {
   }
 }
 
+// THE FILL CONSULTS THE RECORD (§4.4/§4.6) — why the pool is not filling a (machine, project) pair
+// right now, or null when it should fill. Two stop-reasons, both keyed on the pair:
+//   • build_readiness_record status 'missing' — a persistent INFRA fault (address pools, daemon
+//     down, context missing, port bind refused) flipped the pair's recorded verdict, so the pool
+//     stops provisioning onto a machine known to be unable to host this project's build. The
+//     console matrix badge is already red from the SAME record — one fact, N readers.
+//   • the proof-failed teardown cooldown (§4.3) — past the decommission cap the pair cools down:
+//     no more reaps AND no more provisioning, so a main that cannot build holds the gate under
+//     'required' instead of churning provision→fail→reap or piling unclaimable xells to max_xells.
+// Exported for the stage-2 verify (the fill-stop on a recorded 'missing' drives the real SQL).
+export async function fillStopReasonFor(projectId, m) {
+  if (!m) return null;
+  const rec = await one(
+    `SELECT status FROM build_readiness_record WHERE machine_id=$1 AND project_id=$2`,
+    [m.id, projectId]).catch(() => null);
+  if (rec?.status === 'missing') {
+    return `build_readiness_record for (${m.key}, this project) is 'missing' — the machine cannot `
+      + 'host the project\'s build; the fault is a human\'s (the console card names the check and '
+      + 'the one medic action)';
+  }
+  const cd = proofFailCooldownFor(proofFailPairKey(m.docker_ctx || m.key, projectId));
+  if (cd) {
+    return `proof-failed teardown cap reached — this (machine, project) pair is on cooldown until `
+      + new Date(cd).toISOString();
+  }
+  return null;
+}
+
 // Fill to / trim past `target` ready xells — on one machine (m) or project-wide (m = null).
 // m.processLocal marks the process-runner special case: the queenzee-host machine of a project
 // whose xells ALL live there by construction. Its ready set is the project-wide query — the
@@ -345,21 +461,44 @@ async function reconcileProject(projectId, target) {
 // is the runaway this flag exists to avoid — while the machine's max_xells still caps the fill
 // below (liveXellCount counts NULL-ctx rows into the queenzee host).
 async function fillTrim(projectId, target, m) {
+  // THE FILL-STOP (§4.4/§4.6): a recorded 'missing' (or a proof-failed cooldown) pair is NOT
+  // provisioned. Said on state CHANGE only — the pool ticks every 15s and a verbatim repeat would
+  // drown the lines that carry news; a stopped pair that is over target still trims below.
+  const fillStop = await fillStopReasonFor(projectId, m);
+  if (m) {
+    const key = `fillstop:${m.id}:${projectId}`;
+    if (fillStop) {
+      if (lastMachineGuardSaid.get(key) !== fillStop) {
+        lastMachineGuardSaid.set(key, fillStop);
+        logline('pool', `fill STOPPED for project ${String(projectId).slice(0, 8)} on ${m.key}: ${fillStop}`);
+      }
+    } else if (lastMachineGuardSaid.has(key)) {
+      lastMachineGuardSaid.delete(key);
+      logline('pool', `fill RESUMED for project ${String(projectId).slice(0, 8)} on ${m.key} — the fault cleared`);
+    }
+  }
+
   // A QUARANTINED xell is excluded from the ready set on both arms — it must not count toward the
   // target (the pool should provision a fresh cage to take its place) and it must not land in the
   // TRIM surplus either. Reaping the cage is the human's explicit choice (the other arm of the
   // ticket #81 decision), never a pool-sweep accident; a quarantined row sits untouched until a
   // human clears it or reaps it.
+  //
+  // Under 'required', a PROOF-FAILED xell is not stock either (§4.3): it must not count toward
+  // pool_size, so the fill provisions a replacement (and the failed one is decommissioned by the
+  // routing pass, capped). Under 'advisory'/'off' it is still claimable and still counts.
+  const excludeProofFailed = (await projectReadinessProof(projectId)) === 'required'
+    ? ` AND (proof_at IS NULL OR proof_error IS NULL)` : '';
   const ready = m && !m.processLocal
     ? await q(
       `SELECT x.id, x.slug, x.worktree_path FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
-        WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND x.quarantined_at IS NULL AND c.docker_ctx=$2
+        WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND x.quarantined_at IS NULL AND c.docker_ctx=$2${excludeProofFailed}
         ORDER BY x.ready_at DESC NULLS LAST, x.created_at DESC`, [projectId, m.docker_ctx])
     : await q(
-      `SELECT id, slug, worktree_path FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production AND quarantined_at IS NULL
+      `SELECT id, slug, worktree_path FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production AND quarantined_at IS NULL${excludeProofFailed}
         ORDER BY ready_at DESC NULLS LAST, created_at DESC`, [projectId]);
 
-  if (ready.length < target) {
+  if (ready.length < target && !fillStop) {
     // max_xells is MACHINE-WIDE: every live dev xell on the host counts (all projects, claimed
     // and working too), so a busy machine fills less than pool_size rather than blowing past it.
     let room = target - ready.length;
