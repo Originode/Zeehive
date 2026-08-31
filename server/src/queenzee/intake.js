@@ -169,8 +169,27 @@ class NeedsWorktree extends Error {
 // quarantine (the explicit rescue arm) and /xell again.
 export async function claimReadyXellForSkill(xellId) {
   if (!xellId) return null;
+  // THE PROOF GATE, applied to the skill-claim too (provision-proof §4.3): the SAME gate as
+  // dispatch's claimReadyXell, in the SAME statement, so under readiness_proof='required' an
+  // unproven / proof-failed / preflight-failed xell is not claimable by /xell either — a human
+  // standing in a known-broken worktree is pointed at the fresh stock instead of being told to
+  // work there. The one deliberate difference from dispatch: a PRODUCTION xell is exempt. Dispatch's
+  // claim refuses production xells outright (NOT is_production) because a pooled xell is never
+  // production; the /xell skill-claim is the legitimate door into a production worktree (the
+  // /xell-prod flow — a human standing in it claims it), and the readiness_proof policy governs
+  // POOLED stock, never a human's explicit production work. So a production xell is always
+  // claimable here, exactly as it is today. (NOT EXISTS over pool_config — a project with no row
+  // falls back to the default advisory, see the sibling claim in lib/xell-claim.js.)
   return one(
-    `UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 AND status='ready' AND quarantined_at IS NULL RETURNING *`, [xellId]);
+    `UPDATE xell x SET status='claimed', is_pooled=false
+       WHERE x.id=$1 AND x.status='ready' AND x.quarantined_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_config pc
+            WHERE pc.project_id = x.project_id
+              AND pc.readiness_proof = 'required'
+              AND NOT x.is_production
+              AND (x.proof_at IS NULL OR x.proof_error IS NOT NULL OR x.preflight_error IS NOT NULL))
+       RETURNING x.*`, [xellId]);
 }
 
 // The legible refusal when a skill-claim cannot take the xell it is standing in. The session is
@@ -191,12 +210,36 @@ export function skillClaimUnavailable(xellId, state) {
     err.code = 'XELL_QUARANTINED';
     return err;
   }
+  // Still 'ready' but the claim came back empty: the only refusal left is the PROOF GATE
+  // (provision-proof §4.3) — the xell was not decommissioned, not renamed, not claimed; it is
+  // exactly as the CAS found it, and the project's readiness_proof='required' policy will not let
+  // it be claimed because it is not proven stock. Name WHICH condition failed, so the human knows
+  // what would make it claimable (clear the preflight/proof error, or wait for the pool to
+  // reprovision a proven replacement) instead of retrying the same doomed claim.
+  if (state?.status === 'ready') {
+    const reason = proofGateRefusal(state);
+    const err = new Error(
+      `xell ${state.slug || xellId} is still ready but NOT claimable under this project's `
+      + `readiness_proof='required' policy — ${reason}. It is not stock: a fresh, proven xell will `
+      + 'be provisioned in its place. Open the fresh worktree and re-run /xell there.');
+    err.code = 'XELL_PROOF_GATE';
+    return err;
+  }
   const err = new Error(
     `xell ${state?.slug || xellId} is ${state?.status || 'gone'} — it was decommissioned while this `
     + 'session was claiming it, so claiming it would resurrect a xell whose worktree is being removed. '
     + 'A fresh ready xell will be provisioned; open its worktree and re-run /xell there.');
   err.code = 'XELL_UNAVAILABLE';
   return err;
+}
+
+// WHY a still-'ready' xell failed the claim's proof gate — the named condition, pure (testable
+// without a database). Mirrors the claim conjunct: proven = proof_at NOT NULL AND proof_error IS
+// NULL AND preflight_error IS NULL; anything else is refused under 'required'.
+export function proofGateRefusal(state) {
+  if (state?.preflight_error) return `its db preflight is failing: ${state.preflight_error}`;
+  if (state?.proof_error) return `its provision proof failed: ${state.proof_error}`;
+  return 'it has never been proven (proof_at IS NULL)';
 }
 
 // POST /api/xell/claim  { session_id, cwd, task, runtime?, project? }
@@ -309,8 +352,12 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   if (!updatedXell) {
     // Read the quarantine columns too: the CAS now refuses a quarantined xell, and the refusal the
     // human reads must name the QUARANTINE (rescue vs reap), not a decommission (reprovision).
+    // The proof columns ride along so a proof-gate refusal (still 'ready', refused under
+    // readiness_proof='required') can name WHICH condition failed instead of reading as a
+    // decommission.
     const state = await one(
-      `SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`,
+      `SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason,
+              proof_at, proof_error, preflight_error FROM xell WHERE id=$1`,
       [xell.id]).catch(() => null);
     await q(`DELETE FROM zee WHERE id=$1`, [zee.id]).catch(() => {
       logline('intake', `warn: could not compensate zee ${zee.id} for unclaimable xell ${xell.slug} — `
@@ -459,7 +506,8 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   if (xell_id && !claimed) {
     // Not fatal by itself — the xell is very often legitimately claimed already. It IS fatal when
     // the xell is on its way out, and that is precisely the case a dispatch used to walk into.
-    const state = await one(`SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`, [xell_id]);
+    const state = await one(`SELECT slug, status, is_production, quarantined_at, quarantine_deaths, quarantine_reason,
+                                    proof_at, proof_error, preflight_error FROM xell WHERE id=$1`, [xell_id]);
     // A QUARANTINED cage is the one "already claimed" case a dispatch must NEVER walk into: the whole
     // point of the quarantine (ticket #81) is that no recovery path feeds it another agent until a
     // human decides. The claim above refused it (claimReadyXell), so we land here with the row in
@@ -472,6 +520,21 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
         `xell ${state?.slug || xell_id} is ${state?.status || 'gone'} — it is being decommissioned, so `
         + 'dispatching into it would spawn a zee into a worktree that is about to be deleted. '
         + 'Dispatch into another xell; the pool will have provisioned a fresh one.');
+    }
+    // Still 'ready' but the claim came back empty, and the xell is not production (a ready
+    // PRODUCTION xell named explicitly keeps its pre-existing behaviour of proceeding unclaimed —
+    // that is the /xell-prod door, never pooled stock). The only remaining refusal is the PROOF
+    // GATE: the project runs readiness_proof='required' and this xell is unproven / proof-failed /
+    // preflight-failed. Dispatch MUST NOT proceed into it — that would be claiming a known-broken
+    // xell, the exact thing the gate exists to forbid (§4.3). Say which condition failed; the
+    // dispatcher names a specific xell, so this is a legible refusal, not a fall-through to fresh
+    // spawn (an UNNAMED dispatch falls through naturally, via claimFirstReady → null → §4.7).
+    if (state?.status === 'ready' && !state.is_production) {
+      throw new Error(
+        `xell ${state.slug || xell_id} is still ready but NOT claimable under this project's `
+        + `readiness_proof='required' policy — ${proofGateRefusal(state)}. It is not stock. Dispatch `
+        + 'into another (proven) xell, or let the pool provision a replacement; a fresh-spawned '
+        + 'xell runs the preflight synchronously and surfaces the proof verdict in its briefing.');
     }
   }
 

@@ -38,18 +38,44 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 
 // DISPATCH takes a pooled xell: ready → claimed, in one statement. Returns the claimed row, or
-// null when somebody else got there first (another dispatch, or the sweep). is_pooled goes false
-// with it, exactly as the later spawn UPDATE does — this simply moves that fact EARLIER, to the
-// moment the xell was actually spoken for, instead of leaving it 'ready' through the rename.
+// null when somebody else got there first (another dispatch, or the sweep) — OR when the project's
+// readiness_proof policy refuses it (below). is_pooled goes false with it, exactly as the later
+// spawn UPDATE does — this simply moves that fact EARLIER, to the moment the xell was actually
+// spoken for, instead of leaving it 'ready' through the rename.
 export async function claimReadyXell(xellId) {
   if (!xellId) return null;
   // A QUARANTINED xell is not claimable, ever (ticket #81): the claim is the CAS every dispatch
   // path funnels through, so refusing here is what makes "a quarantined cage gets no new agent" a
   // fact rather than a list of callers that remembered to check. The callers that name an explicit
   // id still re-read the row to say WHY (xellQuarantineRefusal); this is the hard guarantee.
+  //
+  // THE PROOF GATE (provision-proof §4.3, stage 2). The claim and the pool's sweep take the xell
+  // with the SAME conditional UPDATE off status='ready' (TKT-88-D6B4), and the readiness_proof
+  // policy is an additional conjunct computed IN THE SAME STATEMENT — so the gate cannot be beaten
+  // by reading the policy first and updating later; there is no read-then-write window to
+  // interleave. Per project:
+  //   'off'      — today's behaviour, byte for byte (the conjunct degenerates to `TRUE`);
+  //   'advisory' — refuses nothing; the proven-first ORDER in readyXells (intake.js) is the
+  //                advisory fleet's preference, never a refusal;
+  //   'required' — an unproven (proof_at IS NULL), proof-failed (proof_error NOT NULL) or
+  //                preflight-failed (preflight_error NOT NULL) xell is NOT STOCK: the claim
+  //                returns null, and a dispatch that finds no claimable xell falls through to the
+  //                EXISTING fresh-spawn path (§4.7) — it must never fall through to claiming a
+  //                known-broken xell, which is exactly what a claim without the conjunct does.
+  // The gate is written NOT EXISTS over pool_config (rather than the plan's literal inner join) so
+  // a project with NO pool_config row — never onboarded a readiness policy, which every raw test
+  // project and any legacy edge is — falls back to the DEFAULT advisory and keeps claiming, exactly
+  // as migration 236's NOT NULL DEFAULT 'advisory' intends. Only a row that SAYS 'required' AND a
+  // xell that is unproven can trip it. (Driven against a real postgres in the stage-2 verify suite.)
   const row = await one(
-    `UPDATE xell SET status='claimed', is_pooled=false
-       WHERE id=$1 AND status='ready' AND NOT is_production AND quarantined_at IS NULL RETURNING *`, [xellId]);
+    `UPDATE xell x SET status='claimed', is_pooled=false
+       WHERE x.id=$1 AND x.status='ready' AND NOT x.is_production AND x.quarantined_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_config pc
+            WHERE pc.project_id = x.project_id
+              AND pc.readiness_proof = 'required'
+              AND (x.proof_at IS NULL OR x.proof_error IS NOT NULL OR x.preflight_error IS NOT NULL))
+       RETURNING x.*`, [xellId]);
   if (row) broadcast('xell', row);
   return row;
 }
@@ -73,6 +99,15 @@ export async function claimFirstReady(candidates = []) {
 // 'tearing-down' is not a new vocabulary word: it is the status reapXell sets two lines later, and
 // what recoverOrphanTeardowns already knows how to finish. Setting it HERE is what makes the take
 // exclusive — from this moment no dispatch can claim the xell either.
+//
+// DELIBERATELY NO proof-gate conjunct (provision-proof §4.3): the sweep DEcommissions, and a
+// proof-failed xell under `required` is decommissioned through THIS path — pool.js calls
+// sweepDecommission with the proof error as the reason AFTER routing has recorded the evidence
+// (§4.6). If the take refused proof-failed xells the way the claim does, the very xells the
+// policy says must be removed and replaced would be undecommissionable — they would sit 'ready'
+// and untrimmable forever, and the fill could never make room for a replacement. The gate lives
+// on the CLAIM (claimReadyXell / claimReadyXellForSkill): the sweep's job is to take what is not
+// stock, and a proof-failed xell is exactly that.
 export async function takeReadyXellForSweep(scanned) {
   if (!scanned?.id) return null;
   // A QUARANTINED xell is not swept (ticket #81), ever: reaping the cage is the human's EXPLICIT
