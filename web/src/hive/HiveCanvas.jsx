@@ -169,6 +169,11 @@ export function managerCard(x, crew = []) {
 // The facts a xell HOVER TOOLTIP shows — pure, so the imperative DOM code stays dumb and a test can
 // assert the content without a browser. The directive is the xell's own brief (task_text) first
 // line; the status is the same hive status label the hexagon's pill paints.
+//
+// `fault` names the failing readiness check VERBATIM (the preflight rule — "the check, named, or a
+// human goes looking", provision-proof §4.8): preflight_error when the DSN probe failed, else
+// proof_error when the burn-in found a broken chip. A dirty hexagon without the named check sends
+// a human looking; with it, they know what to DO.
 export function xellTooltipParts(x) {
   return {
     head: x?.slug || '—',
@@ -176,6 +181,7 @@ export function xellTooltipParts(x) {
     manager: x?.zee_type === 'manager',
     directive: x?.task_text ? firstLine(x.task_text) : null,
     status: hiveStatusLabel(x),
+    fault: x?.preflight_error || x?.proof_error || null,
   };
 }
 // compact burn formatters (mirror the dashboard's fmtTok/fmtUsd) for the per-xell burn on the flower
@@ -696,6 +702,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       st.className = 'hive-xt-status';
       st.textContent = `status · ${parts.status}`;
       tip.el.appendChild(st);
+      // The failing readiness check, NAMED — a dirty hexagon without this sends a human looking.
+      if (parts.fault) {
+        const fault = document.createElement('div');
+        fault.className = 'hive-xt-fault';
+        fault.textContent = `⚠ ${parts.fault}`;
+        tip.el.appendChild(fault);
+      }
     }
     const bb = wrapRef.current?.getBoundingClientRect();
     if (bb) {

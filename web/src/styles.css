@@ -2172,6 +2172,8 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-xt-dir { margin-top: 4px; font-size: 12px; color: #e6ebf2; word-break: break-word; }
 .hive-xt-dir.none { color: #8a93a6; font-style: italic; }
 .hive-xt-status { margin-top: 3px; font-size: 11px; color: #8a93a6; }
+.hive-xt-fault { margin-top: 4px; font-size: 11px; color: #ffb4a2; background: rgba(217,85,59,.12);
+  padding: 3px 6px; border-radius: 6px; word-break: break-word; }
 
 /* the panels half scrolls independently; drop the old flex/rail padding assumptions */
 .hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }

@@ -354,6 +354,9 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     // The readiness preflight's verdict (#53): a vacant xell whose DSN the queenzee wrote does not
     // open must not read `ready`. The named check itself rides on x.preflight_error for the card.
     preflightFailed: !!x.preflight_error,
+    // The provision proof's verdict (§4.8): a vacant xell whose burn-in found a broken chip must
+    // equally not read `ready`. proof_error rides on x.proof_* (fetchXellRows reads x.*) for the card.
+    proofFailed: !!x.proof_error,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).

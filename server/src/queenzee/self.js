@@ -150,6 +150,9 @@ export async function selfStatus(xell) {
       // The readiness preflight (#53), so a zee sees the same verdict a human does rather than
       // discovering the fault by tripping over it hours in.
       preflightFailed: !!xell.preflight_error,
+      // The provision proof (§4.8) — the burn-in's verdict, beside the preflight. A vacant xell
+      // whose chips were proven broken must read `dirty`, not `ready`.
+      proofFailed: !!xell.proof_error,
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
       // Queued for the runway (067) — the zee sees the same `holding` hexagon a human does, which is
       // how it can tell its push really did land in the pattern rather than vanish.
@@ -198,6 +201,27 @@ export async function selfStatus(xell) {
       // Production, readable but not writable — the manager's binding. Named separately from
       // `on_prod` so nothing downstream mistakes a reader for a writer.
       on_prod_readonly: xell.db_coupling === 'db-prod-readonly',
+    },
+    // READINESS (provision-proof §4.8) — the two evidence layers, beside each other so a zee can
+    // tell "never proven" from "proven broken". proofFailed above is the hive hexagon; this is the
+    // NAMED check, the preflight rule ("the check, named, or a human goes looking") applied to a
+    // zee reading its own status.
+    readiness: {
+      preflight: {
+        failed: !!xell.preflight_error,
+        error: xell.preflight_error || null,
+        checks: xell.preflight_checks || [],
+      },
+      proof: {
+        failed: !!xell.proof_error,
+        error: xell.proof_error || null,
+        checks: xell.proof_checks || [],
+        at: xell.proof_at || null,
+        commit: xell.proof_commit || null,
+        // NULL semantics contract: proof_at IS NULL = never proven (legacy — gates nothing);
+        // proof_at NOT NULL AND proof_error IS NULL = proven.
+        proven: !!(xell.proof_at && !xell.proof_error),
+      },
     },
     // ── the crew (managers) / who I report to (workers) ──
     ...(crew ? { crew: { count: crew.length, workers: crew,

@@ -534,9 +534,12 @@ export const squashOffer = (r, branch = 'main') =>
   + `${branch}, on top of the remote base. The review diff is identical, the intermediate commits are not pushed, and `
   + `nothing local is rewritten.`;
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
-// Machine × project build-readiness (ticket #173): per-machine verdict {ok|unknown|missing}
-// with the failing check named, rendered in the container matrix where the pool knobs are set.
-export const getBuildReadiness = (projectId) => fetch(`/api/projects/${projectId}/build-readiness`).then((r) => r.json());
+// Machine × project build-readiness (ticket #173 + provision-proof §4.8): per-machine verdict
+// {ok|unknown|missing} with the failing check named, rendered in the container matrix. Default
+// reads the RECORDED verdict (the pool's proof cycle keeps it fresh — no probe click needed);
+// `refresh=1` runs the live probe and persists its result.
+export const getBuildReadiness = (projectId, refresh) =>
+  fetch(`/api/projects/${projectId}/build-readiness${refresh ? '?refresh=1' : ''}`).then((r) => r.json());
 // Machine × project build-bootstrap (ticket #173 follow-on): the one-click action that CREATES
 // the dev prerequisites the probe names as missing. dryRun (default) returns the plan and performs
 // nothing — the console shows it before a human commits; dryRun:false performs each step

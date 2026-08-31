@@ -31,7 +31,7 @@ import { checkContainers, decommissionContainer } from '../queenzee/containers.j
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
-import { buildReadinessForProject } from '../lib/build-readiness.js';
+import { buildReadinessForProject, recordedBuildReadinessForProject, recordBuildReadinessProbe } from '../lib/build-readiness.js';
 import { performBuildBootstrap } from '../lib/build-bootstrap.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -1067,13 +1067,25 @@ router.get('/projects/:id/readiness', async (req, res) => {
   try { res.json(await projectReadiness(await resolveProjectParam(req.params.id))); }
   catch (err) { res.status(projectErrorStatus(err, 404)).json({ error: err.message }); }
 });
-// Machine × project BUILD-READINESS (ticket #173): for every machine of this project, can a
-// build actually work there? Read-only probe — same docker facts verifyRequires uses, plus the
-// meta-DB facts a placement needs. Verdict per machine: ok | unknown | missing, with the
-// failing check NAMED. Rendered in the container matrix where the pool knobs are set.
+// Machine × project BUILD-READINESS (ticket #173 + provision-proof §4.8): for every machine of
+// this project, can a build actually work there? Verdict per machine: ok | unknown | missing,
+// with the failing check NAMED. Rendered in the container matrix where the pool knobs are set.
+//
+// The DEFAULT reads build_readiness_record — the remembered verdict, kept fresh by the pool's
+// proof cycle and the hourly re-record, so the badge no longer requires a human to have recently
+// clicked. `?refresh=1` runs the LIVE read-only probe and persists its results into the record
+// (the human's recheck click updates the persistent fact).
 router.get('/projects/:id/build-readiness', async (req, res) => {
-  try { res.json(await buildReadinessForProject(req.params.id)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try {
+    const projectId = await resolveProjectParam(req.params.id);
+    if (req.query.refresh === '1') {
+      const rows = await buildReadinessForProject(projectId);
+      await recordBuildReadinessProbe(projectId, rows);
+      res.json(rows);
+    } else {
+      res.json(await recordedBuildReadinessForProject(projectId));
+    }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Machine × project BUILD BOOTSTRAP (ticket #173 follow-on): the one-click action that turns the
 // probe's "missing" answer into created DEV prerequisites. PLAN FIRST — dry_run (the default)

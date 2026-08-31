@@ -40,8 +40,114 @@ import { spawnPrepFor, bakesImage } from '../lib/spawn-prep.js';
 import { ensurePreppedImage } from '../lib/cxell.js';
 import { deviceConfig } from '../lib/devices.js';
 import { serverRoleIsProcess } from '../lib/manifest.js';
+// PROVISION PROOF — the burn-in queue (plan §4.4). The pool owns "work on the pool's clock" (the
+// image-bake precedent), so it owns the proof queue too: enqueue after each real provision,
+// backfill the unproven ready xells, one proof per machine at a time, and persist the machine×
+// project verdict into build_readiness_record so one recorded fact serves all N xells on a pair.
+import { proveXell, buildReadinessRecordFromProof } from '../lib/xell-proof.js';
+import { upsertBuildReadinessRecord, buildReadinessForProject } from '../lib/build-readiness.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
+// ── THE PROOF QUEUE (plan §4.4) ────────────────────────────────────────────────
+// A FIFO of xell ids waiting to be burned in, plus a per-machine single-flight set. Builds take
+// MINUTES and are daemon-heavy, so ONE proof per machine at a time — the same single-flight
+// discipline as the revive loop, and never two proofs on one xell (the FIFO is deduped by id).
+const proofQueue = [];
+const proofBusy = new Set();               // machine keys currently running a proof
+const MACHINE_READINESS_RERECORD_MS = 60 * 60 * 1000;   // hourly (plan §4.4)
+let lastMachineReadinessReRecord = 0;
+
+// Enqueue a proof after each real provision — fire-and-forget like warmWorktree: a provision that
+// failed because a proof was slow would be a worse bug than the one this fixes. The backfill scan
+// in maybeRunProofs picks it up the same tick (a fresh xell is ready + unproven the moment
+// provisionXell returns), so this is belt-and-braces on top of the scan.
+export function enqueueProof(xellId) {
+  if (!xellId || proofQueue.includes(xellId)) return;
+  proofQueue.push(xellId);
+}
+
+// The machine key a proof for this xell runs on: the server container's docker_ctx, or the
+// queenzee-host ctx for a process-runner xell (its worktree/processes/cage all live there).
+async function proofMachineKey(xellId) {
+  const row = await one(
+    `SELECT c.docker_ctx, x.project_id FROM container c JOIN xell x ON x.id = c.owner_xell_id
+      WHERE c.owner_xell_id=$1 AND c.role='server'`, [xellId]).catch(() => null);
+  return { key: row?.docker_ctx || queenzeeHostCtx(), projectId: row?.project_id || null };
+}
+
+// The machine row for a proof's key — the docker_ctx that hosts the xell's app tier.
+async function machineForProof(key) {
+  if (!key) return null;
+  return one(`SELECT id FROM machine WHERE docker_ctx=$1 OR key=$1`, [key]).catch(() => null);
+}
+
+// Run one proof and persist the machine×project verdict (plan §4.4 + §4.6). Fire-and-forget from
+// maybeRunProofs (the machine stays busy until the whole thing — build + record — finishes).
+async function proveAndRecord(xellId, projectId, machineKey) {
+  const verdict = await proveXell(xellId);
+  const machine = await machineForProof(machineKey);
+  if (machine && projectId) {
+    const rec = buildReadinessRecordFromProof(verdict);
+    if (rec) await upsertBuildReadinessRecord(machine.id, projectId, rec).catch(() => null);
+  }
+  return verdict;
+}
+
+// The pool tick's proof pass: backfill the unproven ready xells (oldest first), drain the
+// enqueue-queue, all under the one-proof-per-machine cap; skip a pair whose recorded verdict is
+// 'missing' (one recorded fact serves all — N xells do not each need to rediscover an exhausted
+// address pool); and on a slow cycle re-record machine×project readiness via the live probe.
+//
+// `prove` is the seam test/provision-proof.test.mjs drives to assert the backfill + cap without
+// standing up real builds: it defaults to proveAndRecord (proveXell + record the verdict).
+// `rerecord` turns the hourly machine×project re-record cycle on (default true) — the test passes
+// false so the slow cycle's real docker probe never runs under the stubbed harness.
+export async function maybeRunProofs({ prove = proveAndRecord, rerecord = true } = {}) {
+  if (MODE !== 'real') return;             // simulate: prove nothing, stamp nothing
+  const unproven = await q(
+    `SELECT id FROM xell
+      WHERE status='ready' AND NOT is_production AND quarantined_at IS NULL AND proof_at IS NULL
+      ORDER BY created_at ASC`).catch(() => []);
+  // Merge the explicit queue and the backfill scan, oldest-first, deduped.
+  const ids = [...new Set([...proofQueue, ...unproven.map((r) => r.id)])];
+  proofQueue.length = 0;
+  for (const id of ids) {
+    const { key, projectId } = await proofMachineKey(id);
+    if (!key || proofBusy.has(key)) continue;                     // one proof per machine
+    if (projectId) {
+      const machine = await machineForProof(key);
+      if (machine) {
+        const rec = await one(
+          `SELECT status FROM build_readiness_record WHERE machine_id=$1 AND project_id=$2`,
+          [machine.id, projectId]).catch(() => null);
+        if (rec?.status === 'missing') continue;                  // skip the recorded-missing pair
+      }
+    }
+    proofBusy.add(key);
+    prove(id, projectId, key)
+      .catch((e) => logline('proof', `prove ${id}: ${e.message}`))
+      .finally(() => proofBusy.delete(key));
+  }
+
+  // Slow cycle: re-record machine×project readiness (plan §4.4) so the recorded verdict is never
+  // staler than the last time anyone actually tried — the console matrix and the fill both read it.
+  const now = Date.now();
+  if (rerecord && now - lastMachineReadinessReRecord >= MACHINE_READINESS_RERECORD_MS) {
+    lastMachineReadinessReRecord = now;
+    const projects = await q(`SELECT id FROM project`).catch(() => []);
+    for (const p of projects) {
+      try {
+        const rows = await buildReadinessForProject(p.id);
+        for (const r of rows) {
+          if (!r.machine_id || !r.status) continue;
+          await upsertBuildReadinessRecord(r.machine_id, p.id, r).catch(() => null);
+        }
+      } catch { /* a probe failure must never fail the pool tick */ }
+    }
+    logline('proof', `re-recorded machine×project build-readiness for ${projects.length} project(s)`);
+  }
+}
 
 // Say the machine-guard skip when it CHANGES, not every 15s tick — the same "say it when it
 // CHANGES" rule monitor.js uses for the census and stale-claim lines. Keyed per project so a
@@ -262,6 +368,10 @@ async function fillTrim(projectId, target, m) {
       try {
         const x = await provisionXell({ projectId, mode: MODE, machineCtx: m?.docker_ctx });
         logline('pool', `provisioned ready xell ${x.slug} (${MODE}${m ? ` on ${m.key}` : ''}) → server :${x.ports.serverPort} web :${x.ports.webPort}`);
+        // ENQUEUE THE BURN-IN (plan §4.4): fire-and-forget like warmWorktree — a provision that
+        // failed because a proof was slow would be a worse bug than the one this fixes. The proof
+        // pass below picks it up the same tick (a fresh xell is ready + unproven).
+        if (MODE === 'real') enqueueProof(x.id);
       } catch (err) {
         console.error(`[pool] provision failed${m ? ` on ${m.key}` : ''}:`, err.message);
         break; // stop hammering on persistent failure this tick
@@ -290,6 +400,10 @@ export async function ensureReady() {
   for (const p of projects) {
     await reconcileProject(p.id, p.target).catch((e) => console.error('[pool] reconcile', e.message));
   }
+  // THE PROOF PASS runs on the pool's clock, after the reconcile/fill/trim — the same tick that
+  // owns "work on the pool's clock". Backfills the unproven ready xells, drains the provision-time
+  // queue, and re-records machine×project readiness hourly (plan §4.4).
+  await maybeRunProofs().catch((e) => console.error('[pool] proof pass', e.message));
 }
 
 export function startPool() {

@@ -39,15 +39,17 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
   // stay editable so an operator can still zero them.
   const poolingDeadFor = (m) => !!spinoffIsProcess && !m.is_queenzee_host;
 
-  // MACHINE × PROJECT BUILD-READINESS (ticket #173): per-machine "can a build actually work
-  // HERE?" probe, fetched once on mount and on a badge re-check. Read-only; the verdict is
-  // ok | unknown | missing with the failing check named, rendered in each column header.
+  // MACHINE × PROJECT BUILD-READINESS (ticket #173 + provision-proof §4.8): per-machine "can a
+  // build actually work HERE?" verdict, ok | unknown | missing with the failing check named,
+  // rendered in each column header. The DEFAULT read (mount) is the RECORDED verdict — kept fresh
+  // by the pool's proof cycle and the hourly re-record, so the badge needs no probe click. A badge
+  // / header re-check passes `true` → the live read-only probe, persisted into the record.
   const [readiness, setReadiness] = useState(null);          // array of per-machine verdicts
   const [readinessBusy, setReadinessBusy] = useState(false);
-  const loadReadiness = useCallback(async () => {
+  const loadReadiness = useCallback(async (refresh = false) => {
     if (!projectId) { setReadiness(null); return; }
     setReadinessBusy(true);
-    try { setReadiness(await getBuildReadiness(projectId)); }
+    try { setReadiness(await getBuildReadiness(projectId, refresh ? 1 : undefined)); }
     catch { setReadiness(null); }   // the badge shows an un-checked state; the matrix stays usable
     finally { setReadinessBusy(false); }
   }, [projectId]);
@@ -108,7 +110,7 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
                        poolingDead={poolingDeadFor(col.m)}
                        readiness={readinessByMachine[col.m.id]}
                        readinessBusy={readinessBusy}
-                       onRecheck={loadReadiness}
+                       onRecheck={() => loadReadiness(true)}
                        // Spec: a xell never crosses docker contexts for its database, so every dev
                        // machine wants this project's own dev db. Missing-here-but-exists-elsewhere
                        // is a WARNING (spawns here are being refused); missing-everywhere is the

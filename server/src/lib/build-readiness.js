@@ -297,3 +297,65 @@ export async function buildReadinessForProject(projectId, { docker = dockerAdapt
   }));
   return rows;
 }
+
+// Upsert one (machine, project) verdict into build_readiness_record — latest verdict per pair;
+// history stays in the event log (migration 236). The pool queue persists the outcome of each
+// proof here, and the hourly re-record cycle persists fresh probe results, so every reader (the
+// console machine matrix, the pool fill, the proof backfill) consults the RECORD, not a live
+// docker round-trip (DR-2).
+export async function upsertBuildReadinessRecord(machineId, projectId, { status, error = null, checks = [] } = {}) {
+  if (!machineId || !projectId || !status) return null;
+  return one(
+    `INSERT INTO build_readiness_record (machine_id, project_id, status, error, checks)
+     VALUES ($1,$2,$3,$4,$5::jsonb)
+     ON CONFLICT (machine_id, project_id)
+     DO UPDATE SET status=$3, error=$4, checks=$5::jsonb, probed_at=now()
+     RETURNING *`,
+    [machineId, projectId, status, error, JSON.stringify(checks || [])]);
+}
+
+// The RECORDED build-readiness read model — the console machine matrix's default source. Reads
+// build_readiness_record (one fact serves all N xells on a pair) instead of requiring a fresh
+// probe click. Returns the same per-machine shape buildReadinessForProject does; a machine with
+// no record has status null (the badge shows "not checked yet"). `recorded:false` distinguishes
+// "never probed" from a real verdict.
+export async function recordedBuildReadinessForProject(projectId) {
+  const project = await one(`SELECT id FROM project WHERE id=$1`, [projectId]);
+  if (!project) throw new Error('project not found');
+  const rows = await q(
+    `SELECT m.id AS machine_id, m.key AS machine_key, m.docker_ctx, m.can_build,
+            COALESCE(mp.pool_size, 0) AS pool_size, COALESCE(mp.dev_priority, 0) AS dev_priority,
+            m.enabled,
+            br.status, br.error, br.checks, br.probed_at
+       FROM machine m
+       LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
+       LEFT JOIN build_readiness_record br ON br.machine_id = m.id AND br.project_id = $1
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]);
+  return rows.map((r) => ({
+    machine_id: r.machine_id,
+    machine_key: r.machine_key,
+    docker_ctx: r.docker_ctx,
+    can_build: !!r.can_build,
+    pool_size: Number(r.pool_size) || 0,
+    dev_priority: Number(r.dev_priority) || 0,
+    enabled: !!r.enabled,
+    status: r.status || null,
+    error: r.error || null,
+    checks: r.checks || [],
+    probed_at: r.probed_at || null,
+    recorded: !!r.status,
+  }));
+}
+
+// Persist a batch of probe rows (from buildReadinessForProject) into the record — the refresh
+// path: a human's recheck click updates the persistent fact, so the badge never needs a recent
+// click again. Returns the count written.
+export async function recordBuildReadinessProbe(projectId, rows) {
+  let n = 0;
+  for (const r of rows) {
+    if (!r.machine_id || !r.status) continue;
+    const rec = await upsertBuildReadinessRecord(r.machine_id, projectId, r).catch(() => null);
+    if (rec) n++;
+  }
+  return n;
+}

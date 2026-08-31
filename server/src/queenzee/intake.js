@@ -94,12 +94,19 @@ async function harnessIdForType({ projectId, targetId, effectiveType, harness })
 // A MANAGER dispatch (POST /api/managers) passes zeeType 'manager' and draws from everything: it is
 // going to stamp the type anyway, and a ready manager xell is the ideal target for it.
 // zeeType null keeps the unfiltered list — that is the claim path, which matches an exact cwd.
-async function readyXells(projectId, { zeeType = null } = {}) {
+// Export seam for test/provision-proof.test.mjs (proven-first ordering). No behaviour change —
+// the ORDER BY clause is what the test asserts.
+export async function readyXells(projectId, { zeeType = null } = {}) {
   // Machine-priority first (023, now per-project 038): a claim takes a ready xell from the
   // machine THIS PROJECT prefers before any other — "if local priority is higher, dev xells get
   // spawned there first" applies to dispatch exactly like it does to the pool fill. Priority is a
   // (machine, project) fact (machine_pool), so the join carries the project through. With no
   // machine_pool row every priority is 0 and this is the old freshest-first order unchanged.
+  //
+  // PROVEN-FIRST (provision-proof §4.8, advisory): within a machine, a claim prefers a xell whose
+  // chips are PROVEN (proof_at NOT NULL AND proof_error IS NULL) over a never-proven or
+  // proof-failed one. ORDER BY only — the WHERE is untouched, so an advisory fleet prefers proven
+  // stock without ever refusing a dispatch. Legacy rows (proof_at IS NULL) sort with the unproven.
   return q(
     `SELECT x.* FROM xell x
        LEFT JOIN container sc ON sc.owner_xell_id = x.id AND sc.role = 'server'
@@ -108,7 +115,9 @@ async function readyXells(projectId, { zeeType = null } = {}) {
       WHERE x.project_id = $1 AND x.status = 'ready'
         AND x.quarantined_at IS NULL
         AND ($2::text IS DISTINCT FROM 'worker' OR COALESCE(x.zee_type, 'worker') <> 'manager')
-      ORDER BY COALESCE(mp.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC,
+               (x.proof_at IS NOT NULL AND x.proof_error IS NULL) DESC,
+               x.ready_at DESC NULLS LAST, x.created_at DESC`,
     [projectId, zeeType]);
 }
 
