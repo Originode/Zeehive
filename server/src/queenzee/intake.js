@@ -43,6 +43,7 @@ import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harne
 import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.js';
 import { projectDocFiles } from '../lib/project-docs.js';
 import { currentConditionsMarkdownForProject } from '../lib/current-conditions.js';
+import { rePreflightAfterBindingChange, proofConditionLine } from '../lib/proof-policy.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
@@ -654,8 +655,29 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
         }
       }
       await bindManagerToProdReadonly(targetId);
+      // Deliberately NO re-preflight here: the manager's bind is production READ-ONLY, and preflight
+      // never opens production (preflight.js skips it by design — a human granted that bind). A
+      // guaranteed-skip preflight would be noise on every manager dispatch; the §4.5 re-preflight
+      // gates the three NON-prod binding changes (dispatch attach, the db-clone cut inside it, and
+      // the dbclone switch).
     } else if (targetId && (db || db_container || dump)) {
       await attachXellDb(targetId, { coupling: db, container: db_container, dump });
+      // RE-PREFLIGHT ON THE NEW BINDING (§4.5, insertion points 1+2): the attach just re-pointed
+      // this xell's DSN — a pooled xell's proof was recorded against the binding it HAD, so it is
+      // stale by definition the moment it changed. Open the NEW DSN before the zee spawns, bounded
+      // by PREFLIGHT_TIMEOUT_MS. Under 'required' a failure REFUSES the dispatch (ok:false, the
+      // named check, DSN identity without the secret — the refusal `reason` below) and the claim is
+      // released by the catch block above, so the xell goes back to 'ready' with its new binding
+      // and the pool routes it (§4.6) rather than someone being dispatched into it. Under 'advisory'
+      // the spawn proceeds: the verdict is already on the row (notePreflight) and the briefing's
+      // conditions block carries it (proofConditionLine). This closes the #47/TKT-181 class at the
+      // moment it actually occurs, not at provision time when the binding was different. A retry of
+      // the next candidate is deliberately NOT a loop here: a refused binding (e.g. a clone that
+      // cannot be minted) fails for the SAME reason on every ready xell of this project — the refusal
+      // names the check for the human; the claim release is what frees the next candidate for the
+      // NEXT dispatch.
+      const rePreflight = await rePreflightAfterBindingChange(targetId);
+      if (rePreflight.refused) throw new Error(rePreflight.reason);
     }
 
     // Assign the harness BEFORE the zee starts, so its persona/skills are in the very first briefing.
@@ -1249,8 +1271,15 @@ export async function briefing(xellId, zee, task, { headless = true, cxell = fal
   // render is null when the project has none, so a briefing for a healthy project is unchanged.
   // Resolved live at briefing time so a line a manager added a minute ago is already in the very
   // next briefing — there is no rebuild, no re-spawn, no cache to go stale.
-  const xellRow = await one(`SELECT project_id FROM xell WHERE id=$1`, [xellId]);
+  const xellRow = await one(
+    `SELECT project_id, proof_at, proof_error, preflight_at, preflight_error FROM xell WHERE id=$1`, [xellId]);
   const conditions = await currentConditionsMarkdownForProject(xellRow?.project_id);
+  // …plus THIS xell's own failing proof/preflight state, when there is one (§4.5): under 'advisory'
+  // a FAILED binding re-preflight must be visible in the very briefing that follows it, not only on
+  // the row. proofConditionLine returns null for a healthy xell, so a healthy briefing is
+  // byte-identical to before this feature existed. Both blocks render the same dated ⚠ line shape.
+  const ownProof = proofConditionLine(xellRow);
+  const conditionsBlock = [conditions, ownProof].filter(Boolean).join('\n\n') || null;
   // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +
   // "how you are running") and ABOVE the task — the fixed precedence in docs §4. core adds no new
   // TEXT (its content is the manual + rules, already here), so an unharnessed xell is unchanged.
@@ -1302,8 +1331,9 @@ export async function briefing(xellId, zee, task, { headless = true, cxell = fal
     '  yourself, and never touch the xource (the read-only main repo).',
     // CURRENT CONDITIONS — live impediments for THIS project, dated and visibly ephemeral, placed
     // where they are read (above the persona and the task) rather than skimmed past. Null when the
-    // project has none — no empty section, no skim-past noise.
-    ...(conditions ? ['', conditions] : []),
+    // project has none — no empty section, no skim-past noise. (The per-xell proof state, if any,
+    // was joined into `conditionsBlock` above.)
+    ...(conditionsBlock ? ['', conditionsBlock] : []),
     // HARNESS LAYER — the assigned persona/skills, below the law above and above the task below.
     ...(harnessBlock ? ['', harnessBlock] : []),
     '',

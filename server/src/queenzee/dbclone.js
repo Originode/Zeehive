@@ -18,6 +18,7 @@ import { q, one } from '../db/pool.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { attachXellDb } from '../lib/xell-db.js';
 import { emitXellEnv } from '../lib/provision.js';
+import { rePreflightAfterBindingChange } from '../lib/proof-policy.js';
 import { logline } from '../lib/logbus.js';
 import { SCHEMA_DIR, OPS_DIR } from './shipmigrate.js';
 
@@ -77,6 +78,17 @@ export async function dbCloneTick() {
       logline('dbclone',
         `${x.slug} → db-clone (${r.database} in ${r.container}). Its app tier still runs on the OLD `
         + 'DATABASE_URL until its next build — the zee is told to rebuild; nothing is restarted under it.');
+      // RE-PREFLIGHT on the clone the zee was just handed (§4.5, insertion point 3): the DSN changed
+      // mid-work, so open the clone before the next build reads it. This is NOT a refusal site — the
+      // xell is already claimed and working, so there is no "next candidate" to retry — the verdict
+      // lands on the row (notePreflight) and, under 'required', marks the xell not-stock for the
+      // routing pass (§4.6). Bounded by PREFLIGHT_TIMEOUT_MS, never throws.
+      const rePreflight = await rePreflightAfterBindingChange(x.id);
+      if (!rePreflight.verdict.ok) {
+        logline('dbclone', `${x.slug}: clone attach re-preflight NOT READY — ${rePreflight.verdict.error}`
+          + (rePreflight.refused ? ' (readiness_proof=required: the xell is no longer stock — routing '
+            + 'will decommission it after recording the evidence)' : ''));
+      }
       // regenerate the harness-free projection so the next build/compose picks the clone up
       // (dryRun in simulate: report the drift, write into no worktree — see PROVISION_MODE above)
       await emitXellEnv(x.id, { dryRun: PROVISION_MODE !== 'real' })
