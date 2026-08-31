@@ -916,6 +916,21 @@ export async function reapXell(xellId, reason = 'human-cleanup', force = false) 
   return data;
 }
 
+// RESCUE a quarantined xell (ticket #81: the RESCUE arm of the rescue-or-reap decision). Clears the
+// quarantine stamp (quarantined_at, quarantine_deaths, quarantine_reason, consecutive_deaths) so a
+// fresh agent may be dispatched into the SAME worktree/branch. The opposite of reap: the branch and
+// its unlanded work are kept. Idempotent — clearing an un-quarantined xell is a no-op (ok:true,
+// cleared:false), so a stale console button never 409s.
+export async function rescueXell(xellId, by = 'human@console') {
+  const r = await fetch(`/api/xells/${xellId}/unquarantine`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `rescue failed (${r.status})`);
+  if (data?.ok === false) throw new Error(data.error || 'rescue refused');
+  return data;
+}
+
 // Change a zee's permission mode (the mode chip on a xell card). The server live-applies when
 // it holds the session's handle (headless zees mid-turn); otherwise it records the value and
 // returns { applied:false, note } explaining that the running session keeps its own mode.

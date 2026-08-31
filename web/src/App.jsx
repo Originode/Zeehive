@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell,
-         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
+         reapXell, rescueXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          sendXellMessage,
          swapXellZee,
@@ -27,6 +27,7 @@ const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || 
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
+import { itemReachable } from './hive/level.js';
 // the project-scoping filter for the fleet render surfaces (honeycomb and everything fed from it)
 import { projectScoped } from './projectFilter.js';
 import CrewChip from './CrewChip.jsx';
@@ -1005,12 +1006,19 @@ export default function App() {
   for (const i of openItems) if (i.parent_id) nodeChildCount.set(i.parent_id, (nodeChildCount.get(i.parent_id) || 0) + 1);
   const ctxItemId = hiveMode === 'nodes'
     ? (nodePath.length ? nodePath[nodePath.length - 1].id : rootWorkItem?.id || null) : null;
+  // Is an open item REACHABLE by drilling — every ancestor up to the project root itself open?
+  // A xell assigned to an open item under a done/cancelled parent has no level anyone can open:
+  // the terminal parent never renders, so the child (and its xell) was counted by the statusline
+  // yet drawn NOWHERE — the "says 16 of 18 but I only see a few" miscount report. Those xells
+  // must surface at the ROOT level instead of vanishing (hive/level.js holds the rule).
+  const openItemById = new Map(openItems.map((i) => [i.id, i]));
   let hiveCells;
   if (hiveMode === 'projects') {
     hiveCells = (projects || []).map((p) => ({ id: `proj:${p.id}`, hex_kind: 'project', slug: p.name, project: p }));
   } else {
     const xellById = new Map(xells.map((x) => [x.id, x]));
     const openXellItem = new Set(openItems.map((i) => i.xell_id).filter(Boolean));
+    const openItemByXell = new Map(openItems.filter((i) => i.xell_id).map((i) => [i.xell_id, i]));
     const level = ctxItemId ? openItems.filter((i) => i.parent_id === ctxItemId) : [];
     const seen = new Set();
     hiveCells = [];
@@ -1031,9 +1039,23 @@ export default function App() {
       }
     }
     if (!nodePath.length) {
-      for (const x of xells) if (!openXellItem.has(x.id) && !seen.has(x.id)) hiveCells.push(x);
+      for (const x of xells) {
+        if (seen.has(x.id)) continue;
+        const it = openXellItem.has(x.id) ? openItemByXell.get(x.id) : null;
+        // a xell on a REACHABLE deeper node shows at ITS level, not here; a xell on an
+        // UNREACHABLE node (terminal/missing parent) surfaces at root rather than nowhere
+        if (it && itemReachable(it, openItemById, rootWorkItem?.id)) continue;
+        hiveCells.push(it
+          ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0 }
+          : x);
+      }
     }
   }
+  // How many of the project's xells this LEVEL actually draws — the statusline reconciles its
+  // whole-project count against this, so "16 of 18 in use" over five hexagons reads as levelling,
+  // not as a miscount. Projects mode draws no xells at all, so the chip stays silent there.
+  const levelXellCount = hiveMode === 'nodes' ? hiveCells.filter((c) => !c.hex_kind).length : null;
+  const otherLevelXells = levelXellCount != null ? Math.max(0, xells.length - levelXellCount) : 0;
 
   // drill into a project: select it and land at its root level
   const openProjectLevel = (p) => {
@@ -1143,6 +1165,28 @@ export default function App() {
     // the persona (and an optional brief); the server owns every refusal, so nothing is pre-checked
     // here beyond opening the right modal.
     if (kind === 'swap') { setSwapXell({ ...x, diff }); return; }
+    // 🛟 RESCUE — the RESCUE arm of the quarantine decision (ticket #81): clears the quarantine so a
+    // fresh agent can be dispatched into the same worktree/branch. The opposite of done/reap — the
+    // branch and its unlanded work are KEPT. Idempotent server-side, so a stale click is a no-op.
+    if (kind === 'rescue') {
+      if (!(await showConfirm(`Rescue ${x.slug}?\n\nClears its quarantine so a fresh agent can be `
+        + `dispatched into the same worktree and branch. Its unlanded work stays intact — this is the `
+        + `"rescue the branch" arm; done/cleanup is the "reap the cage" arm that deletes them.`,
+        { okLabel: 'Rescue' }))) return;
+      const id = `xrescue-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Rescuing ${x.slug}…` });
+      rescueXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Rescued ${x.slug}`, onRetry: null,
+          body: r?.cleared ? 'quarantine cleared — you can dispatch a fresh agent'
+            : 'was not quarantined — nothing to clear' });
+        else updateToast(id, { kind: 'error', title: 'Rescue refused', onRetry: null,
+          body: r?.error || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Rescue failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
     if (kind === 'push' || kind === 'land') {
       if (!(await showConfirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
@@ -1481,8 +1525,24 @@ export default function App() {
                     projectId={projectId || project.id} onChanged={refresh}
                     pushToast={pushToast} dismissToast={dismissToast} />
         <span className="k">Status:</span>{' '}
-        <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
+        {/* The count is the WHOLE PROJECT (every non-retired xell in the meta-DB, production
+            excluded) while the honeycomb draws ONE LEVEL of the work-node tree — so fewer hexagons
+            than this is levelling, not a miscount. The title says so, and the "on other levels"
+            chip beside it reconciles the two numbers whenever they differ. */}
+        <span title={'Counted from the meta-DB: every non-retired xell of this project (production excluded). '
+          + '"In use" = working, claimed, idle or awaiting-done. The honeycomb draws one level of the '
+          + 'work-node tree, so it can show fewer hexagons than this count — see the "on other levels" chip.'}>
+          <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
+        </span>
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
+        {otherLevelXells > 0 && (
+          <span className="sub" data-testid="level-hidden-xells"
+                title={`The honeycomb shows ${levelXellCount} xell hexagon(s) on this level of the work-node tree; `
+                  + `the project's other ${otherLevelXells} xell(s) sit on other levels — drill into a node `
+                  + `(or use the crumb strip) to see them. The counts on the left are the whole project.`}>
+            {' · '}{otherLevelXells} on other levels
+          </span>
+        )}
         {/* GATEWAY REACHABILITY at the address cages are actually given — a WORD, never a shade, and
             the address is named when it is down. This is the surface that says "the port cages point
             at is closed" instead of making it look like every provider is down. It rides the same
