@@ -35,7 +35,7 @@ import { buildReadinessForProject, recordedBuildReadinessForProject, recordBuild
 import { performBuildBootstrap } from '../lib/build-bootstrap.js';
 import {
   requireInfra, infraReadiness, infraProof, infraBootstrapPlan, infraBootstrap,
-  infraSettings, infraPropose, decideInfraRequest,
+  infraSettings, infraPropose, decideInfraRequest, buildMedicDispatchBrief,
 } from '../lib/infra-medic.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -667,6 +667,23 @@ router.delete('/project-conditions/:condId', async (req, res) => {
     if (!r.ok) return res.status(400).json(r);
     res.json(r);
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card — the card's dispatch seam (§4.6 / §7): a
+// HUMAN (or a manager) clicks the button; the queenzee claims a ready xell of the card's project,
+// wears the infra-medic harness, and briefs it to fix the PROJECT CONFIG — not the one xell — so
+// the pair stops being broken and the pool resumes filling it. Same PARTIAL worker-token wall as
+// the other conditions routes: an identified worker cannot dispatch a zee (workers do not dispatch).
+// Only the queenzee drives a spawn (requireQueenzeeLoops).
+router.post('/project-conditions/:condId/dispatch-medic', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const cond = await one(`SELECT id, project_id, body FROM project_condition WHERE id=$1`, [req.params.condId]);
+    if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
+    const task = buildMedicDispatchBrief(cond);
+    const out = await dispatchXell({ project: cond.project_id, task, harness: 'infra-medic' });
+    res.json({ ok: true, card: cond.id, project_id: cond.project_id, ...out });
+  } catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
 });
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
 // sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same

@@ -456,6 +456,10 @@ export const getProjectConditions = (projectId) => fetch(`/api/projects/${projec
 export const addProjectCondition = (projectId, body, actor) => siteCall(`/api/projects/${projectId}/conditions`, 'POST', { body, actor });
 export const updateProjectCondition = (condId, body, actor) => siteCall(`/api/project-conditions/${condId}`, 'PUT', { body, actor });
 export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditions/${condId}`, 'DELETE');
+// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card (the card's dispatch seam): the queenzee
+// claims a ready xell of the card's project, wears the infra-medic harness, and briefs it to fix
+// the PROJECT CONFIG. Returns the dispatch receipt ({ status:'dispatched', slug, worktree, … }).
+export const dispatchMedic = (condId) => siteCall(`/api/project-conditions/${condId}/dispatch-medic`, 'POST');
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);

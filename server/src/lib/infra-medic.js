@@ -43,6 +43,40 @@ const projectOfXell = (xell) => {
   return xell.project_id;
 };
 
+// ── the DISPATCH brief for a medic raised from a PROVISION-INFRA card ─────────
+// The card is the dispatch seam (proof-routing.js §4.6): machine + check + the one medic action.
+// The mission is the PROJECT CONFIG, not the one xell — a pair stays broken until the project's
+// manifest/compose/machine/pool is fixed and the pair re-proves, so the fix has to hold for the
+// NEXT xell too. Pure (testable without a database): the card body in, the brief out.
+export function buildMedicDispatchBrief(cond) {
+  const card = String(cond?.body || '').trim() || '(the card body was empty — read `zee infra readiness --refresh`)';
+  return `You are the Infra Medic for this project. A PROVISION-INFRA card is up — a project-level
+provisioning fault that stops xells from building. The card:
+
+  ${card}
+
+Fix the PROJECT CONFIG, not one xell: this pair stays broken until the project's manifest, spinoff
+compose, machine or pool settings are fixed and the pair proves green again. The fix must hold for
+the next xell too — patching this one xell is not a fix.
+
+Your verb family is \`zee infra\` (readiness / proof / bootstrap-plan / settings / bootstrap
+--perform / propose) and your read-only meta-DSN is ZEEHIVE_META_RO_DSN.
+
+1. Read the evidence first: \`zee infra readiness --refresh\`, then \`zee infra settings\`. Name the
+   failing check and its detail exactly.
+2. Fix what a WORKER can fix — the manifest, the spinoff compose, the machine/pool/settings — by
+   landing the change through the ordinary land gate. Config, not this xell.
+3. For what only a human can do — missing external networks or volumes, a registry, a machine, a
+   shared dev db — raise the exact HUMAN-GATED card: \`zee infra bootstrap --plan\` to see it, then
+   \`--perform\` or \`propose\` so a human approves it.
+4. Re-run \`zee infra proof\` when the fix lands. The pair's record clears when it proves green and
+   the pool resumes filling it — that is the definition of done for this card.
+
+Standing refusals (your runbook): never ask for a write DSN to the meta-DB; never route around a
+gate; never invent infrastructure; never present a stale proof as current. Report what you changed
+and the named check you fixed.`;
+}
+
 // ── readiness (NOT gated — read) ─────────────────────────────────────────────
 // Run/read the machine×project readiness for the calling xell's project. `refresh` runs the probe
 // now (and records it, exactly the console's behaviour); otherwise reads the recorded verdict.

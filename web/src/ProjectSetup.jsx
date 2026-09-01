@@ -17,6 +17,7 @@ import {
   getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
   previewProjectDoc,
   getProjectConditions, addProjectCondition, updateProjectCondition, deleteProjectCondition,
+  dispatchMedic,
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
   getWireguard, mintWireguardPeer, setWireguardEndpoint,
   getProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
@@ -2077,9 +2078,20 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
 function ConditionsSection({ project, run, busy }) {
   const [conds, setConds] = useState(null);
   const [add, setAdd] = useState('');
+  const [medicMsg, setMedicMsg] = useState(null);   // result of the last dispatch-medic click
   const load = useCallback(() => getProjectConditions(project.id).then(setConds).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  // A PROVISION-INFRA card is the infra-medic dispatch seam (proof-routing §4.6): the queenzee
+  // claims a ready xell of the project, wears the infra-medic harness, and briefs it to fix the
+  // PROJECT CONFIG (not this one xell) so the pair proves green again.
+  const dispatch = async (c) => {
+    setMedicMsg('⛑ dispatching the infra-medic…');
+    try {
+      const r = await run(() => dispatchMedic(c.id));
+      setMedicMsg(`⛑ medic dispatched → xell ${r?.slug || r?.xell_id || '?'}`);
+    } catch { setMedicMsg(null); }   // the panel's err line already told the human why
+  };
   return (
     <div className="setup-sec" data-testid="conditions-section">
       <h3>Current conditions <span className="pc">(the short, dated list of LIVE IMPEDIMENTS injected into every briefing — EPHEMERAL, the opposite of the docs)</span></h3>
@@ -2090,8 +2102,10 @@ function ConditionsSection({ project, run, busy }) {
         read back with <code>zee conditions</code>. This is <b>not documentation</b>: when a line stops
         being true, delete it — a stale line is worse than none, so there is no archive and no confirm.
       </div>
+      {medicMsg && <div className="pc" data-testid="medic-dispatch-msg">{medicMsg}</div>}
       {(conds || []).map((c) => {
         const d = String(c.updated_at || c.created_at || '').slice(0, 10);
+        const isMedicCard = String(c.body || '').startsWith('PROVISION-INFRA:');
         return (
           <div key={c.id} className="setup-row" data-testid={`condition-${c.id}`}>
             <input value={c.body} data-condition-id={c.id}
@@ -2101,6 +2115,13 @@ function ConditionsSection({ project, run, busy }) {
                    onBlur={(e) => { const v = String(e.target.value || '').trim();
                      if (v && v !== c.body) wrapped(() => updateProjectCondition(c.id, v, 'human')); }}
                    style={{ minWidth: 360 }} />
+            {isMedicCard && (
+              <button type="button" className="pill" disabled={busy}
+                      onClick={() => dispatch(c)}
+                      title="Dispatch the infra-medic to fix this project's config (manifest/compose/machine) so the pair builds and proves green">
+                ⛑ Dispatch medic
+              </button>
+            )}
             <span className="pc" title="last touched (the date injected into briefings)">[<b>{d}</b>]</span>
             <span className="pc">{c.updated_by || ''}</span>
             <button type="button" className="hm-del" disabled={busy}
