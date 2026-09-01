@@ -9,7 +9,7 @@ import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
 import { resolveRealDbContainerCached, derivedTcpDsn } from '../lib/xell-db.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
-import { provisionXell } from '../lib/provision.js';
+import { provisionXell, emitXellEnv } from '../lib/provision.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
 import { claimReadyXell, claimFirstReady } from '../lib/xell-claim.js';
@@ -45,7 +45,8 @@ import { projectDocFiles } from '../lib/project-docs.js';
 import { currentConditionsMarkdownForProject } from '../lib/current-conditions.js';
 import { rePreflightAfterBindingChange, proofConditionLine } from '../lib/proof-policy.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
-import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
+import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE, mintMetaReader, dropMetaReader, metaDbHostPort } from '../lib/prod-readonly.js';
+import { hasInfraTroubleshoot } from '../lib/harness-capabilities.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
@@ -504,6 +505,10 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   const claimed = xell_id ? await claimReadyXell(xell_id)
     : await claimFirstReady(await readyXells(projectId, { zeeType: askedType || 'worker' }));
   const targetId = xell_id || claimed?.id || null;
+  // Whether THIS dispatch minted a meta-RO reader for the target (a medic). Set only after the
+  // harness assignment below — the capability lives on the harness — and consulted by the spawn-
+  // failure compensation, which must give the role back if the cage never started.
+  let metaBound = false;
   if (xell_id && !claimed) {
     // Not fatal by itself — the xell is very often legitimately claimed already. It IS fatal when
     // the xell is on its way out, and that is precisely the case a dispatch used to walk into.
@@ -705,6 +710,29 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
       }
     }
 
+    // META-RO BIND at dispatch (provision-proof stage 3, build item 4): when the xell's EFFECTIVE
+    // harness chain carries the 'infra-troubleshoot' capability (the infra-medic), mint it a per-xell
+    // SELECT-only role on the ORCHESTRATOR'S OWN meta-DB and inject it as ZEEHIVE_META_RO_DSN. After
+    // the harness assignment (the capability lives on the harness — the chain is only knowable now)
+    // and before the spawn (the env the cage is built from must carry it). Mirrors
+    // bindManagerToProdReadonly's lifecycle: fails closed on a mint error, PRODRO_MODE=simulate mints
+    // nothing real, and the spawn-failure compensation below drops the role if the cage never started.
+    // A plain worker's chain carries no capability, so this is a read-only SELECT + one UPDATE on a
+    // non-medic — the same universal-path cheapness the prod-network guard keeps.
+    if (targetId && await hasInfraTroubleshoot(targetId)) {
+      const mrow = await one(`SELECT * FROM xell WHERE id=$1`, [targetId]);
+      await mintMetaReader(mrow);
+      // Re-project .zeehive.env so ZEEHIVE_META_RO_DSN is in the file before the zee starts. Same
+      // best-effort-but-never-silent rule as the manager bind: emitXellEnv stamps the failure on the
+      // row and the boot reconcile retries it — and even if this explicit emit fails, the DSN lives
+      // in xell.meta_ro_dsn, so the cage build's own env emission picks it up from there.
+      const emit = await emitXellEnv(targetId).catch((e) => ({ error: e.message }));
+      if (emit?.error) logline('intake', `${mrow.slug}: ZEEHIVE_META_RO_DSN minted but .zeehive.env NOT `
+        + `re-emitted (${emit.error}) — the boot reconcile will retry`);
+      metaBound = true;
+      logline('intake', `${mrow.slug}: bound to the meta-DB READ-ONLY (infra-medic) — ZEEHIVE_META_RO_DSN set`);
+    }
+
     // Pasted files: save them into the (possibly just-renamed) target worktree and append a
     // reference block so the zee is handed PATHS to Read, not a base64 blob in its prompt. Done
     // AFTER the rename above, which moves the worktree folder — so we re-read the current path.
@@ -746,6 +774,16 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   } catch (err) {
     if (targetId && effectiveType === 'manager') {
       await unbindManagerFromProdReadonly(targetId, `the dispatch failed before the zee started: ${err.message}`);
+    }
+    // The medic's meta-RO bind is the same class of write as the manager's: a real role on the
+    // meta-DB. If the cage never started, the role must go back — a credential nobody is using, for
+    // an agent that never began, is exactly what the reaper exists to prevent and must not depend on
+    // the reaper running. dropMetaReader never throws; the compensation cannot hide the real error.
+    if (metaBound) {
+      const mrow = await one(`SELECT * FROM xell WHERE id=$1`, [targetId]);
+      const md = await dropMetaReader(mrow);
+      logline('intake', `${mrow.slug}: meta-RO role ${md.role || ''} ${md.dropped ? 'DROPPED' : `not dropped (${md.reason || md.error || '—'})`}`
+        + ` — the dispatch failed before the zee started`);
     }
     // …and the CLAIM goes back the same way, for the same reason: the spawn can throw on its way up
     // (a paused fleet, no connected provider account, a model the harness policy forbids) before any
@@ -1779,7 +1817,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // A manager holds prod READ-ONLY ('db-prod-readonly') — it must reach the prod db host:port too,
   // or the SELECT-only role it was given is unusable and the whole binding is theatre; both that
   // coupling and the human grant are in PROD_REACHING_COUPLINGS.
-  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, dbCoupling: xell.db_coupling });
+  // An INFRA-MEDIC's ZEEHIVE_META_RO_DSN dials the orchestrator's OWN meta-DB — SELECT-only, but the
+  // socket has to open for the grant to mean anything. Its host:port is allowed for exactly that
+  // cage (keyed off the stored DSN: a live meta_ro_dsn means the bind was minted for it), whatever
+  // project the medic is on; a worker holds no DSN and nothing is opened.
+  const allowList = xell.meta_ro_dsn ? [metaDbHostPort()] : [];
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, dbCoupling: xell.db_coupling, allowList });
 
   // RECORD THE MODEL THE CAGE WILL ACTUALLY RUN. A claude alias means nothing to a non-claude CLI,
   // so the adapter drops it and runs the vendor's own — which left production holding deepseek-cxell

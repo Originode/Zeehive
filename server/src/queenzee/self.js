@@ -18,6 +18,7 @@ import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource,
          refreshCxellOriginMain } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
+import { metaDbHostPort } from '../lib/prod-readonly.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
 // about the branch it just walked into (see branchHandover).
@@ -1277,11 +1278,14 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 // lib/cxell-seal.js, which is now the single query behind all three seals (spawn, this re-seal, and
 // the re-seal of a cage restarted after a host reboot). Read it before touching any of them.
 async function resealCxellForStack(xellId) {
-  const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
+  const xell = await one(`SELECT slug, project_id, meta_ro_dsn FROM xell WHERE id=$1`, [xellId]);
   // prodBound: true — the bind has just been granted, so this xell's OWN prod db is now allowed (the
   // xell row this reads was written before the grant, so its coupling cannot say so yet). The query
   // itself, and the alias-only caveat above, live in lib/cxell-seal.js with the spawn seal's copy.
-  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, prodBound: true });
+  // A medic's meta-RO DSN (live → the bind was minted for this xell) must stay reachable across the
+  // re-seal, exactly as the spawn seal opens it.
+  const allowList = xell.meta_ro_dsn ? [metaDbHostPort()] : [];
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, prodBound: true, allowList });
   const sealed = await sealCxell({ ctx: 'default', name: cxellName(xell.slug), blockTcp });
   return { blockTcp, tail: sealed[sealed.length - 1] || null };
 }

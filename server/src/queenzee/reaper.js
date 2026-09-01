@@ -210,6 +210,16 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
       + '(released, NOT deleted) before teardown. Production is untouched.');
   }
 
+  // An INFRA-MEDIC held the ORCHESTRATOR'S OWN meta-DB through its own read-only postgres role
+  // (mintMetaReader, provision-proof stage 3). Same rule as the manager's prod reader just above: a
+  // role that outlives the agent it was minted for is a credential nobody owns. Best-effort —
+  // dropMetaReader never throws, and the role is inert once its DSN is gone with the cxell.
+  if (xell.meta_ro_dsn) {
+    const { dropMetaReader } = await import('../lib/prod-readonly.js');
+    const mr = await dropMetaReader(xell);
+    logline('reaper', `${xell.slug}: meta-RO role ${mr.role || ''} ${mr.dropped ? 'DROPPED' : `not dropped (${mr.reason || mr.error || '—'})`}`);
+  }
+
   logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`
     + ` [liveness: ${verdict ? verdict.why : 'FORCED — the guard was not consulted'}]`);
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])

@@ -470,6 +470,20 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
     lines.push(`DATABASE_URL=${dbUrl}`);
   }
 
+  // ZEEHIVE_META_RO_DSN — the infra-medic's READ-ONLY bind to the orchestrator's OWN meta-DB
+  // (provision-proof stage 3). Distinct from DATABASE_URL on purpose: a medic still does its own
+  // work on its own database; this line is the SEPARATE SELECT-only credential for the meta-DB, the
+  // one that lets it read the provisioning evidence (machines, containers, pool, readiness, proof).
+  // The DSN is minted at dispatch (lib/prod-readonly.js mintMetaReader) and lives in
+  // xell.meta_ro_dsn; a live value here is the ONLY reason the line is emitted, and the reaper
+  // clears the column when it drops the role with the xell. The same §6.2 refusal above does NOT
+  // apply: this is a minted SELECT-only reader (default_transaction_read_only=on), the exact class
+  // the exemption is about — a medic could no more reap a live xell than a manager could.
+  if (xell.meta_ro_dsn) {
+    lines.push(`# ZEEHIVE_META_RO_DSN — the meta-DB, READ-ONLY (SELECT-only zee_ro_ role minted for this xell)`);
+    lines.push(`ZEEHIVE_META_RO_DSN=${xell.meta_ro_dsn}`);
+  }
+
   // QUEENZEE_INPROC=false — API-only when this xell shares THE queenzee's meta-DB (TKT-136-FE32).
   //
   // index.js takes advisory lock 715533001 on whatever DATABASE_URL it opens. A spinoff whose
@@ -543,6 +557,7 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
       // never an environment's to set, present in the file or not.
       const reserved = new Set([
         'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', 'QUEENZEE_INPROC',
+        'ZEEHIVE_META_RO_DSN',
         serverEnv, webEnv,
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);

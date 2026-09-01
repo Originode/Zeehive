@@ -22,6 +22,7 @@
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { q, one } from '../db/pool.js';
+import { config } from '../config.js';
 import { logline } from './logbus.js';
 import { psql, prodDb, assertProdDbTarget, prodDbAddress, connRefAlias } from '../queenzee/shipmigrate.js';
 
@@ -35,15 +36,17 @@ export function roRoleName(slug) {
 
 // Columns that hold STORED CREDENTIALS, per table — the reason a read-only role must not see them.
 // The rule (ticket TKT-96): if a column has a `*_hint` sibling, the raw column is a secret (the hint
-// is what a reader may see); plus the two measured columns that carry credentials but have no hint —
-// environment_var.value (the secret half of is_secret rows) and xell.prod_ro_dsn (every manager's
-// production DSN, which embeds a password). Every `*_hint`, is_secret, id, timestamp and non-secret
-// config column stays readable. Kept as DATA so a new secret column is a one-line addition here and
-// the re-grant below can compute the NON-secret list from the live schema.
+// is what a reader may see); plus the measured columns that carry credentials but have no hint —
+// environment_var.value (the secret half of is_secret rows), xell.prod_ro_dsn (every manager's
+// production DSN, which embeds a password) and xell.meta_ro_dsn (every infra-medic's meta-DB DSN,
+// which embeds a password too — a reader must never read another reader's credential back out).
+// Every `*_hint`, is_secret, id, timestamp and non-secret config column stays readable. Kept as DATA
+// so a new secret column is a one-line addition here and the re-grant below can compute the
+// NON-secret list from the live schema.
 const SECRET_COLUMNS = {
   provider_token: ['token'],
   environment_var: ['value'],
-  xell: ['prod_ro_dsn'],
+  xell: ['prod_ro_dsn', 'meta_ro_dsn'],
 };
 
 // The blanket `GRANT SELECT ON ALL TABLES` in readonlyRoleSql hands the reader EVERY column of these
@@ -393,6 +396,103 @@ export async function dropProdReader(xell) {
   } catch (e) {
     const msg = e?.message || String(e);
     logline('prod-ro', `could not drop read-only role ${roRoleName(xell.slug)}: ${msg}`);
+    return { dropped: false, error: msg };
+  }
+}
+
+// ── META-RO — the infra-medic's read-only bind to the ORCHESTRATOR'S OWN META-DB ────────────────
+//
+// The manager bind reads a PROJECT's production database. The infra-medic (provision-proof stage 3)
+// reads the ORCHESTRATOR's own meta-DB — the database THIS server itself connects to
+// (config.databaseUrl) — because the provisioning evidence (machines, containers, pool, readiness
+// records, proof verdicts) lives there and nowhere else. Same guarantee as prod-RO, aimed at a
+// different database: a per-xell `zee_ro_<slug>` role, LOGIN+CONNECT+SELECT, read-only transaction,
+// secret columns revoked, injected into the cxell as ZEEHIVE_META_RO_DSN, dropped by the reaper
+// with the xell. PRODRO_MODE=simulate mints nothing real and a DSN that cannot authenticate — the
+// same simulate contract the manager bind has.
+//
+// The mint runs through the server's OWN pool, not a docker exec: the meta-DB is not a project's
+// prod container, it is the database this process already owns (it runs the migrations through the
+// same pool). That is exactly why the role grant is legitimate here — the queenzee IS the meta-DB's
+// owner — and why a cxell zee can never do the same: a zee holds only the SELECT-only role, whose
+// only privilege is to read.
+//
+// The address the DSN is built on comes from the SAME parse a cxell would dial: config.databaseUrl.
+// In production that is the meta-DB's published host:port (or its docker-network alias on the
+// running daemon — the cxell firewall opens whichever address this parse yields, see cxell-seal.js),
+// and in a nested queenzee it is the spinoff clone, which the block list never drops anyway.
+
+// The meta-DB's identity as THIS process sees it: {host, port, name, user} from the server's own
+// DATABASE_URL. PURE and exported so the seal-time firewall opening dials exactly the same address
+// the minted DSN carries.
+export function metaDbHandle() {
+  const u = new URL(config.databaseUrl);
+  return {
+    host: u.hostname || 'localhost',
+    port: u.port ? Number(u.port) : 5432,
+    name: decodeURIComponent((u.pathname || '').replace(/^\//, '')) || 'postgres',
+    user: decodeURIComponent(u.username || '') || 'postgres',
+  };
+}
+
+// The `host:port` a cxell zee dials for the meta-RO DSN — the one pair the firewall must NOT drop.
+export function metaDbHostPort() {
+  const { host, port } = metaDbHandle();
+  return `${host}:${port}`;
+}
+
+// Mint (or re-mint) THIS xell's read-only META-DB reader and return its DSN. Fails closed: if the
+// role cannot be provisioned the bind FAILS — there is no fallback to the owner credential, because
+// "read-only, except when provisioning hiccups" is not read-only (the same rule as the manager bind).
+export async function mintMetaReader(xell) {
+  const role = roRoleName(xell.slug);
+  const password = randomBytes(24).toString('base64url');
+  const db = metaDbHandle();
+  const sql = readonlyRoleSql(role, password, db.name, db.user);
+
+  if (PRODRO_MODE === 'simulate') {
+    logline('prod-ro', `SIMULATE: would create read-only role ${role} on the meta-DB (${db.name})`);
+  } else {
+    try {
+      await q(sql);
+    } catch (e) {
+      throw new Error(`could not provision the meta-DB read-only role ${role} on ${db.name}: ${e.message}`);
+    }
+    logline('prod-ro', `created/refreshed read-only role ${role} on the meta-DB (${db.name}) — SELECT only`);
+  }
+
+  const dsn = readonlyDsn({ host: db.host, port: db.port, role, password, dbName: db.name });
+  if (!dsn) throw new Error(`could not build a meta-DB read-only DSN from ${db.host}:${db.port}`);
+  if (xell.id) await q(`UPDATE xell SET meta_ro_dsn=$2 WHERE id=$1`, [xell.id, dsn]);
+  return { role, dsn, mode: PRODRO_MODE, database: db.name, address: `${db.host}:${db.port}` };
+}
+
+// Give the access back. Called by the reaper when a medic xell is torn down — a role that outlives
+// its agent is a credential nobody owns. Best-effort and never throws (a teardown must not wedge on
+// an unreachable database; the role is inert without its DSN either way). Same shape as dropProdReader.
+export async function dropMetaReader(xell) {
+  try {
+    const role = roRoleName(xell.slug);
+    const db = metaDbHandle();
+    if (PRODRO_MODE === 'simulate') {
+      logline('prod-ro', `SIMULATE: would drop read-only meta role ${role}`);
+      // Clear the stored DSN even in simulate. The ROLE is cluster state and simulate skips it, but
+      // xell.meta_ro_dsn is OUR row — leaving it set means the xell still reports a meta-RO credential
+      // it is no longer meant to hold, in the one mode the whole path is exercised in.
+      if (xell.id) await q(`UPDATE xell SET meta_ro_dsn=NULL WHERE id=$1`, [xell.id]);
+      return { dropped: true, role, mode: 'simulate' };
+    }
+    const sql = dropProdReaderSql(role, db.name, db.user);
+    try {
+      await q(sql);
+    } catch (e) {
+      logline('prod-ro', `could not drop read-only meta role ${role}: ${e.message}`);
+    }
+    if (xell.id) await q(`UPDATE xell SET meta_ro_dsn=NULL WHERE id=$1`, [xell.id]);
+    return { dropped: true, role };
+  } catch (e) {
+    const msg = e?.message || String(e);
+    logline('prod-ro', `could not drop read-only meta role ${roRoleName(xell.slug)}: ${msg}`);
     return { dropped: false, error: msg };
   }
 }

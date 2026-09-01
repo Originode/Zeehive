@@ -33,6 +33,10 @@ import { listMachines, createMachine, updateMachine, deleteMachine, provisionDev
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
 import { buildReadinessForProject, recordedBuildReadinessForProject, recordBuildReadinessProbe } from '../lib/build-readiness.js';
 import { performBuildBootstrap } from '../lib/build-bootstrap.js';
+import {
+  requireInfra, infraReadiness, infraProof, infraBootstrapPlan, infraBootstrap,
+  infraSettings, infraPropose, decideInfraRequest,
+} from '../lib/infra-medic.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
@@ -190,6 +194,17 @@ router.post('/land/requests/:id/:decision(approve|reject)', async (req, res) => 
   const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
   try {
     res.json(await decideLandRequest(req.params.id, decision, req.body?.by || 'human@console'));
+  } catch (err) {
+    res.status(409).json({ error: err.message });
+  }
+});
+
+// Human decision on an INFRA card (bootstrap / propose) — the medic's gated verbs. ONLY a human
+// approves: a zee never decides. On approve the QUEENZEE performs the kind (performBuildBootstrap
+// verbatim for bootstrap; the settings whitelist for propose) and the row becomes the receipt.
+router.post('/infra/requests/:id/:decision(approve|reject)', async (req, res) => {
+  try {
+    res.json(await decideInfraRequest(req.params.id, req.params.decision, req.body?.by || 'human@console'));
   } catch (err) {
     res.status(409).json({ error: err.message });
   }
@@ -1924,6 +1939,62 @@ router.post('/xell/self/migration-number', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfMigrationNumber(x, { name: req.body?.name || null, again: !!req.body?.again })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── the INFRA-MEDIC surface: /api/xell/self/infra/* (provision-proof plan §7, stage 3) ───────────
+// Token-scoped like every self verb, project-resolved from the CALLING xell (the medic acts on its
+// own project and nothing else), and enabled ONLY when the calling xell's EFFECTIVE harness chain
+// carries the 'infra-troubleshoot' capability — a harness inheriting the medic counts, a disabled
+// ancestor grants nothing (lib/infra-medic.js). Read wide, write through gates (§7.1).
+router.get('/xell/self/infra/readiness', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    await requireInfra(x);
+    res.json(await infraReadiness(x, { refresh: req.query.refresh === '1' }));
+  } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+});
+// Burn-in a pooled xell of the project — throwaway containers, NOT gated (same class as `zee build`).
+router.post('/xell/self/infra/proof', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    await requireInfra(x);
+    res.json(await infraProof(x, { xellSlug: req.body?.xell || null }));
+  } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
+// The dry-run plan performBuildBootstrap already computes — performs NOTHING, NOT gated.
+router.post('/xell/self/infra/bootstrap-plan', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    await requireInfra(x);
+    res.json(await infraBootstrapPlan(x, { machineId: req.body?.machine_id || null }));
+  } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
+// bootstrap --perform → HUMAN-GATED card. Creates nothing; a human approves; the queenzee performs
+// with the console 🔧's exact contract (guardDevOnly intact, every step recorded).
+router.post('/xell/self/infra/bootstrap', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    await requireInfra(x);
+    res.json(await infraBootstrap(x, { machineId: req.body?.machine_id || null, reason: req.body?.reason || null }));
+  } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
+// Non-secret projection of the project's settings (manifest cache, pool_config, machines + pool,
+// container rows, deploy_site) — NOT gated.
+router.get('/xell/self/infra/settings', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    await requireInfra(x);
+    res.json(await infraSettings(x));
+  } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+});
+// propose → HUMAN-GATED settings card (pool knobs, registry, machine priority, manifest refresh).
+// Applies nothing until a human approves; who asked, what changed, recorded.
+router.post('/xell/self/infra/propose', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    await requireInfra(x);
+    res.json(await infraPropose(x, { change: req.body?.change || null, reason: req.body?.reason || null }));
+  } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.
 router.post('/xell/self/ship', async (req, res) => {
