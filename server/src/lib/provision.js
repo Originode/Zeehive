@@ -20,7 +20,7 @@ import { resolveSite } from './sites.js';
 import { namingFor, serverRoleIsProcess } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx,
-         implicitPoolMachine, liveXellCount } from './machines.js';
+         implicitPoolMachine, liveXellCount, siteHostForMachine } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
@@ -1073,7 +1073,15 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   }
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
-  const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
+  // deploy_site is the source of truth for WHERE a tier runs (docs/deploy-topology-spec.md §5):
+  // the dev site whose docker_ctx matches the machine's own context WINS over the machine row's
+  // host_ip (TKT-180 — before this, ugreen-nas carried host_ip=10.0.1.18 while the daemon and
+  // every other source said 10.1.0.18, and every spin container stamped from that row inherited
+  // an address that never answered). No machine → the project's default dev site → deprecated
+  // project column → global env default, unchanged.
+  const machineSiteHost = machine ? await siteHostForMachine(project.id, machine.docker_ctx) : null;
+  const devHost = machineSiteHost || machine?.host_ip
+    || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
   // A machine row with no host_ip used to produce literal "http://null:PORT" URLs — a URL the
   // health prober can never answer. For a CONTAINERIZED queenzee whose host-machine row carries
