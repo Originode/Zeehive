@@ -153,7 +153,7 @@ export async function composeMedicSystemPrompt() {
   const { effectiveHarness } = await import('./harness.js');
   const row = await one(`SELECT * FROM harness WHERE key='infra-medic'`);
   if (!row) {
-    // A database that never ran 238 still gets a working medic: the 249 runbook text is the law and
+    // A database that never ran 238 still gets a working medic: the 246 runbook text is the law and
     // it lives in the migration; this fallback is only the identity line.
     return 'You are the Infra Medic — a META-PLANE resident agent loop. Your tools are your whole reach.';
   }

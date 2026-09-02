@@ -61,7 +61,8 @@ export const MEDIC_PROJECT_COLUMNS = ['registry', 'manifest', 'manifest_hash', '
 // belt and braces against a future blanket grant).
 export const MEDIC_NO_WRITE_TABLES = [
   'xell', 'zee', 'medic', 'medic_action', 'harness', 'provider_token',
-  'land_request', 'ship_request', 'seed_request', 'infra_request',
+  'land_request', 'ship_request', 'prod_seed_request', 'prod_bind_request', 'infra_request',
+  'credential_inject_request', 'manager_mint_request', 'done_suggestion',
   'zee_turn', 'llm_gateway_request',
 ];
 
