@@ -1,40 +1,50 @@
--- ZEE DECOUPLED FROM XELL — a zee is an AGENT; a xell is an ENVIRONMENT; a medic is a zee WITH NO
--- ENVIRONMENT (docs/medic-meta-plane-plan.md §3.1, DR-7). Relaxing zee.xell_id (NOT NULL since 001)
--- to an exactly-one-of (xell_id | medic_id) keeps the whole observability spine — zee row, turn
--- ledger, feed events, zee_conversation — carrying medic turns UNCHANGED, and every existing query
--- that JOINs zee→xell simply never sees a medic (which is the separation the Medic Bay wants:
--- the honeycomb renders xell rows and excludes medics structurally, for free).
+-- ZEE DECOUPLED FROM XELL — the medic plane's one FK relaxation (docs/medic-meta-plane-plan.md
+-- §3.1, DR-7; provision-proof kit stage 4; requires 244's medic table).
 --
--- zee_turn.xell_id and session_event.xell_id are ALREADY nullable (001) — no change needed there.
+-- A xell is an ENVIRONMENT; a zee is an AGENT. Until now an agent could not exist without an
+-- environment (zee.xell_id NOT NULL) — which is exactly the coupling the medic breaks: a medic is
+-- a zee whose "environment" is the meta-DB itself. Relaxing the one column (instead of minting a
+-- "virtual xell") keeps every consumer honest: the pool, the reaper, the preflight, the proof
+-- ladder and the honeycomb all read xell rows and simply never see a medic — the separation the
+-- directive asks for, for free. zee_turn.xell_id and session_event.xell_id have been nullable
+-- since 001, so the observability spine already tolerates a xell-less zee.
 --
--- Idempotent, additive, forward-only. Every existing row has xell_id set and medic_id absent, so
--- the CHECKs validate without a rewrite.
-
--- ── zee: exactly one plane ───────────────────────────────────────────────────────────────────
+-- The CHECK is exactly-one-of: a zee is on a xell OR on a medic, never both, never neither. Same
+-- trio on zee_conversation (192) — for a medic the durable work unit IS the medic row, so a
+-- resumed medic starts warm on its own history exactly as a swapped zee does on its xell's.
+--
+-- one_active_zee_per_xell (001) is a unique index on (xell_id): NULLs never collide in a btree
+-- unique index, so medic zees do not trip it — but the SAME invariant must hold per medic, so the
+-- mirror index is added here.
+--
+-- Idempotent, additive, forward-only.
 ALTER TABLE zee ALTER COLUMN xell_id DROP NOT NULL;
 ALTER TABLE zee ADD COLUMN IF NOT EXISTS medic_id uuid REFERENCES medic(id) ON DELETE CASCADE;
-COMMENT ON COLUMN zee.medic_id IS
-  'set iff this zee is a META-PLANE MEDIC turn-runner (DR-7) — then xell_id is NULL: a medic has no environment';
-DO $$ BEGIN
-  ALTER TABLE zee ADD CONSTRAINT zee_exactly_one_plane
-    CHECK (((xell_id IS NOT NULL))::int + ((medic_id IS NOT NULL))::int = 1);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
--- one LIVE zee per medic — the exact mirror of one_active_zee_per_xell (001). The 001 index is a
--- partial on (xell_id); NULL xell_id rows are simply absent from it, so it needs no change.
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_zee_per_medic ON zee (medic_id)
-  WHERE medic_id IS NOT NULL AND status IN ('spawning','online','working','idle');
 
--- ── zee_conversation: the durable unit is the medic row, exactly as it is the xell for a zee ─
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'zee_exactly_one_plane') THEN
+    ALTER TABLE zee ADD CONSTRAINT zee_exactly_one_plane
+      CHECK ((xell_id IS NOT NULL)::int + (medic_id IS NOT NULL)::int = 1);
+  END IF;
+END $$;
+
+-- a medic has at most one LIVE zee at a time — the mirror of one_active_zee_per_xell
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_zee_per_medic ON zee (medic_id)
+  WHERE status IN ('spawning','online','working','idle') AND medic_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS zee_medic_idx ON zee (medic_id);
+
+-- The conversation store: same relaxation, same exactly-one-of.
 ALTER TABLE zee_conversation ALTER COLUMN xell_id DROP NOT NULL;
 ALTER TABLE zee_conversation ADD COLUMN IF NOT EXISTS medic_id uuid REFERENCES medic(id) ON DELETE CASCADE;
-COMMENT ON COLUMN zee_conversation.medic_id IS
-  'set iff this message belongs to a MEDIC''s working memory (DR-7) — then xell_id is NULL; a resumed medic starts warm on its own history';
+
 DO $$ BEGIN
-  ALTER TABLE zee_conversation ADD CONSTRAINT zee_conversation_exactly_one_plane
-    CHECK (((xell_id IS NOT NULL))::int + ((medic_id IS NOT NULL))::int = 1);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
--- the medic-side twin of UNIQUE (xell_id, seq) — the append path upserts ON CONFLICT against it
-CREATE UNIQUE INDEX IF NOT EXISTS zee_conversation_medic_seq_uq ON zee_conversation (medic_id, seq)
-  WHERE medic_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS zee_conversation_medic_idx ON zee_conversation (medic_id, seq)
-  WHERE medic_id IS NOT NULL;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'zee_conversation_exactly_one_plane') THEN
+    ALTER TABLE zee_conversation ADD CONSTRAINT zee_conversation_exactly_one_plane
+      CHECK ((xell_id IS NOT NULL)::int + (medic_id IS NOT NULL)::int = 1);
+  END IF;
+END $$;
+
+-- Replay order per medic — the mirror of zee_conversation's UNIQUE (xell_id, seq).
+CREATE UNIQUE INDEX IF NOT EXISTS zee_conversation_medic_seq_uq
+  ON zee_conversation (medic_id, seq) WHERE medic_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS zee_conversation_medic_idx ON zee_conversation (medic_id, seq);
