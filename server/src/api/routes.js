@@ -7,7 +7,7 @@ import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { deliveryTelemetry } from '../lib/delivery-telemetry.js';
 import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
-import { recentLogs } from '../lib/logbus.js';
+import { recentLogs, logline } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
 import { bus, broadcast, activityFanout } from '../lib/events.js';
@@ -668,29 +668,90 @@ router.delete('/project-conditions/:condId', async (req, res) => {
     res.json(r);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card — the card's dispatch seam (§4.6 / §7, the
-// console button). The medic is a MANAGER zee on the ORCHESTRATOR'S OWN project (the meta-plane
-// model, corrected 2026-09-02): only ZEEHIVE's production database IS the meta-DB, so a manager
-// there sees the whole fleet's config read-only. createManagerZee binds it to prod READ-ONLY, the
-// 'infra-medic' harness (now manager-type, migration 242) carries the 'infra-troubleshoot'
-// capability, and the brief carries the card's TARGET project (cond.project_name / project_id) so
-// the medic reads — and files human-gated cards on — the pair that is actually broken. Same PARTIAL
-// worker-token wall as the other conditions routes: an identified worker cannot dispatch a zee
-// (workers do not dispatch). Only the queenzee drives a spawn (requireQueenzeeLoops).
+// Dispatch the MEDIC from a PROVISION-INFRA card — the card's dispatch seam (§4.6 / §7, the
+// console button). WHAT the ⛑ creates is the condition's project's `medic_plane` knob (248,
+// docs/medic-meta-plane-plan.md §6):
+//
+//   'meta' (default)  — a META-PLANE medic: a medic row + an in-process tool loop
+//                       (queenzee/medic-spawn.js). No xell, no cage, no containers — the
+//                       corrected model (DR-7). The turn runs to completion in the background;
+//                       the route answers as soon as the medic row exists, so the console's
+//                       fire-and-forget toast contract is unchanged.
+//   'manager-zee'     — the superseded stage-3 path (createManagerZee on the orchestrator's own
+//                       project), kept callable as the one-flip rollback.
+//
+// Same PARTIAL worker-token wall as the other conditions routes: an identified worker cannot
+// dispatch (workers do not dispatch). Only the queenzee drives a spawn (requireQueenzeeLoops).
 router.post('/project-conditions/:condId/dispatch-medic', requireQueenzeeLoops, async (req, res) => {
   try {
     const g = await refuseWorkerZeeToken(req);
     if (g) return res.status(403).json(g);
     const cond = await one(
-      `SELECT c.id, c.project_id, c.body, p.name AS project_name
+      `SELECT c.id, c.project_id, c.body, p.name AS project_name, p.medic_plane
          FROM project_condition c JOIN project p ON p.id = c.project_id
         WHERE c.id=$1`, [req.params.condId]);
     if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
-    const selfProject = await selfProjectId();
-    const task = buildMedicDispatchBrief(cond);
-    const out = await createManagerZee({ project: selfProject, task, harness: 'infra-medic', title: 'infra medic' });
-    res.json({ ok: true, card: cond.id, condition_project_id: cond.project_id, project_id: selfProject, ...out });
+    if (cond.medic_plane === 'manager-zee') {
+      const selfProject = await selfProjectId();
+      const task = buildMedicDispatchBrief(cond);
+      const out = await createManagerZee({ project: selfProject, task, harness: 'infra-medic', title: 'infra medic' });
+      return res.json({ ok: true, plane: 'manager-zee', card: cond.id,
+                        condition_project_id: cond.project_id, project_id: selfProject, ...out });
+    }
+    // Turn 1 runs in the background (dispatchMedic's own contract) — a medic loop is minutes of
+    // model calls, and the button's contract is a receipt, not a wait. Errors land on the medic
+    // row ('errored') and in the Bay.
+    const { dispatchMedic: spawnMetaMedic } = await import('../queenzee/medic-spawn.js');
+    const out = await spawnMetaMedic({ condition: cond });
+    res.json({ ...out, card: cond.id, condition_project_id: cond.project_id,
+               message: 'medic attending in the Medic Bay — no xell, no cage; watch the Bay for its actions' });
   } catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
+});
+// ── THE MEDIC BAY's read/act routes (stage 4, plan §5). Medics are NOT xells: the honeycomb
+// never sees them, and these four routes are the Bay's whole surface. The same partial worker
+// wall as the conditions routes — a caged worker has no business steering the fleet's medics. ──
+router.get('/medics', async (req, res) => {
+  try {
+    const { listMedics } = await import('../lib/medics.js');
+    res.json(await listMedics({ includeRetired: req.query.all === '1' }));
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.get('/medics/:id', async (req, res) => {
+  try {
+    const { medicDetail } = await import('../lib/medics.js');
+    const out = await medicDetail(req.params.id);
+    if (!out) return res.status(404).json({ error: 'no such medic' });
+    res.json(out);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/medics/:id/retire', async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { retireMedic } = await import('../lib/medics.js');
+    const row = await retireMedic(req.params.id, { by: req.body?.actor || 'human@console' });
+    if (!row) return res.status(404).json({ error: 'no such medic' });
+    res.json({ ok: true, medic: row });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// A human answers an awaiting-human medic — the Bay's reply box. The answer is the next turn's
+// user message; the turn runs in the background like turn 1.
+router.post('/medics/:id/message', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const text = String(req.body?.message || '').trim();
+    if (!text) return res.status(400).json({ error: 'a message is required — it becomes the medic\'s next turn' });
+    const medic = await one(`SELECT * FROM medic WHERE id=$1`, [req.params.id]);
+    if (!medic) return res.status(404).json({ error: 'no such medic' });
+    if (medic.status === 'retired') return res.status(400).json({ error: 'this medic is retired — dispatch a fresh one from the condition' });
+    const { updateMedicStatus } = await import('../lib/medics.js');
+    await updateMedicStatus(medic.id, 'diagnosing');   // the ask is answered; the flag comes down
+    import('../queenzee/medic-spawn.js')
+      .then(({ runMedicTurn }) => runMedicTurn(medic, { task: text, kind: 'resume' }))
+      .catch((e) => logline('medic', `medic ${String(medic.id).slice(0, 8)} resume failed to start: ${e.message}`));
+    res.json({ ok: true, medic_id: medic.id, message: 'resumed — the answer is its next turn' });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
 // sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same

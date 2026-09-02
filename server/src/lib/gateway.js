@@ -597,27 +597,53 @@ export async function zeeTurnForXell(xellId) {
   }
 }
 
+// The medic mirror of zeeTurnForXell (245: a medic's zee is keyed by medic_id, not xell_id).
+export async function zeeTurnForMedic(medicId) {
+  try {
+    if (!medicId) return { zeeId: null, turnId: null };
+    const zee = await one(
+      `SELECT id FROM zee WHERE medic_id=$1
+         AND status IN ('spawning','online','working','idle')
+        ORDER BY created_at DESC LIMIT 1`, [medicId]);
+    if (!zee) return { zeeId: null, turnId: null };
+    const turn = await one(
+      `SELECT id FROM zee_turn WHERE zee_id=$1 AND status='started'
+        ORDER BY started_at DESC LIMIT 1`, [zee.id]);
+    return { zeeId: zee.id, turnId: turn?.id || null };
+  } catch (e) {
+    logline('gateway', `zeeTurnForMedic failed (${String(e.message).slice(0, 120)})`);
+    return { zeeId: null, turnId: null };
+  }
+}
+
 // Insert one gateway request row. Returns the row id (for the completion UPDATE) or null.
 // EXPORTED for the test — the proxy is the only production caller, but the round-trip (record →
 // complete → read) is exactly what test/gateway.test.mjs must prove.
 // When zeeId is not supplied, the live zee + open turn for the xell are looked up (best-effort)
 // so the ledger attributes every request to the zee/turn that made it.
+// PLANE-AGNOSTIC (stage 4): `xell` is the SUBJECT — a xell row, or the medic subject
+// (lib/medics.js medicSubject: id null, medic_id set). A medic's calls carry no xell_id (there is
+// no xell) and are attributed by medic_id (247) plus the medic's own zee/turn rows, so a
+// meta-plane loop appears in the SAME ledger, priced the same way, as every caged zee.
 export async function recordRequest({ xell, zeeId = null, turnId = null, kind, provider, model,
                                      method, path, sessionId = null }) {
   try {
     if (!zeeId) {
-      const live = await zeeTurnForXell(xell?.id);
+      const live = xell?.medic_id
+        ? await zeeTurnForMedic(xell.medic_id)
+        : await zeeTurnForXell(xell?.id);
       zeeId = live.zeeId;
       turnId = live.turnId;
     }
     const row = await one(
       `INSERT INTO llm_gateway_request
-         (xell_id, zee_id, turn_id, project_id, kind, provider, model, method, path, session_id, meta)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
+         (xell_id, zee_id, turn_id, project_id, kind, provider, model, method, path, session_id, meta,
+          medic_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)
        RETURNING id`,
       [xell?.id || null, zeeId || null, turnId || null, xell?.project_id || null,
        kind, provider || null, model || null, method || 'POST', path || '',
-       sessionId || null, JSON.stringify({})]);
+       sessionId || null, JSON.stringify({}), xell?.medic_id || null]);
     return row?.id || null;
   } catch (e) {
     logline('gateway', `could not record a gateway request (${String(e.message).slice(0, 120)})`);
@@ -787,9 +813,19 @@ export async function gatewayProxy(req, res) {
     logline('gateway', `hello probe answered for ${parsed.provider} (${req.method})`);
     return res.status(200).json({ ok: true, service: 'zeehive-llm-gateway' });
   }
-  const xell = await xellForToken(parsed.xellToken).catch(() => null);
+  // TWO PLANES, ONE DOOR (stage 4): the token resolves to a XELL or — for a meta-plane medic, which
+  // has no xell — to a MEDIC, whose subject is xell-shaped (id null, medic_id set, project_id = the
+  // project it attends). The medic path is tried second and only when the xell lookup misses, so an
+  // ordinary call costs exactly one query as before. Both end in the same forward + the same ledger
+  // row: a medic's model calls are no less recorded than a caged zee's.
+  let xell = await xellForToken(parsed.xellToken).catch(() => null);
   if (!xell) {
-    return res.status(401).json({ error: 'gateway: unknown xell identity (the token in the path does not match a live xell)' });
+    const { medicForToken, medicSubject } = await import('./medics.js');
+    const medic = await medicForToken(parsed.xellToken).catch(() => null);
+    if (medic && medic.status !== 'retired') xell = medicSubject(medic);
+  }
+  if (!xell) {
+    return res.status(401).json({ error: 'gateway: unknown xell/medic identity (the token in the path matches no live xell and no medic)' });
   }
   // Which dialect does the provider speak? openai + kimi are the OpenAI-compatible CLIs
   // (/v1/chat/completions); claude + deepseek run the claude CLI (Anthropic dialect, /v1/messages).

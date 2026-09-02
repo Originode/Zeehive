@@ -14,6 +14,7 @@ import { startWorkSync } from './queenzee/worksync.js';
 import { startHeldDoneReaper } from './queenzee/done-held.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
+import { refreshMedicRoleAtBoot } from './lib/medic-role.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { logHarnessSummary } from './lib/harness.js';
@@ -209,6 +210,11 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // ones that are provably stale (lib/provision.reconcileXellEnvs).
   reconcileXellEnvs({ reason: 'boot' })
     .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
+  // The medic role's GRANTs move with the schema (a table created since the last mint is not
+  // covered by an old blanket grant), and boot is exactly when a schema change arrives — so
+  // re-mint here. Best-effort: a failed mint retries lazily on first medic use (medic-role.js),
+  // and MEDICRW_MODE=simulate mints nothing (the nested-queenzee contract).
+  refreshMedicRoleAtBoot();
   // AND THE RECONCILE FOR THE MACHINE ITSELF. The app tier restarts with the host; the CXELLS DO
   // NOT (intake runs them with no restart policy, deliberately — a cage dockerd brought back would
   // have no firewall and no ssh door, because both are runtime state inside its namespace). So the
