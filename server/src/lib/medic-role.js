@@ -96,10 +96,26 @@ export function medicRoleSql(password, dbName, owner) {
     `GRANT USAGE ON SCHEMA public TO ${MEDIC_ROLE};`,
     `GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${MEDIC_ROLE};`,
     `GRANT SELECT, USAGE ON ALL SEQUENCES IN SCHEMA public TO ${MEDIC_ROLE};`,
-    // The one secret the read does NOT include: vendor API keys (see the header).
-    `DO $ms$ BEGIN
-       IF to_regclass('provider_token') IS NOT NULL THEN
-         REVOKE SELECT (token) ON provider_token FROM ${MEDIC_ROLE};
+    // The one secret the read does NOT include: vendor API keys (see the header). A column-level
+    // `REVOKE SELECT (token)` against the blanket table grant is a SILENT NO-OP — the postgres trap
+    // prod-readonly.js's secretTableSql documents, and test/medic-role.test.mjs watched this role
+    // hand the token out before this took its shape. So: revoke table-level SELECT and re-grant the
+    // NON-secret columns by name, computed from information_schema — a column added later fails
+    // CLOSED instead of silently re-opening the secret. (Only provider_token: DR-8 deliberately
+    // keeps the credential-shaped CONFIG columns — container.conn_pw, environment_var.value —
+    // readable, because a TKT-181-class fault IS the patient.)
+    `DO $ms$
+     DECLARE _cols text;
+     BEGIN
+       IF to_regclass('public.provider_token') IS NOT NULL THEN
+         EXECUTE 'REVOKE SELECT ON public.provider_token FROM ${MEDIC_ROLE}';
+         SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) INTO _cols
+           FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'provider_token'
+            AND column_name <> 'token';
+         IF _cols IS NOT NULL THEN
+           EXECUTE 'GRANT SELECT (' || _cols || ') ON public.provider_token TO ${MEDIC_ROLE}';
+         END IF;
        END IF;
      END $ms$;`,
     ...writes,
