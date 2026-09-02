@@ -21,6 +21,7 @@ import {
   probePublishedRole, publishedUrl,
 } from '../queenzee/containers.js';
 import { assertSpinoffNotOnProdNetworks } from './spinoff-network-guard.js';
+import { composeContainerName } from './compose-names.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
@@ -345,6 +346,29 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
         manifest: project?.manifest || null,
         prodComposeYaml: prodYaml,
       });
+    }
+
+    // THE COMPOSE FILE NAMES THE CONTAINER, NOT THE TEMPLATE. The row's name came from the
+    // project's naming template at provision time; if this branch's compose pins a different
+    // `container_name:`, the template is simply wrong about reality and every name-keyed reader
+    // (health matching, `docker exec`, decommission) is aimed at a container that never exists.
+    // omnibiz's webapp was `omnibiz_spin_web_{slug}` in compose and `omnibiz_spin_webapp_{slug}`
+    // in the meta-DB: the rows read 'down' minutes after their own builds reported success, so
+    // app-serve:webapp could never pass and the readiness proof could never say 'ok'.
+    // Re-stamp before the build so what we record is what the daemon will hold. Conservative by
+    // construction: composeContainerNameFor answers null for "no pin / cannot resolve", and null
+    // changes nothing.
+    if (spinYaml) {
+      const service = project?.manifest?.roles?.[c.role]?.service || c.role;
+      const real = composeContainerName(spinYaml, service, { SPINOFF_SLUG: xell.slug });
+      if (real && real !== c.name) {
+        const was = c.name;
+        c = await one(`UPDATE container SET name=$2 WHERE id=$1 RETURNING *`, [c.id, real]);
+        broadcast('container', c);
+        logline('build', `${xell.slug}: ${c.role} container is named "${real}" by `
+          + `${spinRel} — the meta-DB said "${was}" (naming template). Re-stamped: a row that names `
+          + 'a container docker never creates reads down forever.');
+      }
     }
   }
 
