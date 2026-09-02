@@ -84,8 +84,9 @@ async function waitForBuild() {
         // published-port branch — a failed finalize sets health=down AND the port probe also reads
         // down, and without this order the zee only ever saw "port refused" with no stderr.
         console.log(`  ✗ ${c.role} (${c.name}) is ${c.health.toUpperCase()} — the build FAILED.`);
-        // The classified next step (INFRA — not your code / CODE — your worktree) is computed
-        // server-side and rides the status payload, so --wait and --watch print the same sentence.
+        // The classified next step (INFRA — not your code / CODE — your worktree / UNKNOWN —
+        // could not tell) is computed server-side and rides the status payload, so --wait and
+        // --watch print the same sentence.
         if (c.last_build_error_next_step) {
           console.log('');
           for (const line of String(c.last_build_error_next_step).split('\n')) console.log(`  ${line}`);

@@ -280,6 +280,9 @@ try {
     const unk = buildReadinessRecordFromProof({ ok: false, error: 'x',
       checks: [{ check: 'app-build:server', ok: false, skipped: false, detail: 'timeout', class: null }] });
     ok(unk.status === 'unknown', 'unclassified verdict → unknown (never green)');
+    const unk2 = buildReadinessRecordFromProof({ ok: false, error: 'x',
+      checks: [{ check: 'app-build:server', ok: false, skipped: false, detail: 'did not complete', class: 'UNKNOWN' }] });
+    ok(unk2.status === 'unknown', 'UNKNOWN-classed verdict → unknown (never green, never read as CODE-only ok)');
   }
 
 } finally {
