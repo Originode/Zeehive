@@ -5,6 +5,11 @@
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+// The one async docker adapter (lib/build-readiness.js) — the ONLY sanctioned way this module
+// shells out to docker asynchronously. The TKT-85 port-allocation fix reads the daemon's bound
+// ports with it (never spawnSync on the event loop, and bounded); build-readiness.js imports
+// nothing from here, so there is no cycle.
+import { dockerAdapter } from './build-readiness.js';
 import { resolve, dirname } from 'node:path';
 import pg from 'pg';
 import { pool, q, one } from '../db/pool.js';
@@ -15,7 +20,7 @@ import { resolveSite } from './sites.js';
 import { namingFor, serverRoleIsProcess } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx,
-         implicitPoolMachine, liveXellCount } from './machines.js';
+         implicitPoolMachine, liveXellCount, siteHostForMachine, ensureDbContainerConnPw } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
@@ -72,6 +77,85 @@ export function computePorts(slug, project = {}) {
     serverPort: (Number(project.port_server_base) || 3100) + slot,
     webPort: (Number(project.port_web_base) || 5200) + slot,
   };
+}
+
+// ── HOST-PORT ALLOCATION (TKT-85 family, provision-proof plan §4.5) ─────────────────────────────
+// The per-xell db host-port used to be a PURE FORMULA (base + slot). A pure formula cannot see the
+// two things that actually own host ports: the daemon's published ports (another xell's db, a human
+// postgres, a container from a different code path — everything `docker ps` shows) and the rows
+// OTHER xells recorded in the meta-DB (including a row that was never bound yet — a modeled
+// compose-era db — and a row on a daemon that is currently down). Two xells whose slugs hash to the
+// same slot collided silently: the second `docker run -p` died with "port is already allocated"
+// (and provisioning failed), or the compose-era path recorded a row whose port nobody could bind.
+//
+// So the slot is the STARTING guess; the actual port is the first free one walking UP from it,
+// checked against the UNION of (meta-DB recorded db host ports on this context) and (one bounded
+// `docker ps --format '{{.Ports}}'` read of the daemon's published ports). An unreachable daemon
+// DEGRADES to meta-DB-only allocation, logged, never a hang — and never a spawnSync on the event
+// loop. Every probe is bounded (a docker ps against a remote context is a network round-trip).
+
+// The host port of every published mapping in `docker ps --format '{{.Ports}}'` output. Pure —
+// entries look like `0.0.0.0:5503->5432/tcp, [::]:5503->5432/tcp`; exposed-but-unpublished ports
+// (bare `5432/tcp`) are not published bindings and never appear in {{.Ports}}.
+export function publishedPortsFromPs(output) {
+  const ports = new Set();
+  // One mapping per token. Tokens are separated by ',' within a container's line AND by the newline
+  // between containers (`docker ps --format '{{.Ports}}'` prints one line per container), so split
+  // on either. Each mapping looks like `0.0.0.0:5509->5432/tcp` or `[::]:5508->5432/tcp`; the host
+  // port is the digit run before `->`.
+  for (const token of String(output || '').split(/[,\s]+/)) {
+    const m = token.match(/:(\d+)->/);
+    if (m) ports.add(Number(m[1]));
+  }
+  return ports;
+}
+
+// The first free db host port for `slot` on `ctx`. Never throws: a read that cannot complete must
+// not fail a provision — the caller (docker run) remains the arbiter of a genuinely taken port.
+export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = null, skip = [], docker = dockerAdapter } = {}) {
+  const formula = Number(base) + slot;
+  const taken = new Set();
+  // Host ports this caller already FAILED to bind (the bind-refusal retry walks past them so the
+  // search makes forward progress even if the daemon read does not yet see the racer).
+  for (const p of skip) taken.add(Number(p));
+  // meta-DB recorded db host ports on THIS context — the other xells (modeled or live) this one
+  // would collide with even when the daemon is unreachable.
+  const recorded = await q(
+    `SELECT host_port FROM container WHERE role='db' AND docker_ctx=$1 AND host_port IS NOT NULL`, [ctx])
+    .catch(() => []);
+  for (const r of recorded) taken.add(Number(r.host_port));
+  // the daemon's published ports — the source of truth for what is actually bound. Bounded, async,
+  // and failure-tolerant: an unreachable daemon degrades to meta-DB-only (logged, never a hang).
+  const ps = await docker(ctx, ['ps', '--format', '{{.Ports}}'], { timeout: 4000 });
+  if (ps?.unknown) {
+    console.warn(`[provision] freeDbHostPort (${ctx}): ${ps.reason} — allocating from the meta-DB `
+      + `recorded db ports only; a daemon-side collision will surface as a bind refusal and retry`);
+  } else {
+    for (const p of publishedPortsFromPs(ps?.stdout)) taken.add(p);
+  }
+  // Walk up a bounded window from the formula slot. If every port in the window is claimed (a very
+  // full hive), fall back to the FORMULA port and let the bind refusal/retry below be the arbiter —
+  // a provision never fails on a crowded host by guessing a port the caller cannot use.
+  const window = Number(process.env.PORT_ALLOC_WINDOW) || 64;
+  for (let s = slot; s < slot + window; s++) {
+    const port = Number(base) + s;
+    if (!taken.has(port)) return port;
+  }
+  return formula;
+}
+
+// The host port for a xell's spin compose db service, as lib/build.js projects it into the build
+// env (SPINOFF_DB_PORT). A recorded per-xell db row (db-isolated coupling — provision stamped the
+// port) is authoritative, exactly like the server/web rows. With NO db row (db-shared-dev coupling)
+// the generated compose falls back to its DEFAULT 5500 — and 5500 is the one host port every other
+// row-less spin db also wants, so row-less xells collided cross-xell ("Bind for 0.0.0.0:5500 failed"
+// took a build down twice). So a row-less xell ALLOCATES like provision's per-xell db instead of
+// inheriting the default. Failure-tolerant: an allocation that blows up (daemon AND meta-DB both
+// gone) degrades to null = the compose default — the bind stays the arbiter, never a build blocker.
+export async function spinComposeDbPort({ recordedPort, ctx, slug, project = {}, docker = dockerAdapter }) {
+  if (recordedPort != null) return recordedPort;
+  const { slot } = computePorts(slug, project);
+  return freeDbHostPort(ctx, { slot, projectId: project?.id ?? null, docker }).catch(() => null);
 }
 
 // The harness-free projection (spec §3.4): a generated, gitignored env file in the worktree so
@@ -186,6 +270,42 @@ export async function sameDatabase(a, b) {
   return sameDatabaseByHostPort(a, b);
 }
 
+// Inject the ACTUAL password into a passwordless TCP DSN — the heart of TKT-181-9EDA.
+//
+// conn_refs are stored passwordless by design ("parameters, not secrets"): a docker-exec psql
+// authenticates through the container's socket, so the inventory never needed the role password.
+// A CXELL zee has no docker and reaches postgres over TCP, where postgres demands SCRAM — so the
+// projection carries the password of the database it names, recorded per container at provision
+// (container.conn_pw). Pure and exported for tests. Never overwrites a password already in the
+// DSN (a minted reader DSN, a prod-RO DSN — those are their own credentials).
+export function dsnWithPassword(dsn, password, { user = null } = {}) {
+  if (!dsn || !password) return dsn;
+  try {
+    const u = new URL(String(dsn).replace(/^postgres(ql)?:/, 'http:'));
+    if (u.password) return dsn;                     // already carries a credential — never overwrite it
+    if (!u.username && user) u.username = user;
+    u.password = password;
+    return String(u).replace(/^http:/, 'postgresql:');
+  } catch { return dsn; }                            // unparseable — leave as-is for the consumer
+}
+
+// WHICH password a resolved DSN should carry. The per-container conn_pw is authoritative: it is
+// whatever actually provisioned that postgres. Only an OWNED per-xell db — created by this code
+// (or its compose) with the manifest credential — may fall back to manifest.db.password, and for
+// EVERY runner (a compose-runner xell's own db is composed with the same manifest value). Rows
+// created after this migration carry conn_pw (provision.js records it on both runner paths), so
+// this fallback only serves rows that predate the column — exactly the ones whose container was
+// created with the manifest credential, which is why the manifest is safe HERE and nowhere else.
+// Shared dev / prod / clone rows are NEVER guessed: their real POSTGRES_PASSWORD is whatever
+// provisioned the container (measured 2026-09-02: ugreen-nas's shared dev db was created by
+// provision-xell-db.sh's default 'omnibiz' while the manifest says 'zeehive'), and a guessed
+// password fails auth exactly as hard as none at all.
+export function passwordForDsn(rowConnPw, { owned = false, manifestDb = {} } = {}) {
+  if (rowConnPw) return rowConnPw;
+  if (owned && manifestDb.password) return manifestDb.password;
+  return null;
+}
+
 // WHICH DATABASE THIS XELL IS MEANT TO TALK TO — the one rule, in one place.
 //
 // Extracted out of writeXellEnv unchanged, because a second reader needs the SAME answer: the
@@ -223,11 +343,13 @@ export async function sameDatabase(a, b) {
 export async function resolveXellDsn(xell, project, containers = []) {
   const xellId = xell.id;
   let dbUrl = null;
+  let dbPw = null;                             // the ACTUAL password of the database dbUrl names (container.conn_pw)
+  let dbOwned = false;                          // dbUrl came from THIS xell's OWN per-xell db container
   let source = null;
   let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
   if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
     const linkedProd = await one(
-      `SELECT c.conn_ref, c.host AS host, c.host_port
+      `SELECT c.conn_ref, c.conn_pw, c.host AS host, c.host_port
          FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
         WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
     bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
@@ -243,6 +365,9 @@ export async function resolveXellDsn(xell, project, containers = []) {
       : (linkedProd?.conn_ref
         || derivedTcpDsn(linkedProd, await dbIdentity(xell.project_id))
         || xell.prod_ro_dsn || null);
+    // A db-shared-prod bind's OWN password (if recorded) rides in the DSN; the prod-readonly
+    // minted DSN already carries its own credential and must never be overwritten below.
+    if (xell.db_coupling === 'db-shared-prod' && dbUrl) dbPw = linkedProd?.conn_pw || null;
     if (dbUrl) source = xell.db_coupling === 'db-prod-readonly' ? 'prod-readonly-dsn' : 'prod-linked';
     if (bindingIsProd && !dbUrl) {
       logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
@@ -253,7 +378,10 @@ export async function resolveXellDsn(xell, project, containers = []) {
   }
   // …else the xell's OWN db container, when it has one.
   if (!dbUrl && !bindingIsProd) {
-    dbUrl = containers.find((c) => c.role === 'db')?.conn_ref || null;
+    const own = containers.find((c) => c.role === 'db') || null;
+    dbUrl = own?.conn_ref || null;
+    dbPw = own?.conn_pw || null;
+    dbOwned = !!dbUrl;
     if (dbUrl) source = 'own-db-container';
   }
   // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
@@ -261,13 +389,14 @@ export async function resolveXellDsn(xell, project, containers = []) {
   // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
   if (!dbUrl && xell.db_coupling === 'db-clone') {
     const inst = await one(
-      `SELECT di.name, c.conn_ref FROM db_instance di JOIN container c ON c.id = di.container_id
+      `SELECT di.name, c.conn_ref, c.conn_pw FROM db_instance di JOIN container c ON c.id = di.container_id
         WHERE di.owner_xell_id=$1 AND di.kind='clone' AND c.conn_ref IS NOT NULL LIMIT 1`, [xellId]);
     if (inst?.conn_ref) {
       try {
         const u = new URL(String(inst.conn_ref).replace(/^postgres(ql)?:/, 'http:'));
         u.pathname = `/${inst.name}`;
         dbUrl = String(u).replace(/^http:/, 'postgresql:');
+        dbPw = inst.conn_pw || null;
         source = 'clone-instance';
       } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
     }
@@ -281,36 +410,32 @@ export async function resolveXellDsn(xell, project, containers = []) {
   // pins DATABASE_URL to its db alias for the containers, so the extra line only hands the zee a
   // working address and never changes what the stack resolves. The §6.2 guard still applies
   // unchanged (the reader-binding exemption in writeXellEnv is about the COUPLING, not the runner).
-  const spin = project?.manifest?.tiers?.spinoff || {};
-  const spinRunner = spin.runner || null;
   if (!dbUrl && xell.db_coupling === 'db-shared-dev') {
     const used = await one(
-      `SELECT c.conn_ref, c.host, c.host_port, c.docker_ctx
+      `SELECT c.conn_ref, c.conn_pw, c.host, c.host_port, c.docker_ctx
          FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
         WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' LIMIT 1`, [xellId]);
-    if (used?.conn_ref) { dbUrl = used.conn_ref; source = 'shared-dev-container'; }
+    if (used?.conn_ref) { dbUrl = used.conn_ref; dbPw = used.conn_pw || null; source = 'shared-dev-container'; }
     else if (used?.host && used?.host_port) {
       // A shared dev db that records no conn_ref but IS published: derive the TCP DSN the same
       // way the prod path does (derivedTcpDsn), so a caged zee still gets a door rather than
-      // falling through to a docker-exec psql a cxell cannot run.
+      // falling through to a docker-exec psql a cxell cannot run. The derived DSN names the same
+      // container, so its recorded password rides with it.
       const dsn = derivedTcpDsn(used, await dbIdentity(xell.project_id));
-      if (dsn) { dbUrl = dsn; source = 'shared-dev-derived'; }
+      if (dsn) { dbUrl = dsn; dbPw = used.conn_pw || null; source = 'shared-dev-derived'; }
     }
   }
-  // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
-  // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may
-  // carry the committed dev credential (the same one the compose files already commit); inject
-  // it for process xells when the ref has none. Anything genuinely secret stays out of manifests.
+  // The password the projected DSN carries: per-container conn_pw when recorded (authoritative),
+  // else the manifest credential ONLY for an owned per-xell db — the database this code created
+  // with that exact value, compose runner included. Shared dev / prod / clone rows are NEVER
+  // guessed from the manifest (their real password is whatever provisioned the container, which
+  // the manifest does not know: TKT-181-9EDA); a row with no conn_pw there stays passwordless so
+  // the readiness preflight names the fault instead of the zee discovering it mid-task.
   const manifestDb = project?.manifest?.db || {};
-  if (dbUrl && spinRunner === 'process' && manifestDb.password) {
-    try {
-      const u = new URL(String(dbUrl).replace(/^postgres(ql)?:/, 'http:'));
-      if (!u.password) {
-        if (!u.username && manifestDb.user) u.username = manifestDb.user;
-        u.password = manifestDb.password;
-        dbUrl = String(u).replace(/^http:/, 'postgresql:');
-      }
-    } catch { /* unparseable ref — emit as-is and let the guard/consumer complain */ }
+  if (dbUrl) {
+    const pw = passwordForDsn(dbPw, { owned: dbOwned, manifestDb });
+    const withPw = dsnWithPassword(dbUrl, pw, { user: manifestDb.user });
+    if (withPw) dbUrl = withPw;
   }
   return { dsn: dbUrl, source, binding_is_prod: bindingIsProd };
 }
@@ -327,7 +452,7 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   const site = await resolveSite(xell.project_id, 'dev');
   const cs = await q(
-    `SELECT role, host_port, conn_ref, docker_ctx FROM container
+    `SELECT role, host_port, conn_ref, conn_pw, docker_ctx FROM container
       WHERE owner_xell_id=$1 AND role IN ('server','webapp','db')`, [xellId]);
   const portOf = (role) => cs.find((c) => c.role === role)?.host_port ?? '';
   // The context the xell's stack ACTUALLY runs on — machines made this per-xell, so the site's
@@ -384,6 +509,20 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
         + 'because this xell holds it READ-ONLY (SELECT-only role) — the §6.2 reap risk needs writes');
     }
     lines.push(`DATABASE_URL=${dbUrl}`);
+  }
+
+  // ZEEHIVE_META_RO_DSN — the infra-medic's READ-ONLY bind to the orchestrator's OWN meta-DB
+  // (provision-proof stage 3). Distinct from DATABASE_URL on purpose: a medic still does its own
+  // work on its own database; this line is the SEPARATE SELECT-only credential for the meta-DB, the
+  // one that lets it read the provisioning evidence (machines, containers, pool, readiness, proof).
+  // The DSN is minted at dispatch (lib/prod-readonly.js mintMetaReader) and lives in
+  // xell.meta_ro_dsn; a live value here is the ONLY reason the line is emitted, and the reaper
+  // clears the column when it drops the role with the xell. The same §6.2 refusal above does NOT
+  // apply: this is a minted SELECT-only reader (default_transaction_read_only=on), the exact class
+  // the exemption is about — a medic could no more reap a live xell than a manager could.
+  if (xell.meta_ro_dsn) {
+    lines.push(`# ZEEHIVE_META_RO_DSN — the meta-DB, READ-ONLY (SELECT-only zee_ro_ role minted for this xell)`);
+    lines.push(`ZEEHIVE_META_RO_DSN=${xell.meta_ro_dsn}`);
   }
 
   // QUEENZEE_INPROC=false — API-only when this xell shares THE queenzee's meta-DB (TKT-136-FE32).
@@ -459,6 +598,7 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
       // never an environment's to set, present in the file or not.
       const reserved = new Set([
         'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', 'QUEENZEE_INPROC',
+        'ZEEHIVE_META_RO_DSN',
         serverEnv, webEnv,
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);
@@ -974,7 +1114,15 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   }
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
-  const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
+  // deploy_site is the source of truth for WHERE a tier runs (docs/deploy-topology-spec.md §5):
+  // the dev site whose docker_ctx matches the machine's own context WINS over the machine row's
+  // host_ip (TKT-180 — before this, ugreen-nas carried host_ip=10.0.1.18 while the daemon and
+  // every other source said 10.1.0.18, and every spin container stamped from that row inherited
+  // an address that never answered). No machine → the project's default dev site → deprecated
+  // project column → global env default, unchanged.
+  const machineSiteHost = machine ? await siteHostForMachine(project.id, machine.docker_ctx) : null;
+  const devHost = machineSiteHost || machine?.host_ip
+    || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
   // A machine row with no host_ip used to produce literal "http://null:PORT" URLs — a URL the
   // health prober can never answer. For a CONTAINERIZED queenzee whose host-machine row carries
@@ -1025,6 +1173,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
 
   const client = await pool.connect();
   let createdDbContainer = null;   // a docker-run per-xell db to tear down if the tx fails
+  let sharedDevContainerId = null; // the shared dev db linked below — for a real-mode conn_pw backfill
   try {
     await client.query('BEGIN');
     const { rows: [xell] } = await client.query(
@@ -1090,19 +1239,46 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       const dbName = mdb.name || project.db_name || 'app';
       const dbUser = mdb.user || project.db_user || 'postgres';
       const dbPass = mdb.password || 'dev';
-      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      // ALLOCATE THE HOST PORT AGAINST REAL OWNERSHIP (TKT-85 family, plan §4.5): the slot formula
+      // is the STARTING guess; the actual port is the first free one walking up from it, checked
+      // against the union of the meta-DB's recorded db host ports on this context and one bounded
+      // `docker ps --format '{{.Ports}}'` read of the daemon (async — never spawnSync on the event
+      // loop). docker run below remains the arbiter of a genuinely taken port (a TOCTOU between the
+      // read and the run), which is why the bind is RETRIED on the next free slot instead of failing
+      // the attach. The stage-2 re-preflight is the safety net; this is the fix.
+      const dbBase = Number(spinTier.ports?.db?.base) || 5500;
+      let dbPort = await freeDbHostPort(devCtx, { base: dbBase, slot: ports.slot, projectId });
       const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
       if (mode === 'real') {
-        const run = spawnSync('docker',
-          ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
-           // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
-           // the published host port below is the HUMAN's door (psql from the host)
-           '--network', 'zee-hive-net',
-           '-p', `${dbPort}:5432`,
-           '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
-           '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
-           '--label', `zeehive.slug=${slug}`, dbImage],
-          { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+        const skipPorts = [];     // host ports this provision already failed to bind — walk past them
+        let run = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          run = spawnSync('docker',
+            ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
+             // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
+             // the published host port below is the HUMAN's door (psql from the host)
+             '--network', 'zee-hive-net',
+             '-p', `${dbPort}:5432`,
+             '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
+             '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
+             '--label', `zeehive.slug=${slug}`, dbImage],
+            { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+          if (run.status === 0) break;
+          const err = (run.stderr || '').slice(-300);
+          // A BIND REFUSAL is the collision the allocation raced: something bound the port between
+          // the ps read and this docker run. Retry on the next free slot — a fresh freeDbHostPort
+          // re-reads the daemon (now seeing the new binder) AND skips the port we just lost, so the
+          // walk makes forward progress. Anything else (image pull, daemon down) is a real failure
+          // and stays one.
+          if (/port is already allocated|address already in use|bind.*already/i.test(err)) {
+            console.warn(`[provision] ${slug}: db host port :${dbPort} refused at bind — retrying the `
+              + `next free slot (${err.trim().slice(0, 90)})`);
+            skipPorts.push(dbPort);
+            dbPort = await freeDbHostPort(devCtx, { base: dbBase, slot: ports.slot, projectId, skip: skipPorts });
+            continue;
+          }
+          break;
+        }
         if (run.status !== 0) {
           throw new Error(`per-xell db container ${nmDb.container} failed: ${(run.stderr || '').slice(-300)}`);
         }
@@ -1139,20 +1315,23 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
           }
         }
       }
-      // conn_ref stays passwordless (parameters, not secrets) — emitXellEnv injects the
-      // manifest's committed dev credential for process xells. The HOST in it depends on where
-      // the consumers run: a containerized queenzee's process xells and its cxells resolve the
-      // db by CONTAINER NAME over zee-hive-net (localhost:<published port> is the container's
-      // own empty loopback — seen live: the first in-container process start died on connect
-      // and its port never answered); the host era keeps the published-port form.
+      // conn_ref stays passwordless (parameters, not secrets) — conn_pw carries the credential
+      // resolveXellDsn injects into the projected DATABASE_URL (TKT-181-9EDA). The HOST in
+      // conn_ref depends on where the consumers run: a containerized queenzee's process xells
+      // and its cxells resolve the db by CONTAINER NAME over zee-hive-net (localhost:<published
+      // port> is the container's own empty loopback — seen live: the first in-container process
+      // start died on connect and its port never answered); the host era keeps the published-port
+      // form.
       const inContainer = existsSync('/.dockerenv');
       const connRef = inContainer
         ? `postgresql://${dbUser}@${nmDb.container}:5432/${dbName}`
         : `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`;
+      // conn_pw IS recorded here (TKT-181-9EDA): this code just docker-ran the container with
+      // POSTGRES_PASSWORD=dbPass, so dbPass is the ONE password the projected DSN must carry.
       const { rows: [dbc] } = await client.query(
-        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,owner_xell_id,site_id,health)
-         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10) RETURNING id`,
-        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef,
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,conn_pw,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11) RETURNING id`,
+        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef, dbPass,
          xell.id, devSiteId, mode === 'real' ? 'up' : 'unknown']);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
     } else if (coupling === 'db-isolated' && project.manifest?.roles?.db?.service) {
@@ -1167,13 +1346,21 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       const mdb = project.manifest?.db || {};
       const dbName = mdb.name || project.db_name || 'app';
       const dbUser = mdb.user || project.db_user || 'postgres';
-      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      const dbPass = mdb.password || 'dev';
+      // ALLOCATE AGAINST REAL OWNERSHIP, same as the process twin (TKT-85, plan §4.5): there is no
+      // docker run here to catch a collision (compose binds at first build), so the ROW must record
+      // a port the daemon does not already own — otherwise the recorded conn_ref is a lie from the
+      // moment it is written and the compose stack fails to bind. The union check is the fix.
+      const dbPort = await freeDbHostPort(devCtx, { base: Number(spinTier.ports?.db?.base) || 5500,
+                                                    slot: ports.slot, projectId });
       const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
+      // conn_pw IS recorded (TKT-181-9EDA): the compose stack this row models is generated with
+      // POSTGRES_PASSWORD=dbPass (lib/compose-gen.js), so dbPass is what a TCP DSN must carry.
       const { rows: [dbc] } = await client.query(
-        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,compose_project,compose_file,owner_xell_id,site_id,health)
-         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11,'down') RETURNING id`,
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,conn_pw,compose_project,compose_file,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11,$12,'down') RETURNING id`,
         [projectId, nmDb.container, dbImage, devCtx, urlHost, dbPort,
-         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`,
+         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`, dbPass,
          namingFor(project, 'db', slug).composeProject, project.compose_spinoff,
          xell.id, devSiteId]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
@@ -1191,7 +1378,8 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
             AND (docker_ctx = $2 OR docker_ctx IS NULL)
           ORDER BY (docker_ctx = $2) DESC NULLS LAST LIMIT 1`, [projectId, devCtx]);
       if (shared.rows[0]) {
-        await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'uses') ON CONFLICT DO NOTHING`, [xell.id, shared.rows[0].id]);
+        sharedDevContainerId = shared.rows[0].id;
+        await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'uses') ON CONFLICT DO NOTHING`, [xell.id, sharedDevContainerId]);
       }
     }
     await client.query('COMMIT');
@@ -1201,6 +1389,17 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // the harness-free projection rides every REAL provision; failure is logged, never fatal
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {
+      // The shared dev db this xell USES may predate container.conn_pw (the column is new: TKT-181-
+      // 9EDA). Its row has no password to project, so before writing this xell's .zeehive.env, ask
+      // the LIVE container what POSTGRES_PASSWORD it was created with and record it — the only
+      // honest source (the meta-DB never knew, and the manifest can be a different password, as the
+      // ugreen-nas shared dev db proved). A row we still cannot read stays passwordless and the
+      // preflight below names the fault; this is a best-effort repair, never a reason to fail the
+      // provision.
+      if (sharedDevContainerId) {
+        await ensureDbContainerConnPw(sharedDevContainerId, { mode })
+          .catch((e) => logline('provision', `${slug}: shared dev db conn_pw backfill failed (ignored): ${e.message}`));
+      }
       await emitXellEnv(xell.id).catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
       // …and OPEN what was just written, before anyone treats this xell as ready (#53). Writing a
       // DATABASE_URL and that DATABASE_URL answering are two different facts, and the gap is what

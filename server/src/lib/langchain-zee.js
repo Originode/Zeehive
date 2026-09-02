@@ -41,9 +41,11 @@ export function isOpenAIDialect(provider) {
 
 // The gateway base URL + dialect for a provider — the same path shape gatewayEnv mints for the
 // vendor CLIs. The xell token travels in the PATH, so the gateway attributes the call to the xell
-// without parsing the bearer (which stays the provider key).
-export function chatModelConfig({ provider = 'claude', xellToken = null } = {}) {
-  const gw = gatewayEnv({ xellToken, provider });
+// without parsing the bearer (which stays the provider key). ASYNC because gatewayEnv PROVES the
+// gateway address before minting it (chooseGatewayBaseUrl — cached), so a langchain turn never
+// starts against a base-url the queenzee itself cannot reach.
+export async function chatModelConfig({ provider = 'claude', xellToken = null } = {}) {
+  const gw = await gatewayEnv({ xellToken, provider });
   return {
     dialect: isOpenAIDialect(provider) ? 'chat-completions' : 'messages',
     baseUrl: isOpenAIDialect(provider) ? gw.OPENAI_BASE_URL : gw.ANTHROPIC_BASE_URL,
@@ -183,7 +185,7 @@ export async function resetConversation(xellId) {
 // inherit the previous persona's system context.
 export async function runLangchainTurn({ xell, task = null, provider = 'claude', model = null,
                                           apiKey = null, xellToken = null, system = null } = {}) {
-  const { baseUrl } = chatModelConfig({ provider, xellToken });
+  const { baseUrl } = await chatModelConfig({ provider, xellToken });
   const chat = buildChatModel({ provider, model, apiKey, baseUrl });
   const history = await loadConversation(xell.id);
   const messages = [];
@@ -252,7 +254,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
                                                apiKey = null, xellToken = null, system = null,
                                                tools = toolList(), maxIterations = MAX_TOOL_ITERATIONS,
                                                onAssistant = null, onTool = null } = {}) {
-  const { baseUrl } = chatModelConfig({ provider, xellToken });
+  const { baseUrl } = await chatModelConfig({ provider, xellToken });
   const chat = buildChatModel({ provider, model, apiKey, baseUrl });
   const history = await loadConversation(xell.id);
   const messages = [];

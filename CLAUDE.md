@@ -170,17 +170,20 @@ docs/            specs and rationale (see the doc map)
    SVG (082), it is edited in the console's harness manager or by migration, and the queenzee
    GENERATES the files it injects into a xell (stamped as generated). `lib/harness.js` reads no
    filesystem, so a harness cannot be "missing files" on any project or in any container. Project
-   entry-point docs work the same way (081, 083, `lib/project-docs.js`) and are never written over a
-   path the project has committed. Do not reintroduce a repo copy of either: the folder-and-row split
-   shipped a fleet of manager zees with no manual at all, and hid a migration's edit behind a hash
-   that said the two agreed.
+   entry-point docs work the same way (081, 083, `lib/project-docs.js`): the row is the single source
+   and the file in a xell is an artefact of it — generated into every xell at deployment, even over a
+   path this repo has committed (this very file; Option B, `docs/entry-point-doc-source.md`). Do not
+   reintroduce a repo copy of either: the folder-and-row split shipped a fleet of manager zees with no
+   manual at all, and hid a migration's edit behind a hash that said the two agreed.
 11. **A project's entry-point doc is ONE text, not one file per tool.** `project_doc.body` is the
-   source of truth and `targets` says which providers receive it; the FILENAMES are a registry in
-   code (`lib/agent-docs.js` — `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.github/copilot-instructions.md`,
-   `.cursor/rules/*.mdc`, …), each entry carrying the vendor doc that settles it. Never add a second
-   row to give another tool the same instructions — tick its provider. Every generated file also ends
-   with THAT xell's stack, generated per xell (`lib/xell-stack.js`): that is house rule 7 for an agent
-   that has no `zee status` to ask.
+   single source of truth and `targets` says which providers receive it; the FILENAMES are a registry
+   in code (`lib/agent-docs.js` — `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
+   `.github/copilot-instructions.md`, `.cursor/rules/*.mdc`, …), each entry carrying the vendor doc
+   that settles it. Never add a second row to give another tool the same instructions — tick its
+   provider. Every generated file also ends with THAT xell's stack, generated per xell
+   (`lib/xell-stack.js`): that is house rule 7 for an agent that has no `zee status` to ask. The
+   generated copy is git-excluded and skip-worktree'd in a xell, so it never lands in a diff; editing
+   it changes nothing — content changes go through the Docs tab or a migration.
 
 ## 6. Doc map — which file answers what
 
@@ -202,7 +205,7 @@ docs/            specs and rationale (see the doc map)
 | what a NESTED queenzee can actually reach (loop by loop, read vs write) | [docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md) |
 | `config.repoRoot` = the server's OWN tree, never a project's files | [docs/repo-root-audit.md](docs/repo-root-audit.md) |
 | what a cxell carries (every provider's credential, namespaced) and how a zee reads it with `zee creds` | [docs/cxell-provider-env.md](docs/cxell-provider-env.md) |
-| **this file has a second copy** (`project_doc.body`) — which one is the source | [docs/entry-point-doc-source.md](docs/entry-point-doc-source.md) |
+| **why this file is generated** (row is the source; the committed file is superseded) | [docs/entry-point-doc-source.md](docs/entry-point-doc-source.md) |
 | what runs where in production, and the cutover | [docker/zeehive/README.md](docker/zeehive/README.md) |
 | **why** a gate is shaped the way it is; traps already paid for | [HANDOFF.md](HANDOFF.md) — **history, not instructions** |
 

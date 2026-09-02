@@ -170,6 +170,11 @@ export function managerCard(x, crew = []) {
 // The facts a xell HOVER TOOLTIP shows — pure, so the imperative DOM code stays dumb and a test can
 // assert the content without a browser. The directive is the xell's own brief (task_text) first
 // line; the status is the same hive status label the hexagon's pill paints.
+//
+// `fault` names the failing readiness check VERBATIM (the preflight rule — "the check, named, or a
+// human goes looking", provision-proof §4.8): preflight_error when the DSN probe failed, else
+// proof_error when the burn-in found a broken chip. A dirty hexagon without the named check sends
+// a human looking; with it, they know what to DO.
 export function xellTooltipParts(x) {
   return {
     head: x?.slug || '—',
@@ -177,6 +182,7 @@ export function xellTooltipParts(x) {
     manager: x?.zee_type === 'manager',
     directive: x?.task_text ? firstLine(x.task_text) : null,
     status: hiveStatusLabel(x),
+    fault: x?.preflight_error || x?.proof_error || null,
   };
 }
 
@@ -723,6 +729,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       st.className = 'hive-xt-status';
       st.textContent = `status · ${parts.status}`;
       tip.el.appendChild(st);
+      // The failing readiness check, NAMED — a dirty hexagon without this sends a human looking.
+      if (parts.fault) {
+        const fault = document.createElement('div');
+        fault.className = 'hive-xt-fault';
+        fault.textContent = `⚠ ${parts.fault}`;
+        tip.el.appendChild(fault);
+      }
     }
     const bb = wrapRef.current?.getBoundingClientRect();
     if (bb) {
@@ -2901,6 +2914,7 @@ export function petalVerbs(x, diff) {
   const cxell = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
   const manager = isManagerXell(x);
   const st = x.hive_status;
+  const quarantined = !!x.quarantined_at;
   const canLand = (!!diff && diff.ahead > 0)                      // committed work not yet on main…
     || st === 'occ-landRequest' || st === 'occ-landHint';         // …or a land request/hint standing
   const canShip = shipLine(x, diff) === 'ready'                   // landed, clean, not in prod…
@@ -2936,7 +2950,18 @@ export function petalVerbs(x, diff) {
   // Not on a MANAGER: re-dispatching a manager re-mints its production read-only role (a live
   // CREATE/ALTER ROLE + password rotation), so the server refuses to re-crew one — and a button that
   // can only ever return a refusal is the same mistake as drawing `land` on a manager.
-  v[1] = manager ? ['done'] : ['swap', 'done'];
+  //
+  // QUARANTINED (ticket #81): the cage killed N zees in a row and is FROZEN — no agent until a human
+  // decides between the two arms, which are exactly the two verbs this petal then carries. RESCUE
+  // clears the quarantine so a fresh agent can be dispatched into the same worktree/branch; DONE
+  // (the "reap the cage" arm) tears it down. SWAP is replaced by rescue because the quarantine guard
+  // refuses to dispatch ANY new agent into the cage — a swap button that can only return a refusal
+  // is the same mistake as drawing `land` on a manager.
+  if (quarantined) {
+    v[1] = ['rescue', 'done'];
+  } else {
+    v[1] = manager ? ['done'] : ['swap', 'done'];
+  }
   // The GIT verbs — pull, land and PR — exist only for a xell that can write to the xource. A MANAGER
   // cannot: xellgit's ctx() refuses every git write verb for it, and the landgate declines its push
   // without even raising a request. Drawing those buttons on a manager offers a human three clicks
@@ -2958,11 +2983,11 @@ export function petalVerbs(x, diff) {
 // (VERB_MENU_LABEL); hover tooltips (VERB_TOOLTIP) name the icon on the canvas.
 const VERB_LABEL = {
   build: '🔨', terminal: '⌨', nudge: '💬', env: '❖', message: '📨',
-  pull: '↓', land: '⬆', pr: 'PR', ship: '🚀', swap: '♻',
+  pull: '↓', land: '⬆', pr: 'PR', ship: '🚀', swap: '♻', rescue: '🛟',
   pause: '⏸', resume: '▶', directives: '🧭', observability: '◉', cage: '⟳',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
-  done: 'error', swap: 'working', pause: 'error', resume: 'working', cage: 'error' };
+  done: 'error', swap: 'working', pause: 'error', resume: 'working', cage: 'error', rescue: 'working' };
 // Verb tooltips shown when hovering an icon-only button on the canvas flower.
 const VERB_TOOLTIP = {
   terminal: 'Open a live terminal into this cxell zee',
@@ -2975,6 +3000,7 @@ const VERB_TOOLTIP = {
   pr: 'Open a pull request',
   ship: 'Ship to production',
   swap: 'Swap the zee for a different persona',
+  rescue: 'Rescue this quarantined xell — clear the quarantine so a fresh agent can be dispatched into the same worktree and branch',
   done: 'Mark this xell done',
   pause: 'Pause this xell — interrupts its zee mid-turn',
   resume: 'Resume this xell — calls the zee back',
@@ -2992,6 +3018,7 @@ const VERB_MENU_LABEL = {
   observability: '◉ Observability',
   pull: '↓ Pull', land: '⬆ Land', pr: 'PR', ship: '🚀 Ship',
   swap: '♻ Swap zee', pause: '⏸ Pause', resume: '▶ Resume', cage: '⟳ Restart cage',
+  rescue: '🛟 Rescue',
 };
 // Which menu rows carry the destructive tone (the flower paints the same kinds with COL.error).
 // The cage restart earns it: if a turn is live in there, the restart ends it.

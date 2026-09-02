@@ -39,6 +39,29 @@ TARGET="$(git rev-parse --verify "${REF}^{commit}" 2>/dev/null)" || {
 BEFORE="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 say "syncing working tree of $SRC → ${TARGET:0:12} (ref '$REF'); HEAD was $BEFORE"
 
+# DIRECTION — belt and braces (2026-08-23). The AUTHORITATIVE guard is in the server
+# (server/src/lib/ship-direction.js, asked in shipgate.runShipBody before anything is built), and it
+# has to be: this script is baked into the SERVER IMAGE and lags master until that image is
+# republished, so it cannot protect the very ship that rebuilds it. This is the last line of defence
+# for the reset below, nothing more.
+#
+# The check the file already had (`merge-base --is-ancestor "$PREV" "$TARGET"`, below) is about
+# whether STASHING is needed — it guards uncommitted work, never the DIRECTION of the move. This one
+# guards the direction: if TARGET is an ancestor of the checkout's CURRENT commit, `git reset --hard
+# "$TARGET"` walks the deployment BACKWARDS, which is exactly what silently reverted two shipped
+# fixes on 2026-08-23. Refuse and leave the tree untouched; a rollback is a revert landed on main and
+# shipped forward, never a reset to an older sha.
+CURRENT="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+if [ -n "$CURRENT" ] && [ "$CURRENT" != "$TARGET" ] \
+     && git merge-base --is-ancestor "$TARGET" "$CURRENT" 2>/dev/null; then
+  BEHIND="$(git rev-list --count "${TARGET}..${CURRENT}" 2>/dev/null || echo '?')"
+  say "REFUSED: BACKWARDS ship refused — the target ${TARGET:0:12} is an ancestor of what this checkout"
+  say "REFUSED: already has (${CURRENT:0:12}), $BEHIND commit(s) behind. Resetting to it would roll the"
+  say "REFUSED: deployment BACKWARDS and revert everything shipped since. Tree left at $BEFORE, untouched."
+  say "REFUSED: re-request the ship at the current main tip (a human approves the new sha), or land a revert."
+  exit 1
+fi
+
 # Decide whether to stash. THE SUBTLETY (measured 2026-07-19): after the landing gate's
 # `update-ref` advances master, the working tree still holds the PRE-landing commit's files, so
 # `git status` reports the whole ref-move delta as "changes" — but that is EXPECTED and fully

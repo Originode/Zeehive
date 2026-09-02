@@ -404,6 +404,77 @@ export async function deliverXourceIntoCxell({ ctx = 'default', slug, worktree, 
   }
 }
 
+// ── REFRESH a live cage's origin/main — NO merge, ONLY the tracking ref (TKT-185) ────────────────
+// After a successful land, the cage's refs/remotes/origin/main stays at the tip it was handed at
+// spawn (or the last sync). `zee zees` / cxellDiff measure "unlanded" as
+// `rev-list origin/main..HEAD` and the source shortstat against merge-base(origin/main, HEAD), so a
+// stale origin/main makes every successfully-landed commit read as still unlanded — the load-bearing
+// done-guard crying wolf. deliverXourceIntoCxell already knows how to push a tip in, but it is the
+// sync door (thin-then-full, may throw). This is the POST-LAND door: always a FULL self-contained
+// bundle via a temp ref (so a cage missing the base still fetches), fetches ONLY into
+// refs/remotes/origin/main, touches no worktree / index / merge state, and NEVER throws — a dead
+// cage or a missing ref returns { refreshed:false } so a landing / nudge can keep going.
+//
+//   git update-ref refs/zeehive/refresh <tip>                # queenzee side, on the worktree
+//   git bundle create <tmp>/main.bundle refs/zeehive/refresh # FULL — no --not boundary
+//   docker cp <bundle> <cxell>:/tmp/main.bundle
+//   git fetch -f /tmp/main.bundle refs/zeehive/refresh:refs/remotes/origin/main
+export async function refreshCxellOriginMain({ ctx = 'default', slug, worktree, ref }) {
+  try {
+    if (!slug) return { refreshed: false, reason: 'no slug' };
+    if (!ref) return { refreshed: false, reason: 'no xource ref' };
+    if (!worktree || !existsSync(worktree)) {
+      return { refreshed: false, reason: `no host worktree on disk (${worktree || 'null'})` };
+    }
+    const name = cxellName(slug);
+    const tmp = mkdtempSync(join(tmpdir(), 'zee-refresh-'));
+    const git = (args) => new Promise((resolve, reject) => {
+      const g = spawn('git', ['-C', worktree, ...args], { windowsHide: true });
+      let out = '', err = '';
+      g.stdout.on('data', (d) => (out += d.toString()));
+      g.stderr.on('data', (d) => (err += d.toString()));
+      g.on('error', reject);
+      g.on('close', (c) => (c === 0 ? resolve(out.trim())
+        : reject(new Error(`git ${args.join(' ')} exited ${c}: ${err.slice(0, 300)}`))));
+    });
+    try {
+      let tip;
+      try { tip = await git(['rev-parse', '--verify', ref]); }
+      catch (e) {
+        return { refreshed: false, reason: `xource ref unreadable (${ref}): ${String(e.message).slice(0, 200)}` };
+      }
+      // Stage the tip under a stable temp ref so the fetch mapping never depends on the xource's
+      // branch name (master vs main) and the bundle always carries an unambiguous tip.
+      await git(['update-ref', 'refs/zeehive/refresh', tip]);
+      const bundle = join(tmp, 'main.bundle');
+      // FULL bundle — self-contained, no --not boundary. A cage that never synced (or whose objects
+      // drifted) must still be able to fetch; a thin bundle would refuse on a missing prerequisite.
+      await git(['bundle', 'create', bundle, 'refs/zeehive/refresh']);
+      try {
+        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+        await dk(ctx, ['exec', name, 'bash', '-lc',
+          "cd /work/repo && git fetch -f /tmp/main.bundle 'refs/zeehive/refresh:refs/remotes/origin/main'"],
+          { timeoutMs: 60000 });
+      } catch (e) {
+        return { refreshed: false, reason: `cxell unreachable or fetch refused: ${String(e.message).slice(0, 300)}` };
+      } finally {
+        await dk(ctx, ['exec', '-u', '0', name, 'rm', '-f', '/tmp/main.bundle']).catch(() => {});
+      }
+      logline('cxell', `${slug}: refreshed origin/main → ${String(tip).slice(0, 8)} (post-land; no merge)`);
+      return { refreshed: true, ref, tip };
+    } finally {
+      // Drop the staging ref so it does not linger on the worktree between refreshes.
+      await git(['update-ref', '-d', 'refs/zeehive/refresh']).catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  } catch (e) {
+    // Absolute last resort — callers (land nudge, selfLand, selfHealSync) must never be failed by
+    // a refresh. Anything that escaped the inner returns lands here as refreshed:false.
+    logline('cxell', `${slug || '?'}: refreshCxellOriginMain failed closed: ${String(e.message || e).slice(0, 200)}`);
+    return { refreshed: false, reason: String(e.message || e).slice(0, 300) };
+  }
+}
+
 // ── SYNC a live cxell with its xource — PURE SCRIPT, no model in the loop ─────────────────────────
 // Deliver the xource in (above), then MERGE origin/main into the cxell's branch, inside the cxell,
 // with the queenzee identity so it never depends on the container's git config. This is the whole
@@ -1582,7 +1653,7 @@ function credentialEnvFor(adapter, { token, baseUrl = null, model = null } = {})
 // transport failure). onEvent(obj) fires per normalized event — init (session id), assistant
 // turns, result. Bypass/auto mode inside is safe HERE and only here — the cxell is the
 // permission system, and every adapter runs its CLI's equivalent of skip-permissions.
-export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
+export async function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
   // The credential goes through the ONE guarded door (credentialEnvFor): a token that is plainly
   // another vendor's throws HERE, before docker is spawned, so the dispatch fails with a sentence
   // naming both vendors instead of the cage burning a turn on the vendor's own "invalid api key".
@@ -1597,7 +1668,7 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
     // off (GATEWAY_PORT === PORT), gatewayEnv returns {} and the adapter's real URLs are kept.
     // Without the xell identity token the gateway would 401 every call, so the env is only added
     // when one is present — a caller with no token keeps the adapter's direct URLs.
-    ...(xellToken ? Object.entries(gatewayEnv({ xellToken, provider: adapter.provider }))
+    ...(xellToken ? Object.entries(await gatewayEnv({ xellToken, provider: adapter.provider }))
       .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ];
   const cmd = ['exec', '-i',
@@ -1834,7 +1905,7 @@ export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, 
   // URLs are kept).
   const env = [
     ...credentialEnvFor(adapter, { token: vendorTok, model }),
-    ...(identTok ? Object.entries(gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
+    ...(identTok ? Object.entries(await gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
       .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ].flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);
@@ -2127,19 +2198,39 @@ export async function writeFileIntoCxellIfChanged({ ctx = 'default', slug, relPa
   return { changed: r.verdict === 'WROTE', path: full, rel: safe, exit_code: r.code };
 }
 
-// Write a GENERATED file into a cxell — but never over a git-TRACKED path.
+// Write a GENERATED file into a cxell — over a git-tracked path ONLY when the caller says the path is
+// one the meta-DB owns (project_doc rows / harness files), and never over an unrelated tracked one.
 //
 // This is the injector for the project entry-point docs (lib/project-docs.js): markdown the meta-DB
 // owns and the queenzee materializes into a xell, exactly like the harness files. The difference is
-// WHERE they land — a repo-relative path like AGENTS.md, which the project itself may already have
-// committed. Writing over that would replace the project's own instructions with an operator's, dirty
-// the worktree of every xell, and put a file nobody wrote into a landing diff for a human to approve.
+// WHERE they land — a repo-relative path like CLAUDE.md/AGENTS.md, which the project itself may have
+// committed. Writing over that used to be refused outright (house rule 11), which is exactly why the
+// generated docs were ALWAYS skipped in this repo: CLAUDE.md is committed, so the row's text never
+// landed. Option B (docs/entry-point-doc-source.md) reverses that: the ROW is the single source and
+// the committed file is the generated copy, so a tracked entry-point path the meta-DB owns is now
+// superseded — written over, git-excluded, and skip-worktree'd so it can never dirty a landing diff.
 //
-// So git decides, inside the cage, in the same exec that would do the writing: tracked → nothing is
-// written and the caller is told why; untracked → written AND added to .git/info/exclude, so the
-// artefact can never travel into a commit either. The payload is buffered to a temp file first so the
-// decision cannot half-happen (and so a skip does not break the pipe mid-write).
-export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000 }) {
+// An UNRELATED tracked path (a file no project_doc row claims — README.md, a project's own source)
+// stays protected exactly as before: writing over that would still replace the project's own work with
+// an operator's. The caller owns the exemption by passing `overwriteTracked:true`; default is the old
+// refusal, so no caller silently gains clobber power.
+//
+// So git decides, inside the cage, in the same exec that would do the writing:
+//   tracked + !overwriteTracked → nothing is written, caller is told why (TRACKED);
+//   tracked +  overwriteTracked → written, added to .git/info/exclude, and skip-worktree so the
+//                                 superseded committed copy can never surface in a diff (WROTE_TRACKED);
+//   untracked                   → written AND added to .git/info/exclude (WROTE, unchanged).
+//
+// Why skip-worktree on a tracked path AND the exclude line? The exclude line is what keeps a FRESH
+// write from showing up; skip-worktree is what keeps the SUPERSEDED index entry from showing up as a
+// deletion the moment a landing diff or `git add -A` runs. `git rm --cached` would also silence it but
+// rewrites the index in a way that makes a later `zee sync` merge against the file noisier; the
+// skip-bit is the lighter touch and it is what keeps the xell's working tree honest for the zee.
+//
+// The payload is buffered to a temp file first so the decision cannot half-happen (and so a skip does
+// not break the pipe mid-write).
+export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000,
+                                                   overwriteTracked = false } = {}) {
   const name = cxellName(slug);
   const safe = String(relPath).replace(/\\/g, '/').split('/')
     .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
@@ -2151,22 +2242,39 @@ export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPat
     `P=${sq(safe)}`,
     'tmp="$(mktemp)"',
     'cat > "$tmp"',
-    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
+    'T=0',
+    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then T=1; fi',
+    // OVERWRITE_TRACKED is injected by THIS docker exec (-e below) from the caller's flag — never
+    // read from the cage's own env. A zee cannot widen its own doc writes; the default when the flag
+    // is absent (or a caller forgets to pass it) is 0, i.e. the old protected behaviour.
+    'if [ "$T" = 1 ] && [ "${OVERWRITE_TRACKED:-0}" != 1 ]; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
     'mkdir -p "$(dirname "$P")"',
     'mv "$tmp" "$P"',
     'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
-    'echo WROTE',
+    // skip-worktree: the file was tracked and is now superseded — without this, the index entry would
+    // read as a staged DELETION in every landing diff (`git add -A` sweeps it in). The skip-bit keeps
+    // the superseded committed copy invisible while leaving the index entry in place for `zee sync`.
+    'if [ "$T" = 1 ]; then git update-index --skip-worktree -- "$P" >/dev/null 2>&1 || true; echo WROTE_TRACKED; else echo WROTE; fi',
   ].join('\n');
   // Through dkVerdict, like every other exec that states its own outcome. This site is where the
   // verdict was read as `String(await dk(...))` — '[object Object]', matching nothing — so every doc
   // the container really DID write was reported as skipped: the write worked and the report lied. The
   // helper hands back a STRING there is no object to stringify by accident.
-  const r = await dkVerdict(ctx, ['exec', '-i', name, 'bash', '-lc', script],
-                            { markers: ['WROTE', 'TRACKED'], label: `${name}: ${safe}`,
+  const args = ['exec', '-i', name, 'bash', '-lc', script];
+  // The -e goes into the docker exec, so the SCRIPT is one text for both modes — the caller's flag
+  // only decides which value the exec injects. This keeps the guard-testable script (test
+  // project-docs.test.mjs §3 reads it out of the source) identical for protected and supersede runs.
+  args.splice(2, 0, '-e', `OVERWRITE_TRACKED=${overwriteTracked ? '1' : '0'}`);
+  const r = await dkVerdict(ctx, args,
+                            { markers: ['WROTE', 'WROTE_TRACKED', 'TRACKED'], label: `${name}: ${safe}`,
                               input: String(text ?? ''), timeoutMs });
   if (r.verdict === 'TRACKED') {
     return { written: false, skipped: 'tracked', rel: safe,
-      reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
+      reason: `${safe} is tracked by git in this xell and no project doc row owns it — the project's own committed copy is left alone` };
+  }
+  if (r.verdict === 'WROTE_TRACKED') {
+    return { written: true, superseded: true, rel: safe, path: `/work/repo/${safe}`,
+      reason: `${safe} was committed in this repo; the meta-DB row now owns it, so the committed copy is superseded and git-excluded` };
   }
   if (r.verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
   // No verdict AND a failed exec: the container never got to speak (no such container, the script died

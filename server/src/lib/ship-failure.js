@@ -14,6 +14,7 @@
 // for the classifier.
 
 export const SHIP_FAILURE_CAUSES = [
+  'ship-behind-live',
   'image-pull',
   'npm-install',
   'migration-refused',
@@ -25,6 +26,13 @@ export const SHIP_FAILURE_CAUSES = [
 // Order matters: FIRST MATCH WINS, so migration-refused must come before the generic docker/npm
 // patterns it also contains, and the distinctive causes before the catch-all.
 const RULES = [
+  // The DIRECTION guard (lib/ship-direction.js) — a ship whose target is an ancestor of what prod
+  // already runs is refused before anything is built. It sets this cause explicitly, and the rule is
+  // here (FIRST) so the same refusal recognises itself when it arrives as TEXT instead: through the
+  // shell belt-and-braces in scripts/self-ship-sync.sh, whose output reaches the classifier as a
+  // build log. It leads the list because a refusal is a verdict, not one of the failure shapes below.
+  { cause: 'ship-behind-live',
+    test: (s) => /roll (?:PRODUCTION|production|prod) BACKWARDS|would roll production backwards|is an ancestor of (?:what production already runs|the (?:currently )?deployed)|BACKWARDS ship refused/i.test(s) },
   // The 5+3 knowable-at-request-time failures (ticket #58) plus the ledger's own words.
   { cause: 'migration-refused',
     test: (s) => /refus(?:e|ing) to migrate|migration (?:aborted|failed)|ledger (?:unreadable|cannot be read)|cannot (?:create|read) ledger|no prod db container/i.test(s) },

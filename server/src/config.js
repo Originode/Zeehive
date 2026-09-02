@@ -80,6 +80,19 @@ export const config = {
   // the stable one and the compose-network name is the fallback, not the other way round.
   cxellApiBase: process.env.CXELL_API_BASE || 'http://host.docker.internal:4700',
   cxellApiFallback: process.env.CXELL_API_FALLBACK || 'http://host.docker.internal:4700',
+  // The EXTERNALLY-REACHABLE base URL for /api/ext/v1 — the address a DEPLOYED project on another
+  // host uses to file tickets. DELIBERATELY NOT the cxell address above: cxellApiBase defaults to
+  // host.docker.internal:4700, which means "the docker host I am running on" — right for a cxell
+  // container sitting beside the queenzee, WRONG for a deployed project on its own host (the
+  // omnibiz helpdesk bridge sat silently broken for two weeks on exactly that default). An
+  // operator sets EXT_API_BASE to the real address (a LAN host:port, a tunnel URL, a reverse-proxy
+  // origin). When unset it falls back to DEV_HOST_IP (the queenzee host's LAN address) on the API
+  // port so the default is honest wherever a LAN address is known; when neither is set it is null —
+  // meaning "no externally-reachable address configured", which /api/ext/v1/whoami, /api/ext/v1/
+  // limits and the console report plainly instead of handing an integrator an address that points
+  // at its own docker host.
+  extApiBase: process.env.EXT_API_BASE
+    || (process.env.DEV_HOST_IP ? `http://${process.env.DEV_HOST_IP}:${int(process.env.PORT, 4700)}` : null),
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),

@@ -24,7 +24,7 @@ import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { startPreviewPorts } from './lib/preview-ports.js';
 import { attachStreamWebSocket } from './lib/stream.js';
-import { gatewayProxy, gatewayHello, GATEWAY_PORT } from './lib/gateway.js';
+import { gatewayProxy, gatewayHello, gatewayHealth, GATEWAY_PORT, verifyGatewayReachable } from './lib/gateway.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -265,11 +265,21 @@ if (config.gatewayPort !== config.port) {
   // express mounts a wildcard; gatewayProxy parses the identity/provider from req.url.
   gatewayApp.get('/api/hello', gatewayHello);
   gatewayApp.head('/api/hello', gatewayHello);
+  // The gateway's SIGNATURE route — the reachability probe's identification half. Tiny, no auth,
+  // no provider path: it exists so the probe can tell "the port serves a server" apart from "the
+  // port serves OUR gateway", without ever turning an answering address into a refusal.
+  gatewayApp.get('/_gw/health', gatewayHealth);
   gatewayApp.all('/x/*', gatewayProxy);
   gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: expected /x/<xell-token>/<provider>/v1/…' }));
   const gatewayServer = gatewayApp.listen(GATEWAY_PORT, '0.0.0.0', () => {
     console.log(`[zeehive] LLM gateway on http://0.0.0.0:${GATEWAY_PORT}  (cxells point their provider base-urls here)`);
     logline('api', `LLM gateway online — :${GATEWAY_PORT} (/v1/messages, /v1/chat/completions)`);
+    // STARTUP PROBE (TKT-179): prove the gateway address a cage will actually be handed, once,
+    // before any dispatch — the incident was a gateway that answered on 127.0.0.1:4701 inside the
+    // container but whose port was NOT published, so every cage got host.docker.internal:4701 and
+    // every provider failed with the vendor's words for 13h. Best-effort: logs the verdict loudly,
+    // never crashes the boot (the dispatch path still refuses per-mint if the state persists).
+    void verifyGatewayReachable();
   });
   gatewayServer.on('error', (e) => {
     console.error(`[zeehive] LLM gateway could not bind :${GATEWAY_PORT} — ${e.message}`);

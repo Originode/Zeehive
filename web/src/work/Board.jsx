@@ -26,6 +26,16 @@ import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, statusLa
 // row shows per-lane counts of the work hidden under it (a Jira-epic swimlane). The caret toggles;
 // the row title opens the drawer. Toggles are remembered in localStorage keyed by item id.
 //
+// HIDE-A-COLUMN: each column header also carries a show/hide toggle (default SHOWN). A hidden
+// column stops rendering that lane's work-node CARDS (in the leaf packs and leaf bands) and its
+// drop targets (so neither drag nor Alt+arrows can land a card where the human cannot see it) —
+// and, instead of the cards, every swimlane ROW band at every depth shows ONE summary card in
+// that column: the count of every leaf under that row with that status (the recursive shape of
+// leafLaneCounts), which opens the row's drawer on click. Collapse composes simply: a collapsed
+// row already shows counts, so its hidden-column cell shows the same summary card the expanded
+// row does. The header count is untouched — hiding cards, never the fact that work exists.
+// Toggles are remembered in localStorage keyed by column key, defaulting to shown.
+//
 // MOVES ARE SCOPED TO A ROW. A card can be dragged (or Alt+arrowed) between the lanes of ITS OWN
 // row only — a move is still exactly status/sort_order, never parent_id. Re-parenting stays in the
 // drawer; this board deliberately adds NO cross-row drops. The optimistic move + server-sentence
@@ -68,6 +78,7 @@ import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, statusLa
 // rewrite a manager's plan from a poller, which is precisely the authority a board must not have.
 
 const COLLAPSE_KEY = 'zeehive.work.board.collapsed.';
+const HIDDEN_KEY = 'zeehive.work.board.hidden.';
 
 export default function Board({ projectId, rootId, statuses: statusesProp, onOpen, reloadKey = 0 }) {
   const [statuses, setStatuses] = useState(statusesProp || null);
@@ -81,16 +92,51 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
   const [dragId, setDragId] = useState(null);
   const [dropAt, setDropAt] = useState(null);   // { cardId } | { rowId, key, index } — the drop target highlighted
   const [collapsed, setCollapsed] = useState(() => new Set());
+  const [hiddenCols, setHiddenCols] = useState(() => new Set());
+
+  // The hidden-column set, seeded from localStorage the same way the collapse set is — but keyed by
+  // COLUMN key and defaulting to SHOWN (a status the vocabulary adds is visible until a human hides
+  // it). `seedHidden` is called from both the statuses effect (vocabulary keys) and `load` (payload
+  // columns) so the first paint of the board already has hidden columns hidden.
+  const seedHidden = useCallback((keys) => {
+    setHiddenCols((s) => {
+      let changed = false;
+      const n = new Set(s);
+      for (const key of keys) {
+        if (s.has(key)) continue;
+        let stored = null;
+        try { stored = localStorage.getItem(HIDDEN_KEY + key); } catch { /* private mode */ }
+        if (stored === '1') { n.add(key); changed = true; }
+      }
+      return changed ? n : s;
+    });
+  }, []);
+
+  const toggleHidden = useCallback((key) => {
+    setHiddenCols((s) => {
+      const n = new Set(s);
+      if (n.has(key)) { n.delete(key); try { localStorage.setItem(HIDDEN_KEY + key, '0'); } catch { /* private */ } }
+      else { n.add(key); try { localStorage.setItem(HIDDEN_KEY + key, '1'); } catch { /* private */ } }
+      return n;
+    });
+  }, []);
 
   // The vocabulary. Fetched once (or handed down by WorkConsole, which needs it for the drawer too).
+  // The hidden-column set is seeded here too (from the vocabulary's keys), so the FIRST board paint
+  // already has hidden columns hidden — a flash of every card would lie about the view the human chose.
   useEffect(() => {
-    if (statusesProp) { setStatuses(statusesProp); return; }
+    if (statusesProp) { setStatuses(statusesProp); seedHidden(statusesProp.map((s) => s.key)); return; }
     let live = true;
     getWorkStatuses()
-      .then((v) => { if (live) setStatuses(vocabOf(v).statuses); })
+      .then((v) => {
+        if (!live) return;
+        const vocab = vocabOf(v).statuses;
+        setStatuses(vocab);
+        seedHidden(vocab.map((s) => s.key));
+      })
       .catch((e) => { if (live) setErr(e); });
     return () => { live = false; };
-  }, [statusesProp]);
+  }, [statusesProp, seedHidden]);
 
   // The collapse set is seeded straight from the payload (not from a post-render effect) so the
   // FIRST paint already has the rows collapsed — a flash of everything-expanded would lie about
@@ -126,10 +172,11 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
       const b = await getBoard(projectId, rootId);
       setBoard(b);
       seedCollapse(b);
+      seedHidden((b.columns || []).map((c) => c.key));
       setErr(null);
     } catch (e) { setErr(e); }
     finally { setLoading(false); }
-  }, [projectId, rootId, seedCollapse]);
+  }, [projectId, rootId, seedCollapse, seedHidden]);
 
   // A live refetch must never yank the board out from under a drag in progress: the SSE stream can
   // fire mid-gesture (another zee moved something), and re-rendering the lanes then would drop
@@ -236,7 +283,7 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
   // (allow* does not preventDefault, so the browser refuses it). This is the whole "no cross-row
   // re-parenting" rule — there is nothing to enforce in the move, because the drop never fires.
   const allowLane = (e, rowId, key, index) => {
-    if (!dragRef.current || dragRef.current.rowId !== rowId) return;
+    if (!dragRef.current || dragRef.current.rowId !== rowId || hiddenCols.has(key)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
     if (dropAt?.zone !== 'tail' || dropAt?.rowId !== rowId || dropAt?.key !== key || dropAt?.index !== index)
@@ -254,7 +301,7 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
   // cards is exactly where a reorder wants to land, and it is not a card. packIndex maps the pointer
   // onto the lane's stack slot (the same index a card drop computes).
   const allowPackLane = (e, rowId, key) => {
-    if (!dragRef.current || dragRef.current.rowId !== rowId) return;
+    if (!dragRef.current || dragRef.current.rowId !== rowId || hiddenCols.has(key)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
     const index = packIndex(e);
@@ -292,12 +339,21 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     el?.focus();
   }, [board]);
 
+  // Alt+arrows carry a card to the next status lane of its row — skipping HIDDEN columns, because a
+  // keyboard move that lands a card where the human cannot see it is a move that looks like a bug.
+  const nextVisible = (colIndex, dir) => {
+    for (let i = colIndex + dir; i >= 0 && i < columns.length; i += dir) {
+      if (!hiddenCols.has(columns[i].key)) return columns[i];
+    }
+    return null;
+  };
+
   const onCardKey = (e, card, colIndex, laneIndex, laneCount) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen?.(card.id); return; }
     if (!e.altKey) return;
     const here = columns[colIndex];
-    const to = e.key === 'ArrowLeft' ? columns[colIndex - 1]
-      : e.key === 'ArrowRight' ? columns[colIndex + 1] : null;
+    const to = e.key === 'ArrowLeft' ? nextVisible(colIndex, -1)
+      : e.key === 'ArrowRight' ? nextVisible(colIndex, 1) : null;
     if (to) {
       e.preventDefault();
       refocus.current = card.id;
@@ -323,28 +379,40 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
       <div className="work-matrix">
         <div className="work-mhead">
           <div className="work-mh-label">work item</div>
-          {columns.map((col) => (
-            <section key={col.key}
-                     className={`work-col-h${col.terminal ? ' terminal' : ''}${col.unknown ? ' unknown' : ''}`}
-                     data-col={col.key}>
-              <span className="work-col-name">{col.label}</span>
-              <span className="work-col-n">{col.items.length}</span>
-            </section>
-          ))}
+          {columns.map((col) => {
+            const hidden = hiddenCols.has(col.key);
+            return (
+              <section key={col.key}
+                       className={`work-col-h${col.terminal ? ' terminal' : ''}${col.unknown ? ' unknown' : ''}`}
+                       data-col={col.key}>
+                <span className="work-col-name">{col.label}</span>
+                <span className="work-col-actions">
+                  <span className="work-col-n">{col.items.length}</span>
+                  <button type="button" className={`work-col-hide${hidden ? ' off' : ''}`}
+                          data-testid={`work-col-hide-${col.key}`}
+                          aria-pressed={!hidden}
+                          title={hidden ? `show the ${col.label} column` : `hide the ${col.label} column`}
+                          onClick={() => toggleHidden(col.key)}>
+                    <span aria-hidden="true">{hidden ? '○' : '◉'}</span>
+                  </button>
+                </span>
+              </section>
+            );
+          })}
         </div>
         <div className="work-mbody">
           {bands.map((band) => {
             if (band.kind === 'row') {
               return (
                 <RowBand key={band.node.id} node={band.node} depth={band.depth} collapsed={band.collapsed}
-                         columns={columns} statuses={statuses}
+                         columns={columns} statuses={statuses} hiddenCols={hiddenCols}
                          onToggle={toggle} onOpen={onOpen} />
               );
             }
             if (band.kind === 'tail') {
               return (
                 <RowTail key={`tail-${band.node.id}`} node={band.node} depth={band.depth}
-                         columns={columns} index={index} dropAt={dropAt}
+                         columns={columns} index={index} dropAt={dropAt} hiddenCols={hiddenCols}
                          onDragOver={allowLane} onDrop={onDrop} />
               );
             }
@@ -352,7 +420,7 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
               return (
                 <LeafPack key={`pack-${band.node.id}`} node={band.node} depth={band.depth}
                           columns={columns} statuses={statuses} index={index}
-                          dragId={dragId} dropAt={dropAt}
+                          dragId={dragId} dropAt={dropAt} hiddenCols={hiddenCols}
                           onOpen={onOpen} onCardKey={onCardKey}
                           onDragStart={onDragStart} onDragEnd={endDrag}
                           allowCard={allowCard} allowPackLane={allowPackLane}
@@ -366,7 +434,8 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
             const colIndex = columns.findIndex((c) => c.key === card.status);
             return (
               <LeafBand key={card.id} card={card} depth={band.depth} columns={columns}
-                        statuses={statuses} dragging={dragId === card.id}
+                        statuses={statuses} hiddenCols={hiddenCols}
+                        dragging={dragId === card.id}
                         dropOn={dropAt?.cardId === card.id}
                         onOpen={() => onOpen?.(card.id)}
                         onKey={(e) => onCardKey(e, card, colIndex, laneIndex, stack.length)}
@@ -484,7 +553,7 @@ export function leafLaneCounts(node, out = new Map()) {
 }
 
 // ── the bands ──────────────────────────────────────────────────────────────────
-export function RowBand({ node, depth, collapsed, columns, statuses, onToggle, onOpen }) {
+export function RowBand({ node, depth, collapsed, columns, statuses, hiddenCols = new Set(), onToggle, onOpen }) {
   const kids = node.children || [];
   const counts = leafLaneCounts(node);
   return (
@@ -504,13 +573,22 @@ export function RowBand({ node, depth, collapsed, columns, statuses, onToggle, o
       {columns.map((col) => {
         const n = counts.get(col.key) || 0;
         const own = collapsed && col.key === node.status;
+        const hidden = hiddenCols.has(col.key);
         return (
           <div key={col.key}
-               className={`work-row-lane${own ? ' is-own' : ''}${own ? ` work-st-${col.key}` : ''}`}
-               title={own ? `${n ? `${n} ${col.label} — ` : ''}this row's own status` : (n ? `${n} ${col.label}` : undefined)}>
-            {collapsed && n ? (
+               className={`work-row-lane${own ? ' is-own' : ''}${own ? ` work-st-${col.key}` : ''}${hidden ? ' is-hidden' : ''}`}
+               title={hidden ? (n ? `${n} ${col.label} hidden under this row` : `no ${col.label} under this row`)
+                 : own ? `${n ? `${n} ${col.label} — ` : ''}this row's own status`
+                 : (n ? `${n} ${col.label}` : undefined)}>
+            {hidden ? (n ? (
+              <button type="button" className="work-col-summary" data-testid="work-col-summary"
+                      title={`${n} ${col.label} hidden under this row — click to open`}
+                      onClick={(e) => { e.stopPropagation(); onOpen?.(node.id); }}>
+                <b>{n}</b><span>{col.label}</span>
+              </button>
+            ) : null) : (collapsed && n ? (
               <span className="work-row-count"><b>{n}</b>{col.label}</span>
-            ) : null}
+            ) : null)}
           </div>
         );
       })}
@@ -520,19 +598,20 @@ export function RowBand({ node, depth, collapsed, columns, statuses, onToggle, o
 
 // The tail of an EXPANDED row: one drop target per lane, appending to that lane's stack. This is
 // how a card reaches an empty lane (there is no card to drop on) and how it joins the END of a lane.
-export function RowTail({ node, depth, columns, index, dropAt, onDragOver, onDrop }) {
+export function RowTail({ node, depth, columns, index, dropAt, hiddenCols = new Set(), onDragOver, onDrop }) {
   const rowId = node.id;
   return (
     <div className="work-row work-tail" data-row={rowId}>
       <div className="work-row-label" style={{ paddingLeft: 6 + depth * 13 }} />
       {columns.map((col) => {
+        const hidden = hiddenCols.has(col.key);
         const stack = index.laneStacks.get(rowId)?.get(col.key) || [];
         const on = dropAt?.zone === 'tail' && dropAt?.rowId === rowId && dropAt?.key === col.key;
         return (
-          <div key={col.key} className={`work-row-lane${on ? ' drop' : ''}`}
-               onDragOver={(e) => onDragOver(e, rowId, col.key, stack.length)}
-               onDrop={(e) => onDrop(e, rowId, col.key, stack.length)}>
-            {!stack.length && <span className="work-row-empty">—</span>}
+          <div key={col.key} className={`work-row-lane${on ? ' drop' : ''}${hidden ? ' is-hidden' : ''}`}
+               onDragOver={hidden ? undefined : (e) => onDragOver(e, rowId, col.key, stack.length)}
+               onDrop={hidden ? undefined : (e) => onDrop(e, rowId, col.key, stack.length)}>
+            {!stack.length && !hidden && <span className="work-row-empty">—</span>}
           </div>
         );
       })}
@@ -545,7 +624,7 @@ export function RowTail({ node, depth, columns, index, dropAt, onDragOver, onDro
 // reading left-to-right then down in sort order. Each card is still its own drop target (halfOf),
 // and the LANE is too — the wrapped gaps between side-by-side cards are where a reorder wants to
 // land, and packIndex turns a lane drop into the same stack slot a card drop would.
-export function LeafPack({ node, depth, columns, statuses, index, dragId, dropAt,
+export function LeafPack({ node, depth, columns, statuses, index, dragId, dropAt, hiddenCols = new Set(),
                   onOpen, onCardKey, onDragStart, onDragEnd,
                   allowCard, allowPackLane, onDrop, halfOf, packIndex }) {
   const rowId = node.id;
@@ -553,13 +632,14 @@ export function LeafPack({ node, depth, columns, statuses, index, dragId, dropAt
     <div className="work-row work-leafpack" data-testid="work-row-leafpack" data-row={rowId}>
       <div className="work-row-label" style={{ paddingLeft: 6 + depth * 13 }} />
       {columns.map((col) => {
-        const stack = index.laneStacks.get(rowId)?.get(col.key) || [];
+        const hidden = hiddenCols.has(col.key);
+        const stack = hidden ? [] : (index.laneStacks.get(rowId)?.get(col.key) || []);
         const colIndex = columns.findIndex((c) => c.key === col.key);
         const on = dropAt?.zone === 'pack' && dropAt?.rowId === rowId && dropAt?.key === col.key;
         return (
-          <div key={col.key} className={`work-row-lane${on ? ' drop' : ''}`}
-               onDragOver={(e) => allowPackLane(e, rowId, col.key)}
-               onDrop={(e) => onDrop(e, rowId, col.key, packIndex(e))}>
+          <div key={col.key} className={`work-row-lane${on ? ' drop' : ''}${hidden ? ' is-hidden' : ''}`}
+               onDragOver={hidden ? undefined : (e) => allowPackLane(e, rowId, col.key)}
+               onDrop={hidden ? undefined : (e) => onDrop(e, rowId, col.key, packIndex(e))}>
             {stack.map((card, laneIndex) => (
               <Card key={card.id} card={card} statuses={statuses}
                     dragging={dragId === card.id}
@@ -578,21 +658,25 @@ export function LeafPack({ node, depth, columns, statuses, index, dragId, dropAt
   );
 }
 
-export function LeafBand({ card, depth, columns, statuses, dragging, dropOn, onOpen, onKey,
+export function LeafBand({ card, depth, columns, statuses, hiddenCols = new Set(), dragging, dropOn, onOpen, onKey,
                     onDragStart, onDragEnd, onDragOver, onDrop }) {
   return (
     <div className="work-row work-leaf" data-testid="work-row-leaf">
       <div className="work-row-label" style={{ paddingLeft: 6 + depth * 13 }} />
-      {columns.map((col) => (
-        <div key={col.key} className={`work-row-lane${col.key === card.status ? ' has-card' : ''}`}>
-          {col.key === card.status && (
-            <Card card={card} statuses={statuses} dragging={dragging} dropOn={dropOn}
-                  onDragStart={onDragStart} onDragEnd={onDragEnd}
-                  onDragOver={onDragOver} onDrop={onDrop}
-                  onKey={onKey} onOpen={onOpen} />
-          )}
-        </div>
-      ))}
+      {columns.map((col) => {
+        const show = col.key === card.status && !hiddenCols.has(col.key);
+        return (
+          <div key={col.key}
+               className={`work-row-lane${show ? ' has-card' : ''}${hiddenCols.has(col.key) ? ' is-hidden' : ''}`}>
+            {show && (
+              <Card card={card} statuses={statuses} dragging={dragging} dropOn={dropOn}
+                    onDragStart={onDragStart} onDragEnd={onDragEnd}
+                    onDragOver={onDragOver} onDrop={onDrop}
+                    onKey={onKey} onOpen={onOpen} />
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

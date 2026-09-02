@@ -16,7 +16,9 @@
 //      be surprised);
 //   3. FILING: the ticket is a real `ticket` row in the KEY's project — provenance stamped
 //      (source, external_ref, api_key_id), numbered by the same trigger, visible to the console's
-//      own read models;
+//      own read models — AND the project's deployed manager zees are notified (inbox always;
+//      same door as the console Notify button / `zee ticket --notify`). A deduped retry does not
+//      re-notify;
 //   4. IDEMPOTENCY: the same external_ref POSTed twice is ONE ticket (200 + deduped), a different
 //      ref is a second one, and a POST with no ref says out loud that it is not idempotent;
 //   5. ATTACHMENTS: a png (base64) and a json/xml/txt log (utf8 text) ride in with the ticket and
@@ -46,6 +48,12 @@ import pg from 'pg';
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
+process.env.TKB_NOTIFY = '0';              // no desk pings from a test
+// The operator-set externally-reachable address (docs/ticketing-api.md §0). Set BEFORE config is
+// imported so this suite proves the whole discovery path: server configured with EXT_API_BASE →
+// whoami and limits both answer with that base_url. The alternative default (unset → null, never
+// host.docker.internal) is asserted in cage-api-address.test.mjs.
+process.env.EXT_API_BASE = 'http://ext.example.test:4700';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -54,6 +62,7 @@ const section = (t) => console.log(`\n── ${t} ──`);
 const client = new pg.Client({ connectionString: url });
 const PID = '00000000-0000-4000-8000-000000019001';   // "the deployed project" (omnibiz stand-in)
 const OTHER = '00000000-0000-4000-8000-000000019002'; // a second project the key must never reach
+const XO = '00000000-0000-4000-8000-000000019011';    // xource for PID (manager xell needs one)
 
 // a real 1x1 png, so the round trip is over bytes a caller would actually send
 const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -71,6 +80,14 @@ try {
   await cleanup();
   await client.query(`INSERT INTO project (id, name, repo_root, main_branch) VALUES ($1,'ticket-api-test','/tmp/ticket-api-test','master')`, [PID]);
   await client.query(`INSERT INTO project (id, name, repo_root, main_branch) VALUES ($1,'ticket-api-other','/tmp/ticket-api-other','master')`, [OTHER]);
+  // A deployed manager of PID — without one, filing would still succeed but the fleet would never
+  // learn (the bug this suite now pins). No live cxell session: notify stores in inbox and reports
+  // not-delivered, which is enough to prove the intake path reached the manager.
+  await client.query(`INSERT INTO xource (id, project_id, ref) VALUES ($1,$2,'master')`, [XO, PID]);
+  const mgr = (await client.query(
+    `INSERT INTO xell (project_id, xource_id, slug, branch, worktree_path, status, is_pooled, zee_type)
+       VALUES ($1,$2,'tktapi-mgr','spinoff/tktapi-mgr','/tmp/ticket-api-test/tktapi-mgr','working',false,'manager')
+       RETURNING id, slug`, [PID, XO])).rows[0];
 
   const { router } = await import('../server/src/api/routes.js');
   const { pool } = await import('../server/src/db/pool.js');
@@ -129,6 +146,9 @@ try {
      && who.body.attachments.max_attachment_bytes === 10 * 1024 * 1024
      && who.body.settable_statuses.join() === 'queued,cancelled',
      'whoami names the project the key files into, its scopes and the limits');
+  ok(who.body.base_url === process.env.EXT_API_BASE
+     && typeof who.body.base_url_note === 'string' && who.body.base_url_note.length > 0,
+     `whoami carries the operator-set base_url (${who.body.base_url}) — the address a deployed project should use`);
   const wrongScope = await call('/ext/v1/tickets', { method: 'POST', key: RKEY, body: { title: 'nope' } });
   ok(wrongScope.status === 403 && /tickets:write/.test(wrongScope.body.error),
      'a read-only key filing a ticket → 403 naming the missing scope');
@@ -139,6 +159,9 @@ try {
   const limits = await call('/ext/v1/limits');
   ok(limits.status === 200 && limits.body.attachments.content_types.includes('application/json'),
      'GET /ext/v1/limits answers without a key at all');
+  ok(limits.body.base_url === process.env.EXT_API_BASE
+     && limits.body.base_url === who.body.base_url,
+     'the keyless limits carries the same base_url as whoami — resolvable before a credential exists');
 
   // ── 3 + 5: filing, with the evidence ─────────────────────────────────────
   section('filing a ticket with its evidence');
@@ -169,15 +192,48 @@ try {
      && row.label === 'omnibiz helpdesk' && row.number >= 1,
      'the row is an ORDINARY ticket in the key\'s project, provenance stamped');
 
+  // Filing must wake the fleet: the project's manager finds the ticket in its inbox. Without this,
+  // a deployed product can file into ZEEHIVE and nobody ever learns the row exists. `notified` on
+  // the answer is the observability contract — a silent 201 is the same defect as a helpdesk
+  // sweep that reports healthy while filing into nobody.
+  section('filing notifies the project\'s manager(s)');
+  ok(Array.isArray(filed.body.notified?.managers) && filed.body.notified.managers.includes(mgr.slug)
+     && filed.body.notified.reason === null,
+     `notified.managers names the reached manager (${JSON.stringify(filed.body.notified)})`);
+  const inbox = (await client.query(
+    `SELECT body, kind, from_slug FROM zee_message WHERE to_xell_id=$1 ORDER BY created_at`,
+    [mgr.id])).rows;
+  ok(inbox.length === 1 && inbox[0].kind === 'report',
+     `the manager has exactly one notification in its inbox (${inbox.length})`);
+  ok(inbox[0].body.includes(filed.body.code) && inbox[0].body.includes(filed.body.title)
+     && /NOTIFICATION, not an order/.test(inbox[0].body),
+     'it carries the code, the title, and says plainly that it assigns nothing');
+  ok(/api:omnibiz helpdesk/.test(inbox[0].body) || inbox[0].from_slug === 'api:omnibiz helpdesk',
+     'and names the API key that filed it');
+  const afterFile = (await client.query(
+    `SELECT status, assignee, work_item_id FROM ticket WHERE id=$1`, [filed.body.id])).rows[0];
+  ok(afterFile.status === 'queued' && afterFile.assignee === null && afterFile.work_item_id === null,
+     'notifying assigned nothing — the ticket is still queued with no work item');
+
   // ── 4: idempotency ───────────────────────────────────────────────────────
   section('a retry is the same ticket');
   const retry = await call('/ext/v1/tickets', { method: 'POST', key: KEY, body: {
     title: 'Checkout 504s on payment', external_ref: 'OMNI-4471' } });
   ok(retry.status === 200 && retry.body.deduped === true && retry.body.id === filed.body.id,
      'the same external_ref → 200 + deduped, the SAME ticket id');
+  ok(Array.isArray(retry.body.notified?.managers) && retry.body.notified.managers.length === 0
+     && retry.body.notified.reason === 'deduped: already filed',
+     `deduped answer: notified empty with the dedupe reason (${JSON.stringify(retry.body.notified)})`);
+  const inboxAfterRetry = (await client.query(
+    `SELECT count(*)::int n FROM zee_message WHERE to_xell_id=$1`, [mgr.id])).rows[0].n;
+  ok(inboxAfterRetry === 1, 'a deduped retry does NOT re-notify the manager (still one zee_message)');
   const second = await call('/ext/v1/tickets', { method: 'POST', key: KEY, body: {
     title: 'Search returns 500 for empty query', external_ref: 'OMNI-4472', kind: 'bug' } });
   ok(second.status === 201 && second.body.id !== filed.body.id, 'a different ref → a second ticket');
+  ok(second.body.notified?.managers?.includes(mgr.slug), 'a different ref notifies again (slug in notified)');
+  const inboxAfterSecond = (await client.query(
+    `SELECT count(*)::int n FROM zee_message WHERE to_xell_id=$1`, [mgr.id])).rows[0].n;
+  ok(inboxAfterSecond === 2, 'a different ref notifies again (one message per fresh ticket)');
   const noRef = await call('/ext/v1/tickets', { method: 'POST', key: KEY, body: { title: 'no ref here' } });
   ok(noRef.status === 201 && /NOT idempotent/.test(noRef.body.note || ''),
      'no external_ref → filed, with a note saying a retry would duplicate it');
@@ -289,6 +345,10 @@ try {
   const theirs = await call('/ext/v1/tickets', { method: 'POST', key: OKEY,
     body: { title: 'their own ticket', external_ref: 'OTHER-1' } });
   ok(theirs.status === 201 && theirs.body.id !== filed.body.id, 'the other project files its own');
+  // OTHER has no manager xell at all — create must still 201, and notified must SAY so (not silent).
+  ok(Array.isArray(theirs.body.notified?.managers) && theirs.body.notified.managers.length === 0
+     && theirs.body.notified.reason === 'no live manager in this project',
+     `zero managers → notified empty with reason (${JSON.stringify(theirs.body.notified)})`);
   const reach = await call(`/ext/v1/tickets/${theirs.body.id}`, { key: KEY });
   ok(reach.status === 404, 'our key cannot READ their ticket by id → 404 (not 403 — no probing)');
   const reachPatch = await call(`/ext/v1/tickets/${theirs.body.id}`, { method: 'PATCH', key: KEY,

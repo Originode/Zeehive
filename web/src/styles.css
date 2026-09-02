@@ -397,6 +397,27 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 /* the decision card(s) for the clicked chip, inline right under the bar */
 .ny-decision { display: flex; flex-direction: column; gap: 8px; }
+/* The PROJECT blocker chip (a machine×project that cannot build/provision, surfaced on the bar even
+   when no xell is waiting — the pool just stopped filling). Amber like every other need, but edged
+   with the fault colour: this one is a build being stopped, not a decision a zee is waiting on. */
+.needsyou .ny-chip.proj { border-color: rgba(229,85,78,.55); }
+.needsyou .ny-chip.proj.active { border-color: var(--down); background: rgba(229,85,78,.16);
+  box-shadow: 0 0 0 1px var(--down) inset; }
+/* One opened blocker: the dated condition line + its ⛑ Dispatch-medic button. The body is a
+   first-class sentence (a PROVISION-INFRA card quotes the check detail), so it is readable in full,
+   wrapped, never clipped to a head the way a chip's title has to be. */
+.ny-blocker { display: flex; flex-direction: column; gap: 5px; background: var(--panel2);
+  border: 1px solid var(--line); border-left: 2px solid rgba(229,85,78,.7); border-radius: 6px;
+  padding: 8px 10px; }
+.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ny-blocker-date { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+.ny-blocker-body { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
+  line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.needsyou .pill { background: rgba(229,85,78,.16); color: var(--text);
+  border: 1px solid rgba(229,85,78,.6); border-radius: 5px; font-size: 12px; padding: 3px 9px;
+  cursor: pointer; white-space: nowrap; }
+.needsyou .pill:hover { border-color: var(--down); background: rgba(229,85,78,.28); }
+.needsyou .pill:disabled { opacity: .55; cursor: default; }
 /* WHY a tend was raised. A tend has no Approve/Reject — the only thing it carries is the zee's
    reason, so that reason is the loudest word in the note rather than a footnote to it. */
 .ny-why { color: var(--building); }
@@ -615,6 +636,12 @@ a.cbox:hover { border-color: var(--accent); }
 }
 .statusline .providerlimits-prov.is-warn b { color: var(--amber, #d4a017); }
 .statusline .providerlimits-prov.is-tight b { color: var(--danger, #c44); }
+/* GATEWAY HEALTH — is the LLM gateway reachable at the address cages are actually given? The WORD is
+   the signal (gatewayHealthWord), colour is reinforcement: ok is muted, unknown is muted/amber, down
+   is DANGER (every dispatch dies while the gateway port is closed). The address is named when down. */
+.statusline .gateway-health { color: var(--muted); font-size: 14px; }
+.statusline .gateway-health.gateway_down { color: var(--danger, #c44); font-weight: 600; }
+.statusline .gateway-health.gateway_unknown { color: var(--amber, #d4a017); }
 .statusline .providerlimits-name { color: var(--muted); font-size: 12px; }
 /* Project setup: remaining limit next to each provider account. */
 .token-usage-limit {
@@ -836,7 +863,10 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .mx-head.off { opacity: .45; }
 .mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
-.mx-name { display: flex; align-items: center; gap: 6px; }
+/* The header packs up to six items (name, ＋prod, conn, build-ready, bootstrap, ✕) into a
+   minmax(120px,1fr) column — they must WRAP: unwrapped nowrap buttons cannot shrink, and the
+   overflow paints straight over the neighbouring machine's column. */
+.mx-name { display: flex; align-items: center; gap: 3px 6px; flex-wrap: wrap; }
 .mx-name b { font-size: 13px; }
 /* the per-machine connection probe (Deploy tab) — one button that is also the verdict */
 .mx-conn { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
@@ -2186,6 +2216,8 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-xt-dir { margin-top: 4px; font-size: 12px; color: #e6ebf2; word-break: break-word; }
 .hive-xt-dir.none { color: #8a93a6; font-style: italic; }
 .hive-xt-status { margin-top: 3px; font-size: 11px; color: #8a93a6; }
+.hive-xt-fault { margin-top: 4px; font-size: 11px; color: #ffb4a2; background: rgba(217,85,59,.12);
+  padding: 3px 6px; border-radius: 6px; word-break: break-word; }
 
 /* the panels half scrolls independently; drop the old flex/rail padding assumptions */
 .hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }
@@ -2761,6 +2793,11 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   background: var(--panel2); border-right: 1px solid var(--line); border-radius: 10px 0 0 0; }
 .work-mhead .work-col-h { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line);
   border-bottom: 0; background: var(--panel); }
+.work-col-actions { display: inline-flex; align-items: center; gap: 6px; }
+.work-col-hide { flex: 0 0 auto; background: none; border: 0; color: var(--accent); cursor: pointer;
+  font-size: 11px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
+.work-col-hide:hover { color: var(--text); background: var(--panel2); }
+.work-col-hide.off { color: var(--muted); opacity: .7; }
 .work-mbody { display: flex; flex-direction: column; border: 1px solid var(--line);
   border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden; }
 
@@ -2783,6 +2820,20 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-row-count { color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
   display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
 .work-row-count b { color: var(--text); font-size: 13px; }
+
+/* a HIDDEN column's per-row summary card: one per swimlane row band at every depth, reading as a
+   count of every leaf under that row with that status. A button so it opens the row's drawer like
+   the row title does. */
+.work-col-summary { display: inline-flex; align-items: baseline; gap: 5px; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 5px 9px; color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
+  white-space: nowrap; max-width: 100%; }
+.work-col-summary b { color: var(--text); font-size: 14px; line-height: 1; }
+.work-col-summary:hover { border-color: var(--accent); }
+
+/* the leaf-pack / leaf / tail lanes of a hidden column: no cards, no drop targets — a quiet empty
+   strip that keeps the matrix columns aligned. */
+.work-row-lane.is-hidden { background: color-mix(in srgb, var(--muted) 3%, transparent); }
 
 /* a COLLAPSED row still occupies its full-width lane strip; tint the ONE lane that is its own
    status so where the row stands reads at a glance. The tint is `--st` — the same status colour
@@ -3522,7 +3573,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }
 
 /* ════════════════════════════════════════════════════════════════════════════════
-   MOBILE CHAT UI (/m?project=…) — web/src/MobileChat.jsx
+   MOBILE CHAT UI (/m/<project>/…) — web/src/MobileChat.jsx
    A phone-first sibling of the console. Every class is prefixed .mob- so it can never
    collide with the console's classes. It owns the FULL screen: no width cap, no centering —
    a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with

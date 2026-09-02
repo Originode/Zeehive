@@ -21,44 +21,46 @@ let fail = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) fail++; };
 const section = (t) => console.log(`\n── ${t} ──`);
 
-const { machineDbHost, queenzeeHostCtx } = await import('../server/src/lib/machines.js');
+const { machineDbHostFallback, queenzeeHostCtx } = await import('../server/src/lib/machines.js');
 const inContainer = (await import('node:fs')).existsSync('/.dockerenv');
 const localFallback = inContainer ? 'host.docker.internal' : 'localhost';
 
-section('machineDbHost — the explicit places win, in order');
-const mk = (m = {}, p = {}, c = {}) => machineDbHost(
+section('machineDbHostFallback — the explicit legacy places win, in order (when no deploy_site matches)');
+const mk = (m = {}, p = {}, c = {}) => machineDbHostFallback(
   { docker_ctx: 'remote-ctx', host_ip: null, ...m },
   { dev_host_ip: null, ...p },
   { devHostIp: null, ...c });
 
-ok(mk({ host_ip: '10.0.1.18' }) === '10.0.1.18', 'machine.host_ip is the first answer');
+ok(mk({ host_ip: '10.0.1.18' }) === '10.0.1.18', 'machine.host_ip is the first fallback answer');
 ok(mk({ host_ip: '10.0.1.18' }, { dev_host_ip: '10.9.9.9' }) === '10.0.1.18',
    'machine.host_ip beats project.dev_host_ip');
 ok(mk({}, { dev_host_ip: '10.9.9.9' }, { devHostIp: '10.8.8.8' }) === '10.9.9.9',
    'project.dev_host_ip beats config.devHostIp');
 ok(mk({}, {}, { devHostIp: '10.8.8.8' }) === '10.8.8.8', 'config.devHostIp beats the fallback');
 
-section('machineDbHost — the QUEENZEE-HOST (local) machine falls back, so a local dev db records a URL');
+section('machineDbHostFallback — the QUEENZEE-HOST (local) machine falls back, so a local dev db records a URL');
 const local = { docker_ctx: queenzeeHostCtx(), host_ip: null };
-ok(machineDbHost(local, { dev_host_ip: null }, { devHostIp: null }) === localFallback,
+ok(machineDbHostFallback(local, { dev_host_ip: null }, { devHostIp: null }) === localFallback,
    `local machine with no host → '${localFallback}' (the host's own address), never null`);
-ok(machineDbHost(local, { dev_host_ip: null }, { devHostIp: null }) !== null,
+ok(machineDbHostFallback(local, { dev_host_ip: null }, { devHostIp: null }) !== null,
    '…and therefore never leaves the chip with "no URL recorded"');
 
-section('machineDbHost — a REMOTE machine with no host still fails closed');
-ok(machineDbHost({ docker_ctx: 'ugreen-nas', host_ip: null }, { dev_host_ip: null }, { devHostIp: null }) === null,
+section('machineDbHostFallback — a REMOTE machine with no host still fails closed');
+ok(machineDbHostFallback({ docker_ctx: 'ugreen-nas', host_ip: null }, { dev_host_ip: null }, { devHostIp: null }) === null,
    'remote machine with none of the three places → null (fail closed, not a guessed localhost)');
-ok(machineDbHost({ docker_ctx: 'ugreen-nas', host_ip: '' }, { dev_host_ip: null }, { devHostIp: null }) === null,
+ok(machineDbHostFallback({ docker_ctx: 'ugreen-nas', host_ip: '' }, { dev_host_ip: null }, { devHostIp: null }) === null,
    'an empty-string host_ip is treated as absent too');
 
 section('the dev-db provisioner resolves through machineDbHost (source-pinned)');
 const machines = readFileSync(join(ROOT, 'server', 'src', 'lib', 'machines.js'), 'utf8');
-ok(/const host = machineDbHost\(m, project, config\);/.test(machines),
-   'provisionDevDb resolves its host through machineDbHost');
+ok(/const host = await machineDbHost\(m, project, config\);/.test(machines),
+   'provisionDevDb resolves its host through machineDbHost (awaiting the site-first resolution)');
 ok(/host\.docker\.internal/.test(machines) && /'localhost'/.test(machines),
    'the local fallback names both reachable host forms, exactly like lib/provision.js');
 ok(/machineDbHost\(m, project, cfg\)/.test(machines),
    'machineDbHost is the exported helper under test (not inlined)');
+ok(/siteHostForMachine\(projectId, dockerCtx\)/.test(machines),
+   'deploy_site is consulted first — siteHostForMachine is the exported precedence flip (TKT-180)');
 
 console.log(fail ? `\n${fail} FAILURE(S)` : '\nall good');
 process.exit(fail ? 1 : 0);

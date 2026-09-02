@@ -1,0 +1,13 @@
+-- FIX UGREEN-NAS machine.host_ip — align the machine row with the deploy_site/compose truth.
+--
+-- WHY THIS FILE EXISTS. The ugreen-nas machine row carried host_ip=10.0.1.18 while the
+-- deploy_site row and docker-compose.prod.yml (ZEEHIVE_CTX_UGREEN=tcp://10.1.0.18:2375) both say
+-- the daemon is at 10.1.0.18. Because machine.host_ip used to be authoritative for a
+-- machine-placed container's advertised host, every ugreen-nas spin container row was stamped
+-- 10.0.1.18 — an address that never answers — and `zee build --wait` reported a genuinely-serving
+-- container as DOWN (TKT-180). The code fix makes deploy_site.host win; this seed corrects the
+-- stale machine row so the fallback path (no site row) is also right.
+--
+-- IDEMPOTENT, as a seed must be (seeds are not ledgered and may legitimately be re-run):
+-- the UPDATE only fires when host_ip is not already 10.1.0.18, so re-running is a no-op.
+UPDATE machine SET host_ip = '10.1.0.18' WHERE key = 'ugreen-nas' AND host_ip IS DISTINCT FROM '10.1.0.18';

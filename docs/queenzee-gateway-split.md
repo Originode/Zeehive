@@ -631,10 +631,10 @@ currently kills every live host-side turn.
 
 ### Phase 7 — close the doors
 Delete the inline fallbacks and `QUEENZEE_INPROC`. Empty the Phase-0 allowlist. Add the doc-map rows
-to `CLAUDE.md` **and** sync `project_doc.body` in the same landing
-(`zee migration-number`, then `node scripts/sync-project-doc.mjs <NNN>` — `test/project-doc-drift.test.mjs`
-fails otherwise). *This deliberately did not happen in this design landing: a doc-map row for something
-nobody can use yet would cost a migration and buy nothing.*
+to `CLAUDE.md` **and** carry the row in the same landing (a migration that sets `project_doc.body` —
+the row is the single source, so this is the supported change flow). *This deliberately did not happen
+in this design landing: a doc-map row for something nobody can use yet would cost a migration and buy
+nothing.*
 
 ---
 

@@ -158,6 +158,23 @@ try {
   await q(`DELETE FROM db_snapshot WHERE project_id=$1`, [projId]);
   await q(`DELETE FROM pool_config WHERE project_id=$1`, [projId]);
   await q(`DELETE FROM project WHERE id=$1`, [projId]);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n── the dump window scales with the SOURCE size, never below the old 30-min floor ──');
+  // The live failure that motivated it: omnibiz grew to ~5 GB, and a full dump at ~1.5-3 MB/s needs
+  // 30-60 min, but the fixed 30-minute stream window killed EVERY attempt mid-stream (live partials
+  // of 4.9-5.07 GB left on the destination). The window is now sized from the measured source size.
+  const FLOOR = 30 * 60 * 1000, CEILING = 3 * 60 * 60 * 1000;
+  const GiB = 1024 * 1024 * 1024;
+  ok(m.streamTimeoutFor(null) === FLOOR, 'unknown source size (probe failed) → the old 30-min floor, dump still runs');
+  ok(m.streamTimeoutFor(0) === FLOOR, 'a zero/empty probe result → the floor, not a zero-second window');
+  ok(m.streamTimeoutFor(1 * GiB) === 2 * 1024 * 1000, 'a 1 GiB DB → ~34 min (size/1MB/s × 2 margin, above the floor)');
+  ok(m.streamTimeoutFor(2 * GiB) === 4 * 1024 * 1000, 'a 2 GiB DB (the old omnibiz size) → ~68 min');
+  // THE regression: a 5 GiB DB must get a ~2.8 h window, NOT the 30 min that killed every live retry.
+  ok(m.streamTimeoutFor(5 * GiB) === 10 * 1024 * 1000,
+    `a 5 GiB DB (today's omnibiz) → ${10 * 1024 / 60} min, past what the fixed 30-min window allowed`);
+  ok(m.streamTimeoutFor(30 * GiB) === CEILING, 'a huge DB is capped at the 3 h ceiling (a flowing-but-stuck transfer still dies)');
+  ok(m.streamTimeoutFor(30 * GiB) > m.streamTimeoutFor(5 * GiB), 'the window is monotonic in size up to the cap');
 } finally {
   await pool.end().catch(() => {});
 }

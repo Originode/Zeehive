@@ -9,7 +9,7 @@ import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
 import { resolveRealDbContainerCached, derivedTcpDsn } from '../lib/xell-db.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
-import { provisionXell } from '../lib/provision.js';
+import { provisionXell, emitXellEnv } from '../lib/provision.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
 import { claimReadyXell, claimFirstReady } from '../lib/xell-claim.js';
@@ -34,6 +34,7 @@ import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
 import { turnStopReason } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText, recordFeedEvent } from '../lib/turn-ledger.js';
 import { gatewayEnv } from '../lib/gateway.js';
+import { GATEWAY_UNREACHABLE_DEATH } from '../lib/turn-death.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
@@ -42,8 +43,10 @@ import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harne
 import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.js';
 import { projectDocFiles } from '../lib/project-docs.js';
 import { currentConditionsMarkdownForProject } from '../lib/current-conditions.js';
+import { rePreflightAfterBindingChange, proofConditionLine } from '../lib/proof-policy.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
-import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
+import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE, mintMetaReader, dropMetaReader, metaDbHostPort } from '../lib/prod-readonly.js';
+import { hasInfraTroubleshoot } from '../lib/harness-capabilities.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
@@ -93,12 +96,19 @@ async function harnessIdForType({ projectId, targetId, effectiveType, harness })
 // A MANAGER dispatch (POST /api/managers) passes zeeType 'manager' and draws from everything: it is
 // going to stamp the type anyway, and a ready manager xell is the ideal target for it.
 // zeeType null keeps the unfiltered list — that is the claim path, which matches an exact cwd.
-async function readyXells(projectId, { zeeType = null } = {}) {
+// Export seam for test/provision-proof.test.mjs (proven-first ordering). No behaviour change —
+// the ORDER BY clause is what the test asserts.
+export async function readyXells(projectId, { zeeType = null } = {}) {
   // Machine-priority first (023, now per-project 038): a claim takes a ready xell from the
   // machine THIS PROJECT prefers before any other — "if local priority is higher, dev xells get
   // spawned there first" applies to dispatch exactly like it does to the pool fill. Priority is a
   // (machine, project) fact (machine_pool), so the join carries the project through. With no
   // machine_pool row every priority is 0 and this is the old freshest-first order unchanged.
+  //
+  // PROVEN-FIRST (provision-proof §4.8, advisory): within a machine, a claim prefers a xell whose
+  // chips are PROVEN (proof_at NOT NULL AND proof_error IS NULL) over a never-proven or
+  // proof-failed one. ORDER BY only — the WHERE is untouched, so an advisory fleet prefers proven
+  // stock without ever refusing a dispatch. Legacy rows (proof_at IS NULL) sort with the unproven.
   return q(
     `SELECT x.* FROM xell x
        LEFT JOIN container sc ON sc.owner_xell_id = x.id AND sc.role = 'server'
@@ -107,7 +117,9 @@ async function readyXells(projectId, { zeeType = null } = {}) {
       WHERE x.project_id = $1 AND x.status = 'ready'
         AND x.quarantined_at IS NULL
         AND ($2::text IS DISTINCT FROM 'worker' OR COALESCE(x.zee_type, 'worker') <> 'manager')
-      ORDER BY COALESCE(mp.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC,
+               (x.proof_at IS NOT NULL AND x.proof_error IS NULL) DESC,
+               x.ready_at DESC NULLS LAST, x.created_at DESC`,
     [projectId, zeeType]);
 }
 
@@ -159,8 +171,27 @@ class NeedsWorktree extends Error {
 // quarantine (the explicit rescue arm) and /xell again.
 export async function claimReadyXellForSkill(xellId) {
   if (!xellId) return null;
+  // THE PROOF GATE, applied to the skill-claim too (provision-proof §4.3): the SAME gate as
+  // dispatch's claimReadyXell, in the SAME statement, so under readiness_proof='required' an
+  // unproven / proof-failed / preflight-failed xell is not claimable by /xell either — a human
+  // standing in a known-broken worktree is pointed at the fresh stock instead of being told to
+  // work there. The one deliberate difference from dispatch: a PRODUCTION xell is exempt. Dispatch's
+  // claim refuses production xells outright (NOT is_production) because a pooled xell is never
+  // production; the /xell skill-claim is the legitimate door into a production worktree (the
+  // /xell-prod flow — a human standing in it claims it), and the readiness_proof policy governs
+  // POOLED stock, never a human's explicit production work. So a production xell is always
+  // claimable here, exactly as it is today. (NOT EXISTS over pool_config — a project with no row
+  // falls back to the default advisory, see the sibling claim in lib/xell-claim.js.)
   return one(
-    `UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 AND status='ready' AND quarantined_at IS NULL RETURNING *`, [xellId]);
+    `UPDATE xell x SET status='claimed', is_pooled=false
+       WHERE x.id=$1 AND x.status='ready' AND x.quarantined_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_config pc
+            WHERE pc.project_id = x.project_id
+              AND pc.readiness_proof = 'required'
+              AND NOT x.is_production
+              AND (x.proof_at IS NULL OR x.proof_error IS NOT NULL OR x.preflight_error IS NOT NULL))
+       RETURNING x.*`, [xellId]);
 }
 
 // The legible refusal when a skill-claim cannot take the xell it is standing in. The session is
@@ -181,12 +212,36 @@ export function skillClaimUnavailable(xellId, state) {
     err.code = 'XELL_QUARANTINED';
     return err;
   }
+  // Still 'ready' but the claim came back empty: the only refusal left is the PROOF GATE
+  // (provision-proof §4.3) — the xell was not decommissioned, not renamed, not claimed; it is
+  // exactly as the CAS found it, and the project's readiness_proof='required' policy will not let
+  // it be claimed because it is not proven stock. Name WHICH condition failed, so the human knows
+  // what would make it claimable (clear the preflight/proof error, or wait for the pool to
+  // reprovision a proven replacement) instead of retrying the same doomed claim.
+  if (state?.status === 'ready') {
+    const reason = proofGateRefusal(state);
+    const err = new Error(
+      `xell ${state.slug || xellId} is still ready but NOT claimable under this project's `
+      + `readiness_proof='required' policy — ${reason}. It is not stock: a fresh, proven xell will `
+      + 'be provisioned in its place. Open the fresh worktree and re-run /xell there.');
+    err.code = 'XELL_PROOF_GATE';
+    return err;
+  }
   const err = new Error(
     `xell ${state?.slug || xellId} is ${state?.status || 'gone'} — it was decommissioned while this `
     + 'session was claiming it, so claiming it would resurrect a xell whose worktree is being removed. '
     + 'A fresh ready xell will be provisioned; open its worktree and re-run /xell there.');
   err.code = 'XELL_UNAVAILABLE';
   return err;
+}
+
+// WHY a still-'ready' xell failed the claim's proof gate — the named condition, pure (testable
+// without a database). Mirrors the claim conjunct: proven = proof_at NOT NULL AND proof_error IS
+// NULL AND preflight_error IS NULL; anything else is refused under 'required'.
+export function proofGateRefusal(state) {
+  if (state?.preflight_error) return `its db preflight is failing: ${state.preflight_error}`;
+  if (state?.proof_error) return `its provision proof failed: ${state.proof_error}`;
+  return 'it has never been proven (proof_at IS NULL)';
 }
 
 // POST /api/xell/claim  { session_id, cwd, task, runtime?, project? }
@@ -299,8 +354,12 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   if (!updatedXell) {
     // Read the quarantine columns too: the CAS now refuses a quarantined xell, and the refusal the
     // human reads must name the QUARANTINE (rescue vs reap), not a decommission (reprovision).
+    // The proof columns ride along so a proof-gate refusal (still 'ready', refused under
+    // readiness_proof='required') can name WHICH condition failed instead of reading as a
+    // decommission.
     const state = await one(
-      `SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`,
+      `SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason,
+              proof_at, proof_error, preflight_error FROM xell WHERE id=$1`,
       [xell.id]).catch(() => null);
     await q(`DELETE FROM zee WHERE id=$1`, [zee.id]).catch(() => {
       logline('intake', `warn: could not compensate zee ${zee.id} for unclaimable xell ${xell.slug} — `
@@ -446,10 +505,15 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   const claimed = xell_id ? await claimReadyXell(xell_id)
     : await claimFirstReady(await readyXells(projectId, { zeeType: askedType || 'worker' }));
   const targetId = xell_id || claimed?.id || null;
+  // Whether THIS dispatch minted a meta-RO reader for the target (a medic). Set only after the
+  // harness assignment below — the capability lives on the harness — and consulted by the spawn-
+  // failure compensation, which must give the role back if the cage never started.
+  let metaBound = false;
   if (xell_id && !claimed) {
     // Not fatal by itself — the xell is very often legitimately claimed already. It IS fatal when
     // the xell is on its way out, and that is precisely the case a dispatch used to walk into.
-    const state = await one(`SELECT slug, status, quarantined_at, quarantine_deaths, quarantine_reason FROM xell WHERE id=$1`, [xell_id]);
+    const state = await one(`SELECT slug, status, is_production, quarantined_at, quarantine_deaths, quarantine_reason,
+                                    proof_at, proof_error, preflight_error FROM xell WHERE id=$1`, [xell_id]);
     // A QUARANTINED cage is the one "already claimed" case a dispatch must NEVER walk into: the whole
     // point of the quarantine (ticket #81) is that no recovery path feeds it another agent until a
     // human decides. The claim above refused it (claimReadyXell), so we land here with the row in
@@ -462,6 +526,21 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
         `xell ${state?.slug || xell_id} is ${state?.status || 'gone'} — it is being decommissioned, so `
         + 'dispatching into it would spawn a zee into a worktree that is about to be deleted. '
         + 'Dispatch into another xell; the pool will have provisioned a fresh one.');
+    }
+    // Still 'ready' but the claim came back empty, and the xell is not production (a ready
+    // PRODUCTION xell named explicitly keeps its pre-existing behaviour of proceeding unclaimed —
+    // that is the /xell-prod door, never pooled stock). The only remaining refusal is the PROOF
+    // GATE: the project runs readiness_proof='required' and this xell is unproven / proof-failed /
+    // preflight-failed. Dispatch MUST NOT proceed into it — that would be claiming a known-broken
+    // xell, the exact thing the gate exists to forbid (§4.3). Say which condition failed; the
+    // dispatcher names a specific xell, so this is a legible refusal, not a fall-through to fresh
+    // spawn (an UNNAMED dispatch falls through naturally, via claimFirstReady → null → §4.7).
+    if (state?.status === 'ready' && !state.is_production) {
+      throw new Error(
+        `xell ${state.slug || xell_id} is still ready but NOT claimable under this project's `
+        + `readiness_proof='required' policy — ${proofGateRefusal(state)}. It is not stock. Dispatch `
+        + 'into another (proven) xell, or let the pool provision a replacement; a fresh-spawned '
+        + 'xell runs the preflight synchronously and surfaces the proof verdict in its briefing.');
     }
   }
 
@@ -581,8 +660,29 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
         }
       }
       await bindManagerToProdReadonly(targetId);
+      // Deliberately NO re-preflight here: the manager's bind is production READ-ONLY, and preflight
+      // never opens production (preflight.js skips it by design — a human granted that bind). A
+      // guaranteed-skip preflight would be noise on every manager dispatch; the §4.5 re-preflight
+      // gates the three NON-prod binding changes (dispatch attach, the db-clone cut inside it, and
+      // the dbclone switch).
     } else if (targetId && (db || db_container || dump)) {
       await attachXellDb(targetId, { coupling: db, container: db_container, dump });
+      // RE-PREFLIGHT ON THE NEW BINDING (§4.5, insertion points 1+2): the attach just re-pointed
+      // this xell's DSN — a pooled xell's proof was recorded against the binding it HAD, so it is
+      // stale by definition the moment it changed. Open the NEW DSN before the zee spawns, bounded
+      // by PREFLIGHT_TIMEOUT_MS. Under 'required' a failure REFUSES the dispatch (ok:false, the
+      // named check, DSN identity without the secret — the refusal `reason` below) and the claim is
+      // released by the catch block above, so the xell goes back to 'ready' with its new binding
+      // and the pool routes it (§4.6) rather than someone being dispatched into it. Under 'advisory'
+      // the spawn proceeds: the verdict is already on the row (notePreflight) and the briefing's
+      // conditions block carries it (proofConditionLine). This closes the #47/TKT-181 class at the
+      // moment it actually occurs, not at provision time when the binding was different. A retry of
+      // the next candidate is deliberately NOT a loop here: a refused binding (e.g. a clone that
+      // cannot be minted) fails for the SAME reason on every ready xell of this project — the refusal
+      // names the check for the human; the claim release is what frees the next candidate for the
+      // NEXT dispatch.
+      const rePreflight = await rePreflightAfterBindingChange(targetId);
+      if (rePreflight.refused) throw new Error(rePreflight.reason);
     }
 
     // Assign the harness BEFORE the zee starts, so its persona/skills are in the very first briefing.
@@ -608,6 +708,29 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
           if (def) await assignHarness(targetId, def);
         }
       }
+    }
+
+    // META-RO BIND at dispatch (provision-proof stage 3, build item 4): when the xell's EFFECTIVE
+    // harness chain carries the 'infra-troubleshoot' capability (the infra-medic), mint it a per-xell
+    // SELECT-only role on the ORCHESTRATOR'S OWN meta-DB and inject it as ZEEHIVE_META_RO_DSN. After
+    // the harness assignment (the capability lives on the harness — the chain is only knowable now)
+    // and before the spawn (the env the cage is built from must carry it). Mirrors
+    // bindManagerToProdReadonly's lifecycle: fails closed on a mint error, PRODRO_MODE=simulate mints
+    // nothing real, and the spawn-failure compensation below drops the role if the cage never started.
+    // A plain worker's chain carries no capability, so this is a read-only SELECT + one UPDATE on a
+    // non-medic — the same universal-path cheapness the prod-network guard keeps.
+    if (targetId && await hasInfraTroubleshoot(targetId)) {
+      const mrow = await one(`SELECT * FROM xell WHERE id=$1`, [targetId]);
+      await mintMetaReader(mrow);
+      // Re-project .zeehive.env so ZEEHIVE_META_RO_DSN is in the file before the zee starts. Same
+      // best-effort-but-never-silent rule as the manager bind: emitXellEnv stamps the failure on the
+      // row and the boot reconcile retries it — and even if this explicit emit fails, the DSN lives
+      // in xell.meta_ro_dsn, so the cage build's own env emission picks it up from there.
+      const emit = await emitXellEnv(targetId).catch((e) => ({ error: e.message }));
+      if (emit?.error) logline('intake', `${mrow.slug}: ZEEHIVE_META_RO_DSN minted but .zeehive.env NOT `
+        + `re-emitted (${emit.error}) — the boot reconcile will retry`);
+      metaBound = true;
+      logline('intake', `${mrow.slug}: bound to the meta-DB READ-ONLY (infra-medic) — ZEEHIVE_META_RO_DSN set`);
     }
 
     // Pasted files: save them into the (possibly just-renamed) target worktree and append a
@@ -651,6 +774,16 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   } catch (err) {
     if (targetId && effectiveType === 'manager') {
       await unbindManagerFromProdReadonly(targetId, `the dispatch failed before the zee started: ${err.message}`);
+    }
+    // The medic's meta-RO bind is the same class of write as the manager's: a real role on the
+    // meta-DB. If the cage never started, the role must go back — a credential nobody is using, for
+    // an agent that never began, is exactly what the reaper exists to prevent and must not depend on
+    // the reaper running. dropMetaReader never throws; the compensation cannot hide the real error.
+    if (metaBound) {
+      const mrow = await one(`SELECT * FROM xell WHERE id=$1`, [targetId]);
+      const md = await dropMetaReader(mrow);
+      logline('intake', `${mrow.slug}: meta-RO role ${md.role || ''} ${md.dropped ? 'DROPPED' : `not dropped (${md.reason || md.error || '—'})`}`
+        + ` — the dispatch failed before the zee started`);
     }
     // …and the CLAIM goes back the same way, for the same reason: the spawn can throw on its way up
     // (a paused fleet, no connected provider account, a model the harness policy forbids) before any
@@ -1045,9 +1178,16 @@ export async function setZeeMode(zeeId, permissionMode) {
 // Best-effort: no live cxell → nothing to do; NEVER throws.
 // GENERATE this project's entry-point docs (AGENTS.md/CLAUDE.md …) into a cxell. Same trigger as the
 // harness files — a zee being assigned — because they answer the same question for a zee arriving with
-// no context: what is this project and how do I work in it. Never overwrites a git-tracked path
-// (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
-// and a zee never received is exactly the silence this whole mechanism exists to remove.
+// no context: what is this project and how do I work in it.
+//
+// The meta-DB row is the SOURCE of truth (docs/entry-point-doc-source.md, Option B) — every xell gets
+// the generated file at deployment, including at a path the repo has committed (this repo's CLAUDE.md
+// is exactly that). So the injector is called with overwriteTracked:true for these entry-point paths:
+// the paths are ones project_doc rows own, and lib/cxell.js then writes over the committed copy,
+// git-excludes it and skip-worktrees it. An UNRELATED tracked path (a file no row claims) stays
+// protected — the same lib/cxell.js decision, with the caller's flag defaulting to false there.
+// Every outcome is logged: a doc an operator wrote and a zee never received is exactly the silence
+// this whole mechanism exists to remove.
 export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
   // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
   // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
@@ -1058,7 +1198,7 @@ export async function injectProjectDocsIntoXell({ ctx = 'default', slug, project
   const skipped = [];
   for (const f of files) {
     try {
-      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text });
+      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text, overwriteTracked: true });
       if (r.written) written++; else skipped.push(r.reason || `${f.relPath} not written`);
     } catch (e) {
       failed++;
@@ -1169,8 +1309,15 @@ export async function briefing(xellId, zee, task, { headless = true, cxell = fal
   // render is null when the project has none, so a briefing for a healthy project is unchanged.
   // Resolved live at briefing time so a line a manager added a minute ago is already in the very
   // next briefing — there is no rebuild, no re-spawn, no cache to go stale.
-  const xellRow = await one(`SELECT project_id FROM xell WHERE id=$1`, [xellId]);
+  const xellRow = await one(
+    `SELECT project_id, proof_at, proof_error, preflight_at, preflight_error FROM xell WHERE id=$1`, [xellId]);
   const conditions = await currentConditionsMarkdownForProject(xellRow?.project_id);
+  // …plus THIS xell's own failing proof/preflight state, when there is one (§4.5): under 'advisory'
+  // a FAILED binding re-preflight must be visible in the very briefing that follows it, not only on
+  // the row. proofConditionLine returns null for a healthy xell, so a healthy briefing is
+  // byte-identical to before this feature existed. Both blocks render the same dated ⚠ line shape.
+  const ownProof = proofConditionLine(xellRow);
+  const conditionsBlock = [conditions, ownProof].filter(Boolean).join('\n\n') || null;
   // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +
   // "how you are running") and ABOVE the task — the fixed precedence in docs §4. core adds no new
   // TEXT (its content is the manual + rules, already here), so an unharnessed xell is unchanged.
@@ -1222,8 +1369,9 @@ export async function briefing(xellId, zee, task, { headless = true, cxell = fal
     '  yourself, and never touch the xource (the read-only main repo).',
     // CURRENT CONDITIONS — live impediments for THIS project, dated and visibly ephemeral, placed
     // where they are read (above the persona and the task) rather than skimmed past. Null when the
-    // project has none — no empty section, no skim-past noise.
-    ...(conditions ? ['', conditions] : []),
+    // project has none — no empty section, no skim-past noise. (The per-xell proof state, if any,
+    // was joined into `conditionsBlock` above.)
+    ...(conditionsBlock ? ['', conditionsBlock] : []),
     // HARNESS LAYER — the assigned persona/skills, below the law above and above the task below.
     ...(harnessBlock ? ['', harnessBlock] : []),
     '',
@@ -1669,7 +1817,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // A manager holds prod READ-ONLY ('db-prod-readonly') — it must reach the prod db host:port too,
   // or the SELECT-only role it was given is unusable and the whole binding is theatre; both that
   // coupling and the human grant are in PROD_REACHING_COUPLINGS.
-  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, dbCoupling: xell.db_coupling });
+  // An INFRA-MEDIC's ZEEHIVE_META_RO_DSN dials the orchestrator's OWN meta-DB — SELECT-only, but the
+  // socket has to open for the grant to mean anything. Its host:port is allowed for exactly that
+  // cage (keyed off the stored DSN: a live meta_ro_dsn means the bind was minted for it), whatever
+  // project the medic is on; a worker holds no DSN and nothing is opened.
+  const allowList = xell.meta_ro_dsn ? [metaDbHostPort()] : [];
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, dbCoupling: xell.db_coupling, allowList });
 
   // RECORD THE MODEL THE CAGE WILL ACTUALLY RUN. A claude alias means nothing to a non-claude CLI,
   // so the adapter drops it and runs the vendor's own — which left production holding deepseek-cxell
@@ -1824,7 +1977,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       catch (e) { logline('cxell', `${name}: could not inject harness file ${f.relPath} (${String(e.message).slice(0, 100)})`); }
     }
     // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
-    // provider actually looks for. Generated, never written over a file the project itself committed.
+    // provider actually looks for. The row is the SOURCE (Option B, docs/entry-point-doc-source.md):
+    // the injector supersedes a tracked entry-point path the row owns — this repo's committed
+    // CLAUDE.md included — rather than skipping it.
     await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
@@ -1868,8 +2023,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // adapter's own base URL (the adapter.env baseUrl above is the provider's real URL; the gateway
     // replaces it). The token stays the provider key (adapter.env's token) — unchanged credential
     // model, the identity travels in the URL.
-    const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
-    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
+    const gwEnv = await gatewayEnv({ xellToken, provider: adapter.provider });
+    // Log HOST:PORT only — the full env value carries the xell identity token in its PATH
+    // (/x/<token>/<provider>), and no token ever goes in a logline. `new URL().host` is host:port.
+    const gwBase = gwEnv.ANTHROPIC_BASE_URL
+      ? (() => { try { return new URL(gwEnv.ANTHROPIC_BASE_URL).host; } catch { return '(unknown host)'; } })()
+      : '(off)';
+    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwBase})`);
     await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
                          agentEnv: { ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
@@ -2048,8 +2208,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
-                          extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
+  const handle = await runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
+                                extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.
@@ -2186,17 +2346,21 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js). A
       // HEALTHY end resets the xell's consecutive-death streak (ticket #81) — the cage demonstrably
       // carried this agent through a full turn, so the run of deaths is honestly over.
+      // A GATEWAY death returns the rewritten stop_reason ('zeehive gateway unreachable at …'), which
+      // is what the TURN LEDGER should close with — the one line a human reads to find out what died.
+      let filed = null;
       if (errored) {
-        await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                              reason: String(result?.result || 'error'),
-                              code, err, result, source: 'turn' });
+        filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                      reason: String(result?.result || 'error'),
+                                      code, err, result, source: 'turn' });
       } else {
         await resetXellConsecutiveDeaths(xell.id);
       }
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
         status: errored ? 'errored' : 'ended',
-        burn: b, stopReason: stop,
+        burn: b,
+        stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal ? filed.message : stop,
         summary: lastAssistantText(result),
         meta: { errored },
       });
@@ -2228,15 +2392,18 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
       logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
-      await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
       // The other half of the same question (see the resolve path above): a run that died on the way
       // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
       // runZee's reject carries the exit code and a bounded stderr tail (cxell.js), which rides here
-      // so the row captures what the CLI said even when it printed no result event.
-      await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
-                            reason: String(err.message),
-                            code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
-                            source: 'turn' });
+      // so the row captures what the CLI said even when it printed no result event. FILED BEFORE the
+      // ledger closes so a gateway death's rewritten stop_reason is what the turn row closes with.
+      const filed = await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                                          reason: String(err.message),
+                                          code: err.code ?? null, err: err.errTail ?? '', result: err.result ?? null,
+                                          source: 'turn' });
+      await endTurn(turn?.id, { status: 'errored', burn: null,
+                                stopReason: filed?.signal === GATEWAY_UNREACHABLE_DEATH.signal
+                                  ? filed.message : scrubSecrets(String(err.message)).slice(0, 200) });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,

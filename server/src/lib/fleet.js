@@ -15,9 +15,11 @@ import { backupDue } from '../queenzee/maintenance.js';
 import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
+import { listProjectConditions } from './current-conditions.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
+import { gatewayHealth } from '../queenzee/gateway-health.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -353,6 +355,9 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     // The readiness preflight's verdict (#53): a vacant xell whose DSN the queenzee wrote does not
     // open must not read `ready`. The named check itself rides on x.preflight_error for the card.
     preflightFailed: !!x.preflight_error,
+    // The provision proof's verdict (§4.8): a vacant xell whose burn-in found a broken chip must
+    // equally not read `ready`. proof_error rides on x.proof_* (fetchXellRows reads x.*) for the card.
+    proofFailed: !!x.proof_error,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
@@ -796,6 +801,13 @@ export async function getFleet(projectId) {
   // as a receipt so "did the new key reach the cages?" does not vanish.
   const credentialInject = await listCredentialInjectRequests(pid, { open: true });
 
+  // CURRENT CONDITIONS — the project's live-impediment list (the briefing-time injection). Rides the
+  // fleet snapshot so the console's needs-you surface (a blocked project's ⛑ medic chip — the one
+  // thing a provision halt leaves the bar silent about) and the conditions editor read the SAME poll;
+  // a condition is a slow-changing fact, and one ≤ CONDITION_LIMIT query on an already-heavy snapshot
+  // is cheaper than a second endpoint the console has to keep in step with.
+  const conditions = await listProjectConditions(pid);
+
   return {
     project,
     pool,
@@ -824,11 +836,16 @@ export async function getFleet(projectId) {
     xource,
     manager_mint: managerMint,
     credential_inject: credentialInject,
+    conditions,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,
     // Per-project pause state (migration 101) — alongside the fleet-wide `pause` above.
     project_pause: projPause,
+    // GATEWAY REACHABILITY at the address cages are actually given — the cached verdict of the
+    // health-monitor's best-effort probe (queenzee/gateway-health.js). Read from the cache, never
+    // a fetch here: a probe failure must never fail the fleet read or a page render.
+    gateway_health: gatewayHealth(),
   };
 }
 

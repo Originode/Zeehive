@@ -25,14 +25,19 @@ import { q } from '../db/pool.js';
 export const PROD_REACHING_COUPLINGS = ['db-shared-prod', 'db-prod-readonly'];
 
 // Every prod db in the fleet as host:port, MINUS this xell's own project's when the xell is bound to
-// production. `prodBound` may be passed explicitly (self.js, after the bind is granted, where the
-// row it reads is already stale); otherwise it is derived from the coupling.
-export async function prodDbBlockList({ projectId, dbCoupling = null, prodBound = null } = {}) {
+// production, and MINUS any pair on `allowList` (host:port strings the caller has already decided
+// this cage must reach — the infra-medic's meta-RO bind, whose ZEEHIVE_META_RO_DSN dials the
+// orchestrator's own meta-DB and must not be dropped for that cage, whatever project it is on).
+// `prodBound` may be passed explicitly (self.js, after the bind is granted, where the row it reads
+// is already stale); otherwise it is derived from the coupling.
+export async function prodDbBlockList({ projectId, dbCoupling = null, prodBound = null, allowList = [] } = {}) {
   const prodDbs = await q(
     `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
       WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
   const bound = prodBound === null ? PROD_REACHING_COUPLINGS.includes(dbCoupling) : !!prodBound;
+  const allowed = new Set(allowList.map((a) => String(a)));
   return prodDbs
     .filter((r) => !(bound && r.project_id === projectId))
-    .map((r) => `${r.host}:${r.host_port}`);
+    .map((r) => `${r.host}:${r.host_port}`)
+    .filter((hp) => !allowed.has(hp));
 }

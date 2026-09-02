@@ -1,14 +1,18 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell,
-         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
+         reapXell, rescueXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          sendXellMessage,
          swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
          routePrompt, deployRouter, redeployRouter, addManagerZee,
-         squashHelps, squashOffer } from './api.js';
+         squashHelps, squashOffer,
+         dispatchMedic } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
+// the ONE place the gateway-health state becomes words ("gateway unreachable at <addr>") — same
+// vocabulary in every surface, tested in plain node (web/src/gatewayHealth.js)
+import { gatewayHealthWord } from './gatewayHealth.js';
 import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
@@ -24,6 +28,7 @@ const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || 
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
+import { itemReachable } from './hive/level.js';
 // the project-scoping filter for the fleet render surfaces (honeycomb and everything fed from it)
 import { projectScoped } from './projectFilter.js';
 import CrewChip from './CrewChip.jsx';
@@ -56,32 +61,10 @@ import WorkConsole from './work/WorkConsole.jsx';
 import { listWorkItems, deployWorkItem, createWorkItem } from './work/workApi.js';
 import DeliveryTelemetry from './DeliveryTelemetry.jsx';
 import Toasts from './Toasts.jsx';
+// THE URL IS THE WORK-NODE PATH — /<project>/<child>/<child>. See web/src/route.js for the scheme.
+import { findProject, formatPath, legacyProjectParam, parsePath, pathSegments, resolveNodes } from './route.js';
 
 const PROJECT_KEY = 'zeehive.project';
-const PROJECT_PARAM = 'project';
-
-// Resolve a project from a URL token (?project=…), matched against either the id or the name
-// (case-insensitive), so a link/refresh lands on a specific project instead of "the first one".
-const findByToken = (ps, token) =>
-  token
-    ? ps.find((p) => p.id === token || p.name?.toLowerCase() === String(token).toLowerCase())
-    : null;
-
-const readProjectParam = () => {
-  try { return new URLSearchParams(window.location.search).get(PROJECT_PARAM); }
-  catch { return null; }
-};
-
-// Keep the URL in step with the selected project (its name — readable, and it survives a refresh)
-// WITHOUT adding history entries, so Back doesn't walk through every project you clicked.
-const writeProjectParam = (project) => {
-  try {
-    const url = new URL(window.location.href);
-    if (project?.name) url.searchParams.set(PROJECT_PARAM, project.name);
-    else url.searchParams.delete(PROJECT_PARAM);
-    window.history.replaceState(null, '', url);
-  } catch { /* history unavailable — non-fatal */ }
-};
 
 // Display only — the DB role is still 'webapp'. "App" is what the thing IS; "webapp" was naming
 // its delivery mechanism, which is the least interesting fact about it.
@@ -278,9 +261,21 @@ export default function App() {
   // children), where a child work_node is a hexagon — the assigned xell when it has one, a vacant
   // dashed seat when it does not — and drilling into a node makes IT the context every new prompt
   // is cut under (parent_work_item on the dispatch).
-  const [hiveMode, setHiveMode] = useState('projects');
+  // The URL IS this pair (route.js): `/` = the projects level, `/<project>/<child>/…` = 'nodes' at
+  // that depth. So both are seeded FROM the address on first paint — a refresh or a shared link
+  // restores the level you were on, which a `?project=` URL could never say.
+  const initialUrl = useRef(parsePath(typeof window === 'undefined' ? '/' : window.location.pathname));
+  const [hiveMode, setHiveMode] = useState(initialUrl.current.project ? 'nodes' : 'projects');
   const [nodePath, setNodePath] = useState([]);      // [{id,title}] from the project root downward
+  // Node segments from the address, held until the plan they name has actually loaded. The URL is
+  // read on the first frame; `workItems` arrives an HTTP round-trip later, and only then can a slug
+  // become a node. Also re-armed by popstate (Back/Forward) and by a project switch.
+  const pendingNodes = useRef(initialUrl.current.nodes);
   const [workItems, setWorkItems] = useState([]);    // the selected project's plan (flat, from /work-items)
+  // Bumped every time the plan is LOADED, including when it comes back empty. The URL resolution
+  // below waits on this rather than on `workItems.length`: a project with no work items would
+  // otherwise leave the address's segments pending forever, and the URL never normalised.
+  const [workRev, setWorkRev] = useState(0);
   const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
@@ -432,6 +427,10 @@ export default function App() {
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
   useEffect(() => { projectsRef.current = projects; }, [projects]);
+  // …and the plan, for the same reason: Back/Forward must resolve the address's node segments
+  // against the CURRENT plan from inside a listener that is not re-bound on every refetch.
+  const workItemsRef = useRef([]);
+  useEffect(() => { workItemsRef.current = workItems; }, [workItems]);
   const applyFleet = useCallback((f) => {
     if (f && (!projectIdRef.current || f.project?.id === projectIdRef.current)) setFleet(f);
   }, []);
@@ -451,6 +450,7 @@ export default function App() {
       // stale-guard, same rule as loadAll: never paint the previous project's plan
       if (!projectIdRef.current || projectIdRef.current === pid) {
         setWorkItems(Array.isArray(items) ? items : []);
+        setWorkRev((n) => n + 1);   // the plan LOADED — even if it came back empty (see workRev)
       }
     } catch { /* keep last */ }
   }, []);
@@ -659,6 +659,36 @@ export default function App() {
     // state declared at the top of the component, so it is always safe to reference here.
   }, [pushToast, dismissToast, refresh, projectId, fleet]);
 
+  // Dispatch the infra-medic from a blocker condition on the NEEDS-YOU BAR — the same seam as
+  // ProjectSetup's conditions row (POST /project-conditions/:id/dispatch-medic), surfaced where a
+  // blocked project first shows up. A project whose pool stopped filling (a PROVISION-INFRA card, a
+  // hand-written blocker) often has NO waiting xell — the fill just stops — so before this the bar
+  // was the one screen that stayed silent about the exact thing it exists to say. The medic is a
+  // MANAGER zee on the Zeehive project (the orchestrator's own — its prod database IS the meta-DB),
+  // briefed with the card VERBATIM + the card's project, to drive THAT project's META-DB CONFIG to
+  // convergence — never another project's code. Spawn takes seconds, so fire-and-forget toasts like
+  // a dispatch; the bar's row button disables itself while this runs and swallows the throw (the
+  // error toast already told the human why).
+  const handleDispatchMedic = useCallback(async (cond) => {
+    const id = `medic-${cond?.id || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: '⛑ Dispatching the infra-medic…',
+      body: 'Spawning a manager zee on the Zeehive project, briefed with this condition verbatim.' });
+    try {
+      const r = await dispatchMedic(cond?.id);
+      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Infra-medic dispatched',
+        body: r?.slug ? `manager zee running in ${r.slug} — it reads the card and drives the config.`
+          : 'spawned — it reads the card and drives the project config to convergence.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 9000);
+      return r;
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Medic dispatch refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
+      throw e;
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
   // ── GitHub outbound (push / open PR) ───────────────────────────────────────
   // Same flow as ProjectSetup's BasicsSection — confirm, call API, report the outcome.
   const doGitHubPush = useCallback(async () => {
@@ -742,15 +772,89 @@ export default function App() {
   useEffect(() => {
     getLogs().then((ls) => setLogs(ls));
     loadProjects().then((ps) => {
-      // URL param wins (a shared/refreshed link is explicit intent), then the last-used project
-      // from localStorage, and only then fall back to the first project we can see.
-      const fromUrl = findByToken(ps, readProjectParam());
+      // The URL wins (a shared/refreshed link is explicit intent) — the PATH first, then the legacy
+      // `?project=` an old bookmark may still carry — then the last-used project from localStorage,
+      // and only then the first project we can see.
+      const fromPath = findProject(ps, initialUrl.current.project);
+      const fromUrl = fromPath || findProject(ps, legacyProjectParam(window.location.search));
       const stored = localStorage.getItem(PROJECT_KEY);
       const picked = fromUrl || ps.find((p) => p.id === stored) || ps[0] || null;
       setProjectId(picked?.id || null);
-      writeProjectParam(picked);   // normalise the URL (fill it in, or fix an unknown token)
+      // An address that named a project — including the legacy param — is a request to be INSIDE
+      // it; a bare `/` is the projects level, and stays there whatever we resolved to load.
+      if (fromUrl) setHiveMode('nodes');
+      if (!fromPath) pendingNodes.current = [];   // a legacy link carries no node path
     });
   }, [loadProjects]);
+
+  // ── the URL ⇄ the level, both ways ───────────────────────────────────────────
+  // STATE → URL. One idempotent effect: whatever the console is showing, the address says it. The
+  // first write REPLACES (normalising `?project=x`, a stale node segment, or `/` into the address
+  // of what actually rendered — none of which a human navigated to), and every later change PUSHES,
+  // so Back walks the levels you drilled through. That is new: the `?project=` era deliberately
+  // never touched history, because walking back through a query param nobody could read was noise.
+  const urlNormalised = useRef(false);
+  useEffect(() => {
+    if (!projects.length) return;                       // nothing resolved yet — don't write a guess
+    const name = projects.find((p) => p.id === projectId)?.name || null;
+    const want = formatPath({
+      project: hiveMode === 'nodes' ? name : null,
+      nodes: hiveMode === 'nodes' ? pathSegments(workItems, nodePath) : [],
+    });
+    // Unresolved segments are still in flight (the plan has not loaded) — leave the address alone
+    // rather than truncating a deep link the moment it is opened.
+    if (pendingNodes.current.length && hiveMode === 'nodes') return;
+    // We have now computed the address of what is really on screen, so the normalising write is
+    // SPENT — whether or not it had anything to write. Flagging it only on an actual write was a
+    // bug the browser found: open a deep link, where the address ALREADY matches, and the first
+    // real navigation would still replaceState — no history entry, and Back left the console.
+    const first = !urlNormalised.current;
+    urlNormalised.current = true;
+    const here = window.location.pathname + window.location.search;
+    if (here === want) return;
+    try {
+      if (first) window.history.replaceState(null, '', want);
+      else window.history.pushState(null, '', want);
+    } catch { /* history unavailable — non-fatal */ }
+  }, [projects, projectId, hiveMode, nodePath, workItems]);
+
+  // URL → STATE, for Back/Forward only.
+  //   • back into ANOTHER project → arm the segments and let the pending-slug resolution below run
+  //     when that project's plan lands (the same path the first paint takes);
+  //   • back into another LEVEL of the project already loaded → resolve at once from the plan we are
+  //     holding. Waiting for a reload that will never come is what would freeze the address here.
+  useEffect(() => {
+    const onPop = () => {
+      const at = parsePath(window.location.pathname);
+      const p = findProject(projectsRef.current, at.project);
+      setHiveMode(at.project ? 'nodes' : 'projects');
+      setExpandedId(null);
+      if (p && p.id !== projectId) {
+        pendingNodes.current = at.nodes;
+        setNodePath([]);
+        setProjectId(p.id);
+        localStorage.setItem(PROJECT_KEY, p.id);
+        setWorkItems([]);
+        return;
+      }
+      pendingNodes.current = [];
+      setNodePath(resolveNodes(workItemsRef.current, at.nodes).nodes);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [projectId]);
+
+  // The plan has arrived — turn the address's slugs into the nodePath they name. A segment that no
+  // longer resolves (the node was deleted, or renamed since the link was made) lands on the longest
+  // valid prefix, and the effect above then rewrites the address to what is actually on screen.
+  // Keyed on workRev, not on the array: a project whose plan comes back EMPTY must still clear the
+  // pending segments, or the address would stay frozen on a level that does not exist.
+  useEffect(() => {
+    if (!workRev || !pendingNodes.current.length) return;
+    const { nodes } = resolveNodes(workItemsRef.current, pendingNodes.current);
+    pendingNodes.current = [];
+    setNodePath(nodes);
+  }, [workRev]);
 
   // (re)load the selected project's data + subscribe to its live stream. Re-runs when the
   // selected project changes (projectId may be null on first paint → server uses the default).
@@ -784,11 +888,14 @@ export default function App() {
   const selectProject = useCallback((id) => {
     setProjectId(id);
     localStorage.setItem(PROJECT_KEY, id);
-    writeProjectParam(projectsRef.current.find((p) => p.id === id));
-    // a project switch lands at ITS root level — the previous project's node path means nothing here
+    // a project switch lands at ITS root level — the previous project's node path means nothing
+    // here, and neither does an address still holding that project's segments
+    pendingNodes.current = [];
     setHiveMode('nodes');
     setNodePath([]);
     setWorkItems([]);
+    // …the URL follows from that state, in the sync effect above — one writer, so a switch, a drill
+    // and a Back all produce the address the same way.
   }, []);
 
   const handleCreate = useCallback(async (body) => {
@@ -805,7 +912,9 @@ export default function App() {
       const next = nextProject?.id || null;
       setProjectId(next);
       if (next) localStorage.setItem(PROJECT_KEY, next); else localStorage.removeItem(PROJECT_KEY);
-      writeProjectParam(nextProject);
+      pendingNodes.current = [];
+      setNodePath([]);
+      if (!next) setHiveMode('projects');   // nothing left to be inside — the address is `/`
     }
     return r;
   }, [loadProjects, projectId]);
@@ -869,6 +978,17 @@ export default function App() {
   // xells on the canvas — the "remnants that linger". So only use the fleet fallback when it
   // actually belongs to the selected project; otherwise show nothing until the new data lands.
   const fleetMatchesSelection = !projectId || fleet.project?.id === projectId;
+  // The needs-you bar's PROJECT blocker chip: this project's CURRENT CONDITIONS that a human can act
+  // on there — a PROVISION-INFRA card (the auto seam: the pool stopped filling this pair) or a
+  // hand-written blocker/note a human added because the project cannot build or provision. The
+  // rolling CODE fact ("main does not build since <sha>") is EXCLUDED — it says the machine CAN
+  // build, so a code fault is that project's crew, never the config-medic, and it gets no ⛑ here
+  // (the SAME predicate as the ProjectSetup row button — one eligibility rule across both surfaces).
+  // Guarded by fleetMatchesSelection so a mid-switch stale snapshot never paints the previous
+  // project's cards under the new project's name.
+  const projectBlockers = fleetMatchesSelection
+    ? (fleet.conditions || []).filter((c) => !String(c.body || '').startsWith('main does not build since'))
+    : [];
   // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
   // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
   // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
@@ -938,12 +1058,19 @@ export default function App() {
   for (const i of openItems) if (i.parent_id) nodeChildCount.set(i.parent_id, (nodeChildCount.get(i.parent_id) || 0) + 1);
   const ctxItemId = hiveMode === 'nodes'
     ? (nodePath.length ? nodePath[nodePath.length - 1].id : rootWorkItem?.id || null) : null;
+  // Is an open item REACHABLE by drilling — every ancestor up to the project root itself open?
+  // A xell assigned to an open item under a done/cancelled parent has no level anyone can open:
+  // the terminal parent never renders, so the child (and its xell) was counted by the statusline
+  // yet drawn NOWHERE — the "says 16 of 18 but I only see a few" miscount report. Those xells
+  // must surface at the ROOT level instead of vanishing (hive/level.js holds the rule).
+  const openItemById = new Map(openItems.map((i) => [i.id, i]));
   let hiveCells;
   if (hiveMode === 'projects') {
     hiveCells = (projects || []).map((p) => ({ id: `proj:${p.id}`, hex_kind: 'project', slug: p.name, project: p }));
   } else {
     const xellById = new Map(xells.map((x) => [x.id, x]));
     const openXellItem = new Set(openItems.map((i) => i.xell_id).filter(Boolean));
+    const openItemByXell = new Map(openItems.filter((i) => i.xell_id).map((i) => [i.xell_id, i]));
     const level = ctxItemId ? openItems.filter((i) => i.parent_id === ctxItemId) : [];
     const seen = new Set();
     hiveCells = [];
@@ -964,9 +1091,23 @@ export default function App() {
       }
     }
     if (!nodePath.length) {
-      for (const x of xells) if (!openXellItem.has(x.id) && !seen.has(x.id)) hiveCells.push(x);
+      for (const x of xells) {
+        if (seen.has(x.id)) continue;
+        const it = openXellItem.has(x.id) ? openItemByXell.get(x.id) : null;
+        // a xell on a REACHABLE deeper node shows at ITS level, not here; a xell on an
+        // UNREACHABLE node (terminal/missing parent) surfaces at root rather than nowhere
+        if (it && itemReachable(it, openItemById, rootWorkItem?.id)) continue;
+        hiveCells.push(it
+          ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0 }
+          : x);
+      }
     }
   }
+  // How many of the project's xells this LEVEL actually draws — the statusline reconciles its
+  // whole-project count against this, so "16 of 18 in use" over five hexagons reads as levelling,
+  // not as a miscount. Projects mode draws no xells at all, so the chip stays silent there.
+  const levelXellCount = hiveMode === 'nodes' ? hiveCells.filter((c) => !c.hex_kind).length : null;
+  const otherLevelXells = levelXellCount != null ? Math.max(0, xells.length - levelXellCount) : 0;
 
   // drill into a project: select it and land at its root level
   const openProjectLevel = (p) => {
@@ -1128,6 +1269,28 @@ export default function App() {
     // the persona (and an optional brief); the server owns every refusal, so nothing is pre-checked
     // here beyond opening the right modal.
     if (kind === 'swap') { setSwapXell({ ...x, diff }); return; }
+    // 🛟 RESCUE — the RESCUE arm of the quarantine decision (ticket #81): clears the quarantine so a
+    // fresh agent can be dispatched into the same worktree/branch. The opposite of done/reap — the
+    // branch and its unlanded work are KEPT. Idempotent server-side, so a stale click is a no-op.
+    if (kind === 'rescue') {
+      if (!(await showConfirm(`Rescue ${x.slug}?\n\nClears its quarantine so a fresh agent can be `
+        + `dispatched into the same worktree and branch. Its unlanded work stays intact — this is the `
+        + `"rescue the branch" arm; done/cleanup is the "reap the cage" arm that deletes them.`,
+        { okLabel: 'Rescue' }))) return;
+      const id = `xrescue-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Rescuing ${x.slug}…` });
+      rescueXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Rescued ${x.slug}`, onRetry: null,
+          body: r?.cleared ? 'quarantine cleared — you can dispatch a fresh agent'
+            : 'was not quarantined — nothing to clear' });
+        else updateToast(id, { kind: 'error', title: 'Rescue refused', onRetry: null,
+          body: r?.error || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Rescue failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
     if (kind === 'push' || kind === 'land') {
       if (!(await showConfirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
@@ -1443,8 +1606,11 @@ export default function App() {
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided in the composer
               (or by the router on a router-gated fleet), opened from the single "+ prompt" button. */}
-          {/* The phone-first mobile chat UI (/m) — a same-tab switch, preserving the project. */}
-          <a className="cs-mobile" href={`./m?project=${encodeURIComponent(project.name)}`}
+          {/* The phone-first mobile chat UI — a same-tab switch to the SAME address under /m, so the
+              project (and the node path you are on) survive the hop: /a/b/c → /m/a/b/c. */}
+          <a className="cs-mobile"
+             href={formatPath({ mobile: true, project: project.name,
+                                nodes: pathSegments(workItems, nodePath) })}
              title="Open the phone-first mobile chat UI">📱 Mobile</a>
           {/* Console settings (browser-local): terminal engine xterm↔wterm, etc. Not project setup. */}
           <button type="button" className="cs-gear" data-testid="console-settings-btn"
@@ -1464,8 +1630,38 @@ export default function App() {
                     projectId={projectId || project.id} onChanged={refresh}
                     pushToast={pushToast} dismissToast={dismissToast} />
         <span className="k">Status:</span>{' '}
-        <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
+        {/* The count is the WHOLE PROJECT (every non-retired xell in the meta-DB, production
+            excluded) while the honeycomb draws ONE LEVEL of the work-node tree — so fewer hexagons
+            than this is levelling, not a miscount. The title says so, and the "on other levels"
+            chip beside it reconciles the two numbers whenever they differ. */}
+        <span title={'Counted from the meta-DB: every non-retired xell of this project (production excluded). '
+          + '"In use" = working, claimed, idle or awaiting-done. The honeycomb draws one level of the '
+          + 'work-node tree, so it can show fewer hexagons than this count — see the "on other levels" chip.'}>
+          <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
+        </span>
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
+        {otherLevelXells > 0 && (
+          <span className="sub" data-testid="level-hidden-xells"
+                title={`The honeycomb shows ${levelXellCount} xell hexagon(s) on this level of the work-node tree; `
+                  + `the project's other ${otherLevelXells} xell(s) sit on other levels — drill into a node `
+                  + `(or use the crumb strip) to see them. The counts on the left are the whole project.`}>
+            {' · '}{otherLevelXells} on other levels
+          </span>
+        )}
+        {/* GATEWAY REACHABILITY at the address cages are actually given — a WORD, never a shade, and
+            the address is named when it is down. This is the surface that says "the port cages point
+            at is closed" instead of making it look like every provider is down. It rides the same
+            fleet poll as everything else here (getFleet → gateway_health, the cached verdict of the
+            health-monitor's best-effort probe) — no extra request, and a probe failure never fails
+            this render (gatewayHealthWord handles unknown/missing state, the chip just says so). */}
+        {fleet.gateway_health && (() => {
+          const gw = gatewayHealthWord(fleet.gateway_health);
+          return (
+            <span className={`gateway-health ${gw.kind}`} data-testid="gateway-health" title={gw.why}>
+              {' · '}{gw.chip}
+            </span>
+          );
+        })()}
         {/* FLEET-CUMULATIVE BURN — spend only (tokens + $). Remaining provider quotas are the
             SEPARATE "limits" chip below — deliberately not mixed, so the two questions stay clear. */}
         {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0
@@ -1571,6 +1767,8 @@ export default function App() {
       <NeedsYouBar xells={xells} links={crewOfFleet} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
                    prodBindByXell={prodBindByXell} seedByXell={seedByXell}
                    doneSuggestByXell={doneSuggestByXell}
+                   blockers={projectBlockers} blockersProjectName={project?.name || ''}
+                   onDispatchMedic={handleDispatchMedic}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
@@ -1869,7 +2067,15 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
 function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
-                       prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {} }) {
+                       prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {},
+                       blockers = [], blockersProjectName = '', onDispatchMedic = null }) {
+  // A PROJECT's blockers are a decision on the bar WITHOUT a xell to key it on — the pool stopped
+  // filling the pair, so there may be no waiting xell at all (which is exactly why this needed a
+  // line of its own). They get a sibling open state and their own dispatch spinner, not the
+  // xell-chip machinery.
+  const [blockersOpen, setBlockersOpen] = useState(false);
+  const [dispatching, setDispatching] = useState(null);
+  const projectLabel = blockersProjectName || 'this project';
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -1920,10 +2126,20 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
       // without breaking anything real. Order in a sum is arbitrary; that assertion is not.
       n: held + prs + tend + bind + seed + doneSug + blocked + envAlert };
   }).filter((w) => w.n > 0);
-  if (!waiting.length) return null;
+  if (!waiting.length && !blockers.length) return null;
 
-  const go = (id) => onJump?.(id === expandedId ? null : id);  // click the open one again to collapse
+  const go = (id) => { setBlockersOpen(false); onJump?.(id === expandedId ? null : id); };  // click the open one again to collapse
   const open = waiting.find((w) => w.x.id === expandedId);
+  // One ⛑ click: hand the condition to the App-level dispatcher (progress toast + refresh) and spin
+  // this row while the manager zee spawns. Refusals are toasted by the dispatcher; the catch here
+  // just clears the spinner (the throw is swallowed so nothing silently proceeds on a refusal).
+  const dispatchOne = async (c) => {
+    if (!onDispatchMedic || dispatching) return;
+    setDispatching(c.id);
+    try { await onDispatchMedic(c); }
+    catch { /* the dispatcher's error toast already told the human why */ }
+    finally { setDispatching(null); }
+  };
   // pending decisions, PLUS an approved landing that is wedging the runway — that one is a decision
   // again (see `blocked` above), and holdsRunway is why it survives `visible` even when dismissed.
   const landings = open
@@ -1937,6 +2153,16 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
     <section className="needsyou">
       <div className="ny-row">
         <span className="ny-t">⚠ waiting on you:</span>
+        {/* THE PROJECT blocker — FIRST, ahead of every xell: a pair the pool stopped filling has no
+            waiting xell to raise a chip, so this is the one way the bar is ever told about it. */}
+        {blockers.length > 0 && (
+          <button key="__proj-blockers__" className={`ny-chip proj${blockersOpen ? ' active' : ''}`}
+                  onClick={() => { setBlockersOpen((v) => !v); if (expandedId) onJump?.(null); }}
+                  title={`${projectLabel} has ${blockers.length} medic-dispatchable condition${blockers.length === 1 ? '' : 's'} — a machine×project that cannot build or provision. Click to review and ⛑ dispatch the infra-medic.`}>
+            ⚠ {projectLabel}
+            <span className="ny-n">{blockers.length} blocker{blockers.length === 1 ? '' : 's'} · ⛑ medic</span>
+          </button>
+        )}
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
                   title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.blocked && `an APPROVED landing is holding the runway with ${w.blockedBy} zee(s) queued behind it — it never landed`, w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`, w.envAlert && `.zeehive.env could NOT be reconciled and a zee is live in it${w.envFull ? `: ${w.envFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
@@ -1988,6 +2214,36 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
               {' '}Fix the cause (usually: re-point this xell&apos;s database) and the next reconcile clears this;
               the zee cannot.</div>
           )}
+        </div>
+      )}
+      {/* The PROJECT blocker's opened form — sibling to the xell decision above. Its chips are the
+          conditions a human can dispatch the infra-medic on (a PROVISION-INFRA card or a written
+          blocker); the CODE fact is excluded at the call site, matching the ProjectSetup row. */}
+      {blockersOpen && (
+        <div className="ny-decision" data-testid="ny-medic-decision">
+          <div className="ny-note" data-testid="ny-medic-note">
+            <b>⚠ {projectLabel}</b> cannot build or provision — the line{blockers.length === 1 ? '' : 's'} below
+            {' '}is on its conditions list as a live impediment a human can act on here. The <b>⛑
+            infra-medic</b> is a <b>manager zee on the Zeehive project</b> (the orchestrator&apos;s own — its
+            production database IS the meta-DB): briefed with the line verbatim and this project as its
+            target, it reads the whole meta-DB read-only and drives <b>this project&apos;s config</b> —
+            machines, pools, manifest cache, shared dev db — to convergence. It never touches another
+            project&apos;s code. {' '}<span className="ny-why">Nothing auto-spawns — dispatch takes a few seconds;
+            delete the line once the medic confirms the pair builds again.</span>
+          </div>
+          {blockers.map((c) => (
+            <div key={c.id} className="ny-blocker" data-testid={`ny-blocker-${c.id}`}>
+              <div className="ny-blocker-head">
+                <span className="ny-blocker-date">[<b>{String(c.updated_at || c.created_at || '').slice(0, 10)}</b>]</span>
+                <button type="button" className="pill" disabled={!!dispatching}
+                        onClick={() => dispatchOne(c)}
+                        title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
+                  {dispatching === c.id ? '⛑ dispatching…' : '⛑ Dispatch medic'}
+                </button>
+              </div>
+              <div className="ny-blocker-body">{c.body}</div>
+            </div>
+          ))}
         </div>
       )}
     </section>

@@ -404,6 +404,13 @@ export const resumeProviderAccount = (projectId, accountId) =>
 export const setProviderAlertAmount = (projectId, provider, amount) =>
   siteCall(`/api/projects/${projectId}/provider-alerts/${provider}`, 'PUT',
     { amount: amount === '' || amount == null ? null : amount });
+// The EXTERNAL TICKETING API's self-describing read (migration 190, TKT-184): keyless, so a
+// build script — or the console's Ticketing API panel — can resolve the externally-reachable base
+// URL a DEPLOYED project should POST to without holding a credential. Carries the attachment
+// limits and `base_url` (config.extApiBase on the server). ─────────
+export const getExtV1Info = () =>
+  fetch('/api/ext/v1/limits').then((r) => (r.ok ? r.json() : { ok: false, base_url: null }));
+
 // ── project API keys — the credential a DEPLOYED project presents to /api/ext/v1 (migration 190).
 // The plaintext key comes back ONCE, on create; every later read carries key_hint alone, so the
 // console must show it at mint time or never (lib/project-api-keys.js). ─────────
@@ -449,6 +456,10 @@ export const getProjectConditions = (projectId) => fetch(`/api/projects/${projec
 export const addProjectCondition = (projectId, body, actor) => siteCall(`/api/projects/${projectId}/conditions`, 'POST', { body, actor });
 export const updateProjectCondition = (condId, body, actor) => siteCall(`/api/project-conditions/${condId}`, 'PUT', { body, actor });
 export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditions/${condId}`, 'DELETE');
+// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card (the card's dispatch seam): the queenzee
+// claims a ready xell of the card's project, wears the infra-medic harness, and briefs it to fix
+// the PROJECT CONFIG. Returns the dispatch receipt ({ status:'dispatched', slug, worktree, … }).
+export const dispatchMedic = (condId) => siteCall(`/api/project-conditions/${condId}/dispatch-medic`, 'POST');
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
@@ -527,9 +538,12 @@ export const squashOffer = (r, branch = 'main') =>
   + `${branch}, on top of the remote base. The review diff is identical, the intermediate commits are not pushed, and `
   + `nothing local is rewritten.`;
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
-// Machine × project build-readiness (ticket #173): per-machine verdict {ok|unknown|missing}
-// with the failing check named, rendered in the container matrix where the pool knobs are set.
-export const getBuildReadiness = (projectId) => fetch(`/api/projects/${projectId}/build-readiness`).then((r) => r.json());
+// Machine × project build-readiness (ticket #173 + provision-proof §4.8): per-machine verdict
+// {ok|unknown|missing} with the failing check named, rendered in the container matrix. Default
+// reads the RECORDED verdict (the pool's proof cycle keeps it fresh — no probe click needed);
+// `refresh=1` runs the live probe and persists its result.
+export const getBuildReadiness = (projectId, refresh) =>
+  fetch(`/api/projects/${projectId}/build-readiness${refresh ? '?refresh=1' : ''}`).then((r) => r.json());
 // Machine × project build-bootstrap (ticket #173 follow-on): the one-click action that CREATES
 // the dev prerequisites the probe names as missing. dryRun (default) returns the plan and performs
 // nothing — the console shows it before a human commits; dryRun:false performs each step
@@ -906,6 +920,21 @@ export async function reapXell(xellId, reason = 'human-cleanup', force = false) 
   // The server refuses an ACTIVE xell without force and returns ok:false — surface that as an
   // error rather than letting the caller treat a refusal as a successful teardown.
   if (data?.ok === false) throw new Error(data.error || 'cleanup refused');
+  return data;
+}
+
+// RESCUE a quarantined xell (ticket #81: the RESCUE arm of the rescue-or-reap decision). Clears the
+// quarantine stamp (quarantined_at, quarantine_deaths, quarantine_reason, consecutive_deaths) so a
+// fresh agent may be dispatched into the SAME worktree/branch. The opposite of reap: the branch and
+// its unlanded work are kept. Idempotent — clearing an un-quarantined xell is a no-op (ok:true,
+// cleared:false), so a stale console button never 409s.
+export async function rescueXell(xellId, by = 'human@console') {
+  const r = await fetch(`/api/xells/${xellId}/unquarantine`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `rescue failed (${r.status})`);
+  if (data?.ok === false) throw new Error(data.error || 'rescue refused');
   return data;
 }
 

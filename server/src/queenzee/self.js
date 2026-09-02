@@ -15,8 +15,10 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
+import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource,
+         refreshCxellOriginMain } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
+import { metaDbHostPort } from '../lib/prod-readonly.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
 // about the branch it just walked into (see branchHandover).
@@ -55,6 +57,7 @@ import { startTurn, endTurn } from '../lib/turn-ledger.js';
 import { appendExecutionEvent } from '../lib/execution-events.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
+         invalidateCrewDiff,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
          NO_PUSH_REASON } from '../lib/managers.js';
 import { xellQuarantineRefusal } from '../lib/xell-quarantine.js';
@@ -67,8 +70,9 @@ import { uploadConversationArchive, conversationsForManager, harnessArchivalSett
 // The A2A outbound send (`zee a2a <card-url> --message "…"`, phase 4) — queenzee-mediated, recorded.
 import { sendExternalA2AMessage } from '../lib/a2a-outbound.js';
 // The A2A MEET group-chat rooms (`zee meet`, docs/zee-meet-plan.md) — the DB half lives here so
-// the self verbs below are thin. Any live zee of a project may create/attend a room by code.
-import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor } from '../lib/a2a-meet.js';
+// the self verbs below are thin. Any live zee of a project may create/attend a room by code;
+// a founder may invite another whole project (DR-5).
+import { createMeet, attendMeet, sayToMeet, listMeetsFor, transcriptFor, inviteToMeet } from '../lib/a2a-meet.js';
 // CURRENT CONDITIONS (ticket #67) — the short, dated, per-PROJECT list of live impediments
 // injected into every briefing. `zee conditions` is the read verb (every zee) and the manager's
 // write verb (--add / --remove). The lib owns the domain; this file adds the manager refusal.
@@ -147,6 +151,9 @@ export async function selfStatus(xell) {
       // The readiness preflight (#53), so a zee sees the same verdict a human does rather than
       // discovering the fault by tripping over it hours in.
       preflightFailed: !!xell.preflight_error,
+      // The provision proof (§4.8) — the burn-in's verdict, beside the preflight. A vacant xell
+      // whose chips were proven broken must read `dirty`, not `ready`.
+      proofFailed: !!xell.proof_error,
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
       // Queued for the runway (067) — the zee sees the same `holding` hexagon a human does, which is
       // how it can tell its push really did land in the pattern rather than vanish.
@@ -195,6 +202,27 @@ export async function selfStatus(xell) {
       // Production, readable but not writable — the manager's binding. Named separately from
       // `on_prod` so nothing downstream mistakes a reader for a writer.
       on_prod_readonly: xell.db_coupling === 'db-prod-readonly',
+    },
+    // READINESS (provision-proof §4.8) — the two evidence layers, beside each other so a zee can
+    // tell "never proven" from "proven broken". proofFailed above is the hive hexagon; this is the
+    // NAMED check, the preflight rule ("the check, named, or a human goes looking") applied to a
+    // zee reading its own status.
+    readiness: {
+      preflight: {
+        failed: !!xell.preflight_error,
+        error: xell.preflight_error || null,
+        checks: xell.preflight_checks || [],
+      },
+      proof: {
+        failed: !!xell.proof_error,
+        error: xell.proof_error || null,
+        checks: xell.proof_checks || [],
+        at: xell.proof_at || null,
+        commit: xell.proof_commit || null,
+        // NULL semantics contract: proof_at IS NULL = never proven (legacy — gates nothing);
+        // proof_at NOT NULL AND proof_error IS NULL = proven.
+        proven: !!(xell.proof_at && !xell.proof_error),
+      },
     },
     // ── the crew (managers) / who I report to (workers) ──
     ...(crew ? { crew: { count: crew.length, workers: crew,
@@ -462,6 +490,23 @@ export async function selfLand(xell) {
     : (healed && healed.state === 'merged' ? ` (after self-healing: merged current ${ref} into your cxell)` : '');
 
   if (push.landed) {
+    // TKT-185: the cage's origin/main is still the pre-land tip. Refresh it NOW (best-effort) so a
+    // manager's `zee zees` — or this zee's own next read — does not report the commits we just
+    // landed as still unlanded. nudgeXellAfterLand does the same on the human-approval path; this
+    // covers the already-approved re-push that lands without waiting on a nudge.
+    if (live && ref) {
+      try {
+        const r = await refreshCxellOriginMain({
+          ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref,
+        });
+        if (r?.refreshed) invalidateCrewDiff(xell.id);
+        else if (r && r.refreshed === false) {
+          logline('self', `${xell.slug}: post-land origin/main refresh skipped — ${r.reason || 'unknown'}`);
+        }
+      } catch (e) {
+        logline('self', `${xell.slug}: post-land origin/main refresh failed closed: ${String(e.message || e).slice(0, 200)}`);
+      }
+    }
     return {
       ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request: await landStatus(xell.id),
       message: withNote(`LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`),
@@ -708,6 +753,14 @@ async function selfHealSync(xell, ref) {
         [xell.id, xell.slug, `sync merge of ${ref} into the cxell`],
       ).catch((e) => logline('self', `could not record queenzee-sync door write: ${String(e.message).slice(0, 160)}`));
     }
+    // TKT-185: keep origin/main current after a sync so `zee zees` cannot cry wolf. sync already
+    // delivered the tip (deliverXourceIntoCxell); this is belt-and-suspenders and never throws.
+    try {
+      const r = await refreshCxellOriginMain({
+        ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref,
+      });
+      if (r?.refreshed) invalidateCrewDiff(xell.id);
+    } catch { /* never fail a sync on a refresh */ }
     return { ok: true, ...s };
   }
   if (s.state === 'conflict') {
@@ -1225,11 +1278,14 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 // lib/cxell-seal.js, which is now the single query behind all three seals (spawn, this re-seal, and
 // the re-seal of a cage restarted after a host reboot). Read it before touching any of them.
 async function resealCxellForStack(xellId) {
-  const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
+  const xell = await one(`SELECT slug, project_id, meta_ro_dsn FROM xell WHERE id=$1`, [xellId]);
   // prodBound: true — the bind has just been granted, so this xell's OWN prod db is now allowed (the
   // xell row this reads was written before the grant, so its coupling cannot say so yet). The query
   // itself, and the alias-only caveat above, live in lib/cxell-seal.js with the spawn seal's copy.
-  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, prodBound: true });
+  // A medic's meta-RO DSN (live → the bind was minted for this xell) must stay reachable across the
+  // re-seal, exactly as the spawn seal opens it.
+  const allowList = xell.meta_ro_dsn ? [metaDbHostPort()] : [];
+  const blockTcp = await prodDbBlockList({ projectId: xell.project_id, prodBound: true, allowList });
   const sealed = await sealCxell({ ctx: 'default', name: cxellName(xell.slug), blockTcp });
   return { blockTcp, tail: sealed[sealed.length - 1] || null };
 }
@@ -1662,6 +1718,14 @@ export async function selfBuild(xell, { role = null, hot = false } = {}) {
   let started;
   try { started = await buildXell(xell.id, { hot, role }); }
   catch (e) { return { ok: false, error: e.message, collected }; }
+
+  // buildXell catches per-container refusals into {error} so one bad container can't block its
+  // siblings — but when EVERY target refused to start (the production ship-only gate), nothing
+  // started and this is a FAILURE, not an ok:true "started" answer. Surface it loudly so `zee build`
+  // exits non-zero instead of printing a JSON with ok:true and a buried error.
+  if (Array.isArray(started) && started.length && started.every((s) => s && s.error)) {
+    return { ok: false, error: started.map((s) => s.error).join('; '), collected };
+  }
 
   const roleLabel = role || 'server + webapp';
   const from = collected?.collected ? `collected HEAD ${String(collected.head).slice(0, 8)}` : 'your worktree';
@@ -2550,20 +2614,22 @@ export async function selfA2ASend(xell, { card_url = null, message = null } = {}
 
 // ── A2A MEET — group chat rooms (`zee meet`, docs/zee-meet-plan.md) ────────────
 // The human directive: "i want agents to be able to talk to each other via some sort of peer to
-// peer a2a chat session like a group chat via a zee meet verb… zees can join and talk." These four
+// peer a2a chat session like a group chat via a zee meet verb… zees can join and talk." These
 // verbs are the self half of that surface (the CLI + routes are thin wrappers). Any live zee of a
 // project may create a room (create), attend a room by the code a founder printed (attend), post to
-// a room it is a member of (say), and list/read its rooms (list/transcript). The design decisions
-// are recorded in docs/zee-meet-decision-record.md — the short version: a room is a first-class
-// store (DR-1), attendance is self-serve and recorded (DR-2), and a post is one transcript row plus
-// a best-effort delivery fan-out (DR-3).
+// a room it is a member of (say), and list/read its rooms (list/transcript). A founder may invite
+// another whole project into the room (invite, DR-5). The design decisions are recorded in
+// docs/zee-meet-decision-record.md — the short version: a room is a first-class store (DR-1),
+// attendance is self-serve and recorded (DR-2), a post is one transcript row plus a best-effort
+// delivery fan-out (DR-3), and cross-project access is by explicit founder invite only (DR-5).
 export async function selfMeetCreate(xell, { title = null } = {}) {
   const r = await createMeet({ xell, title });
   if (!r.ok) return { ok: false, error: r.error };
   return {
     ok: true, meet_id: r.room.id, code: r.code, title: r.room.title,
     members: [{ slug: xell.slug, role: 'founder' }],
-    message: `Created meet "${r.room.title}". Hand this code to the zees you want in: \`zee meet attend ${r.code}\``,
+    message: `Created meet "${r.room.title}". Hand this code to the zees you want in: \`zee meet attend ${r.code}\`. `
+      + `To let another project's zees in: \`zee meet invite ${r.code} --project <name>\`.`,
   };
 }
 
@@ -2586,6 +2652,17 @@ export async function selfMeetSay(xell, { code = null, message = null } = {}) {
     ok: true, posted: r.posted, code: r.code, meet_id: r.meet_id, message: r.message,
     deliveries: r.deliveries,
     message_text: `Posted to ${r.code}. ${r.deliveries.length} live member(s) notified; the rest catch up with \`zee meet --transcript\`.`,
+  };
+}
+
+export async function selfMeetInvite(xell, { code = null, project = null, remove = false } = {}) {
+  const r = await inviteToMeet({ xell, code, project, remove: !!remove });
+  if (!r.ok) return { ok: false, error: r.error, matches: r.matches };
+  return {
+    ok: true, code: r.code, meet_id: r.meet_id, project: r.project,
+    invited: r.invited || false, removed: r.removed || false, already: r.already || false,
+    noop: r.noop || false, invites: r.invites || [],
+    message: r.message,
   };
 }
 

@@ -19,6 +19,46 @@ omnibiz, running on somebody else's server
    work items ──assigned──▶ a zee in a xell         ← the integration WATCHES this happen
 ```
 
+## 0. Reachability — where this API actually lives
+
+The server behind `/api/ext/v1` is **the ZEEHIVE queenzee**. A "deployed project" is a system
+running on **another host** — it has no xell, no console, no token; it holds a key and files
+tickets over HTTP. For that to work, the other host must be able to reach the queenzee over the
+network. That is a fact about the deployment, not a constant, and this section is the honest
+version of it.
+
+**The address an integrator should use is the API's own `base_url` answer, not a guessed
+constant.** Resolve it with the keyless probe (below) before you wire anything:
+
+```sh
+curl -s http://<the server you already know>/api/ext/v1/limits
+# → { "ok": true, "base_url": "http://10.1.0.15:4700", "attachments": { … } }
+```
+
+`GET /api/ext/v1/limits` needs **no key**, and `GET /api/ext/v1/whoami` (with a key) carries the
+same `base_url`. Both are generated from the server's single operator-settable value, so an
+integrator reading `base_url` off the API can never drift from the deployment.
+
+**How the address is set.** The server reads it from one place:
+
+| where | what |
+|---|---|
+| env `EXT_API_BASE` | the operator's explicit answer — a LAN `http://host:port`, a tunnel URL, or a reverse-proxy origin. **This is the one knob.** |
+| env `DEV_HOST_IP` | fallback when `EXT_API_BASE` is unset: the queenzee host's LAN address on the API port (`http://<DEV_HOST_IP>:4700`) |
+| neither set | `base_url` is `null` — **no externally-reachable address is configured**. The API says so plainly; it does not invent one. |
+
+**What "deployed project" means for reachability, today.** ZEEHIVE has **LAN ingress only**: the
+queenzee publishes its API port on its host and answers on that host's LAN address. There is no
+public URL unless the operator puts a tunnel or reverse proxy in front and sets `EXT_API_BASE` to
+it. So today a deployed project can file tickets if it can reach the queenzee's LAN address; it
+cannot from the public internet, and no amount of `host.docker.internal` cleverness changes that —
+that name means "the docker host *I* am running on", which for a deployed project is **its own
+host**, where no queenzee listens. That is the exact mistake that broke the omnibiz bridge (§6).
+
+**The `base_url` you see is the address you should hand the integration.** Do not substitute
+`host.docker.internal` for it, and do not copy a constant out of this document — read it off
+`/api/ext/v1/limits` or `/api/ext/v1/whoami`.
+
 ## Why it exists
 
 Everything a deployed project knows about its own faults — the exception its users hit, the log its
@@ -32,10 +72,10 @@ the same ticket back to see what the fleet did about it.
 ## 1. Getting a key
 
 Keys are **per project** and minted by a human in the console (Project setup → *Ticketing API
-keys*), or over the console API:
+keys*), or over the console API (`<base_url>` is the address from §0):
 
 ```sh
-curl -sX POST http://<queenzee>/api/projects/<project-id>/api-keys \
+curl -sX POST http://<base_url>/api/projects/<project-id>/api-keys \
      -H 'Content-Type: application/json' \
      -d '{"label":"omnibiz helpdesk","scopes":["tickets:read","tickets:write"]}'
 ```
@@ -77,9 +117,9 @@ inside the key's project.
 
 | | |
 |---|---|
-| `GET /api/ext/v1/whoami` | which project this key files into, its scopes, the vocabulary and the limits |
-| `GET /api/ext/v1/limits` | the attachment limits, **without a key** (a build script can check a file size before it holds a credential) |
-| `POST /api/ext/v1/tickets` | file one — `attachments[]` rides along |
+| `GET /api/ext/v1/whoami` | which project this key files into, its scopes, the vocabulary, the limits — and `base_url` (§0) |
+| `GET /api/ext/v1/limits` | the attachment limits and `base_url`, **without a key** (a build script can resolve the address and check a file size before it holds a credential) |
+| `POST /api/ext/v1/tickets` | file one — `attachments[]` rides along; answer carries `notified` (which managers woke, or why none did) |
 | `GET /api/ext/v1/tickets` | list yours — `?status=` `?kind=` `?q=` `?external_ref=` |
 | `GET /api/ext/v1/tickets/:ref` | **monitor** one: status, comments, attachments, and what the fleet is doing |
 | `PATCH /api/ext/v1/tickets/:ref` | update what you reported (rule 3) |
@@ -95,8 +135,13 @@ tell it.
 
 ### File a ticket with its evidence
 
+`<base_url>` is the address this API answers at — resolve it with the keyless `GET
+/api/ext/v1/limits` (§0), never hardcode it:
+
 ```sh
-curl -sX POST https://<queenzee>/api/ext/v1/tickets \
+BASE_URL=$(curl -s http://<the server you already know>/api/ext/v1/limits | jq -r .base_url)
+
+curl -sX POST "$BASE_URL/api/ext/v1/tickets" \
   -H "Authorization: Bearer $ZEEHIVE_TICKET_KEY" -H 'Content-Type: application/json' -d '{
     "title": "Checkout 504s on payment",
     "body":  "Every third order fails at the gateway.",
@@ -118,13 +163,25 @@ curl -sX POST https://<queenzee>/api/ext/v1/tickets \
 { "code": "TKT-41-9c2b", "ref": "#41", "status": "queued", "priority": 1,
   "attachments": [ { "id": "…", "filename": "screenshot.png", "kind": "image", "sha256": "…",
                      "download_url": "/api/ext/v1/tickets/…/attachments/…" } ],
-  "work": { "items": [], "count": 0, "open": 0 }, "deduped": false }
+  "work": { "items": [], "count": 0, "open": 0 }, "deduped": false,
+  "notified": { "managers": ["omnibiz-mgr"], "reason": null } }
 ```
+
+`notified` is create-only (POST, including a deduped 200). It is the observability contract: the
+caller must be able to tell whether anybody woke.
+
+| | |
+|---|---|
+| `notified.managers` | slugs of the project's deployed managers that were actually reached (inbox always; typed into a live cxell when one exists) |
+| `notified.reason` | `null` when `managers` is non-empty; otherwise why none were — `"no live manager in this project"` on a fresh create, or `"deduped: already filed"` on a repeat (which never re-notifies) |
+
+A `201` with `"managers": []` and `"reason": "no live manager in this project"` is a ticket that
+exists and nobody knows about — treat it as a problem in the integrator, not as health.
 
 ### Monitor it
 
 ```sh
-curl -s https://<queenzee>/api/ext/v1/tickets/TKT-41-9c2b -H "Authorization: Bearer $KEY"
+curl -s "$BASE_URL/api/ext/v1/tickets/TKT-41-9c2b" -H "Authorization: Bearer $KEY"
 ```
 
 ```json
@@ -185,7 +242,8 @@ The intended loop, for a project that has a helpdesk already:
 
 1. store the key as a secret in the deployed project (never in its repo);
 2. on a new helpdesk case, `POST /api/ext/v1/tickets` with the case id as `external_ref` and the
-   case URL as `external_url`, attaching whatever the customer sent;
+   case URL as `external_url`, attaching whatever the customer sent — the project's deployed
+   manager zees are notified on intake (inbox / live session), so the fleet learns it exists;
 3. on every later reply, `POST …/comments` (attachments ride along);
 4. poll `GET /api/ext/v1/tickets/:ref` — or the whole list — and mirror `status`, `status_label`
    and `work.items[].progress` back into the helpdesk;
@@ -194,13 +252,37 @@ The intended loop, for a project that has a helpdesk already:
 A project with **no** helpdesk gets the same value from a thin client: a form, a crash handler, or
 a CI job that files a ticket when a smoke test fails.
 
+### What the omnibiz bridge must change (TKT-184)
+
+The omnibiz helpdesk→ZEEHIVE bridge was built on the wrong address and sat **silently broken for
+two weeks**: no ticket it filed ever reached a board, and nothing said so. The concrete corrections
+on the omnibiz side:
+
+- **`ZEEHIVE_TICKETS_BASE_URL` must default to the resolved `base_url` from §0, not
+  `http://host.docker.internal:4700`.** That string means "the docker host I am running on" — for
+  the deployed omnibiz service that is **omnibiz's own host**, where no ZEEHIVE queenzee listens.
+  Read the real address with the keyless probe and point the client at it:
+  ```sh
+  BASE_URL=$(curl -s -m 10 http://<queenzee host>:4700/api/ext/v1/limits | jq -r .base_url)
+  export ZEEHIVE_TICKETS_BASE_URL="$BASE_URL"
+  ```
+- **Drop the `extra_hosts: host.docker.internal:host-gateway` wiring from
+  `docker-compose.prodsrc.yml`.** It exists to make `host.docker.internal` resolve to the deployed
+  host — the wrong address, made reachable. With the base URL set to the real queenzee address the
+  alias is both useless and a standing invitation to re-break the default.
+- The ZEEHIVE-side address is **LAN-only today** (see §0): omnibiz prod (host `10.2.0.16`) must be
+  able to route to the queenzee host (`10.1.0.15`, port `4700`) over the LAN, or a human must stand
+  up a tunnel/reverse proxy and set `EXT_API_BASE` on the server to the public URL. Whether to build
+  that ingress is a deployment decision, not an integration one.
+
 ## 7. What this deliberately does NOT do
 
-- **It does not notify a manager zee.** Handing a ticket to a manager types into a live agent
-  session (`POST /api/tickets/:id/notify`), and an external system must not be able to interrupt an
-  agent. A human (or a manager reading its own board) decides what to pick up.
 - **It does not assign, break down, or cast work.** Those are fleet verbs, and rule 3 is the same
-  argument.
+  argument. Filing through this door DOES notify the project's deployed manager zees (the same
+  `ticketManagers` + `notifyManagerOfTicket` path the console's Notify button and
+  `zee ticket --notify` use): the message lands in each manager's inbox, and is typed into a live
+  cxell session when one exists. A notification is not an order — nothing is assigned and no work
+  is cast. A deduped retry does not re-notify.
 - **It has no rate limiting of its own.** The key is the only gate today. If a key is abused,
   revoke it — and put a rate limit in front of the queenzee, where the rest of the ingress lives.
 - **It is not a webhook OUT.** An integration polls; nothing calls back into the deployed project.
@@ -209,9 +291,10 @@ a CI job that files a ticket when a smoke test fails.
 ## 8. Proving it
 
 `test/ticket-api-external.test.mjs` drives the whole surface over real HTTP against the real
-express router: minting and revoking keys, every refusal at the door, filing with evidence,
-idempotency, a byte-identical attachment round trip, monitoring by id/code/number, the update
-rules, cross-project isolation, and the console's view of the same rows.
+express router: minting and revoking keys, every refusal at the door, filing with evidence
+(and the manager-inbox notify that filing triggers), idempotency (including that a deduped
+retry does not re-notify), a byte-identical attachment round trip, monitoring by id/code/number,
+the update rules, cross-project isolation, and the console's view of the same rows.
 
 ```sh
 DATABASE_URL=… node test/ticket-api-external.test.mjs

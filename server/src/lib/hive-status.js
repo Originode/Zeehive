@@ -80,7 +80,7 @@ export function hiveStatus(x, sig = {}) {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
     landHint = false, shipHint = false, prodBindPending = false, seedPending = false,
     doneSuggested = false, landHolding = false, paused = false, xellPaused = false,
-    envAlert = false, preflightFailed = false, managerMintPending = false,
+    envAlert = false, preflightFailed = false, proofFailed = false, managerMintPending = false,
   } = sig;
 
   // ── production ──
@@ -140,12 +140,17 @@ export function hiveStatus(x, sig = {}) {
   // it wrote, and when the DSN it handed out is rejected — seven zees met exactly that in one night
   // (ticket #47) — `ready` is a lie that costs the next agent hours.
   //
+  // The PROVISION PROOF failed (provision-proof plan §4.8): a vacant xell whose burn-in found a
+  // broken chip (app-build / app-serve / db-open) must equally not read `ready` — the same lie,
+  // discovered the same way. proof_error is the failing check, named, for the chip and `zee status`.
+  //
   // It reuses `dirty` rather than adding a word: dirty already means "vacant and needs queenzee
   // housekeeping", which is precisely true here, and the failing CHECK is named on the row
-  // (preflight_error) for the chip and `zee status` — a hexagon colour was never going to carry it.
+  // (preflight_error / proof_error) for the chip and `zee status` — a hexagon colour was never
+  // going to carry it.
   // Deliberately only on a VACANT xell: an occupied one must keep showing what its zee is doing,
   // and a xell still `provisioning` has not been claimed ready by anyone yet.
-  if (s === 'ready')                     return preflightFailed ? 'vac-dirty' : 'vac-ready';
+  if (s === 'ready')                     return (preflightFailed || proofFailed) ? 'vac-dirty' : 'vac-ready';
 
   // ── occupied: a zee is on it. Human-actionable requests first, then live activity. ──
   if (shipPending)                       return 'occ-shipRequest';

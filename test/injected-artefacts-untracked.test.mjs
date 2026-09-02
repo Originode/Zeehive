@@ -84,16 +84,19 @@ for (const f of live) {
 // ── the OTHER class of injected artefact: a path the operator chooses ────────────────────────────
 // Project entry-point docs (migration 081) are generated into a xell at a repo-relative path like
 // AGENTS.md — outside the directories above, so an ignore rule cannot be the guard. The guard is that
-// the injector asks git first and refuses a TRACKED path, then excludes what it writes. This repo is
-// the perfect witness: its own CLAUDE.md is tracked, so a project doc could never overwrite it.
-console.log('\n── a generated project doc can never overwrite a tracked file ──');
+// the injector asks git first: a tracked path the row OWNS (overwriteTracked) is superseded —
+// written, git-excluded AND skip-worktree'd — while a tracked path no row claims stays TRACKED. This
+// repo is the perfect witness: its own CLAUDE.md is tracked, and a project doc now supersedes it.
+console.log('\n── a generated project doc supersedes an owned tracked path, protects an unrelated one ──');
 {
   const tracked = (p) => { try { git('ls-files', '--error-unmatch', '--', p); return true; } catch { return false; } };
-  ok(tracked('CLAUDE.md'), "this repo's own CLAUDE.md is tracked (the file a generated doc must not touch)");
+  ok(tracked('CLAUDE.md'), "this repo's own CLAUDE.md is tracked (the entry-point path the row now owns)");
   const injector = readFileSync(join(ROOT, 'server/src/lib/cxell.js'), 'utf8');
   const block = injector.slice(injector.indexOf('writeGeneratedDocIntoCxell'), injector.indexOf('export async function removeCxell'));
   ok(/git ls-files --error-unmatch/.test(block) && /echo TRACKED/.test(block),
-     'the injector asks git before writing and answers TRACKED rather than overwriting');
+     'the injector asks git before writing and answers TRACKED rather than overwriting an unrelated file');
+  ok(/WROTE_TRACKED/.test(block) && /skip-worktree/.test(block),
+     'and a tracked path the row OWNS is superseded: written, excluded and skip-worktree\'d');
   ok(/\.git\/info\/exclude/.test(block),
      'and adds what it DOES write to .git/info/exclude, so the artefact cannot reach a commit');
   // the decision itself is exercised against a real repo in test/project-docs.test.mjs

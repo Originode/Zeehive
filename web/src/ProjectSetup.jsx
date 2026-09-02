@@ -18,9 +18,11 @@ import {
   getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
   previewProjectDoc,
   getProjectConditions, addProjectCondition, updateProjectCondition, deleteProjectCondition,
+  dispatchMedic,
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
   getWireguard, mintWireguardPeer, setWireguardEndpoint,
   getProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
+  getExtV1Info,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -1979,8 +1981,9 @@ function SiteEditor({ site, run, busy }) {
 // four files and watches them drift.
 //
 // The three things it has to SAY, because they are the three ways an operator gets surprised:
-// a generated file is never written over a path the project has committed (git decides, in the cage),
-// it is git-excluded there (so fleet-wide instructions never appear in a landing diff), and every
+// this text is the SOURCE and the files in a workspace are artefacts of it — a tracked entry-point
+// path the row owns is SUPERSEDED (git-excluded + skip-worktree, so it never appears in a landing
+// diff), an unrelated tracked path is still protected (the repo's own file wins there), and every
 // generated file carries a stamp plus THAT xell's own stack inventory — which is why the copy in a
 // workspace is never quite what was typed here.
 export function ProjectDocsSection({ project, run, busy }) {
@@ -1999,13 +2002,14 @@ export function ProjectDocsSection({ project, run, busy }) {
     <div className="setup-sec" data-testid="project-docs-section">
       <h3>Docs <span className="pc">(the project's instructions for AI agents — written ONCE here, generated as each provider's entry-point file in every xell)</span></h3>
       <div className="pc">
-        What you type below is the <b>source of truth</b>. ZEEHIVE generates one file per provider from
-        it — <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>GEMINI.md</code>, … — each stamped as
-        generated, each ending with <b>that xell's own stack</b> (its containers, ports, database and
-        build verbs), and each added to the xell's git excludes so it never lands in a diff. If the
-        project has <b>committed</b> a file at one of those paths, the repo's own copy wins and nothing
-        is written there. Saving also regenerates them in the xells of any zees <b>already running</b>,
-        so a fix does not wait for the next dispatch.
+        What you type below is the <b>single source of truth</b>. ZEEHIVE generates one file per
+        provider from it — <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>GEMINI.md</code>, … —
+        each stamped as generated, each ending with <b>that xell's own stack</b> (its containers, ports,
+        database and build verbs), and each added to the xell's git excludes so it never lands in a
+        diff. If the project has <b>committed</b> a file at one of those paths, the generated copy
+        supersedes it in every xell — the row is the source, the committed file is the artefact. A
+        file <b>no row claims</b> is left alone. Saving also regenerates the files in the xells of any
+        zees <b>already running</b>, so a fix does not wait for the next dispatch.
       </div>
       {(docs || []).map((d) => (
         <ProjectDocEditor key={d.id} doc={d} targets={targets} run={wrapped} busy={busy} />
@@ -2143,9 +2147,22 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
 function ConditionsSection({ project, run, busy }) {
   const [conds, setConds] = useState(null);
   const [add, setAdd] = useState('');
+  const [medicMsg, setMedicMsg] = useState(null);   // result of the last dispatch-medic click
   const load = useCallback(() => getProjectConditions(project.id).then(setConds).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  // The ⛑ is the infra-medic dispatch seam (proof-routing §4.6, provision-proof plan §7): the
+  // route adds a MANAGER-type medic on the Zeehive project — the orchestrator's own, whose prod
+  // database IS the meta-DB — briefed with this card VERBATIM and the card's TARGET project, to
+  // fix the project's META-DB CONFIG (not this one xell) so the machine×project pair stops being
+  // broken. A human clicks; nothing auto-spawns.
+  const dispatch = async (c) => {
+    setMedicMsg('⛑ dispatching the infra-medic…');
+    try {
+      const r = await run(() => dispatchMedic(c.id));
+      setMedicMsg(`⛑ medic dispatched → xell ${r?.slug || r?.xell_id || '?'}`);
+    } catch { setMedicMsg(null); }   // the panel's err line already told the human why
+  };
   return (
     <div className="setup-sec" data-testid="conditions-section">
       <h3>Current conditions <span className="pc">(the short, dated list of LIVE IMPEDIMENTS injected into every briefing — EPHEMERAL, the opposite of the docs)</span></h3>
@@ -2156,8 +2173,21 @@ function ConditionsSection({ project, run, busy }) {
         read back with <code>zee conditions</code>. This is <b>not documentation</b>: when a line stops
         being true, delete it — a stale line is worse than none, so there is no archive and no confirm.
       </div>
+      {medicMsg && <div className="pc" data-testid="medic-dispatch-msg">{medicMsg}</div>}
       {(conds || []).map((c) => {
         const d = String(c.updated_at || c.created_at || '').slice(0, 10);
+        const body = String(c.body || '');
+        // The ⛑ is the medic's dispatch seam — shown on EVERY row except the rolling CODE fact
+        // ("main does not build since <sha>", proof-routing §4.6). A PROVISION-INFRA card is the
+        // auto seam, and a HAND-WRITTEN blocker line ("OMNIBIZ cannot provision — the NAS is out of
+        // addresses") is the same surface: a human wrote it BECAUSE the project's build/provision
+        // is impeded, and the medic (a manager on Zeehive, briefed with this card verbatim) is the
+        // config-fixing agent for exactly that. The CODE fact says the machine CAN build — a code
+        // fault is that project's crew, never the config-medic, so the button must not point a
+        // human at the wrong tool. The server route carries the real walls (MANAGER-only, and the
+        // medic's own scope wall once briefed); this is the affordance, and it is better to show it
+        // too wide than to hide the one button a human is looking for.
+        const showMedic = !body.startsWith('main does not build since');
         return (
           <div key={c.id} className="setup-row" data-testid={`condition-${c.id}`}>
             <input value={c.body} data-condition-id={c.id}
@@ -2167,6 +2197,13 @@ function ConditionsSection({ project, run, busy }) {
                    onBlur={(e) => { const v = String(e.target.value || '').trim();
                      if (v && v !== c.body) wrapped(() => updateProjectCondition(c.id, v, 'human')); }}
                    style={{ minWidth: 360 }} />
+            {showMedic && (
+              <button type="button" className="pill" disabled={busy}
+                      onClick={() => dispatch(c)}
+                      title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
+                ⛑ Dispatch medic
+              </button>
+            )}
             <span className="pc" title="last touched (the date injected into briefings)">[<b>{d}</b>]</span>
             <span className="pc">{c.updated_by || ''}</span>
             <button type="button" className="hm-del" disabled={busy}
@@ -2690,8 +2727,10 @@ function ApiKeysSection({ project, run, busy }) {
   const [label, setLabel] = useState('');
   const [minted, setMinted] = useState(null);   // the plaintext, shown once
   const [copied, setCopied] = useState(false);
+  const [ext, setExt] = useState(null);          // { base_url, base_url_note } — the address a deployed project POSTs to
   const load = useCallback(() => getProjectApiKeys(project.id).then(setKeys).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { getExtV1Info().then(setExt).catch(() => {}); }, []);
 
   const mint = () => run(async () => {
     const out = await createProjectApiKey(project.id, label.trim());
@@ -2724,6 +2763,18 @@ function ApiKeysSection({ project, run, busy }) {
         A key names one project and nothing else: the caller never sends a project id, so it cannot
         reach another board. Tickets filed through it are ordinary tickets — break them down and
         assign zees exactly as usual.
+      </div>
+
+      <div className="pc" style={{ marginBottom: 8 }}>
+        <b>The address a deployed project uses:</b>{' '}
+        {ext?.base_url ? (
+          <span className="mono">{ext.base_url}</span>
+        ) : (
+          <span className="gate g-warn">not configured — no externally-reachable address</span>
+        )}{' '}
+        <button type="button" className="ghost" onClick={() => navigator.clipboard?.writeText(ext?.base_url || '')}
+                title="Copy the base URL">⧉ copy</button>
+        {ext?.base_url_note ? <div className="pc">{ext.base_url_note}</div> : null}
       </div>
 
       {minted && (
