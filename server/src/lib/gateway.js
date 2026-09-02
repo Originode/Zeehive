@@ -825,7 +825,7 @@ export async function gatewayProxy(req, res) {
     if (medic && medic.status !== 'retired') xell = medicSubject(medic);
   }
   if (!xell) {
-    return res.status(401).json({ error: 'gateway: unknown identity (the token in the path matches no live xell and no medic)' });
+    return res.status(401).json({ error: 'gateway: unknown xell/medic identity (the token in the path matches no live xell and no medic)' });
   }
   // Which dialect does the provider speak? openai + kimi are the OpenAI-compatible CLIs
   // (/v1/chat/completions); claude + deepseek run the claude CLI (Anthropic dialect, /v1/messages).
