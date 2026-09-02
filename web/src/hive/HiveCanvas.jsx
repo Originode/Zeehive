@@ -4,6 +4,7 @@ import { hiveColor, hiveStatusLabel, hiveHeat } from './status.js';
 import { isManagerXell, isRouterXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
 import { providerArtOf } from '../providerArt.js';
 import { harnessGear, drawGearLayer } from '../harnessGear.js';
+import { PLUS_MENU_OPTIONS, WORK_NODE_OPTIONS } from './plusMenu.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -182,6 +183,20 @@ export function xellTooltipParts(x) {
     directive: x?.task_text ? firstLine(x.task_text) : null,
     status: hiveStatusLabel(x),
     fault: x?.preflight_error || x?.proof_error || null,
+  };
+}
+
+// The facts a WORK-NODE hover tooltip shows — the counterpart of xellTooltipParts for a cell that
+// is a work item (a task/activity rendered as a vacant seat, or a xell-backed node), pure so the
+// imperative DOM code stays dumb and a test can assert the content without a browser. `kind` is the
+// work_item_kind ('project'|'activity'|'task'); `children` is the open-card count (the ⬡ chip).
+export function workNodeTooltipParts(it) {
+  return {
+    head: it?.title || '—',
+    kind: it?.kind || 'task',
+    kindLabel: it?.kind ? `${it.kind.charAt(0).toUpperCase()}${it.kind.slice(1)}` : 'Task',
+    status: it?.status || 'queued',
+    children: Number(it?.work_children) || 0,
   };
 }
 // compact burn formatters (mirror the dashboard's fmtTok/fmtUsd) for the per-xell burn on the flower
@@ -629,10 +644,17 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
                                     // 'project' is a top-level work_node (a project), and 'worknode'
                                     // is a child work_node with no live xell (a vacant seat). Clicks
                                     // on them route here instead of the flower.
-                                    onOpenProject, onOpenNode, onNodeAssign }) {
+                                    onOpenProject, onOpenNode, onNodeAssign,
+                                    // ── the '+ hexagon' create menu ──────────────────────────────
+                                    // Clicking the persistent + hexagon opens a DOM menu; the four
+                                    // options call back here (App decides what each opens — the
+                                    // dispatch composer, the manager variant, the work tracker, or a
+                                    // new work node). kind ∈ 'prompt'|'manager'|'ticket'|'project'
+                                    // |'activity'|'task'.
+                                    onPlusAction }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
-  const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null });
+  const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null, plus: null });
   const imgCacheRef = useRef(new Map());   // avatar_url → HTMLImageElement (harness badge art)
   const drawRef = useRef(() => {});        // latest draw(), so an image onload can trigger a redraw
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
@@ -651,6 +673,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
   const [ctxXell, setCtxXell] = useState(null);
   // ── the QUEENZEE node's right-click menu (DOM, like the xell one): {x,y} at the cursor ──
   const [ctxQueenzee, setCtxQueenzee] = useState(null);
+  // ── the '+ hexagon' create menu (DOM, like the context menus): null closed | {x,y} open. The
+  //    menu has a MAIN level (prompt/manager/ticket/work_node) and, under work_node, a SUB level
+  //    (project/activity/task) — both are clickable DOM, never canvas-painted buttons. ──
+  const [plusMenu, setPlusMenu] = useState(null);   // {x, y, sub:false}
+  const [plusSub, setPlusSub] = useState(false);    // true = the work_node sub-menu is showing
   // ── queenzee↔xell activity arrows: xell_id → {dir,kind,t0,_id}. Fed by the SSE stream's
   //    queenzee-activity events (App.jsx → queenzeeActivity prop), drained here, drawn as
   //    animated dashed lines in a RAF loop while any are alive. ──
@@ -717,6 +744,54 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     }
     tip.el.style.display = 'block';
   };
+  // The WORK-NODE hover tooltip — the same imperative DOM pattern as showXellTooltip, one element,
+  // content rebuilt only when the node CHANGES. Renders a task/activity node's title + kind + status,
+  // which is exactly what a vacant work-node seat cannot fit on its hexagon (drawWorkNodeHex has
+  // room for a title and a status word, but not a kind + a child count + the status read whole).
+  const showWorkNodeTooltip = (item, e) => {
+    if (!item) { hideXellTooltip(); return; }
+    const tip = xellTipRef.current;
+    if (!tip.el) {
+      tip.el = document.createElement('div');
+      tip.el.className = 'hive-xell-tooltip';
+      wrapRef.current?.appendChild(tip.el);
+    }
+    if (tip.id !== `wn:${item.id}`) {
+      tip.id = `wn:${item.id}`;
+      tip.el.textContent = '';
+      const parts = workNodeTooltipParts(item);
+      const head = document.createElement('div');
+      head.className = 'hive-xt-head';
+      head.textContent = parts.head;
+      const role = document.createElement('span');
+      role.className = 'hive-xt-role';
+      role.textContent = parts.kindLabel;
+      head.appendChild(role);
+      tip.el.appendChild(head);
+      const dir = document.createElement('div');
+      dir.className = 'hive-xt-dir';
+      dir.textContent = `⬡ ${parts.kind}${parts.children ? ` · ${parts.children} open` : ''}`;
+      tip.el.appendChild(dir);
+      const st = document.createElement('div');
+      st.className = 'hive-xt-status';
+      st.textContent = `status · ${parts.status}`;
+      tip.el.appendChild(st);
+    }
+    const bb = wrapRef.current?.getBoundingClientRect();
+    if (bb) {
+      tip.el.style.left = `${e.clientX - bb.left + 14}px`;
+      tip.el.style.top = `${e.clientY - bb.top + 18}px`;
+    }
+    tip.el.style.display = 'block';
+  };
+  // One routing decision for both tooltips: a cell with a WORK_ITEM is a work node (a vacant seat
+  // OR a xell-backed node — both carry it), so it shows the node's own title/kind/status; a plain
+  // xell (no hex_kind) shows the xell's directive+status; a project cell shows neither.
+  const cellTooltip = (x, e) => {
+    if (x?.work_item) showWorkNodeTooltip(x.work_item, e);
+    else if (!x?.hex_kind) showXellTooltip(x, e);
+    else hideXellTooltip();
+  };
 
   const expanded = expandedId ? (xells || []).find((x) => x.id === expandedId) : null;
   useEffect(() => { if (expandedId && !expanded) setExpandedId?.(null); }, [expandedId, expanded, setExpandedId]);
@@ -747,9 +822,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // stroke doesn't clip against the pane border, and let hexes grow bigger (raised `max`) when
     // there are few enough xells that the honeycomb was previously capped well under the pane size.
     const pad = 6;
-    // One extra cell in the layout: the QUEENZEE node occupies the top-left cell (0,0), so the
-    // grid must size for xells + the node or the last xell would overflow the pane.
-    const lay = layoutHoneycomb(list.length + 1, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
+    // Two extra cells in the layout: the QUEENZEE node occupies the top-left cell (0,0) and the
+    // persistent '+ hexagon' sits in the cell BESIDE it (0,1), so the grid must size for xells +
+    // both reserved cells or the last xell would overflow the pane.
+    const lay = layoutHoneycomb(list.length + 2, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
     const cellSize = lay.size;                    // gapless layout cell → the routing lattice
     // corridor gap: a FIXED single-lane gap — the honeycomb no longer sizes itself by the number of
     // traces that must pass (the wire overlay collapsed parallel lanes into one dashed alternating-
@@ -763,11 +839,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // seat once to learn where the expanded xell sits, then re-seat with its six neighbours reserved
     // and its own cell pinned, so the bloom opens exactly where the hexagon already was.
     const cols = Math.max(1, lay.cols);
-    // The QUEENZEE node is not a work-cell: its cell is reserved before any xell is seated, so a
-    // xell (or a manager's crew reaching for its nearest free cell) can never sit on it.
+    // The QUEENZEE node is not a work-cell, and neither is the + hexagon beside it: both cells are
+    // reserved before any xell is seated, so a xell (or a manager's crew reaching for its nearest
+    // free cell) can never sit on either.
     const qzKey = cellKey(0, 0);
-    const baseCells = seatXells(list, cols, { reserved: new Set([qzKey]) });
-    const reserved = new Set([qzKey]);
+    const plusKey = cellKey(0, 1);
+    const baseCells = seatXells(list, cols, { reserved: new Set([qzKey, plusKey]) });
+    const reserved = new Set([qzKey, plusKey]);
     let cells = baseCells;
     if (expanded && baseCells[expanded.id]) {
       const [er, ec] = baseCells[expanded.id];
@@ -962,6 +1040,15 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     geomRef.current.queenzee = { cx: qzCx, cy: qzCy, size: drawSize };
     geomRef.current.queenzeeLogs = qzLogsRect;
 
+    // ── the '+ hexagon': a persistent create affordance in the cell BESIDE the queenzee (0,1) ──
+    // A dashed blank hex with a '+', drawn AFTER the queenzee node so it never collides with it.
+    // Its geometry is recorded (like the queenzee node's) so onPointerMove/onPointerUp can hit-test
+    // it and a click opens the + menu (prompt / manager / ticket / work_node).
+    const [plusCx, plusCy] = cellCenter(0, 1, cellSize, originX, originY);
+    const plusHover = pointInHex(hoverWorldRef.current.x, hoverWorldRef.current.y, plusCx, plusCy, drawSize);
+    drawPlusHex(ctx, plusCx, plusCy, drawSize, { hover: plusHover });
+    geomRef.current.plus = { cx: plusCx, cy: plusCy, size: drawSize };
+
     // ── queenzee↔xell activity arrows (animated dashed lines, driven by SSE events) ─────────────
     // Prune expired lines first so the RAF loop can see when nothing is left and stop. STICKY
     // arrows (a live ship → production) never expire here — they ride fleet.shipping status and
@@ -1155,6 +1242,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const r = geomRef.current.queenzeeLogs;
     return r && wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h ? r : null;
   }, []);
+  const hitPlus = useCallback((wx, wy) => {
+    const p = geomRef.current.plus;
+    return p && pointInHex(wx, wy, p.cx, p.cy, p.size) ? p : null;
+  }, []);
   const hitFlower = useCallback((wx, wy) => {
     const f = geomRef.current.flower;
     if (!f) return null;
@@ -1217,8 +1308,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
   const onPointerDown = (e) => {
     // A LEFT-press on the canvas closes an open context menu (right-press must NOT — it is what
     // opened it; the browser fires contextmenu after pointerdown, so closing here would race it).
+    // The + menu closes the same way; a click on the + hexagon itself reopens it in onPointerUp.
     if (ctxXell && e.button === 0) setCtxXell(null);
     if (ctxQueenzee && e.button === 0) setCtxQueenzee(null);
+    if (plusMenu && e.button === 0) setPlusMenu(null);
     const [mx, my] = relPos(e);
     pointersRef.current.set(e.pointerId, { x: mx, y: my });
     if (pointersRef.current.size === 1) {
@@ -1281,10 +1374,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       // the expanded hex's own cell is under the flower's centre petal — hovering it must not light
       // it as "another xell" (it is already the selection), so it only counts when it is a DIFFERENT one
       const hx = hxRaw && hxRaw.id !== expandedId ? hxRaw : null;
-      const hb = (!cw && !b && !flowerHit && !cont && !hx) ? hitHarness(wx, wy) : null;
+      const plusHit = (!cw && !b && !flowerHit && !cont && !hx) ? hitPlus(wx, wy) : null;
+      const hb = (!cw && !b && !flowerHit && !cont && !hx && !plusHit) ? hitHarness(wx, wy) : null;
       cursor = cw || b || flowerHit ? 'pointer'
         : cont ? 'context-menu'                                    // right-click hint on an icon
-        : (hx || hb) ? 'pointer' : 'default';
+        : (hx || hb || plusHit) ? 'pointer' : 'default';
       // The hover signal is the primary event (it lights the related hexes, wires and commit dots),
       // so it is emitted before the two display tooltips that may ride along on the same move.
       emitHover({ id: hx?.id ?? cw?.id ?? null, commit: null, harness: hb?.id || null });
@@ -1314,11 +1408,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         tooltip.kind = null;
         tooltip.el.style.display = 'none';
       }
-      // Xell tooltip — the directive + status of the xell under the cursor. A button's own tooltip
-      // wins (hx is null over a button); a crew dot and a plain hex both name a xell. A work-node /
-      // project cell is not a xell — its hexagon already says everything the tooltip would.
+      // Hover tooltip — the directive + status of the xell under the cursor, or the title/kind/status
+      // of a work-node cell (a vacant seat or a xell-backed node). A button's own tooltip wins (hx is
+      // null over a button); a crew dot always names a xell. cellTooltip routes the two node kinds;
+      // the + hexagon shows nothing (its label is already on it).
       if (cw) showXellTooltip(xellOf(cw.id), e);
-      else if (hx && !xellOf(hx.id)?.hex_kind) showXellTooltip(xellOf(hx.id), e);
+      else if (plusHit) hideXellTooltip();
+      else if (hx) cellTooltip(xellOf(hx.id), e);
       else hideXellTooltip();
       if (hitNodeBtn(wx, wy)) cursor = 'pointer';
     } else {
@@ -1329,15 +1425,15 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         if (hx) {
           emitHover({ id: hx.id, commit: null, harness: null });   // a hex is ONE xell → key on id
           cursor = 'pointer';
-          // a work-node / project cell is not a xell — no directive tooltip for it
-          if (xellOf(hx.id)?.hex_kind) hideXellTooltip();
-          else showXellTooltip(xellOf(hx.id), e);
+          // work-node cells get the node's own tooltip; a project cell gets none; a xell its own
+          cellTooltip(xellOf(hx.id), e);
         } else {
           const qz = hitQueenzee(wx, wy);
           // a 'none' terminal is an explicitly disabled node: the hex click does nothing, so the
           // cursor reads 'default' rather than promising an action — the logs button still answers
           // 'pointer' above via hitQueenzeeLogs.
           if (qz) { cursor = qzTerminalStatus === 'none' ? 'default' : 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
+          else if (hitPlus(wx, wy)) { cursor = 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
           else {
             // no hex or queenzee under the cursor → a harness badge lights up its consumer xells
             const hb = hitHarness(wx, wy);
@@ -1352,6 +1448,14 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     }
     canvasRef.current.style.cursor = cursor;
   };
+  // Open the + hexagon's create menu at the cursor, closing any other menu (one menu at a time —
+  // the same rule the xell/queenzee context menus follow). The menu starts at its MAIN level.
+  const openPlusMenu = (e) => {
+    setCtxXell(null); setCtxQueenzee(null);
+    setPlusSub(false);
+    setPlusMenu({ x: e.clientX, y: e.clientY });
+  };
+
   const onPointerUp = (e) => {
     const wasPinching = !!pinchRef.current;
     pointersRef.current.delete(e.pointerId);
@@ -1418,12 +1522,16 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       // activity log, the node itself opens a shell into the queenzee machine.
       if (hitQueenzeeLogs(wx, wy)) { onQueenzeeLogs?.(); return; }
       if (hitQueenzee(wx, wy)) { onQueenzeeTerminal?.(); return; }
+      // the + hexagon is persistent — a click opens the create menu whether or not a bloom is open.
+      if (hitPlus(wx, wy)) { openPlusMenu(e); return; }
       setExpandedId(null);
       return;
     }
     // the QUEENZEE node — logs button first (the smaller target), then the node itself.
     if (hitQueenzeeLogs(wx, wy)) { onQueenzeeLogs?.(); return; }
     if (hitQueenzee(wx, wy)) { onQueenzeeTerminal?.(); return; }
+    // the + hexagon — persistent create affordance; a click opens the create menu.
+    if (hitPlus(wx, wy)) { openPlusMenu(e); return; }
     // the work-node chips answer before the hex under them
     const nb = hitNodeBtn(wx, wy);
     if (nb) {
@@ -1516,11 +1624,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     hoverWorldRef.current = { x: NaN, y: NaN };   // queenzee-node hover glow fades
     if (tipRef.current.el) { tipRef.current.kind = null; tipRef.current.el.style.display = 'none'; }
     hideXellTooltip();
+    setPlusMenu(null); setPlusSub(false);
   };
 
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Escape') {
+        if (plusMenu) { setPlusMenu(null); setPlusSub(false); return; }   // dismiss the menu first
         if (ctxXell) { setCtxXell(null); return; }   // dismiss the menu first — never reset the view for it
         if (expandedId) setExpandedId(null);
         else { viewRef.current = { x: 0, y: 0, k: 1 }; draw(); }   // Esc with nothing open: reset view
@@ -1528,7 +1638,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [expandedId, draw, ctxXell]);
+  }, [expandedId, draw, ctxXell, plusMenu]);
 
   // Close the xell context menu on any outside interaction — the same close-on-anything the container
   // context menu uses (App.jsx): click, another contextmenu, scroll, Escape. Attached only while the
@@ -1565,6 +1675,29 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       window.removeEventListener('keydown', onKey);
     };
   }, [ctxQueenzee]);
+
+  // Same close-on-anything for the '+ hexagon' menu. The xell/queenzee menus open on a RIGHT click
+  // (contextmenu), so a document click listener cannot catch the very gesture that opened them. The
+  // + menu opens on a LEFT click, whose click event would fire right after — so the listener is
+  // attached on the NEXT tick, letting the opening click finish first.
+  useEffect(() => {
+    if (!plusMenu) return;
+    const close = () => { setPlusMenu(null); setPlusSub(false); };
+    const onKey = (e) => e.key === 'Escape' && close();
+    const t = setTimeout(() => {
+      document.addEventListener('click', close);
+      document.addEventListener('contextmenu', close);
+      window.addEventListener('scroll', close, true);
+    }, 0);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('click', close);
+      document.removeEventListener('contextmenu', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [plusMenu]);
 
   // wheel must be non-passive to preventDefault page scroll
   useEffect(() => {
@@ -1628,6 +1761,46 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
             ⌨ terminal{qzTerminalStatus === 'none' ? ' (no prod server)'
               : qzTerminalStatus === 'down' ? ' (server down)' : ''}
           </button>
+        </div>
+      )}
+      {/* The '+ hexagon' create menu — a DOM overlay at the cursor, exactly like the context menus
+          above (clickable DOM, never canvas-painted buttons, so it survives redraws). MAIN level:
+          prompt / manager / ticket / work_node; the work_node item swaps to a SUB level (project /
+          activity / task). Each choice calls onPlusAction(kind) then closes; the sub-level back
+          button returns without closing. */}
+      {plusMenu && (
+        <div className="ctxmenu hive-plus-ctx" style={{ left: plusMenu.x, top: plusMenu.y }} role="menu"
+             onClick={(e) => e.stopPropagation()}
+             onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+          <div className="ctxhead">+ create <span className="ctxsub">· a new thing</span></div>
+          {!plusSub ? (
+            PLUS_MENU_OPTIONS.map((o) => (
+              o.kind === 'work_node' ? (
+                <button key={o.kind} role="menuitem" onClick={() => setPlusSub(true)}>
+                  <span>{o.label} <span className="ctx-sub-arrow">▸</span></span>
+                  <span className="ctxsub">{o.sub}</span>
+                </button>
+              ) : (
+                <button key={o.kind} role="menuitem"
+                        onClick={() => { setPlusMenu(null); setPlusSub(false); onPlusAction?.(o.kind, { menu: 'plus' }); }}>
+                  <span>{o.label}</span>
+                  <span className="ctxsub">{o.sub}</span>
+                </button>
+              )
+            ))
+          ) : (
+            <>
+              <button role="menuitem" className="ctx-back"
+                      onClick={() => setPlusSub(false)}>◂ work node</button>
+              {WORK_NODE_OPTIONS.map((o) => (
+                <button key={o.kind} role="menuitem"
+                        onClick={() => { setPlusMenu(null); setPlusSub(false); onPlusAction?.(o.kind, { menu: 'plus' }); }}>
+                  <span>{o.label}</span>
+                  <span className="ctxsub">{o.sub}</span>
+                </button>
+              ))}
+            </>
+          )}
         </div>
       )}
       {(!xells || xells.length === 0) && (
@@ -1761,6 +1934,30 @@ export function drawProjectHex(ctx, hx, { hover, dim }) {
   ctx.fillStyle = NODE.muted;
   const n = Number(p.xell_count) || 0;
   ctx.fillText(`${n} xell${n === 1 ? '' : 's'} · open ⬡`, cx, cy + size * 0.4);
+  // Under the count, one status-coloured dot per xell in this project — the same colour its own
+  // hexagon would be painted one level down (statusColor is the hexagon-fill vocabulary), so the
+  // count and the dots read as the same fleet. project_xells rides only the SELECTED project's cell
+  // (App.jsx feeds it when p.id === projectId); the other project hexagons keep the bare count. The
+  // row is capped at what fits the bottom band; the overflow is counted in words, not crammed in.
+  const px = Array.isArray(x.project_xells) ? x.project_xells : [];
+  if (px.length) {
+    const dy = size * 0.56;                 // just below the count line, still inside the wide band
+    const y = cy + dy;
+    const r = Math.max(2, size * 0.045);
+    const gap = r * 2.7;
+    const halfW = hexHalfWidthAt(size, dy) * 0.94;
+    const shown = Math.min(px.length, Math.max(1, Math.floor((halfW * 2 - r * 2 + gap) / gap)));
+    const x0 = cx - ((shown - 1) * gap) / 2;
+    for (let i = 0; i < shown; i++) {
+      ctx.beginPath(); ctx.arc(x0 + i * gap, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = statusColor(px[i]); ctx.fill();
+    }
+    if (px.length > shown) {
+      ctx.font = `${Math.min(9.5, size * 0.12)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = NODE.muted;
+      ctx.fillText(`+${px.length - shown}`, cx, y + r * 3);
+    }
+  }
   ctx.restore();
 }
 
@@ -2543,6 +2740,33 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
 // rect. `logo` is a preloaded HTMLImageElement of the brand mark (same getImg path harness
 // avatars use); when it is not yet loaded the ⌂ glyph stands in so the node never draws empty.
 //
+// The persistent BLANK '+ hexagon' — the create affordance drawn in the cell beside the queenzee
+// node (0,1). A dashed blank hex with a centred '+', the same not-a-work-cell dashed language the
+// vacant work-node seat uses, but with no title/status/chip: it is not a cell, it is a button. Its
+// geometry is recorded (geomRef.current.plus) and hit-tested so a click opens the + menu.
+export function drawPlusHex(ctx, cx, cy, size, { hover = false } = {}) {
+  const s = size;
+  ctx.save();
+  hexPath(ctx, cx, cy, s);
+  ctx.fillStyle = withAlpha(NODE.fill, hover ? 0.95 : 0.8);
+  ctx.fill();
+  ctx.setLineDash([6, 4]);
+  ctx.lineWidth = hover ? 2.2 : 1.4;
+  ctx.strokeStyle = withAlpha(NODE.stroke, hover ? 1 : 0.6);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = withAlpha(NODE.text, hover ? 1 : 0.75);
+  ctx.font = `600 ${Math.max(12, s * 0.42)}px 'Segoe UI', sans-serif`;
+  ctx.fillText('+', cx, cy + 1);
+  if (s >= 26) {
+    ctx.font = `600 ${Math.max(6.5, s * 0.09)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = withAlpha(NODE.muted, hover ? 1 : 0.65);
+    ctx.fillText('NEW', cx, cy + s * 0.46);
+  }
+  ctx.restore();
+}
+
 // `terminal` is the node's TERMINAL availability ('ready' | 'down' | 'none'). When it is not
 // 'ready' the node is drawn with an explicit disabled state — a muted hex plus a "no terminal" /
 // "server down" tag under the label — so the absence of a shell is visible BEFORE the click,

@@ -128,6 +128,19 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .setup-grid label.setup-check { flex-direction: row; align-items: center; gap: 6px; }
 .setup-grid label.setup-check .pc { flex-basis: 100%; }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+/* the '+ hexagon' NESTED-project create: a forced git-behavior picker. Options are cards — radio,
+   but big enough to hold the label AND its one-line consequence, so a human can decide on sight
+   what "submodule" vs "just use the main repo" actually means for their monorepo. */
+.nested-proj { border: 1px dashed var(--line); border-radius: 8px; padding: 10px; background: var(--panel); }
+.nested-git-label { display: block; font-size: 12px; color: var(--text); margin: 6px 0 4px; }
+.nested-git-opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px; }
+.nested-git-opt { display: flex; flex-direction: column; gap: 2px; padding: 8px; border: 1px solid var(--line);
+  border-radius: 7px; cursor: pointer; background: var(--bg); }
+.nested-git-opt.sel { border-color: var(--accent); background: rgba(91,140,255,.08); }
+.nested-git-opt input { accent-color: var(--accent); }
+.nested-git-opt-label { font-size: 13px; font-weight: 600; color: var(--text); }
+.fsb-confine { display: block; margin: 2px 0 4px; font-size: 11px; }
+.fsb-confine b { font-family: ui-monospace, monospace; }
 
 /* Docs tab: one editor per SOURCE text, with the provider files it generates ticked below it. A
    DISABLED doc is dimmed but still readable — it is text somebody wrote, not a deleted thing. */
@@ -841,6 +854,16 @@ a.cbox:hover { border-color: var(--accent); }
 .ctxmenu button.ctxitem-danger:hover { background: #b3261e; color: #fff; }
 .ctxmenu button.ctxitem-danger:hover .ctxsub { color: rgba(255,255,255,.85); }
 .ctxmenu.confirming { min-width: 250px; }
+/* the '+ hexagon' create menu: a label can carry a sub-line AND a ▸ affordance; the back button on
+   the work-node SUB level is muted and separated so it reads as navigation, not a choice */
+.ctxmenu .ctx-sub-arrow { float: right; color: var(--muted); font-size: 10px; padding-left: 8px; }
+.ctxmenu button:hover .ctx-sub-arrow { color: rgba(255,255,255,.75); }
+.ctxmenu button.ctx-back { color: var(--muted); border-bottom: 1px solid var(--line);
+  border-radius: 0; margin-bottom: 2px; font-size: 11px; }
+.ctxmenu button.ctx-back:hover { color: var(--text); background: var(--panel); }
+/* the '+ hexagon' create menu — a touch wider than the xell/queenzee menus so an option's sub-line
+   has room to read whole */
+.ctxmenu.hive-plus-ctx { min-width: 230px; }
 /* the second-stage confirmation panel */
 .ctxconfirm { padding: 4px 8px 8px; }
 .ctxconfirm .ctxwarn-id { padding: 2px 0 8px; }
