@@ -2082,9 +2082,11 @@ function ConditionsSection({ project, run, busy }) {
   const load = useCallback(() => getProjectConditions(project.id).then(setConds).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
-  // A PROVISION-INFRA card is the infra-medic dispatch seam (proof-routing §4.6): the queenzee
-  // claims a ready xell of the project, wears the infra-medic harness, and briefs it to fix the
-  // PROJECT CONFIG (not this one xell) so the pair proves green again.
+  // The ⛑ is the infra-medic dispatch seam (proof-routing §4.6, provision-proof plan §7): the
+  // route adds a MANAGER-type medic on the Zeehive project — the orchestrator's own, whose prod
+  // database IS the meta-DB — briefed with this card VERBATIM and the card's TARGET project, to
+  // fix the project's META-DB CONFIG (not this one xell) so the machine×project pair stops being
+  // broken. A human clicks; nothing auto-spawns.
   const dispatch = async (c) => {
     setMedicMsg('⛑ dispatching the infra-medic…');
     try {
@@ -2105,7 +2107,18 @@ function ConditionsSection({ project, run, busy }) {
       {medicMsg && <div className="pc" data-testid="medic-dispatch-msg">{medicMsg}</div>}
       {(conds || []).map((c) => {
         const d = String(c.updated_at || c.created_at || '').slice(0, 10);
-        const isMedicCard = String(c.body || '').startsWith('PROVISION-INFRA:');
+        const body = String(c.body || '');
+        // The ⛑ is the medic's dispatch seam — shown on EVERY row except the rolling CODE fact
+        // ("main does not build since <sha>", proof-routing §4.6). A PROVISION-INFRA card is the
+        // auto seam, and a HAND-WRITTEN blocker line ("OMNIBIZ cannot provision — the NAS is out of
+        // addresses") is the same surface: a human wrote it BECAUSE the project's build/provision
+        // is impeded, and the medic (a manager on Zeehive, briefed with this card verbatim) is the
+        // config-fixing agent for exactly that. The CODE fact says the machine CAN build — a code
+        // fault is that project's crew, never the config-medic, so the button must not point a
+        // human at the wrong tool. The server route carries the real walls (MANAGER-only, and the
+        // medic's own scope wall once briefed); this is the affordance, and it is better to show it
+        // too wide than to hide the one button a human is looking for.
+        const showMedic = !body.startsWith('main does not build since');
         return (
           <div key={c.id} className="setup-row" data-testid={`condition-${c.id}`}>
             <input value={c.body} data-condition-id={c.id}
@@ -2115,10 +2128,10 @@ function ConditionsSection({ project, run, busy }) {
                    onBlur={(e) => { const v = String(e.target.value || '').trim();
                      if (v && v !== c.body) wrapped(() => updateProjectCondition(c.id, v, 'human')); }}
                    style={{ minWidth: 360 }} />
-            {isMedicCard && (
+            {showMedic && (
               <button type="button" className="pill" disabled={busy}
                       onClick={() => dispatch(c)}
-                      title="Dispatch the infra-medic to fix this project's config (manifest/compose/machine) so the pair builds and proves green">
+                      title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
                 ⛑ Dispatch medic
               </button>
             )}
