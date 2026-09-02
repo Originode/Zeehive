@@ -14,7 +14,8 @@ import { config } from '../config.js';
 import { pool, q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
-import { computePorts, emitXellEnv } from '../lib/provision.js';
+import { computePorts, emitXellEnv, freeAppSlot } from '../lib/provision.js';
+import { queenzeeHostCtx } from '../lib/machines.js';
 import { namingFor } from '../lib/manifest.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
@@ -77,9 +78,30 @@ export async function renameXellForTask(xellId, title) {
     return { renamed: false, reason: res?.reason || 'script failed' };
   }
 
-  // Ports/names are a pure function of the slug — recompute so the DB matches what a future
-  // build will actually create.
-  const ports = computePorts(newSlug, project);
+  // Names are a pure function of the slug — recompute so the DB matches what a future build will
+  // actually create. PORTS are not: the new slug hashes to a slot somebody else may already hold,
+  // and a rename runs on every dispatch, so this is where most of the live duplicates came from
+  // (a renamed xell landing on a pooled xell's pair). Allocate against real ownership, exactly as
+  // provisioning now does — passing this xell's CURRENT pair as `own`, because the rows being
+  // re-stamped are not an obstacle to themselves (an unchanged slot must stay unchanged). Failure
+  // degrades to the formula: a rename must never fail over a port read.
+  const formulaPorts = computePorts(newSlug, project);
+  const current = await q(
+    `SELECT role, host_port, docker_ctx FROM container
+      WHERE owner_xell_id=$1 AND role IN ('server','webapp') AND host_port IS NOT NULL`, [xellId])
+    .catch(() => []);
+  const renameCtx = current.find((c) => c.role === 'server')?.docker_ctx || queenzeeHostCtx();
+  const ports = await freeAppSlot(renameCtx, {
+    serverBase: formulaPorts.serverPort - formulaPorts.slot,
+    webBase: formulaPorts.webPort - formulaPorts.slot,
+    slot: formulaPorts.slot,
+    own: current.map((c) => Number(c.host_port)),
+  }).catch(() => formulaPorts);
+  if (ports.slot !== formulaPorts.slot) {
+    logline('rename', `${newSlug}: slot ${formulaPorts.slot} (:${formulaPorts.serverPort}/`
+      + `:${formulaPorts.webPort}) is already held on ${renameCtx} — renaming onto slot ${ports.slot} `
+      + `(:${ports.serverPort}/:${ports.webPort})`);
+  }
   const worktree = `${root}/.claude/worktrees/${newSlug}`;
   // runner: process rows carry NO image/compose — the rename must not re-stamp them (they were
   // deliberately NULL at provision). Same per-role/tier resolution provision uses.

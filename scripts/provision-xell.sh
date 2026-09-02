@@ -26,11 +26,17 @@ HOST_IP="${DEV_HOST_IP:-10.1.0.18}"
 BRANCH="spinoff/$SLUG"
 WT="$ROOT/.claude/worktrees/$SLUG"
 
-# deterministic ports from the slug (mirror of spin-env.sh)
+# deterministic ports from the slug (mirror of spin-env.sh) — the STARTING guess only.
+#
+# The formula cannot see who already owns a host port, and with a 90-slot modulus two slugs collide
+# often: the loser's stack died at "Bind for 0.0.0.0:5324 failed: port is already allocated". The
+# QUEENZEE allocates the real pair (recorded rows ∪ docker-published ports) and passes it in, so an
+# inherited SPINOFF_SERVER_PORT/SPINOFF_WEB_PORT WINS here exactly as it already does in
+# spin-env.sh. Called by hand with neither set, the formula is unchanged.
 HASH="$(printf '%s' "$SLUG" | md5sum | cut -c1-4)"
 SLOT="$(( 16#$HASH % 90 ))"
-SERVER_PORT=$((3100 + SLOT))
-WEB_PORT=$((5200 + SLOT))
+SERVER_PORT="${SPINOFF_SERVER_PORT:-$((3100 + SLOT))}"
+WEB_PORT="${SPINOFF_WEB_PORT:-$((5200 + SLOT))}"
 URL="http://$HOST_IP:$WEB_PORT"
 
 # PROVISIONING IS ALL-OR-NOTHING. Everything below runs under `set -e`, so ANY later failure
@@ -70,9 +76,15 @@ HEAD="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # 2) bring up this worktree's ephemeral app tier (shares dev db/infra).
 #    Skipped when PROVISION_APP_TIER=false — worktree-only provisioning (no NAS churn).
 if [ "${PROVISION_APP_TIER:-true}" = "true" ] && [ -f "$WT/scripts/spin-env.sh" ]; then
-  ( cd "$WT" && SPINOFF_DOCKER_CONTEXT="$CTX" DEV_HOST_IP="$HOST_IP" bash scripts/spin-env.sh up >&2 )
+  # The resolved pair is passed DOWN explicitly (spin-env.sh's own documented override): the stack
+  # must bind the ports the queenzee recorded, not re-derive the colliding formula for itself.
+  ( cd "$WT" && SPINOFF_DOCKER_CONTEXT="$CTX" DEV_HOST_IP="$HOST_IP" \
+      SPINOFF_SERVER_PORT="$SERVER_PORT" SPINOFF_WEB_PORT="$WEB_PORT" bash scripts/spin-env.sh up >&2 )
 fi
 
-# 3) emit the machine-readable result the pool maintainer ingests
+# 3) emit the machine-readable result the pool maintainer ingests.
+#    The reported slot is the one actually USED (the ports may have been allocated past a
+#    collision), so a human reading this line and a human reading `docker ps` see one story.
+SLOT=$((SERVER_PORT - 3100))
 printf '{"slug":"%s","branch":"%s","worktree":"%s","head":"%s","slot":%d,"server_port":%d,"web_port":%d,"url":"%s","server_container":"omnibiz_spin_server_%s","web_container":"omnibiz_spin_web_%s"}\n' \
   "$SLUG" "$BRANCH" "$WT" "$HEAD" "$SLOT" "$SERVER_PORT" "$WEB_PORT" "$URL" "$SLUG" "$SLUG"

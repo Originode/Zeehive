@@ -14,13 +14,14 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
-import { spinComposeDbPort } from './provision.js';
+import { spinComposeDbPort, repairCollidedAppPorts } from './provision.js';
 import { npmCacheEnv } from '../lib/npm-cache.js';
 import {
   processRoleReachableHost, processRolePublishedUrl,
   probePublishedRole, publishedUrl,
 } from '../queenzee/containers.js';
 import { assertSpinoffNotOnProdNetworks } from './spinoff-network-guard.js';
+import { composeContainerName } from './compose-names.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
@@ -165,6 +166,57 @@ async function resolveBuildTarget(c) {
   return { runCtx, buildCtx, registry };
 }
 
+// ── ONE COMPOSE STACK, ONE `compose up` AT A TIME ─────────────────────────────────────────────
+// A xell's server and webapp are two ROWS but ONE compose project, and `docker compose up` is not
+// safe to run twice against the same project at once. omnibiz's spinoff compose says
+// `webapp: depends_on: [server]`, so `up -d webapp` creates the SERVER container too — and when the
+// proof kicks both roles off together (xell-proof.js builds every unbuilt role, `zee build` can do
+// the same) the two invocations race:
+//
+//   Network omnibiz-spin-quiet-atlas-34a97a_spinoff  Creating     ← twice, in one build's log
+//   Container omnibiz_spin_server_quiet-atlas-34a97a Creating
+//   service:server:1 Error response from daemon: Conflict. The container name
+//   "/omnibiz_spin_server_quiet-atlas-34a97a" is already in use by container "e570a1f0…".
+//
+// That Conflict is docker's "error response from daemon", so classifyBuildFailure calls it INFRA,
+// which writes build_readiness_record 'missing' and STOPS the project's pool fill (pool.js
+// fillStopReasonFor) — omnibiz stopped provisioning xells on local AND ugreen-nas for exactly this.
+// The loser's container is not even wrong: the sibling created it correctly a second earlier.
+//
+// So the docker work of one stack is serialized here — the row still flips to 'building' at once
+// (the spinner and the API answer are unchanged), it just waits its turn to touch the daemon. The
+// key is (run context, xell): one xell is one compose project, and two xells are never the same
+// stack, so different xells keep building in parallel.
+//
+// DEGRADE, NEVER DEADLOCK: a build that somehow never returns must not wedge every later build of
+// that xell forever, so the wait is bounded (BUILD_STACK_WAIT_MS, default 15min) and then we go
+// anyway — a possible race is strictly better than a permanent freeze.
+const STACK_WAIT_MS = Number(process.env.BUILD_STACK_WAIT_MS) || 15 * 60 * 1000;
+const stackQueues = new Map();
+
+export const stackKeyFor = (c) => `${c?.docker_ctx || 'default'}::${c?.owner_xell_id || c?.id}`;
+
+// Exported for the test: run `fn` after everything already queued on `key` has finished.
+export function onStack(key, fn, { maxWaitMs = STACK_WAIT_MS, onWait = null } = {}) {
+  const prev = stackQueues.get(key);
+  if (prev && onWait) { try { onWait(); } catch { /* logging must never break a build */ } }
+  let gate = prev || Promise.resolve();
+  if (prev && maxWaitMs > 0) {
+    // The timer is CLEARED the moment the previous build settles, so the only thing it can ever
+    // keep alive is a wait that is genuinely still waiting.
+    gate = new Promise((release) => {
+      const t = setTimeout(release, maxWaitMs);
+      const done = () => { clearTimeout(t); release(); };
+      prev.then(done, done);
+    });
+  }
+  const run = gate.then(fn, fn);               // the previous build's OUTCOME is not ours to inherit
+  const tail = run.then(() => {}, () => {});
+  stackQueues.set(key, tail);
+  tail.then(() => { if (stackQueues.get(key) === tail) stackQueues.delete(key); });
+  return run;
+}
+
 // Async spawn (NOT spawnSync) — a real image build would otherwise freeze the event loop.
 // `recorded` carries the meta-DB's compose/env/port facts as env overrides; the script keeps its
 // own derivation as fallback, so a bare invocation (or an old row with NULLs) still works.
@@ -295,12 +347,41 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
         prodComposeYaml: prodYaml,
       });
     }
+
+    // THE COMPOSE FILE NAMES THE CONTAINER, NOT THE TEMPLATE. The row's name came from the
+    // project's naming template at provision time; if this branch's compose pins a different
+    // `container_name:`, the template is simply wrong about reality and every name-keyed reader
+    // (health matching, `docker exec`, decommission) is aimed at a container that never exists.
+    // omnibiz's webapp was `omnibiz_spin_web_{slug}` in compose and `omnibiz_spin_webapp_{slug}`
+    // in the meta-DB: the rows read 'down' minutes after their own builds reported success, so
+    // app-serve:webapp could never pass and the readiness proof could never say 'ok'.
+    // Re-stamp before the build so what we record is what the daemon will hold. Conservative by
+    // construction: composeContainerNameFor answers null for "no pin / cannot resolve", and null
+    // changes nothing.
+    if (spinYaml) {
+      const service = project?.manifest?.roles?.[c.role]?.service || c.role;
+      const real = composeContainerName(spinYaml, service, { SPINOFF_SLUG: xell.slug });
+      if (real && real !== c.name) {
+        const was = c.name;
+        c = await one(`UPDATE container SET name=$2 WHERE id=$1 RETURNING *`, [c.id, real]);
+        broadcast('container', c);
+        logline('build', `${xell.slug}: ${c.role} container is named "${real}" by `
+          + `${spinRel} — the meta-DB said "${was}" (naming template). Re-stamped: a row that names `
+          + 'a container docker never creates reads down forever.');
+      }
+    }
   }
 
   if (buildCtx !== undefined) c = await setBuildCtxRow(c, buildCtx);
   // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
   // registry fails fast with an actionable error rather than stranding a spinner.
   const target = await resolveBuildTarget(c);
+  // A pair of app ports another xell already holds is not a race — it is a duplicate the formula
+  // era wrote into the meta-DB, and it is true every time it is read: this build would ask for a
+  // port the neighbour owns, die with "port is already allocated", be classed INFRA and stop the
+  // project's pool fill. Re-stamp the rows first (first come keeps the port), so the projection
+  // below carries ports that can actually bind. A no-op for every xell without a duplicate.
+  if (c.owner_xell_id) await repairCollidedAppPorts(c.owner_xell_id);
   const siblings = await q(
     `SELECT role, host_port FROM container WHERE owner_xell_id=$1 AND role = ANY($2)`,
     [c.owner_xell_id, [...BUILDABLE, 'db']]);
@@ -338,7 +419,11 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
 
   // background — do NOT await; a real build takes minutes
   (async () => {
-    const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded });
+    const { json, err } = await onStack(stackKeyFor(c),
+      () => runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded }),
+      { onWait: () => logline('build', `${c.name}: another role of ${xell.slug} is already inside `
+          + `docker compose on ${c.docker_ctx || 'default'} — waiting for that build to finish (one `
+          + `compose project, one \`up\` at a time)`) });
     const ok = !!json && json.ok !== false;
     const failReason = ok ? null : formatBuildFailure(err);
     const failureClass = ok ? null : classifyBuildFailure(failReason);

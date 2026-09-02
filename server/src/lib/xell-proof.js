@@ -143,7 +143,9 @@ export function buildReadinessRecordFromProof(verdict) {
 //
 // opts:
 //   roles        — restrict which buildable roles to prove (default ['server','webapp']).
-//   timeoutMs    — the whole settle budget (default PROOF_TIMEOUT_MS).
+//   timeoutMs    — the settle budget PER BUILD (default PROOF_TIMEOUT_MS). Roles of one xell share
+//                  one compose project, so lib/build.js runs them one at a time; N builds take N
+//                  build times, and a queue must not be reported as a hang.
 //   mode         — 'real' proves; anything else is a full no-op (default: the module PROOF_MODE,
 //                  which is 'real' only when BUILD_MODE≠simulate AND PROVISION_MODE=real).
 //   deps         — injection seam for tests: { preflight, buildXell, getBuildStatus,
@@ -225,8 +227,11 @@ export async function proveXell(xellId, {
       }
     }
 
-    // Wait for every build to settle (bounded).
-    const settled = await waitForSettle(xellId, timeoutMs, status);
+    // Wait for every build to settle (bounded). The builds we just kicked off are SERIALIZED per
+    // compose stack (lib/build.js), so two roles cost two build times — budget per build, or the
+    // second role's honest wait gets reported as "did not settle".
+    const budgetMs = timeoutMs * Math.max(1, toBuild.length);
+    const settled = await waitForSettle(xellId, budgetMs, status);
 
     // ── 2 (verdict) + 3. app-build / app-serve per role ────────────────────────────────────
     for (const c of containers) {
@@ -240,7 +245,7 @@ export async function proveXell(xellId, {
         checks.push(pass(`app-build:${name}`, `built @ ${after.last_build_commit || 'unknown'} (${after.health})`));
       } else if (after && after.health === 'building') {
         checks.push(fail(`app-build:${name}`,
-          `build did not settle within ${timeoutMs}ms — still building (see container row)`));
+          `build did not settle within ${budgetMs}ms — still building (see container row)`));
       } else {
         const detail = after?.last_build_error || 'build failed (container down)';
         checks.push(fail(`app-build:${name}`, detail, classifyBuildFailure(detail)));

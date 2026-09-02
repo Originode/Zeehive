@@ -110,38 +110,175 @@ export function publishedPortsFromPs(output) {
   return ports;
 }
 
-// The first free db host port for `slot` on `ctx`. Never throws: a read that cannot complete must
-// not fail a provision — the caller (docker run) remains the arbiter of a genuinely taken port.
-export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = null, skip = [], docker = dockerAdapter } = {}) {
-  const formula = Number(base) + slot;
+// Every host port on `ctx` that something already owns, for the given container ROLES: the union of
+// (meta-DB recorded host ports) ∪ (the daemon's published ports) ∪ (ports this caller already lost
+// at bind). Shared by both allocators so the db tier and the app tier read ownership the SAME way.
+// Never throws — a read that cannot complete must not fail a provision.
+//
+// PROCESS-runner rows carry docker_ctx NULL (a bare process in a worktree, no daemon), yet they
+// publish on the QUEENZEE HOST's ports. So when the target context IS the queenzee host, those
+// row-less-of-context rows are counted too — otherwise a process xell's :3147 is invisible to the
+// container xell that is about to ask the same host for :3147.
+// `own` is the inverse of `skip`: host ports the CALLER already holds and is about to re-stamp (a
+// rename re-ports the very rows it is reading). They are not an obstacle to themselves, so they are
+// removed from the union last — but never a port the caller explicitly listed in `skip`, which is
+// how a caller says "I am fleeing this one".
+async function takenHostPorts(ctx, { roles, skip = [], own = [], docker = dockerAdapter, who = 'alloc' }) {
   const taken = new Set();
-  // Host ports this caller already FAILED to bind (the bind-refusal retry walks past them so the
-  // search makes forward progress even if the daemon read does not yet see the racer).
   for (const p of skip) taken.add(Number(p));
-  // meta-DB recorded db host ports on THIS context — the other xells (modeled or live) this one
-  // would collide with even when the daemon is unreachable.
+  const onHost = ctx === queenzeeHostCtx();
   const recorded = await q(
-    `SELECT host_port FROM container WHERE role='db' AND docker_ctx=$1 AND host_port IS NOT NULL`, [ctx])
+    `SELECT host_port FROM container
+      WHERE role = ANY($1) AND host_port IS NOT NULL
+        AND (docker_ctx = $2 OR (docker_ctx IS NULL AND $3))`, [roles, ctx, onHost])
     .catch(() => []);
   for (const r of recorded) taken.add(Number(r.host_port));
   // the daemon's published ports — the source of truth for what is actually bound. Bounded, async,
   // and failure-tolerant: an unreachable daemon degrades to meta-DB-only (logged, never a hang).
   const ps = await docker(ctx, ['ps', '--format', '{{.Ports}}'], { timeout: 4000 });
   if (ps?.unknown) {
-    console.warn(`[provision] freeDbHostPort (${ctx}): ${ps.reason} — allocating from the meta-DB `
-      + `recorded db ports only; a daemon-side collision will surface as a bind refusal and retry`);
+    console.warn(`[provision] ${who} (${ctx}): ${ps.reason} — allocating from the meta-DB `
+      + `recorded ports only; a daemon-side collision will surface as a bind refusal and retry`);
   } else {
     for (const p of publishedPortsFromPs(ps?.stdout)) taken.add(p);
   }
+  const skipped = new Set(skip.map(Number));
+  for (const p of own) if (!skipped.has(Number(p))) taken.delete(Number(p));
+  return taken;
+}
+
+// The bounded walk window — how far up from the formula slot an allocation may look.
+const allocWindow = () => Number(process.env.PORT_ALLOC_WINDOW) || 64;
+
+// The first free db host port for `slot` on `ctx`. Never throws: a read that cannot complete must
+// not fail a provision — the caller (docker run) remains the arbiter of a genuinely taken port.
+export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = null, skip = [], docker = dockerAdapter } = {}) {
+  const formula = Number(base) + slot;
+  const taken = await takenHostPorts(ctx, { roles: ['db'], skip, docker, who: 'freeDbHostPort' });
   // Walk up a bounded window from the formula slot. If every port in the window is claimed (a very
   // full hive), fall back to the FORMULA port and let the bind refusal/retry below be the arbiter —
   // a provision never fails on a crowded host by guessing a port the caller cannot use.
-  const window = Number(process.env.PORT_ALLOC_WINDOW) || 64;
+  const window = allocWindow();
   for (let s = slot; s < slot + window; s++) {
     const port = Number(base) + s;
     if (!taken.has(port)) return port;
   }
   return formula;
+}
+
+// The app tier's host ports (server + webapp) for `slot` on `ctx` — the SAME allocation the db tier
+// already got, for the two ports that were still a pure formula.
+//
+// Why this exists: computePorts() hands out base+slot with nobody checking, so two xells whose slugs
+// hash to the same slot are handed the SAME server/web ports. The meta-DB shows that happening in
+// the live hive (two xells on ctx 'default' both recorded :4824/:5324), and the loser's spin stack
+// dies at `Bind for 0.0.0.0:5324 failed: port is already allocated`. That failure is classed INFRA,
+// which writes build_readiness_record='missing', which makes fillStopReasonFor STOP the pool fill
+// for the whole project on that machine — one slot collision silently halts a project's pooling.
+//
+// The two ports move TOGETHER (one slot, both bases) so the pairing every other reader assumes —
+// spin-env.sh's slot, the compose file, a human reading :31xx/:52xx as "the same xell" — survives.
+// A slot is only free when BOTH its ports are free. Same contracts as freeDbHostPort: bounded walk,
+// failure-tolerant reads, and a fully-claimed window falls back to the FORMULA slot so a provision
+// never fails on a crowded host by guessing (the bind stays the arbiter).
+export async function freeAppSlot(ctx, { serverBase = 3100, webBase = 5200, slot = 0, skip = [], own = [], docker = dockerAdapter } = {}) {
+  const sb = Number(serverBase);
+  const wb = Number(webBase);
+  const formula = { slot, serverPort: sb + slot, webPort: wb + slot };
+  const taken = await takenHostPorts(ctx, { roles: ['server', 'webapp'], skip, own, docker, who: 'freeAppSlot' });
+  const window = allocWindow();
+  for (let s = slot; s < slot + window; s++) {
+    if (!taken.has(sb + s) && !taken.has(wb + s)) return { slot: s, serverPort: sb + s, webPort: wb + s };
+  }
+  return formula;
+}
+
+// REPAIR a xell whose recorded app-tier pair is ALREADY OWNED by another xell's rows.
+//
+// freeAppSlot stops NEW collisions; it cannot undo the ones the formula era already wrote into the
+// meta-DB. Those rows are not a race — they are a duplicate that is true every time it is read, so
+// the losing xell can never build: `docker compose up` asks for a port its neighbour holds, dies
+// with "port is already allocated", the failure is classed INFRA, and the project's pool fill stops
+// on that machine. A human re-porting rows by hand is the only cure today (it is what "not
+// provisioning xells" has been costing), and there is nothing to decide: the duplicate is visible
+// in the meta-DB and the fix is the allocation this module already performs.
+//
+// So the build path repairs it, ONCE, deterministically:
+//   • only a DUPLICATE recorded row counts (another owner's row on the same context and port) —
+//     never the daemon, which quite correctly shows THIS xell's own containers holding its ports;
+//   • FIRST COME KEEPS THE PORT: the older xell (by ready_at/created_at, then id) never moves, so
+//     two xells building at once cannot swap places or chase each other up the ladder;
+//   • the rows and the URL are re-stamped together, and .zeehive.env is re-projected, so the cage
+//     and the compose stack agree with the meta-DB.
+// Never throws — a repair that cannot complete leaves the xell exactly as it found it and lets the
+// build fail the way it already would.
+export async function repairCollidedAppPorts(xellId, { docker = dockerAdapter } = {}) {
+  try {
+    const xell = await one(`SELECT id, slug, project_id, ready_at, created_at FROM xell WHERE id=$1`, [xellId]);
+    if (!xell) return { repaired: false, reason: 'no such xell' };
+    const mine = await q(
+      `SELECT id, role, host_port, docker_ctx, url FROM container
+        WHERE owner_xell_id=$1 AND tier='spinoff' AND role IN ('server','webapp') AND host_port IS NOT NULL`,
+      [xellId]);
+    const server = mine.find((c) => c.role === 'server');
+    const webapp = mine.find((c) => c.role === 'webapp');
+    if (!server || !webapp) return { repaired: false, reason: 'no app-tier pair recorded' };
+    const ctx = server.docker_ctx || queenzeeHostCtx();
+
+    // Who else claims either of my two ports on this context? (docker_ctx NULL = a process role on
+    // the queenzee host, which is a real claim when that is where I run — the same rule the
+    // allocator uses.)
+    const onHost = ctx === queenzeeHostCtx();
+    const clashes = await q(
+      `SELECT c.id, c.host_port, c.owner_xell_id, x.slug, COALESCE(x.ready_at, x.created_at) AS since
+         FROM container c LEFT JOIN xell x ON x.id = c.owner_xell_id
+        WHERE c.role IN ('server','webapp') AND c.host_port = ANY($1)
+          AND (c.docker_ctx = $2 OR (c.docker_ctx IS NULL AND $3))
+          AND (c.owner_xell_id IS DISTINCT FROM $4)`,
+      [[Number(server.host_port), Number(webapp.host_port)], ctx, onHost, xellId]);
+    if (!clashes.length) return { repaired: false, reason: 'no duplicate' };
+
+    // FIRST COME KEEPS THE PORT. An unowned row (a shared container holding the port) always wins:
+    // it is not a xell and cannot be asked to move.
+    const since = xell.ready_at || xell.created_at;
+    const iAmOlder = clashes.every((c) => c.owner_xell_id && c.since && since && new Date(c.since) > new Date(since));
+    if (iAmOlder) {
+      return { repaired: false, reason: 'this xell holds the ports first — the newer one moves' };
+    }
+
+    const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+    const formula = computePorts(xell.slug, project || {});
+    const next = await freeAppSlot(ctx, {
+      serverBase: formula.serverPort - formula.slot,
+      webBase: formula.webPort - formula.slot,
+      slot: formula.slot,
+      // my OWN current pair is what I am fleeing — never re-allocate onto it
+      skip: [Number(server.host_port), Number(webapp.host_port)],
+      docker,
+    });
+    if (next.serverPort === Number(server.host_port) || next.webPort === Number(webapp.host_port)) {
+      return { repaired: false, reason: 'no free slot to move to' };
+    }
+
+    const restamp = async (row, port) => {
+      const url = row.url ? String(row.url).replace(/:\d+$/, `:${port}`) : row.url;
+      const updated = await one(
+        `UPDATE container SET host_port=$2, url=$3 WHERE id=$1 RETURNING *`, [row.id, port, url]);
+      if (updated) broadcast('container', updated);
+    };
+    await restamp(server, next.serverPort);
+    await restamp(webapp, next.webPort);
+    // the cage reads its ports from .zeehive.env — re-project so it agrees with the rows
+    await emitXellEnv(xellId).catch(() => { /* best effort: the rows are the source of truth */ });
+    const held = clashes.map((c) => `${c.slug || 'unowned'}:${c.host_port}`).join(', ');
+    logline('build', `${xell.slug}: recorded app ports :${server.host_port}/:${webapp.host_port} are `
+      + `already held on ${ctx} (${held}) — re-stamped to :${next.serverPort}/:${next.webPort} before building`);
+    return { repaired: true, from: { serverPort: Number(server.host_port), webPort: Number(webapp.host_port) },
+             to: { serverPort: next.serverPort, webPort: next.webPort }, held };
+  } catch (e) {
+    console.error(`[provision] app-port collision repair skipped for xell ${xellId}: ${e.message}`);
+    return { repaired: false, reason: e.message };
+  }
 }
 
 // The host port for a xell's spin compose db service, as lib/build.js projects it into the build
@@ -1082,7 +1219,9 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   const slug = await makeSlug(projectId);
   const branch = `spinoff/${slug}`;
   const worktree = `${project.repo_root.replace(/\\/g, '/')}/.claude/worktrees/${slug}`;
-  const ports = computePorts(slug, project);
+  // The formula slot — the STARTING guess. Once the target context is known (below) it is checked
+  // against what actually owns host ports there, exactly like the db port already is.
+  let ports = computePorts(slug, project);
 
   // WHERE this xell's app tier runs. Machine-aware when machine rows exist (highest dev_priority
   // with room under max_xells — spec: "if local priority is higher, dev xells get spawned there
@@ -1131,7 +1270,35 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // what both actually reach the host on. The host era keeps 'localhost' (true there).
   const urlHost = devHost
     || (devCtx === queenzeeHostCtx() && existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost');
-  const url = `http://${urlHost}:${ports.webPort}`;
+
+  // ALLOCATE THE APP TIER'S HOST PORTS AGAINST REAL OWNERSHIP (TKT-85 family, plan §4.5) — the
+  // same fix the per-xell db port got, for the two ports that were still a pure formula. With
+  // port_slot_mod=90 and a dozen live xells per project, two slugs hashing to one slot is routine:
+  // the loser's spin stack dies at "Bind for 0.0.0.0:5324 failed: port is already allocated", that
+  // failure is classed INFRA, and an INFRA failure writes build_readiness_record='missing' — which
+  // STOPS the pool fill for the whole project on that machine. One collision, no more xells.
+  // Both ports move together on one slot; the rows stamped below are what lib/build.js projects
+  // into SPINOFF_SERVER_PORT/SPINOFF_WEB_PORT, so the recorded port is what actually gets bound.
+  // The bases are computePorts' OWN (port - slot), never a second reading of the project row: the
+  // allocation must walk the same ladder the formula sits on, or the two would drift.
+  const appBases = { serverBase: ports.serverPort - ports.slot, webBase: ports.webPort - ports.slot };
+  const formulaSlot = ports.slot;
+  const allocated = await freeAppSlot(devCtx, { ...appBases, slot: ports.slot }).catch((e) => {
+    // Never a new way to fail a provision: an allocator that blows up degrades to the formula —
+    // the bind refusal stays the arbiter, exactly as it was before this fix existed.
+    console.warn(`[provision] ${slug}: app-tier port allocation failed (${e.message}) — using the `
+      + `formula ports :${ports.serverPort}/:${ports.webPort}`);
+    return ports;
+  });
+  if (allocated.slot !== ports.slot) {
+    console.warn(`[provision] ${slug}: slot ${ports.slot} (:${ports.serverPort}/:${ports.webPort}) is `
+      + `already owned on ${devCtx} — allocating slot ${allocated.slot} `
+      + `(:${allocated.serverPort}/:${allocated.webPort})`);
+  }
+  ports = allocated;
+  // Derived on READ, never captured: a bind-refusal retry below can move the pair again, and a URL
+  // frozen at the first allocation would point the health prober at a port nothing listens on.
+  const webUrl = () => `http://${urlHost}:${ports.webPort}`;
 
   // A xell's app tier must never reach across docker contexts for its database, so a machine
   // without this project's own shared dev db cannot host xells that need one. Refused HERE, by
@@ -1162,11 +1329,36 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     const script = resolve(config.repoRoot, 'scripts', 'provision-xell.sh');
     // Pass the project's source branch — the script used to hardcode 'main', which silently
     // ignored main_branch and broke every project that isn't on main.
-    const r = spawnSync(resolveBash(), [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
-      encoding: 'utf8', timeout: 600000,
-      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devCtx, DEV_HOST_IP: devHost,
-             PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
-    });
+    const runProvisionScript = () => spawnSync(
+      resolveBash(), [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
+        encoding: 'utf8', timeout: 600000,
+        // The ALLOCATED ports, not the script's own formula: the script (and spin-env.sh under it)
+        // already honour an inherited SPINOFF_SERVER_PORT/SPINOFF_WEB_PORT, so the stack binds
+        // exactly what the container rows below record — and what lib/build.js later rebuilds with.
+        env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devCtx, DEV_HOST_IP: devHost,
+               SPINOFF_SERVER_PORT: String(ports.serverPort), SPINOFF_WEB_PORT: String(ports.webPort),
+               PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
+      });
+    // A BIND REFUSAL is the collision the allocation raced: something bound one of the pair between
+    // the ps read and `spin-env.sh up` — or the daemon read degraded to meta-DB-only (docker
+    // unreachable) and never saw the binder at all. Retry on the next free slot, skipping the pair
+    // we just lost so the walk makes forward progress; the script re-uses the worktree it already
+    // has. Same contract as the per-xell db container's retry below. Anything else (a failed
+    // install, a dead context) is a real failure and stays one, on the FIRST attempt.
+    const bindRefused = (r) => /port is already allocated|address already in use|bind[^\n]*already in use/i
+      .test(`${r?.stderr || ''}\n${r?.stdout || ''}`);
+    const skipPorts = [];
+    let r = runProvisionScript();
+    for (let attempt = 1; attempt < 3 && r.status !== 0 && bindRefused(r); attempt++) {
+      skipPorts.push(ports.serverPort, ports.webPort);
+      const next = await freeAppSlot(devCtx, { ...appBases, slot: formulaSlot, skip: skipPorts })
+        .catch(() => null);
+      if (!next || skipPorts.includes(next.serverPort) || skipPorts.includes(next.webPort)) break;
+      console.warn(`[provision] ${slug}: :${ports.serverPort}/:${ports.webPort} refused at bind — `
+        + `retrying on slot ${next.slot} (:${next.serverPort}/:${next.webPort})`);
+      ports = next;
+      r = runProvisionScript();
+    }
     if (r.status !== 0) throw new Error(`provision-xell.sh failed: ${provisionFailureReason(r)}`);
     health = appTier ? 'up' : 'down'; // worktree exists; containers only up if the app tier ran
   }
@@ -1225,7 +1417,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, c.id]);
     };
     await mk('server', ports.serverPort, 3000, `http://${urlHost}:${ports.serverPort}`);
-    await mk('webapp', ports.webPort, 5173, url);
+    await mk('webapp', ports.webPort, 5173, webUrl());
 
     // Per-xell OWN database container (spec §6.1: a Zeehive xell gets its own meta-DB container,
     // slot-ported, provisioned BY ZEEHIVE). Scoped to db-isolated coupling on a PROCESS-runner
@@ -1434,7 +1626,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
           .catch((e) => logline('pool', `${slug}: cage prewarm errored (ignored): ${e.message}`));
       }
     }
-    return { ...xell, ports, url, mode };
+    return { ...xell, ports, url: webUrl(), mode };
   } catch (err) {
     await client.query('ROLLBACK');
     // the rollback erased the row that owned it — remove the physical container too
