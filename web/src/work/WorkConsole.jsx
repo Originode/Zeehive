@@ -53,8 +53,11 @@ const TABS = [
   { id: 'timeline', label: 'Timeline' },
 ];
 
-export default function WorkConsole({ projectId, projectName, onClose }) {
+export default function WorkConsole({ projectId, projectName, onClose, initialTab }) {
+  // `initialTab` (from the + hexagon's ticket option) FORCES a tab — the + menu asks for the ticket
+  // composer, not "wherever I left the tracker last". When absent the last-used tab persists.
   const [tab, setTab] = useState(() => {
+    if (initialTab && TABS.some((x) => x.id === initialTab)) return initialTab;
     try { const t = localStorage.getItem(TAB_KEY); return TABS.some((x) => x.id === t) ? t : 'board'; }
     catch { return 'board'; }
   });
