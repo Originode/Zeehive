@@ -14,7 +14,7 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
-import { spinComposeDbPort } from './provision.js';
+import { spinComposeDbPort, repairCollidedAppPorts } from './provision.js';
 import { npmCacheEnv } from '../lib/npm-cache.js';
 import {
   processRoleReachableHost, processRolePublishedUrl,
@@ -301,6 +301,12 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
   // registry fails fast with an actionable error rather than stranding a spinner.
   const target = await resolveBuildTarget(c);
+  // A pair of app ports another xell already holds is not a race — it is a duplicate the formula
+  // era wrote into the meta-DB, and it is true every time it is read: this build would ask for a
+  // port the neighbour owns, die with "port is already allocated", be classed INFRA and stop the
+  // project's pool fill. Re-stamp the rows first (first come keeps the port), so the projection
+  // below carries ports that can actually bind. A no-op for every xell without a duplicate.
+  if (c.owner_xell_id) await repairCollidedAppPorts(c.owner_xell_id);
   const siblings = await q(
     `SELECT role, host_port FROM container WHERE owner_xell_id=$1 AND role = ANY($2)`,
     [c.owner_xell_id, [...BUILDABLE, 'db']]);

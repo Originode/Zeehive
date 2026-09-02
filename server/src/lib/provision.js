@@ -187,6 +187,94 @@ export async function freeAppSlot(ctx, { serverBase = 3100, webBase = 5200, slot
   return formula;
 }
 
+// REPAIR a xell whose recorded app-tier pair is ALREADY OWNED by another xell's rows.
+//
+// freeAppSlot stops NEW collisions; it cannot undo the ones the formula era already wrote into the
+// meta-DB. Those rows are not a race — they are a duplicate that is true every time it is read, so
+// the losing xell can never build: `docker compose up` asks for a port its neighbour holds, dies
+// with "port is already allocated", the failure is classed INFRA, and the project's pool fill stops
+// on that machine. A human re-porting rows by hand is the only cure today (it is what "not
+// provisioning xells" has been costing), and there is nothing to decide: the duplicate is visible
+// in the meta-DB and the fix is the allocation this module already performs.
+//
+// So the build path repairs it, ONCE, deterministically:
+//   • only a DUPLICATE recorded row counts (another owner's row on the same context and port) —
+//     never the daemon, which quite correctly shows THIS xell's own containers holding its ports;
+//   • FIRST COME KEEPS THE PORT: the older xell (by ready_at/created_at, then id) never moves, so
+//     two xells building at once cannot swap places or chase each other up the ladder;
+//   • the rows and the URL are re-stamped together, and .zeehive.env is re-projected, so the cage
+//     and the compose stack agree with the meta-DB.
+// Never throws — a repair that cannot complete leaves the xell exactly as it found it and lets the
+// build fail the way it already would.
+export async function repairCollidedAppPorts(xellId, { docker = dockerAdapter } = {}) {
+  try {
+    const xell = await one(`SELECT id, slug, project_id, ready_at, created_at FROM xell WHERE id=$1`, [xellId]);
+    if (!xell) return { repaired: false, reason: 'no such xell' };
+    const mine = await q(
+      `SELECT id, role, host_port, docker_ctx, url FROM container
+        WHERE owner_xell_id=$1 AND tier='spinoff' AND role IN ('server','webapp') AND host_port IS NOT NULL`,
+      [xellId]);
+    const server = mine.find((c) => c.role === 'server');
+    const webapp = mine.find((c) => c.role === 'webapp');
+    if (!server || !webapp) return { repaired: false, reason: 'no app-tier pair recorded' };
+    const ctx = server.docker_ctx || queenzeeHostCtx();
+
+    // Who else claims either of my two ports on this context? (docker_ctx NULL = a process role on
+    // the queenzee host, which is a real claim when that is where I run — the same rule the
+    // allocator uses.)
+    const onHost = ctx === queenzeeHostCtx();
+    const clashes = await q(
+      `SELECT c.id, c.host_port, c.owner_xell_id, x.slug, COALESCE(x.ready_at, x.created_at) AS since
+         FROM container c LEFT JOIN xell x ON x.id = c.owner_xell_id
+        WHERE c.role IN ('server','webapp') AND c.host_port = ANY($1)
+          AND (c.docker_ctx = $2 OR (c.docker_ctx IS NULL AND $3))
+          AND (c.owner_xell_id IS DISTINCT FROM $4)`,
+      [[Number(server.host_port), Number(webapp.host_port)], ctx, onHost, xellId]);
+    if (!clashes.length) return { repaired: false, reason: 'no duplicate' };
+
+    // FIRST COME KEEPS THE PORT. An unowned row (a shared container holding the port) always wins:
+    // it is not a xell and cannot be asked to move.
+    const since = xell.ready_at || xell.created_at;
+    const iAmOlder = clashes.every((c) => c.owner_xell_id && c.since && since && new Date(c.since) > new Date(since));
+    if (iAmOlder) {
+      return { repaired: false, reason: 'this xell holds the ports first — the newer one moves' };
+    }
+
+    const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+    const formula = computePorts(xell.slug, project || {});
+    const next = await freeAppSlot(ctx, {
+      serverBase: formula.serverPort - formula.slot,
+      webBase: formula.webPort - formula.slot,
+      slot: formula.slot,
+      // my OWN current pair is what I am fleeing — never re-allocate onto it
+      skip: [Number(server.host_port), Number(webapp.host_port)],
+      docker,
+    });
+    if (next.serverPort === Number(server.host_port) || next.webPort === Number(webapp.host_port)) {
+      return { repaired: false, reason: 'no free slot to move to' };
+    }
+
+    const restamp = async (row, port) => {
+      const url = row.url ? String(row.url).replace(/:\d+$/, `:${port}`) : row.url;
+      const updated = await one(
+        `UPDATE container SET host_port=$2, url=$3 WHERE id=$1 RETURNING *`, [row.id, port, url]);
+      if (updated) broadcast('container', updated);
+    };
+    await restamp(server, next.serverPort);
+    await restamp(webapp, next.webPort);
+    // the cage reads its ports from .zeehive.env — re-project so it agrees with the rows
+    await emitXellEnv(xellId).catch(() => { /* best effort: the rows are the source of truth */ });
+    const held = clashes.map((c) => `${c.slug || 'unowned'}:${c.host_port}`).join(', ');
+    logline('build', `${xell.slug}: recorded app ports :${server.host_port}/:${webapp.host_port} are `
+      + `already held on ${ctx} (${held}) — re-stamped to :${next.serverPort}/:${next.webPort} before building`);
+    return { repaired: true, from: { serverPort: Number(server.host_port), webPort: Number(webapp.host_port) },
+             to: { serverPort: next.serverPort, webPort: next.webPort }, held };
+  } catch (e) {
+    console.error(`[provision] app-port collision repair skipped for xell ${xellId}: ${e.message}`);
+    return { repaired: false, reason: e.message };
+  }
+}
+
 // The host port for a xell's spin compose db service, as lib/build.js projects it into the build
 // env (SPINOFF_DB_PORT). A recorded per-xell db row (db-isolated coupling — provision stamped the
 // port) is authoritative, exactly like the server/web rows. With NO db row (db-shared-dev coupling)
