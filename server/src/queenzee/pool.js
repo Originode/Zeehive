@@ -46,7 +46,7 @@ import { serverRoleIsProcess } from '../lib/manifest.js';
 // project verdict into build_readiness_record so one recorded fact serves all N xells on a pair.
 import { proveXell, buildReadinessRecordFromProof } from '../lib/xell-proof.js';
 import { upsertBuildReadinessRecord, buildReadinessForProject } from '../lib/build-readiness.js';
-import { routeProofFailure } from '../lib/proof-routing.js';
+import { routeProofFailure, raiseInfraCard } from '../lib/proof-routing.js';
 import { projectReadinessProof } from '../lib/proof-policy.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
@@ -116,6 +116,23 @@ export function resetProofFailBudget() {
   proofFailDecomms.clear();
   proofFailCooldownUntil.clear();
 }
+
+// ── PROVISION-TIME FAULT CARDING (§4.6 — the half the proof never sees) ──────────────────
+// A proof burns in a xell that ALREADY exists; a provision failure never gets that far — the xell
+// cannot be CREATED (an exhausted address pool, a daemon that accepts but cannot start containers,
+// a compose up that dies, a missing shared dev db on the machine). fillTrim catches the throw,
+// breaks, and retries next tick — which, for a fault that never clears, is a SILENT HALT: no
+// record, no matrix badge, no card, no dispatch seam. So each failed tick is counted per
+// (machine, project); past PROVISION_FAIL_THRESHOLD consecutive failures the pair is recorded
+// 'missing' — the SAME record the proof path writes (the matrix badge flips, fillStopReasonFor
+// stops the fill, one fact, N readers) — and the PROVISION-INFRA card is raised through
+// proof-routing's dedup seam (one card per machine per fault episode). Recovery matches a
+// proof-time 'missing': the hourly re-record probe (or a human's recheck click) rewrites the
+// record when the fault actually clears.
+const provisionFailCount = new Map();       // `${machineKey||'?'}:${projectId}` → consecutive failed ticks
+const PROVISION_FAIL_THRESHOLD = Number(process.env.PROVISION_FAIL_THRESHOLD) || 3;
+export function provisionFailurePairKey(machineKey, projectId) { return `${machineKey || '?'}:${projectId}`; }
+export function resetProvisionFailCount() { provisionFailCount.clear(); }
 
 // Decommission ONE proof-failed POOLED xell, capped per (machine, project) per hour (§4.3, under
 // 'required' — a proof-failed xell is not stock, so the fill provisions a replacement). The cap is
@@ -430,8 +447,10 @@ async function reconcileProject(projectId, target) {
 // right now, or null when it should fill. Two stop-reasons, both keyed on the pair:
 //   • build_readiness_record status 'missing' — a persistent INFRA fault (address pools, daemon
 //     down, context missing, port bind refused) flipped the pair's recorded verdict, so the pool
-//     stops provisioning onto a machine known to be unable to host this project's build. The
-//     console matrix badge is already red from the SAME record — one fact, N readers.
+//     stops provisioning onto a machine known to be unable to host this project's build. Flipped by
+//     the proof path (§4.6) AND by the provision-time path (a xell that cannot be CREATED — see
+//     noteProvisionFailure); recovery is the same either way. The console matrix badge is already
+//     red from the SAME record — one fact, N readers.
 //   • the proof-failed teardown cooldown (§4.3) — past the decommission cap the pair cools down:
 //     no more reaps AND no more provisioning, so a main that cannot build holds the gate under
 //     'required' instead of churning provision→fail→reap or piling unclaimable xells to max_xells.
@@ -452,6 +471,43 @@ export async function fillStopReasonFor(projectId, m) {
       + new Date(cd).toISOString();
   }
   return null;
+}
+
+// Card a provision failure by CONSECUTIVE failed tick (§4.6 — the provision-time half of the
+// routing; a fault that stops a xell being CREATED never reaches a proof, so the proof path can
+// not route it). Called from fillTrim's catch. In-memory across ticks — a restart resets the count,
+// the same "a restart is calm" rule as the proof-fail budget. Past the threshold the pair is
+// recorded 'missing' (fillStopReasonFor then stops the fill, the matrix badge flips) and the
+// PROVISION-INFRA card is raised (proof-routing's dedup). NEVER throws — a carding failure must not
+// fail the fill tick. Returns { recorded, carded, reason } for the pool line.
+export async function noteProvisionFailure(projectId, m, err) {
+  const machineKey = m?.key || m?.docker_ctx || null;
+  const pairKey = provisionFailurePairKey(machineKey, projectId);
+  const n = (provisionFailCount.get(pairKey) || 0) + 1;
+  provisionFailCount.set(pairKey, n);
+  if (n < PROVISION_FAIL_THRESHOLD) {
+    return { recorded: false, carded: false,
+             reason: `provision failure ${n}/${PROVISION_FAIL_THRESHOLD} on ${machineKey || '?'} — retried next tick` };
+  }
+  provisionFailCount.delete(pairKey);          // the recorded 'missing' IS the state now
+  if (!machineKey) {
+    return { recorded: false, carded: false,
+             reason: 'no machine row for the pair — nothing to record or card on (legacy project-wide fill)' };
+  }
+  const machine = await one(`SELECT id FROM machine WHERE key=$1 OR docker_ctx=$1`, [machineKey]).catch(() => null);
+  if (!machine) {
+    return { recorded: false, carded: false, reason: `no machine row '${machineKey}' — nothing to record or card on` };
+  }
+  const error = String((err && err.message) || err || 'provision failed');
+  const rec = await upsertBuildReadinessRecord(machine.id, projectId,
+    { status: 'missing', error, checks: [] }).catch(() => null);
+  if (!rec) {
+    return { recorded: false, carded: false,
+             reason: `could not record 'missing' for (${machineKey}, project ${String(projectId).slice(0, 8)})` };
+  }
+  const card = await raiseInfraCard({ projectId, machineKey, check: 'provision', detail: error });
+  return { recorded: true, carded: card.raised,
+           reason: `pair (${machineKey}) recorded 'missing' after ${n} consecutive provision failures — ${card.reason}` };
 }
 
 // Fill to / trim past `target` ready xells — on one machine (m) or project-wide (m = null).
@@ -506,6 +562,9 @@ async function fillTrim(projectId, target, m) {
     for (let i = 0; i < room; i++) {
       try {
         const x = await provisionXell({ projectId, mode: MODE, machineCtx: m?.docker_ctx });
+        // A provision that SUCCEEDS clears the pair's failure streak (a transient fault below the
+        // carding threshold is over — the next persistent episode counts fresh).
+        provisionFailCount.delete(provisionFailurePairKey(m?.key || m?.docker_ctx || null, projectId));
         logline('pool', `provisioned ready xell ${x.slug} (${MODE}${m ? ` on ${m.key}` : ''}) → server :${x.ports.serverPort} web :${x.ports.webPort}`);
         // ENQUEUE THE BURN-IN (plan §4.4): fire-and-forget like warmWorktree — a provision that
         // failed because a proof was slow would be a worse bug than the one this fixes. The proof
@@ -513,6 +572,13 @@ async function fillTrim(projectId, target, m) {
         if (MODE === 'real') enqueueProof(x.id);
       } catch (err) {
         console.error(`[pool] provision failed${m ? ` on ${m.key}` : ''}:`, err.message);
+        // CARD A PERSISTENT HALT (§4.6 — provision-time): count this failed tick for the pair; at
+        // the threshold record 'missing' + raise the PROVISION-INFRA card so a project that can no
+        // longer provision stops retrying SILENTLY forever (the record stops the fill next tick).
+        // Never fatal — a carding failure only means the halt stays silent one more tick.
+        const npf = await noteProvisionFailure(projectId, m, err)
+          .catch((e) => ({ recorded: false, carded: false, reason: `carding error: ${e.message}` }));
+        if (npf.recorded || npf.carded) logline('pool', `[provision fault] ${npf.reason}`);
         break; // stop hammering on persistent failure this tick
       }
     }

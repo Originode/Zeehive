@@ -45,6 +45,13 @@ export function infraMedicAction(check) {
     'requires-present': 'create the required network/volume on this machine',
     'shared-dev-db': "provision the project's shared dev db on this machine",
     'registry-for-handoff': 'configure a registry, or enable build on this machine',
+    // Provision-time (pool.js cards a xell that cannot be CREATED — never reaches a proof): the
+    // error names the fault (exhausted address pool, refused port bind, dead daemon, a missing
+    // prerequisite), and the re-check after the fix is the readiness ladder, not a proof of a xell
+    // that cannot exist yet.
+    'provision': 'the xell could not be CREATED on this machine — repair what the error names '
+      + '(an exhausted address pool, a refused port bind, a dead daemon, a missing prerequisite), '
+      + 'then re-run `zee infra readiness --project <name>` to confirm the pair before re-proving',
   };
   return byFamily[family] || 'repair the named prerequisite on the machine, then re-run the proof';
 }
@@ -74,6 +81,29 @@ const CODE_MARK = /^main does not build since /;
 // in JS — the machine key is user data and a LIKE pattern is one metachar away from a wildcard.
 function infraCardUp(rows, machineKey) {
   return rows.find((r) => INFRA_MARK.test(r.body) && r.body.includes(`machine '${machineKey}'`)) || null;
+}
+
+// Raise the ONE INFRA card for a (project, machine) pair when none is up — the shared seam BOTH
+// failure paths use, so a card's shape and its dedup live in one place: the proof path (routing a
+// failed proof whose record flipped to 'missing') and the provision-time path (pool.js cards a xell
+// that cannot even be CREATED — §4.6, a fault no proof ever sees). Same "say it when it CHANGES"
+// discipline as the routing: while a card is already up (a human has not acknowledged the fault) no
+// second card is raised. Never throws — a card write that fails must not fail its caller.
+// Returns { raised: boolean, card: <condition id>|null, reason }.
+export async function raiseInfraCard({ projectId, machineKey, check, detail }) {
+  try {
+    const rows = await listProjectConditions(projectId).catch(() => []);
+    if (infraCardUp(rows, machineKey)) {
+      return { raised: false, card: null, reason: `INFRA card already up for machine '${machineKey}'` };
+    }
+    const body = infraCardBody({ machineKey, check, detail, action: infraMedicAction(check) });
+    const r = await addProjectCondition(projectId, body, { actor: null });
+    return r.ok
+      ? { raised: true, card: r.condition?.id || null, reason: `INFRA card raised for machine '${machineKey}'` }
+      : { raised: false, card: null, reason: `card refused by conditions list: ${r.error}` };
+  } catch (e) {
+    return { raised: false, card: null, reason: `card error: ${e.message}` };
+  }
 }
 
 // The one rolling CODE fact per project: find the existing card (if any), update it when the sha
@@ -112,23 +142,18 @@ export async function routeProofFailure({ xell, verdict, rec, prevRec, machine, 
     if (rec.status === 'missing') {
       // INFRA — the (machine, project) pair's fault. Card on the transition into 'missing' only:
       // while the record STAYS 'missing' the pool keeps stopping the fill and the matrix badge
-      // stays red — it is the CONSOLE that holds the story, not a re-printed card each proof.
+      // stays red — it is the CONSOLE that holds the story, not a re-printed card each proof. The
+      // card itself is raised through raiseInfraCard — the same dedup seam the provision-time path
+      // (pool.js) uses, so a card's shape and its dedup live in one place.
       if (prevRec?.status === 'missing') {
         return { class: 'infra', card: null, reason: 'pair already recorded missing — no new card' };
       }
       const key = machine?.key || machine?.docker_ctx || '?';
-      const rows = await listProjectConditions(projectId).catch(() => []);
-      if (infraCardUp(rows, key)) {
-        return { class: 'infra', card: null, reason: `INFRA card already up for machine '${key}'` };
-      }
       const failed = (verdict.checks || []).filter((c) => !c.ok && !c.skipped).find((c) => c.class === 'INFRA');
       const check = failed?.check || 'proof';
       const detail = failed?.detail || verdict.error || 'proof failed';
-      const body = infraCardBody({ machineKey: key, check, detail, action: infraMedicAction(check) });
-      const r = await addProjectCondition(projectId, body, { actor: null });
-      return r.ok
-        ? { class: 'infra', card: r.condition?.id || null, reason: `INFRA card raised for machine '${key}'` }
-        : { class: 'infra', card: null, reason: `card refused by conditions list: ${r.error}` };
+      const r = await raiseInfraCard({ projectId, machineKey: key, check, detail });
+      return { class: 'infra', card: r.raised ? (r.card || null) : null, reason: r.reason };
     }
 
     if (rec.status === 'ok') {
