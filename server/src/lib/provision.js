@@ -119,7 +119,11 @@ export function publishedPortsFromPs(output) {
 // publish on the QUEENZEE HOST's ports. So when the target context IS the queenzee host, those
 // row-less-of-context rows are counted too — otherwise a process xell's :3147 is invisible to the
 // container xell that is about to ask the same host for :3147.
-async function takenHostPorts(ctx, { roles, skip = [], docker = dockerAdapter, who = 'alloc' }) {
+// `own` is the inverse of `skip`: host ports the CALLER already holds and is about to re-stamp (a
+// rename re-ports the very rows it is reading). They are not an obstacle to themselves, so they are
+// removed from the union last — but never a port the caller explicitly listed in `skip`, which is
+// how a caller says "I am fleeing this one".
+async function takenHostPorts(ctx, { roles, skip = [], own = [], docker = dockerAdapter, who = 'alloc' }) {
   const taken = new Set();
   for (const p of skip) taken.add(Number(p));
   const onHost = ctx === queenzeeHostCtx();
@@ -138,6 +142,8 @@ async function takenHostPorts(ctx, { roles, skip = [], docker = dockerAdapter, w
   } else {
     for (const p of publishedPortsFromPs(ps?.stdout)) taken.add(p);
   }
+  const skipped = new Set(skip.map(Number));
+  for (const p of own) if (!skipped.has(Number(p))) taken.delete(Number(p));
   return taken;
 }
 
@@ -175,11 +181,11 @@ export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = n
 // A slot is only free when BOTH its ports are free. Same contracts as freeDbHostPort: bounded walk,
 // failure-tolerant reads, and a fully-claimed window falls back to the FORMULA slot so a provision
 // never fails on a crowded host by guessing (the bind stays the arbiter).
-export async function freeAppSlot(ctx, { serverBase = 3100, webBase = 5200, slot = 0, skip = [], docker = dockerAdapter } = {}) {
+export async function freeAppSlot(ctx, { serverBase = 3100, webBase = 5200, slot = 0, skip = [], own = [], docker = dockerAdapter } = {}) {
   const sb = Number(serverBase);
   const wb = Number(webBase);
   const formula = { slot, serverPort: sb + slot, webPort: wb + slot };
-  const taken = await takenHostPorts(ctx, { roles: ['server', 'webapp'], skip, docker, who: 'freeAppSlot' });
+  const taken = await takenHostPorts(ctx, { roles: ['server', 'webapp'], skip, own, docker, who: 'freeAppSlot' });
   const window = allocWindow();
   for (let s = slot; s < slot + window; s++) {
     if (!taken.has(sb + s) && !taken.has(wb + s)) return { slot: s, serverPort: sb + s, webPort: wb + s };
