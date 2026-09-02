@@ -575,12 +575,12 @@ function usage() {
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee db-sandbox [--migrate] [--status] [--stop]   start a REAL throwaway postgres INSIDE this cage (127.0.0.1 only) and print its DSN — how you verify database work when your assigned db is unusable. NOT gated, nothing to ask for: it dies with the container. --migrate applies db/migrations to it; --stop stops it; a second start returns the SAME DSN. It NEVER replaces your assigned DATABASE_URL — pass the DSN yourself, and report a broken assigned db rather than working around it
   zee migration-number [--name "..."] [--again]   ASK for the next free db/migrations number: the queenzee counts what is LANDED plus what every other LIVE xell's worktree and claims already hold — the sibling branches you cannot see (ticket #9). NOT gated. Advisory: it hands out a number, it does not gate your landing. Asking twice returns the SAME number; --again gets a second one
-  zee infra readiness [--machine <key>] [--refresh]   run/read machine×project readiness for YOUR project — the probe's checks, each pass/fail/unknown/skipped (NOT gated, read-only); --machine narrows to one host, --refresh probes NOW instead of reading the recorded verdict
-  zee infra proof --xell <slug>       BURN-IN a pooled xell of YOUR project — throwaway containers, same class as \`zee build\` (NOT gated). The proof verdict names the first failing check when the burn fails
-  zee infra bootstrap --plan --machine <id>   the DRY-RUN plan performBuildBootstrap already computes (NOT gated, performs nothing)
-  zee infra bootstrap --perform --machine <id> [--reason "..."]   HUMAN-GATED CARD → the queenzee performs on approval (the console 🔧 as a verb: creates only manifest-declared DEV infra, never invents/removes, dev-only guard intact)
-  zee infra settings                  NON-SECRET projection of YOUR project's settings (manifest cache, pool_config, machines + machine_pool, containers, deploy sites) — never a token or password
-  zee infra propose --change '<json>' --reason "..."   HUMAN-GATED settings card (pool knobs, registry, machine priority, manifest-cache refresh) → the queenzee applies on approval; who asked, what changed, recorded
+  zee infra readiness [--machine <key>] [--refresh] [--project <name|id>]   run/read machine×project readiness for a TARGET project (yours by default; the medic names ANY project by name or id — reads are open across the meta-DB) — the probe's checks, each pass/fail/unknown/skipped (NOT gated, read-only); --machine narrows to one host, --refresh probes NOW instead of reading the recorded verdict
+  zee infra proof --xell <slug> [--project <name|id>]   BURN-IN a pooled xell of a TARGET project — throwaway containers, same class as \`zee build\` (NOT gated). The proof verdict names the first failing check when the burn fails
+  zee infra bootstrap --plan --machine <id> [--project <name|id>]   the DRY-RUN plan performBuildBootstrap already computes for the target (NOT gated, performs nothing)
+  zee infra bootstrap --perform --machine <id> [--project <name|id>] [--reason "..."]   HUMAN-GATED CARD on the TARGET → the queenzee performs on approval (the console 🔧 as a verb: creates only manifest-declared DEV infra, never invents/removes, dev-only guard intact)
+  zee infra settings [--project <name|id>]   NON-SECRET projection of a TARGET project's settings (manifest cache, pool_config, machines + machine_pool, containers, deploy sites) — never a token or password
+  zee infra propose --change '<json>' --reason "..." [--project <name|id>]   HUMAN-GATED settings card on the TARGET (pool knobs, registry, machine priority, manifest-cache refresh) → the queenzee applies on approval; who asked, what changed, recorded
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
@@ -773,15 +773,22 @@ switch (cmd) {
     break;
   }
   case 'infra': {
-    // THE INFRA-MEDIC SURFACE (provision-proof plan §7, stage 3). The calling xell's EFFECTIVE
-    // harness chain must carry the 'infra-troubleshoot' capability — the server refuses a plain
-    // worker with a clear 403, so wearing the medic harness IS the grant. Read wide, write through
-    // gates: readiness / proof / bootstrap --plan / settings are NOT gated (read-only or throwaway
-    // containers); bootstrap --perform and propose are HUMAN-GATED CARDS that perform NOTHING until
-    // a human approves, then the queenzee performs and the card becomes the receipt.
+    // THE INFRA-MEDIC SURFACE (provision-proof plan §7, stage 3, meta-plane model). The calling
+    // xell's EFFECTIVE harness chain must carry the 'infra-troubleshoot' capability — the server
+    // refuses a plain worker with a clear 403, so wearing the medic harness IS the grant. The TARGET
+    // project is EXPLICIT: --project <name|id> names ANY project (the medic on Zeehive fixes another
+    // project's meta-DB config); without it the server resolves the CALLING xell's own project. Read
+    // wide, write through gates: readiness / proof / bootstrap --plan / settings are NOT gated
+    // (read-only or throwaway containers); bootstrap --perform and propose are HUMAN-GATED CARDS on
+    // the target that perform NOTHING until a human approves, then the queenzee performs and the
+    // card becomes the receipt.
     const sub = positional();
+    const proj = flag('project');
+    const qp = (parts) => { if (proj) parts.push(`project=${encodeURIComponent(proj)}`); return parts.length ? `?${parts.join('&')}` : ''; };
     if (sub === 'readiness') {
-      const r = await req('GET', `/api/xell/self/infra/readiness${rest.includes('--refresh') ? '?refresh=1' : ''}`);
+      const qs = [];
+      if (rest.includes('--refresh')) qs.push('refresh=1');
+      const r = await req('GET', `/api/xell/self/infra/readiness${qp(qs)}`);
       const rows = r.json?.probe || r.json?.recorded || [];
       const key = flag('machine');
       const filtered = key ? rows.filter((x) => x.machine_key === key) : rows;
@@ -792,8 +799,8 @@ switch (cmd) {
     }
     if (sub === 'proof') {
       const xell = flag('xell');
-      if (!xell) { console.error('infra proof needs --xell <slug> — which pooled xell of your project to burn in'); process.exit(1); }
-      out(await req('POST', '/api/xell/self/infra/proof', { xell }));
+      if (!xell) { console.error('infra proof needs --xell <slug> — which pooled xell of the target project to burn in'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/infra/proof', { xell, project: proj }));
       break;
     }
     if (sub === 'bootstrap') {
@@ -803,16 +810,16 @@ switch (cmd) {
         process.exit(1);
       }
       if (rest.includes('--plan')) {
-        out(await req('POST', '/api/xell/self/infra/bootstrap-plan', { machine_id: machineId }));
+        out(await req('POST', '/api/xell/self/infra/bootstrap-plan', { machine_id: machineId, project: proj }));
       } else if (rest.includes('--perform')) {
-        out(await req('POST', '/api/xell/self/infra/bootstrap', { machine_id: machineId, reason: flag('reason') }));
+        out(await req('POST', '/api/xell/self/infra/bootstrap', { machine_id: machineId, reason: flag('reason'), project: proj }));
       } else {
         console.error('infra bootstrap needs --plan (dry-run, NOT gated) or --perform (HUMAN-GATED card)'); process.exit(1);
       }
       break;
     }
     if (sub === 'settings') {
-      out(await req('GET', '/api/xell/self/infra/settings'));
+      out(await req('GET', `/api/xell/self/infra/settings${qp([])}`));
       break;
     }
     if (sub === 'propose') {
@@ -820,10 +827,10 @@ switch (cmd) {
       const reason = flag('reason');
       if (!change) { console.error('infra propose needs --change "<json>" — the settings patch (pool knobs, registry, machine priority, manifest refresh)'); process.exit(1); }
       if (!reason) { console.error('infra propose needs --reason "…" — it is what the human reads on the card'); process.exit(1); }
-      out(await req('POST', '/api/xell/self/infra/propose', { change, reason }));
+      out(await req('POST', '/api/xell/self/infra/propose', { change, reason, project: proj }));
       break;
     }
-    console.error('infra subcommands: readiness [--machine <key>] [--refresh] | proof --xell <slug> | bootstrap --plan|--perform --machine <id> | settings | propose');
+    console.error('infra subcommands: readiness [--machine <key>] [--refresh] [--project <name|id>] | proof --xell <slug> [--project <name|id>] | bootstrap --plan|--perform --machine <id> [--project <name|id>] | settings [--project <name|id>] | propose [--project <name|id>]');
     process.exit(1);
   }
   case 'env': {
