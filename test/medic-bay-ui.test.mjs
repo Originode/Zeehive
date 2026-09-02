@@ -40,7 +40,8 @@ const medics = read('server/src/lib/medics.js');
 console.log('\n── 1. the Bay is its own component AND App renders it, fed a live list ──');
 ok(/export default function MedicBay/.test(bay), 'MedicBay.jsx default-exports the component');
 ok(/import\s+MedicBay\s+from\s+'\.\/MedicBay\.jsx'/.test(app), 'App.jsx imports it');
-const mount = app.match(/<MedicBay[\s\S]{0,300}?\/>/);
+// `<MedicBay[\s>]` on purpose: `<MedicBayX …/>` (a rename that orphans the component) must NOT pass.
+const mount = app.match(/<MedicBay[\s>][\s\S]{0,300}?\/>/);
 ok(!!mount, 'App.jsx RENDERS <MedicBay …/> (an import nothing renders is the old bug)');
 ok(!!mount && /medics=\{medics\}/.test(mount[0]), '…fed the medics list');
 ok(!!mount && /onOpenXell=\{setExpandedId\}/.test(mount[0]),
@@ -94,9 +95,11 @@ ok(/not a zee in a xell|no xell, no cage|meta plane/i.test(app + bay),
    'the console names the plane a medic actually lives on');
 
 console.log('\n── the Bay is styled (an unstyled strip is a strip nobody reads) ──');
-for (const cls of ['.medic-bay ', '.medic-hex', '.medic-panel ', '.medic-ledger', '.medic-asking',
+// The class must be followed by a selector character, never a letter — '.medic-askingX' is not
+// '.medic-asking', and a stylesheet that only ALMOST names the strip leaves it unstyled.
+for (const cls of ['.medic-bay', '.medic-hex', '.medic-panel', '.medic-ledger', '.medic-asking',
                    '.medic-reply', '.medic-transcript'])
-  ok(css.includes(cls), `${cls.trim()} is styled`);
+  ok(new RegExp(cls.replace(/\./g, '\\.') + '[\\s{.,:]').test(css), `${cls} is styled`);
 
 console.log(fail ? `\n${fail} FAILURE(S)\n` : '\nall good\n');
 process.exit(fail ? 1 : 0);
