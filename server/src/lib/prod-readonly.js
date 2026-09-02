@@ -46,6 +46,10 @@ export function roRoleName(slug) {
 const SECRET_COLUMNS = {
   provider_token: ['token'],
   environment_var: ['value'],
+  // container.conn_pw is the ACTUAL postgres password of the role a db container's conn_ref
+  // names, recorded at provision (TKT-181-9EDA) — it must never ride out through a read-only
+  // meta-DB reader. conn_ref itself is deliberately passwordless, so it stays readable.
+  container: ['conn_pw'],
   xell: ['prod_ro_dsn', 'meta_ro_dsn'],
 };
 

@@ -29,6 +29,7 @@ import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { execPsql, cloneInstanceFor, templateInstanceFor, upsertInstance, deleteInstance }
   from './db-instances.js';
+import { ensureDbContainerConnPw } from './machines.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -439,6 +440,14 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
   // Do NOT derive the port from the slug: it collides with host services docker can't see.
   // The script publishes with -p 0 and reports the port docker actually chose.
   let port = 5400 + computePorts(xell.slug).slot;   // simulate-mode placeholder only
+  // The password THIS per-xell db is created with — the manifest's committed dev credential
+  // (same convention the provision-time owned rows use: lib/provision.js docker-runs the process
+  // db with `mdb.password || 'dev'`, and compose-gen.js bakes the same into the db service). The
+  // script default 'omnibiz' would make this row a SECOND manifest-vs-reality split, so it is
+  // always passed explicitly and recorded as conn_pw for the projection (TKT-181-9EDA).
+  const dbPw = project.manifest?.db?.password || 'dev';
+  const dbUser = project.db_user || config.prodDbUser || 'postgres';
+  const dbName = project.db_name || config.prodDbName || 'omnibiz';
 
   if (MODE === 'real') {
     const script = resolve(config.repoRoot, 'scripts', 'provision-xell-db.sh');
@@ -447,8 +456,9 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
     // handled by passing it as a single argv entry (never interpolated into a command string).
     const dumpPath = snapshot?.dump_path ? String(snapshot.dump_path).replace(/\\/g, '/') : '';
     const r = spawnSync(resolveBash(), [script, name, ctx, image || 'omnibiz-postgis:18-3.6-h3',
-      dumpPath, project.db_user || config.prodDbUser || 'postgres', project.db_name || config.prodDbName || 'omnibiz'],
-      { encoding: 'utf8', timeout: 1800000, windowsHide: true });
+      dumpPath, dbUser, dbName],
+      { encoding: 'utf8', timeout: 1800000, windowsHide: true,
+        env: { ...process.env, ZEEHIVE_SPIN_DB_PASSWORD: dbPw } });
     const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
     let res = null; try { res = JSON.parse(line); } catch { /* no JSON */ }
     if (!res?.ok) throw new Error(`isolated db provision failed: ${res?.reason || (r.stderr || '').slice(-200)}`);
@@ -459,17 +469,17 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
   // Upsert: the container name is unique per project, and re-attaching (e.g. attach empty, then
   // attach again WITH a dump) must update the existing row — not explode on the unique key after
   // a 4-minute restore has already succeeded. Docker picks a new port each rebuild, so refresh it.
-  const conn = `postgresql://${project.db_user || config.prodDbUser || 'postgres'}@${devHost}:${port}/${project.db_name || config.prodDbName || 'omnibiz'}`;
+  const conn = `postgresql://${dbUser}@${devHost}:${port}/${dbName}`;
   const row = await one(
     `INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx, host,
-                            host_port, internal_port, conn_ref, owner_xell_id, site_id, health)
-     VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10)
+                            host_port, internal_port, conn_ref, conn_pw, owner_xell_id, site_id, health)
+     VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11)
      ON CONFLICT (project_id, name) DO UPDATE
        SET image_tag=EXCLUDED.image_tag, docker_ctx=EXCLUDED.docker_ctx, host=EXCLUDED.host,
-           host_port=EXCLUDED.host_port, conn_ref=EXCLUDED.conn_ref,
+           host_port=EXCLUDED.host_port, conn_ref=EXCLUDED.conn_ref, conn_pw=EXCLUDED.conn_pw,
            owner_xell_id=EXCLUDED.owner_xell_id, site_id=EXCLUDED.site_id, health=EXCLUDED.health
      RETURNING *`,
-    [project.id, name, image || null, ctx, devHost, port, conn,
+    [project.id, name, image || null, ctx, devHost, port, conn, dbPw,
      xell.id, devSite?.id || null, MODE === 'real' ? 'up' : 'down']);
   broadcast('container', row);
   // Record WHICH snapshot this db was restored from, so a later `zee db-catchup` can anchor its
@@ -665,6 +675,18 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
     [xellId, target.id, target.owner_xell_id === xellId ? 'owns' : 'uses']);
   const row = await one(`UPDATE xell SET db_coupling=$2::db_coupling WHERE id=$1 RETURNING *`, [xellId, mode]);
   broadcast('xell', row);
+
+  // The .zeehive.env re-emit below projects this target's conn_ref — and, since TKT-181-9EDA, its
+  // conn_pw. A SHARED DEV row that predates the conn_pw column has no password to project, so ask
+  // the live container (real mode only) what POSTGRES_PASSWORD it was created with and record it
+  // before the file is written. Best-effort: unreadable rows stay passwordless and the readiness
+  // preflight names the fault. Prod rows are deliberately NOT read back this way — the preflight
+  // never opens prod and a queenzee auto-reading a production credential is a boundary this fix
+  // does not cross; a human granting prod supplies the credential the binding needs.
+  if (MODE === 'real' && target?.role === 'db' && target?.tier === 'dev' && !target.conn_pw) {
+    await ensureDbContainerConnPw(target.id, { mode: MODE })
+      .catch((e) => logline('xell-db', `${xell.slug}: dev db conn_pw backfill failed (ignored): ${e.message}`));
+  }
 
   logline('xell-db', `${xell.slug} → ${mode} (${target.name}${cloneName ? ` / ${cloneName}` : ''})`
     + (snapshot ? ` restored from ${snapshot.dump_path}` : '')
