@@ -184,7 +184,7 @@ function tooltip(c, buildable, busy) {
     : (buildable ? '\nnever built — click the hammer to build' : '');
   // Ticket #173: a failed build's reason lives on the row (last_build_error), not only in the
   // log ring. Show it on the chip when the container is down so a human sees why without opening
-  // the terminal. The classified cause (INFRA | CODE, migration 233) rides beside it.
+  // the terminal. The classified cause (INFRA | CODE | UNKNOWN, migration 233) rides beside it.
   const fail = (c.health === 'down' && c.last_build_error)
     ? `\nbuild failed${c.last_build_error_class ? ` [${c.last_build_error_class}]` : ''}: ${String(c.last_build_error).split('\n').filter(Boolean).slice(-3).join(' · ')}`
     : '';

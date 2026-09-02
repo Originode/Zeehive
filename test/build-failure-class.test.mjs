@@ -1,7 +1,9 @@
 // Ticket "make zee build return actionable failures": classify a failed build as INFRA (host/
-// daemon/network/context — NOT the zee's code, retrying will not help) or CODE (traces to the
-// worktree), persist the class on the container row, and make a prod-tier container REFUSE `zee
-// build` with a sentence naming the ship gate (PROD-SHIP).
+// daemon/network/context — NOT the zee's code, retrying will not help), CODE (confidently traces to
+// the worktree), or UNKNOWN (the classifier could not tell — the FAIL-SAFE: never guess CODE for a
+// host failure, which would send a worker hunting a bug it did not write). Persist the class on the
+// container row, and make a prod-tier container REFUSE `zee build` with a sentence naming the ship
+// gate (PROD-SHIP).
 //
 // The mardale-prod incident (ticket #178): a worker retried `zee build webapp --wait` 40 times
 // while the host failed to create a docker network ('all predefined address pools have been fully
@@ -12,9 +14,11 @@
 // Covered here (against a real postgres — DATABASE_URL — so the column from migration 233 is
 // present; no docker):
 //   • classifyBuildFailure returns INFRA for host/daemon/network/context errors
-//   • classifyBuildFailure returns CODE for worktree errors (and defaults to CODE when unknown)
+//   • classifyBuildFailure returns CODE for confident worktree errors
+//   • classifyBuildFailure returns UNKNOWN for anything it cannot confidently place (never CODE)
 //   • buildFailureNextStep: INFRA says "NOT YOUR CODE" and names the #178 ticket for pool exhaustion
 //   • buildFailureNextStep: CODE points at the worktree
+//   • buildFailureNextStep: UNKNOWN prints the raw output and tells the zee how to tell the two apart
 //   • buildContainer REFUSES a prod-tier container with a sentence naming the ship gate
 //   • a failed finalize persists last_build_error_class; getBuildStatus returns it + the next step
 import { randomUUID } from 'node:crypto';
@@ -46,13 +50,15 @@ try {
      'missing docker context → INFRA');
   ok(classifyBuildFailure('no space left on device') === 'INFRA',
      'host disk exhaustion → INFRA');
+  ok(classifyBuildFailure('Bind for 0.0.0.0:5372 failed: port is already allocated') === 'INFRA',
+     'host port-bind conflict → INFRA (docker \'port is already allocated\')');
   ok(classifyBuildFailure('dial tcp 10.2.0.16:443: connect: connection refused') === 'INFRA',
      'network/transport refused → INFRA');
   ok(classifyBuildFailure('pull access denied for zeehive/foo, repository does not exist') === 'INFRA',
      'registry access denied → INFRA');
   ok(classifyBuildFailure('') === null, 'empty error → null (not classified)');
 
-  console.log('\n── 2. classifyBuildFailure: CODE (worktree) ──');
+  console.log('\n── 2. classifyBuildFailure: CODE (confident worktree errors) ──');
   ok(classifyBuildFailure('compose file not found: docker-compose.spinoff.yml (is docker-compose.spinoff.yml on this branch?)') === 'CODE',
      'compose file missing → CODE');
   ok(classifyBuildFailure('env file not found: /main/.env (the main checkout must have its .env)') === 'CODE',
@@ -63,8 +69,14 @@ try {
      'vite/webpack compile error → CODE');
   ok(classifyBuildFailure('npm ERR! code ERESOLVE\nnpm ERR! Could not resolve dependency') === 'CODE',
      'npm dependency error → CODE');
-  ok(classifyBuildFailure('some unknown build failure that matches nothing') === 'CODE',
-     'unmatched failure defaults to CODE (never wrongly claim infra)');
+
+  console.log('\n── 2b. classifyBuildFailure: UNKNOWN is the fail-safe (never guess CODE) ──');
+  ok(classifyBuildFailure('some unknown build failure that matches nothing') === 'UNKNOWN',
+     'unmatched failure → UNKNOWN (never guessed CODE)');
+  ok(classifyBuildFailure('build failed (container down)') === 'UNKNOWN',
+     'generic \'build failed (container down)\' → UNKNOWN (no persisted reason, so no confident class)');
+  ok(classifyBuildFailure('ERROR: failed to solve: process "/bin/sh -c npm run build" did not complete successfully: exit code: 1') === 'UNKNOWN',
+     'bare docker \'failed to solve\' with no named code line → UNKNOWN');
 
   console.log('\n── 3. buildFailureNextStep: INFRA is actionable and names the ticket ──');
   const infra = buildFailureNextStep('INFRA', 'all predefined address pools have been fully subnetted', { docker_ctx: 'mardale-prod' });
@@ -83,6 +95,17 @@ try {
   const code = buildFailureNextStep('CODE', 'src/App.tsx:12:5 - error TS2322', { docker_ctx: 'default' });
   ok(/CODE — this looks like a problem in YOUR worktree/.test(code), 'CODE next step says the problem is in the worktree');
   ok(/Fix the error below and rebuild/.test(code), 'CODE next step says to fix and rebuild');
+
+  console.log('\n── 4b. buildFailureNextStep: UNKNOWN is honest, not a guess ──');
+  const unknown = buildFailureNextStep('UNKNOWN', 'ERROR: failed to solve: process "/bin/sh -c npm run build" did not complete successfully: exit code: 1');
+  ok(/UNKNOWN — could not classify this failure automatically/.test(unknown),
+     'UNKNOWN next step says it could not classify the failure');
+  ok(/Read the raw build output below/.test(unknown), 'UNKNOWN next step points at the raw output below');
+  ok(/if it names a host\/daemon\/network\/context problem/.test(unknown),
+     'UNKNOWN next step tells the zee how to recognise INFRA');
+  ok(/if it names a file or dependency in YOUR worktree/.test(unknown),
+     'UNKNOWN next step tells the zee how to recognise CODE');
+  ok(!/YOUR worktree.*Fix the error below/.test(unknown), 'UNKNOWN is NOT a CODE verdict (never guesses)');
 
   console.log('\n── 5. PROD-SHIP: a prod-tier container refuses zee build ──');
   // Fixtures: project + xell + a PROD-tier per-xell container. buildContainer's prod check fires
@@ -155,6 +178,20 @@ try {
      'getBuildStatus returns last_build_error_next_step with the INFRA verdict');
   ok(/all predefined address pools have been fully subnetted/.test(row?.last_build_error || ''),
      'the raw docker line is still on the row (evidence is never replaced)');
+
+  // UNKNOWN persists the same way — the class on the row is whatever classifyBuildFailure said,
+  // and getBuildStatus carries its next step.
+  const unkText = 'ERROR: failed to solve: process "/bin/sh -c npm run build" did not complete successfully: exit code: 1';
+  await one(
+    `UPDATE container SET health='down', last_build_error=$2, last_build_error_class=$3 WHERE id=$1 RETURNING *`,
+    [c.id, unkText, classifyBuildFailure(unkText)]);
+  const st2 = await getBuildStatus(xell.id);
+  const row2 = st2.containers.find((x) => x.id === c.id);
+  ok(row2?.last_build_error_class === 'UNKNOWN', 'getBuildStatus returns last_build_error_class=UNKNOWN');
+  ok(/UNKNOWN — could not classify this failure automatically/.test(row2?.last_build_error_next_step || ''),
+     'getBuildStatus returns last_build_error_next_step with the UNKNOWN verdict');
+  ok(/did not complete successfully/.test(row2?.last_build_error || ''),
+     'the raw stderr is still on the row for an UNKNOWN failure (evidence is never replaced)');
 
 } finally {
   for (const id of created.containers) await q(`DELETE FROM container WHERE id=$1`, [id]).catch(() => {});

@@ -27,7 +27,7 @@
 //                           the same fact serving_head already requires, build.js:586).
 //
 // Each failure is classified with the existing classifyBuildFailure (migration 233): the INFRA |
-// CODE class rides on the check — it decides ROUTING later (plan §4.6), never the verdict.
+// CODE | UNKNOWN class rides on the check — it decides ROUTING later (plan §4.6), never the verdict.
 //
 // THE PROOF IS EVIDENCE-DERIVED, VERDICT-STAMPED — same pattern as preflight: the authoritative
 // facts stay where they already live (container.last_build_commit, health, last_build_error,
@@ -118,8 +118,10 @@ export async function noteProof(xellId, verdict) {
 //   any failed check classed INFRA        → 'missing' — the fault is the pair's, not the xell's:
 //                                          address pools, daemon down, context missing, port bind
 //                                          refused. The pool stops filling the pair; proofs skip.
-//   any failed check with no class        → 'unknown' — db-open, a settle timeout, an error that
-//                                          did not classify: we could not tell, and that is never green.
+//   any failed check with no class, or
+//   classed UNKNOWN                       → 'unknown' — db-open, a settle timeout, an error that
+//                                          did not classify: we could not tell, and that is never
+//                                          green.
 //   CODE-only failures                    → 'ok'   — the machine CAN build (a CODE failure proves
 //                                          infra works); the broken code is a PROJECT fact, carried
 //                                          by proof_error (§4.6 CODE).
@@ -129,7 +131,9 @@ export function buildReadinessRecordFromProof(verdict) {
   const failed = (verdict.checks || []).filter((c) => !c.ok && !c.skipped);
   const infra = failed.find((c) => c.class === 'INFRA');
   if (infra) return { status: 'missing', error: `${infra.check}: ${infra.detail}`, checks: verdict.checks || [] };
-  const unknown = failed.some((c) => c.class == null);
+  // A check with NO class (db-open, a settle timeout) or an explicit UNKNOWN (the classifier could
+  // not tell) is never green — an unproven machine must not read as a proven one.
+  const unknown = failed.some((c) => c.class == null || c.class === 'UNKNOWN');
   return unknown
     ? { status: 'unknown', error: verdict.error, checks: verdict.checks || [] }
     : { status: 'ok', error: null, checks: verdict.checks || [] };

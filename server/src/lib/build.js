@@ -34,24 +34,29 @@ export function formatBuildFailure(err, fallback = 'see docker output') {
   return text.length > 1500 ? text.slice(-1500) : text;
 }
 
-// ── BUILD-FAILURE CLASSIFIER — turn a failed build's stderr into INFRA | CODE (ticket "make zee
-// build return actionable failures"). The raw docker tail STAYS in last_build_error (the evidence
-// is never replaced); this decides whether retrying can EVER help, so `zee build --wait` can tell a
-// zee "not your code — file a ticket and stop" instead of sending it into a retry loop (the
-// mardale-prod address-pool exhaustion, ticket #178, was exactly that: the zee's image built fine,
-// the HOST could not create a network, and nothing told it the failure was not its code).
+// ── BUILD-FAILURE CLASSIFIER — turn a failed build's stderr into INFRA | CODE | UNKNOWN (ticket
+// "make zee build return actionable failures"). The raw docker tail STAYS in last_build_error (the
+// evidence is never replaced); this decides whether retrying can EVER help, so `zee build --wait`
+// can tell a zee "not your code — file a ticket and stop" instead of sending it into a retry loop
+// (the mardale-prod address-pool exhaustion, ticket #178, was exactly that: the zee's image built
+// fine, the HOST could not create a network, and nothing told it the failure was not its code).
 //
 // PURE — no I/O. The queenzee calls it at failure time to store last_build_error_class on the row;
 // getBuildStatus returns it and a pre-computed next step. Exported for tests. Matches against the
 // real text the build path actually produces (docker stderr, the compose-file missing sentence from
 // build-container.sh, the compile errors from vite/webpack/tsc) — not a vocabulary invented for the
 // classifier. Modeled on lib/ship-failure.js (classifyShipFailure).
+//
+// FAIL-SAFE: an error that matches NO pattern is UNKNOWN, never CODE. Guessing CODE for a host/
+// daemon failure sends a worker hunting a bug it did not write — the exact harm this card exists to
+// stop — so the honest answer when the classifier cannot tell is "I cannot tell", with the raw
+// stderr as the evidence.
 
-export const BUILD_FAILURE_CLASSES = ['INFRA', 'CODE'];
+export const BUILD_FAILURE_CLASSES = ['INFRA', 'CODE', 'UNKNOWN'];
 
 // Order matters: INFRA is checked first (host/daemon/network/context problems are never the zee's
-// code), everything else defaults to CODE (a failed build is usually the worktree, and it is the
-// safe default: we must never wrongly tell a zee "not your code").
+// code), then CODE (an error that CONFIDENTLY traces to the worktree), and everything that matches
+// neither is UNKNOWN — the classifier never guesses.
 const INFRA_PATTERNS = [
   // docker network/address exhaustion (the mardale-prod incident, ticket #178).
   { test: (s) => /all predefined address pools have been fully subnetted|address pool.*(?:exhausted|fully subnetted)/i.test(s) },
@@ -60,7 +65,9 @@ const INFRA_PATTERNS = [
   // a docker CONTEXT that does not exist / cannot be resolved.
   { test: (s) => /context .* (?:not found|does not exist|missing)|unable to resolve docker endpoint|no such context/i.test(s) },
   // host resource exhaustion — retrying on the same host cannot fix disk/memory/inode pressure.
-  { test: (s) => /no space left on device|ENOSPC|device or resource busy|too many open files|address already in use|resource (?:temporarily )?unavailable|out of (?:memory|disk space)/i.test(s) },
+  // docker compose reports a host-port conflict as 'Bind for 0.0.0.0:PORT failed: port is already
+  // allocated' — same host-state fault as 'address already in use'.
+  { test: (s) => /no space left on device|ENOSPC|device or resource busy|too many open files|address already in use|port is already allocated|resource (?:temporarily )?unavailable|out of (?:memory|disk space)/i.test(s) },
   // network/dns/transport — a registry or host that cannot be reached from where the build runs.
   { test: (s) => /network .* (?:not found|is unreachable|unreachable)|connect: network is unreachable|no such host|getaddrinfo|name or service not known|connection (?:refused|reset|timed out)|i\/o timeout|context deadline exceeded|dial tcp|failed to (?:push|pull).*(?:timeout|network|tls)|x509:|tls handshake/i.test(s) },
   // registry/image-access refusals — credentials/rate-limits/access, not the zee's code.
@@ -68,6 +75,23 @@ const INFRA_PATTERNS = [
   // the docker daemon answered with a server-side error (status codes are only meaningful near an
   // HTTP status — a bare "502" in a log line is not an infra verdict).
   { test: (s) => /error response from daemon|server error|internal server error|bad gateway|service unavailable|(?:status|HTTP)[ :]50[23]/i.test(s) },
+];
+
+// Confident WORKTREE failures — an error that names the zee's own build toolchain. These are only
+// consulted after INFRA has already said no, and they must be specific: the whole point of UNKNOWN
+// is that a generic failure is NOT called CODE by default.
+const CODE_PATTERNS = [
+  // build-container.sh early-exits: the compose/env file a build reads from THIS worktree/branch is
+  // missing — the file comes from the branch, so it IS the zee's code.
+  { test: (s) => /compose file not found:|env file not found:|no such file or directory.*(?:docker-compose|compose\.ya?ml|Dockerfile)|docker-compose\.ya?ml.*(?:not found|no such)/i.test(s) },
+  // TypeScript — an error TS#### code, usually with a source file:line.
+  { test: (s) => /(?:error|\(ts\))\s+TS\d{1,5}|:\s+error TS\d{1,5}/i.test(s) },
+  // vite/webpack/esbuild — module resolution, compile and transform failures.
+  { test: (s) => /failed to compile|module not found|cannot find module|can't resolve|could not resolve|unable to resolve|syntax error|transform failed|error during (?:build|bundle)|rollup.*error/i.test(s) },
+  // npm/pnpm/yarn — dependency resolution/install/script failures.
+  { test: (s) => /npm ERR!|ERESOLVE|ELIFECYCLE|Failed at the .* (?:build|compile) script|peer .*conflicting/i.test(s) },
+  // test runners failing.
+  { test: (s) => /\b(?:AssertionError|Test suite failed to run|Tests? failed)\b|\d+ tests? (?:failed|failing)/i.test(s) },
 ];
 
 // The docker address-pool exhaustion from the mardale-prod incident (ticket #178), detected
@@ -80,7 +104,9 @@ export function isAddressPoolExhaustion(err) {
 export function classifyBuildFailure(err) {
   const text = String(err ?? '').trim();
   if (!text) return null;
-  return INFRA_PATTERNS.some((r) => r.test(text)) ? 'INFRA' : 'CODE';
+  if (INFRA_PATTERNS.some((r) => r.test(text))) return 'INFRA';
+  if (CODE_PATTERNS.some((r) => r.test(text))) return 'CODE';
+  return 'UNKNOWN';
 }
 
 // The exact next step for a classified failure — what a zee should DO, not just what happened. The
@@ -102,8 +128,17 @@ export function buildFailureNextStep(cls, err, container = null) {
       : 'Retrying will not help. File a ticket for the infra team with the docker line below, and STOP the retry loop.';
     return `INFRA — NOT YOUR CODE. This build failed on the host/daemon/network, not on your change. ${where} ${ticket}`.trim();
   }
-  // CODE (default): the error text IS the actionable part.
-  return 'CODE — this looks like a problem in YOUR worktree (compile/test/compose). Fix the error below and rebuild.';
+  if (cls === 'CODE') {
+    // CODE: the error text IS the actionable part.
+    return 'CODE — this looks like a problem in YOUR worktree (compile/test/compose). Fix the error below and rebuild.';
+  }
+  // UNKNOWN — the classifier could not tell, and saying nothing would send a zee into a retry loop
+  // just as surely as a bare docker tail would. The raw stderr prints below this sentence, so the
+  // evidence is right there for the zee (or a human) to judge.
+  return 'UNKNOWN — could not classify this failure automatically. Read the raw build output below: '
+    + 'if it names a host/daemon/network/context problem it is INFRA (not your code — file a ticket and '
+    + 'STOP the retry loop); if it names a file or dependency in YOUR worktree it is CODE (fix and rebuild). '
+    + 'When in doubt, raise it to a human with the output below rather than retrying blindly.';
 }
 
 // The registry a split build hands its image through: the project's own, else the global default.
@@ -527,8 +562,9 @@ export async function getBuildStatus(xellId) {
   const head = xell.worktree_path ? headCommit(xell.worktree_path, 'HEAD') : null;
 
   // c.* (not an explicit column list) so a read path never crashes on a schema the migration has
-  // not yet reached — last_build_error_class (233) rides along when present, and its absence is
-  // handled (buildFailureNextStep defaults to CODE).
+  // not yet reached — last_build_error_class (233) rides along when present, and a row that lacks
+  // it (pre-233, or a failure never classified) is handled honestly: buildFailureNextStep treats a
+  // missing class as UNKNOWN and never guesses CODE.
   const cs = await q(
     `SELECT c.*
        FROM container c WHERE c.owner_xell_id=$1 AND c.role = ANY($2) ORDER BY c.role`,
