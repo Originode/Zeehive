@@ -14,6 +14,11 @@ Dispatch each stage with a one-line task; the brief carries the rest:
 | 1 | `Implement docs/provision-proof-kit/stage-1-proof-machinery.md exactly as written.` | now |
 | 2 | `Implement docs/provision-proof-kit/stage-2-gates.md exactly as written.` | stage 1 is on main |
 | 3 | `Implement docs/provision-proof-kit/stage-3-infra-medic.md exactly as written.` | stage 2 is on main |
+| 4 | `Implement docs/provision-proof-kit/stage-4-medic-meta-plane.md exactly as written.` | stage 3 is on main |
+
+Stage 4 (added 2026-09-02) supersedes stage 3's PLACEMENT of the medic — a medic is not
+deployed in a xell; see [docs/medic-meta-plane-plan.md](../medic-meta-plane-plan.md) and
+DR-7/DR-8. Stage 3's capability column and handlers are its prerequisites, not its rival.
 
 The stages are strictly ordered — each builds on rows, modules and knobs the previous one
 landed. Do not dispatch two stages concurrently: stage 2 edits the claim CAS that stage 1's
@@ -23,7 +28,7 @@ Kit stages ↔ plan phases: stage 1 = plan phases 1+2 (evidence + surfacing, del
 landing — surfacing is what proves the evidence is readable). Stage 2 = plan phase 3 (gates).
 Stage 3 = plan phase 4 (the infra-medic harness).
 
-## After all three land
+## After the stages land
 
 Flipping a project to `readiness_proof='required'` is a **human's per-project decision** in the
 console (DR-3) — zeehive first, after its pool has run green under `advisory` for some days. No

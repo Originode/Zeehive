@@ -1,7 +1,10 @@
 # Decision Record: provision proof — proven chips before a zee, and the infra-medic harness
 
 **Date:** 2026-08-31 (DR-5 corrected 2026-09-02 — the infra-medic was re-decided from a worker
-harness to a MANAGER zee on the orchestrator's own project; see the amendment in DR-5).
+harness to a MANAGER zee on the orchestrator's own project; see the amendment in DR-5.
+**Superseded again 2026-09-02, same day:** DR-5's placement and write model are superseded by
+DR-7/DR-8 below — the medic is a META-PLANE resident, not a zee in a xell of any type; see
+[medic-meta-plane-plan.md](medic-meta-plane-plan.md)).
 **Author:** Architect (xell `figure-out-how-to-make-sure-the-xells-provis-aa002c`)
 **Status:** Decided — design only; implementation is cut as follow-up phases (the companion
 [provision-proof-plan.md](provision-proof-plan.md) is the plan).
@@ -140,6 +143,12 @@ is the cheapest correctness in the design.
 
 ## DR-5 — The infra-medic is a MANAGER zee on the orchestrator's own project: whole-meta-DB read, human-gated config writes, a capability column
 
+> **Superseded in part, 2026-09-02 (the second medic-rework card):** the PLACEMENT half (a
+> manager zee in a real xell) is superseded by **DR-7**, and the WRITE half (no write path,
+> human-gated config cards) by **DR-8**. What survives of DR-5: the scope wall (config, never
+> another project's code), the capability column, DR-6, and the human gate on host mutations.
+> Kept verbatim below per the record rule — a record is never edited to match what happened.
+
 **Correction 2026-09-02 (the medic-rework card).** This decision was first made on 2026-08-31 as
 *a worker harness* — the medic wore the harness in a worktree of the blocked project and landed
 manifest/compose fixes through the ordinary land gate. The first PROVISION-INFRA dispatches
@@ -238,6 +247,100 @@ green) and is the standing owner of keeping it green.
 folklore. **Reversibility:** trivial (it adds a checklist, changes no flow).
 **Would change our mind:** a queenzee-host agent runtime with human-gated host actions — a
 different product decision; supersede then.
+
+## DR-7 — The medic is a META-PLANE resident: an in-process agent loop, never a zee in a xell; its own UI (the Medic Bay)
+
+**Date:** 2026-09-02. **Supersedes:** DR-5's placement (manager zee in a real xell).
+**Directive (verbatim):** *"a medic is not to be deployed in a xell. a medic sees and updates
+meta-db, and deploy zees if needed. make a separate ui for medic hexagons."*
+
+**Decision:** a medic is an agent loop the QUEENZEE runs in its own process (the landed
+langchain-driver precedent, `lib/langchain-zee.js` / `queenzee/langchain-spawn.js`), anchored
+by a first-class `medic` row — no xell, no worktree, no branch, no cage, no containers, no land
+gate. `zee.xell_id` is relaxed (exactly-one-of `xell_id`/`medic_id` CHECK) so the existing
+observability spine (zee row, turn ledger, feed, gateway attribution, `zee_conversation`)
+carries medic turns unchanged. The medic sees the Zeehive SOURCE read-only through path-guarded
+read/search/history tools (no write/exec sibling exists); a ZEEHIVE code fault is a
+`dispatch_worker` of an ordinary Zeehive worker (real xell, normal gates). Medics render in
+their OWN console surface — the ⛑ Medic Bay (own pane, own hexagons from `medic` rows, the
+action ledger and transcript, `awaiting-human` on the needs-you bar) — and never in the
+honeycomb, which renders xell rows and therefore excludes them structurally. Design + migration:
+[medic-meta-plane-plan.md](medic-meta-plane-plan.md).
+
+**Options considered:**
+- *Chosen — in-process loop + `medic` table + relaxed `zee.xell_id`.* For: an organ that
+  repairs provisioning must not DEPEND on provisioning (the live dispatches proved the manager
+  medic inherits the exact faults it is sent to fix — dead shared-dev db, exhausted docker
+  pools); the loop precedent is landed and observed (gateway records every call); relaxing one
+  FK keeps the whole spine (`zee_turn.xell_id` and `session_event.xell_id` are already
+  nullable) and gives the honeycomb exclusion for free.
+- *Keep the manager-zee medic (DR-5 as corrected).* For: landed, one migration old. **Rejected:**
+  it is deployed IN a xell — the directive's exact complaint — and every config fix pays a cage
+  build plus a gated card; the medic was observed blocked by its own patient's disease.
+- *A "virtual xell" row (no worktree, flag `is_meta`).* For: zero FK changes. **Rejected:** the
+  fake row rides into every consumer of xell rows — pool sweeps, the reaper, preflight, the
+  proof ladder, and the honeycomb (the surface the medic must leave) — trading one nullable
+  column for exclusion special-cases in a dozen readers.
+- *A separate medic daemon/service outside the queenzee.* For: process isolation. **Rejected for
+  now:** a second deployable with its own lifecycle and credentials to run what is a bounded
+  tool loop; the plan keeps it as the named escape hatch if in-process turns measurably stall
+  the queenzee (the registry and role move unchanged).
+
+**Consequences:** makes easy — a medic that works while the fleet's provisioning is broken
+(its whole point), instant medic "spawn" (a row + a turn, no cage build), clean UI separation.
+Makes hard (deliberately) — a medic editing ANY repo: no write tool exists on any path. Makes
+impossible — a medic hexagon in the honeycomb lying about being an environment.
+**Reversibility:** the `medic_plane` knob returns the seam to `createManagerZee`; schema steps
+are additive. The one-way door is the follow-up REMOVAL of the cage-side surface (meta-RO bind,
+the `/infra/*` medic consumer) — it waits until the meta medic has run green.
+**Would change our mind:** measured queenzee event-loop degradation from medic turns → move the
+driver to a sidecar (same role, same registry); a medic task that genuinely requires workspace
+execution → that task is a dispatched worker's, by definition.
+
+## DR-8 — The medic writes the meta-DB directly, through a GRANT-scoped role; only host mutations stay human-gated
+
+**Date:** 2026-09-02. **Supersedes:** DR-5's write model ("WRITE: none, ever, by DSN" + the
+human-gated `propose` card for config changes).
+**Directive (verbatim):** *"it can fully access meta-db to fix configs so xells can actualy
+access dbs, or build, etc."*
+
+**Decision:** the medic's SQL tools (`meta_select`, `meta_write`) run on a dedicated
+`zeehive_medic` postgres role whose GRANTs are the wall: SELECT on everything except
+`provider_token` (vendor keys stay a human's re-auth); INSERT/UPDATE (DELETE only where a row
+is legitimately removable, e.g. `project_condition`) on the CONFIG surface only — `machine`,
+`machine_pool`, `pool_config`, `container` (no DELETE), `environment`, `environment_var`,
+`deploy_site`, `project_condition`, `build_readiness_record`, column-scoped `project`. NO grant
+on `xell`, `zee`, `medic`, `harness`, the gate tables or the ledgers — and the `medic_action`
+audit row is written by the driver on the OWNER pool, so the medic cannot forge or trim its own
+receipts. `bootstrap --perform` remains a HUMAN-GATED `infra_request` card: it mutates docker on
+real hosts, which "fully access meta-db" does not cover. Role minted idempotently at boot;
+`MEDICRW_MODE=simulate` mints nothing (the nested-queenzee contract).
+
+**Options considered:**
+- *Chosen — direct writes on a GRANT-scoped role, audited.* For: the human directs it verbatim;
+  the observed cost of DR-5's cards is that every one-line fix (a wrong `conn_pw`, a stale
+  manifest cache) became a two-actor round-trip — the human bottleneck the medic exists to
+  remove; `docs/self-project-prod-data.md`'s incident-backed rejection targeted a role that
+  "can UPDATE xell / DELETE container" (a nested reaper) — this role can do neither, by GRANT,
+  so the rejection's specific cost does not apply.
+- *Keep human-gated cards for all config writes (DR-5).* For: a human reads every change.
+  **Rejected:** it re-installs the bottleneck; the estate's config faults are frequent, small
+  and mechanical (the standing conditions list IS the evidence), and the audit ledger + narrow
+  GRANTs + additive-only surface bound the blast radius a gate was protecting against.
+- *The owner pool with a tool-side table allowlist.* For: no role to mint. **Rejected:** the
+  wall would be an if-statement in the tool — a prompt-shaped defence on a process that reads
+  attacker-influencible text (conditions, error strings). Postgres refuses; an allowlist asks.
+- *Full write including lifecycle tables.* **Rejected outright:** that is the nested reaper,
+  verbatim.
+
+**Consequences:** makes easy — a medic that FIXES (TKT-181-class credential rows, pool knobs,
+stale conditions) in one turn. Makes hard — a medic touching an agent's lifecycle or its own
+audit trail: no GRANT. Makes impossible — silent fixes: every write is a `medic_action` row
+rendered in the Bay. **Reversibility:** REVOKE is one statement per table; demotion of
+`meta_write` back to a gated card can be done per table (the plan names this as the specific
+retreat, recorded as a superseding DR). **Would change our mind:** a config incident a human
+gate would have caught → demote THAT table; chronic "table off the list" refusals → widen by
+named table, by migration, never by handing the loop the owner pool.
 
 ---
 

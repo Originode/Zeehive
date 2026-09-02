@@ -31,15 +31,21 @@ grep -l "readiness_proof" server/src/lib/xell-claim.js >/dev/null && \
 # STAGE 3 complete?  (medic: capability column + verb family)
 grep -rl "capabilities" db/migrations/ | xargs grep -l "infra-troubleshoot" >/dev/null 2>&1 && \
   grep -q "infra" scripts/zee && echo "stage 3: DONE"
+
+# STAGE 4 complete?  (medic in the meta plane: medic table + registry + Bay)
+grep -rl "CREATE TABLE medic" db/migrations/ >/dev/null 2>&1 && \
+  test -f server/src/lib/medic-tools.js && \
+  test -f web/src/MedicBay.jsx && echo "stage 4: DONE"
 ```
 
-- **All three DONE** → the kit is fully implemented. Do not invent stage 4. Verify the whole
+- **All four DONE** → the kit is fully implemented. Do not invent stage 5. Verify the whole
   (`node test/<the kit's tests>.mjs`, `zee build server --wait` in the background), report the
   state, and `zee done --summary` saying the kit is complete.
 - **Otherwise** → your job is the FIRST stage that did not print DONE:
   - stage 1 → implement [stage-1-proof-machinery.md](stage-1-proof-machinery.md)
   - stage 2 → implement [stage-2-gates.md](stage-2-gates.md)
   - stage 3 → implement [stage-3-infra-medic.md](stage-3-infra-medic.md)
+  - stage 4 → implement [stage-4-medic-meta-plane.md](stage-4-medic-meta-plane.md)
 
 **Detection is a floor, not a verdict.** A stage can be PARTIALLY landed (a predecessor died
 mid-way): if your stage's detection half-fires, read what exists (git log on the touched files,

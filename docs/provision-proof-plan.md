@@ -321,6 +321,13 @@ only near-one-way door here, and it is a door we want to walk through.
 
 ## 7. The INFRA-MEDIC harness — troubleshoot any project, onboard the next one
 
+> **⚠ Superseded in part, 2026-09-02 (second correction, same day):** the manager-zee placement
+> and the "write through gates" config model below are superseded by DR-7/DR-8 and
+> [medic-meta-plane-plan.md](medic-meta-plane-plan.md) — the medic is a META-PLANE resident
+> (never deployed in a xell), writes meta-DB config directly through a GRANT-scoped role, and
+> has its own UI (the Medic Bay). The scope wall, the capability column, the host-mutation gate
+> and §7.3's method survive. This section is kept as the record of the intermediate model.
+
 A system-wide harness, key `infra-medic`, **manager-type** (corrected 2026-09-02 — see DR-5;
 originally briefed as a worker), meta-DB-owned like every harness (row is the harness; authored
 by migration via `createHarness` + `harness_memory_put`, house rule 9). It is worn only by

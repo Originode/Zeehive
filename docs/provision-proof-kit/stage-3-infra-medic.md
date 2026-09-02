@@ -1,5 +1,13 @@
 # Stage 3 — the infra-medic harness: capability, verbs, meta-RO bind
 
+> **⚠ Superseded in part, 2026-09-02 (the second medic-rework):** the PLACEMENT this brief
+> builds — a manager zee in a real xell wearing the harness — is superseded by
+> [stage-4-medic-meta-plane.md](stage-4-medic-meta-plane.md) (DR-7/DR-8,
+> [docs/medic-meta-plane-plan.md](../medic-meta-plane-plan.md)): a medic is NOT deployed in a
+> xell; it is a meta-plane loop with GRANT-scoped meta-DB writes and its own UI. What this
+> stage landed still stands and is reused (the capability column, the handlers, migration 242's
+> runbook seam); do not dispatch this brief again — dispatch stage 4.
+
 **Implements:** phase 4 of [docs/provision-proof-plan.md](../provision-proof-plan.md) (landed
 `302df5b5`). **Prerequisite:** stage 2 is on main (the records and routing its verbs read).
 Read plan §7 and DR-5/DR-6 first — they decide everything structural here.
