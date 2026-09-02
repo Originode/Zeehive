@@ -8,7 +8,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
          routePrompt, deployRouter, redeployRouter,
          squashHelps, squashOffer,
-         dispatchMedic } from './api.js';
+         dispatchMedic, listMedics } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 // the ONE place the gateway-health state becomes words ("gateway unreachable at <addr>") — same
 // vocabulary in every surface, tested in plain node (web/src/gatewayHealth.js)
@@ -57,6 +57,9 @@ import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
 import WorkConsole from './work/WorkConsole.jsx';
+// The ⛑ MEDIC BAY — medics have no xell, so they appear in NO xell-shaped surface (not the
+// snapshot, not the honeycomb, not the pool). This is their separate UI (docs/medic-meta-plane-plan.md §5).
+import MedicBay from './MedicBay.jsx';
 // the honeycomb's WORK-NODE hierarchy reads the same plan the board does
 import { listWorkItems, deployWorkItem } from './work/workApi.js';
 import DeliveryTelemetry from './DeliveryTelemetry.jsx';
@@ -431,6 +434,20 @@ export default function App() {
     return ps;
   }, []);
 
+  // THE MEDIC BAY's list (stage 4). Fleet-wide, not project-scoped: a medic attends whatever pair
+  // is broken, and the Bay is the one surface medics have (they are not xells, so the honeycomb
+  // never shows them). medicRev bumps on every medic stream event so the Bay's OPEN panel re-reads
+  // its ledger/transcript while a background turn runs.
+  const [medics, setMedics] = useState([]);
+  const [medicRev, setMedicRev] = useState(0);
+  const loadMedics = useCallback(async () => {
+    try {
+      const m = await listMedics();
+      setMedics(Array.isArray(m) ? m : []);
+      setMedicRev((n) => n + 1);
+    } catch { /* keep last */ }
+  }, []);
+
   // The selected project's PLAN — the flat work-item list the honeycomb's node levels are computed
   // from. `pid` is explicit because the default project's id is only known from the fleet snapshot.
   const loadWorkItemsFor = useCallback(async (pid) => {
@@ -464,9 +481,10 @@ export default function App() {
       syncXells(f?.xells || []);    // adopt the snapshot's decorated xells — no extra NDJSON stream
       loadProjects();               // keep the switcher's xell counts fresh
       loadWorkItemsFor(pid || f?.project?.id);   // …and the plan the honeycomb's node levels read
+      loadMedics();                 // the Medic Bay (fleet-wide — a full resolve refreshes it too)
       setVersion((v) => v + 1);
     } catch { /* keep last */ }
-  }, [projectId, loadProjects, applyFleet, syncXells, loadWorkItemsFor]);
+  }, [projectId, loadProjects, applyFleet, syncXells, loadWorkItemsFor, loadMedics]);
 
   // An EXPLICIT re-read (the caller just acted — dispatch, build, pause, a gate decision…): full.
   const refresh = useCallback(async () => {
@@ -498,11 +516,12 @@ export default function App() {
         getDiffs(pid).then((d) => { if (projectIdRef.current === pid && d) setDiffs(d); });
       }
       if (type === 'work') loadWorkItemsFor(pid);   // a plan change moves the honeycomb's node levels
+      if (type === 'medic' || type === 'medic-action') loadMedics();   // the Bay's list + open panel
       f.catch(() => {});
       loadProjects();
     };
     refreshTimer.current = setTimeout(work, git ? 120 : 400);
-  }, [applyFleet, syncXells, loadProjects, loadWorkItemsFor]);
+  }, [applyFleet, syncXells, loadProjects, loadWorkItemsFor, loadMedics]);
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
@@ -653,21 +672,27 @@ export default function App() {
   // ProjectSetup's conditions row (POST /project-conditions/:id/dispatch-medic), surfaced where a
   // blocked project first shows up. A project whose pool stopped filling (a PROVISION-INFRA card, a
   // hand-written blocker) often has NO waiting xell — the fill just stops — so before this the bar
-  // was the one screen that stayed silent about the exact thing it exists to say. The medic is a
-  // MANAGER zee on the Zeehive project (the orchestrator's own — its prod database IS the meta-DB),
-  // briefed with the card VERBATIM + the card's project, to drive THAT project's META-DB CONFIG to
-  // convergence — never another project's code. Spawn takes seconds, so fire-and-forget toasts like
-  // a dispatch; the bar's row button disables itself while this runs and swallows the throw (the
+  // was the one screen that stayed silent about the exact thing it exists to say.
+  //
+  // WHAT ANSWERS THE BUTTON MOVED, THE BUTTON DID NOT (docs/medic-meta-plane-plan.md §5/§6, DR-7):
+  // a medic is no longer a zee in a xell. By default (project.medic_plane='meta') the queenzee
+  // creates a MEDIC — an in-process loop on its own plane, with no xell, no cage and no land gate —
+  // briefed with the card VERBATIM, which reads the whole meta-DB and writes THAT project's CONFIG
+  // rows on a GRANT-scoped postgres role. It shows up in the ⛑ MEDIC BAY, never in the honeycomb.
+  // The rollback knob value ('manager-zee') still spawns the superseded manager zee, and the
+  // receipt says which one answered. Dispatch takes seconds, so fire-and-forget toasts like a
+  // dispatch; the bar's row button disables itself while this runs and swallows the throw (the
   // error toast already told the human why).
   const handleDispatchMedic = useCallback(async (cond) => {
     const id = `medic-${cond?.id || '?'}-${Date.now()}`;
-    pushToast({ id, kind: 'progress', title: '⛑ Dispatching the infra-medic…',
-      body: 'Spawning a manager zee on the Zeehive project, briefed with this condition verbatim.' });
+    pushToast({ id, kind: 'progress', title: '⛑ Dispatching the medic…',
+      body: 'A meta-plane medic, briefed with this condition verbatim — no xell, no cage.' });
     try {
       const r = await dispatchMedic(cond?.id);
-      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Infra-medic dispatched',
-        body: r?.slug ? `manager zee running in ${r.slug} — it reads the card and drives the config.`
-          : 'spawned — it reads the card and drives the project config to convergence.' });
+      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Medic attending',
+        body: r?.plane === 'manager-zee'
+          ? `manager zee running in ${r.slug || 'a xell'} (the rollback plane) — it reads the card and drives the config.`
+          : 'attending in the ⛑ Medic Bay — watch its actions there; it writes config rows, not code.' });
       refresh();
       setTimeout(() => dismissToast(id), 9000);
       return r;
@@ -1712,6 +1737,12 @@ export default function App() {
                    onDispatchMedic={handleDispatchMedic}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
+      {/* THE MEDIC BAY — its own surface, directly under the needs-you bar (the two answer the same
+          question: what is waiting on a human). Medics are NOT xells, so they are in no snapshot and
+          no honeycomb; the Bay reads /api/medics itself and hides entirely when no medic exists.
+          Clicking a dispatched worker jumps to that worker's REAL hexagon. */}
+      <MedicBay medics={medics} onChanged={loadMedics} bump={medicRev} onOpenXell={setExpandedId} />
+
       <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
 
       {/* PRODUCTION DATA — a zee asking for the live prod database, or for a landed seed file to be
@@ -2068,7 +2099,7 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
         {blockers.length > 0 && (
           <button key="__proj-blockers__" className={`ny-chip proj${blockersOpen ? ' active' : ''}`}
                   onClick={() => { setBlockersOpen((v) => !v); if (expandedId) onJump?.(null); }}
-                  title={`${projectLabel} has ${blockers.length} medic-dispatchable condition${blockers.length === 1 ? '' : 's'} — a machine×project that cannot build or provision. Click to review and ⛑ dispatch the infra-medic.`}>
+                  title={`${projectLabel} has ${blockers.length} medic-dispatchable condition${blockers.length === 1 ? '' : 's'} — a machine×project that cannot build or provision. Click to review and ⛑ dispatch a medic (a meta-plane loop, not a xell).`}>
             ⚠ {projectLabel}
             <span className="ny-n">{blockers.length} blocker{blockers.length === 1 ? '' : 's'} · ⛑ medic</span>
           </button>
@@ -2133,13 +2164,14 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
         <div className="ny-decision" data-testid="ny-medic-decision">
           <div className="ny-note" data-testid="ny-medic-note">
             <b>⚠ {projectLabel}</b> cannot build or provision — the line{blockers.length === 1 ? '' : 's'} below
-            {' '}is on its conditions list as a live impediment a human can act on here. The <b>⛑
-            infra-medic</b> is a <b>manager zee on the Zeehive project</b> (the orchestrator&apos;s own — its
-            production database IS the meta-DB): briefed with the line verbatim and this project as its
-            target, it reads the whole meta-DB read-only and drives <b>this project&apos;s config</b> —
-            machines, pools, manifest cache, shared dev db — to convergence. It never touches another
-            project&apos;s code. {' '}<span className="ny-why">Nothing auto-spawns — dispatch takes a few seconds;
-            delete the line once the medic confirms the pair builds again.</span>
+            {' '}is on its conditions list as a live impediment a human can act on here. The <b>⛑ medic</b>
+            {' '}is <b>not a zee in a xell</b>: it is a loop on the <b>meta plane</b> (the queenzee&apos;s own
+            process — no worktree, no cage, no land gate). Briefed with the line verbatim and this project
+            as its target, it reads the <b>whole meta-DB</b>, <b>writes this project&apos;s config rows</b>
+            {' '}— machines, pools, manifest cache, shared dev db — on a GRANT-scoped postgres role, and
+            dispatches a real Zeehive worker only when the fix needs <b>code</b>. It sees Zeehive&apos;s source
+            read-only and never touches another project&apos;s code. {' '}<span className="ny-why">Nothing
+            auto-spawns — watch it in the ⛑ Medic Bay; delete the line once it confirms the pair builds again.</span>
           </div>
           {blockers.map((c) => (
             <div key={c.id} className="ny-blocker" data-testid={`ny-blocker-${c.id}`}>
@@ -2147,7 +2179,7 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
                 <span className="ny-blocker-date">[<b>{String(c.updated_at || c.created_at || '').slice(0, 10)}</b>]</span>
                 <button type="button" className="pill" disabled={!!dispatching}
                         onClick={() => dispatchOne(c)}
-                        title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
+                        title="Dispatch the medic (a meta-plane loop — no xell, no cage) to fix this project's meta-DB config so the machine×project pair stops being broken">
                   {dispatching === c.id ? '⛑ dispatching…' : '⛑ Dispatch medic'}
                 </button>
               </div>

@@ -456,10 +456,25 @@ export const getProjectConditions = (projectId) => fetch(`/api/projects/${projec
 export const addProjectCondition = (projectId, body, actor) => siteCall(`/api/projects/${projectId}/conditions`, 'POST', { body, actor });
 export const updateProjectCondition = (condId, body, actor) => siteCall(`/api/project-conditions/${condId}`, 'PUT', { body, actor });
 export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditions/${condId}`, 'DELETE');
-// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card (the card's dispatch seam): the queenzee
-// claims a ready xell of the card's project, wears the infra-medic harness, and briefs it to fix
-// the PROJECT CONFIG. Returns the dispatch receipt ({ status:'dispatched', slug, worktree, … }).
+// Dispatch the MEDIC from a condition (the card's dispatch seam). What it creates is the target
+// project's `medic_plane` knob (migration 248): by default a META-PLANE medic — a `medic` row and
+// an in-process loop on the queenzee, NO xell and no cage (docs/medic-meta-plane-plan.md, DR-7) —
+// and, on the rollback value, the superseded manager-zee. The receipt says which: { plane:'meta',
+// medic_id } or { plane:'manager-zee', slug, … }. The BUTTON does not move; only what answers it.
 export const dispatchMedic = (condId) => siteCall(`/api/project-conditions/${condId}/dispatch-medic`, 'POST');
+
+// ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) — medics are NOT xells, so they appear in
+// NO xell-shaped read model: not the fleet snapshot, not the honeycomb, not the pool. These four
+// calls are the Bay's whole data surface. ──
+export const listMedics = (all = false) => fetch(`/api/medics${all ? '?all=1' : ''}`).then((r) => (r.ok ? r.json() : []));
+// The medic panel: the row, its medic_action ledger (every write verbatim), its transcript, the
+// gated cards it filed and the workers it dispatched.
+export const getMedic = (id) => siteCall(`/api/medics/${id}`, 'GET');
+// Retire KEEPS the row and its ledger — the receipt must outlive the medic.
+export const retireMedic = (id) => siteCall(`/api/medics/${id}/retire`, 'POST', { actor: 'human@console' });
+// A human answers an `awaiting-human` medic: the message becomes the medic's next turn (it resumes
+// warm on its own conversation), so an answer is a reply, never a re-brief.
+export const messageMedic = (id, message) => siteCall(`/api/medics/${id}/message`, 'POST', { message });
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
@@ -584,6 +599,9 @@ export const applyComposeOnboarding = (projectId, body = {}) =>
 export const STREAM_TYPES = [
   'zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work', 'fleet-pause',
   'visual-verify', 'xource-clean', 'credential-inject', 'manager-mint',
+  // The Medic Bay's two feeds (stage 4): a medic row moved, or its action ledger grew. The Bay's
+  // list and open panel both re-read on these — a medic writing the meta-DB must be watchable live.
+  'medic', 'medic-action',
 ];
 
 // The event types that can move the GIT GRAPH: a landing moves main, a ship moves production's

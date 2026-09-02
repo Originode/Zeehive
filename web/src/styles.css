@@ -405,6 +405,70 @@ body { margin: 0; background: var(--bg); color: var(--text); }
   cursor: pointer; white-space: nowrap; }
 .needsyou .pill:hover { border-color: var(--down); background: rgba(229,85,78,.28); }
 .needsyou .pill:disabled { opacity: .55; cursor: default; }
+
+/* ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) ──────────────────────────────────────────
+   Medics have no xell, so they are in no honeycomb; this strip is their whole surface. Styled as a
+   SIBLING of .needsyou (same width, same card language, directly beneath it) because the two
+   answer the same question — what is waiting on a human — and a medic that asked must read as
+   loudly as a tend does. Its own palette lives in MedicBay.jsx (MEDIC_COLORS): the hexes are
+   painted from data, so only the chrome is here. */
+.medic-bay { display: flex; flex-direction: column; gap: 8px; background: var(--panel);
+  border: 1px solid var(--line); border-left: 3px solid #4aa3df; border-radius: 10px;
+  padding: 10px 12px; }
+.medic-bay-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.medic-bay-t { font-weight: 600; color: var(--text); }
+.medic-bay-n { color: var(--muted); font-size: 12px; }
+.medic-bay-ask { color: var(--building); }
+.medic-bay-note { color: var(--muted); font-size: 11px; margin-left: auto; }
+.medic-hexes { display: block; max-width: 100%; }
+.medic-hex polygon { transition: fill-opacity .15s ease; }
+.medic-hex:hover polygon { fill-opacity: 1; }
+.medic-hex-t { font-size: 13px; fill: #0e1116; }
+.medic-hex-s { font-size: 9px; fill: var(--muted); font-family: 'Segoe UI', sans-serif; }
+
+.medic-panel { display: flex; flex-direction: column; gap: 8px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.medic-panel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.medic-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.medic-target, .medic-when { color: var(--muted); font-size: 12px; }
+.medic-state { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--building); }
+.medic-panel .pill { background: rgba(74,163,223,.14); color: var(--text);
+  border: 1px solid rgba(74,163,223,.55); border-radius: 5px; font-size: 12px; padding: 3px 9px;
+  cursor: pointer; white-space: nowrap; margin-left: auto; }
+.medic-panel .pill.on { background: rgba(74,163,223,.3); }
+.medic-panel .pill.ghost { background: transparent; }
+.medic-panel .pill:disabled { opacity: .55; cursor: default; }
+/* The one sentence that stops a human hunting for a medic's hexagon in the honeycomb. */
+.medic-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.medic-brief pre, .medic-act-sql { font-family: 'Cascadia Code', monospace; font-size: 11.5px;
+  white-space: pre-wrap; word-break: break-word; color: var(--text); margin: 4px 0 0; }
+/* The ask. Nothing about a medic that is waiting may be quiet. */
+.medic-asking { display: flex; flex-direction: column; gap: 6px; background: rgba(224,161,58,.12);
+  border: 1px solid rgba(224,161,58,.5); border-radius: 8px; padding: 8px 10px; }
+.medic-asking-why { font-size: 13px; color: var(--text); }
+.medic-reply { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-family: inherit; font-size: 12px; resize: vertical; }
+/* THE LEDGER — the only receipt a config write leaves, so it is rendered verbatim and monospaced. */
+.medic-ledger { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px;
+  max-height: 40vh; overflow-y: auto; }
+.medic-act { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.medic-act.refused { border-color: rgba(229,85,78,.6); }
+.medic-act-head { font-size: 12px; color: var(--text); }
+.medic-act-tables, .medic-act-rows, .medic-act-when { color: var(--muted); font-size: 11px; }
+.medic-act-refused { color: var(--down); font-size: 11.5px; margin-top: 4px; }
+.medic-transcript { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.medic-msg { display: flex; gap: 6px; font-size: 12px; line-height: 1.5; }
+.medic-msg-role { color: var(--muted); }
+.medic-msg-text { white-space: pre-wrap; word-break: break-word; }
+.medic-msg.user .medic-msg-text { color: var(--muted); }
+.medic-cards, .medic-workers { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.medic-card { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.medic-card.pending { border-color: rgba(224,161,58,.55); }
+.medic-gate { color: var(--muted); }
+.medic-tabs { display: flex; gap: 6px; }
+.medic-tabs .pill { margin-left: 0; }
+.medic-empty { color: var(--muted); font-size: 12px; }
+.medic-err { color: var(--down); font-size: 12px; }
 /* WHY a tend was raised. A tend has no Approve/Reject — the only thing it carries is the zee's
    reason, so that reason is the loudest word in the note rather than a footnote to it. */
 .ny-why { color: var(--building); }
