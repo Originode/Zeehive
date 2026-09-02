@@ -16,7 +16,7 @@
 // AND A THIRD CASE, which is the one that keeps coming up: when both colliding files are LANDED ON MAIN,
 // the collision is HISTORY. Every database that follows main has run both, in whatever order a string sort
 // gave, and no rename can change that — it can only re-run one of them for everybody. The honest answer
-// there is to RECORD the pair (the grandfather list) and move on, which is what this repo has done seven
+// there is to RECORD the pair (the grandfather list) and move on, which is what this repo has done eight
 // times. "Applied on this database" and "landed on main" are different facts and give different advice:
 // the first is about one machine, the second is about the fleet, and only the second makes a collision
 // permanent. A file that exists on another XELL's branch is neither — that one is still free to move, and

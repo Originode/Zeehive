@@ -98,6 +98,16 @@ const GRANDFATHERED = {
   // And one more, landed in the minutes between this lint being written and being landed. Both files
   // were already on main, so neither was mine to renumber — the repair is forward, i.e. this line.
   '088': ['088_manager_manual_harness_key.sql', '088_manager_manual_scratch_resolution.sql'],
+  // And then a NINTH: a number handed out at 18:20 by `zee migration-number` had already been taken
+  // by a file landed at 17:06:37 — 75 minutes earlier, on the implement-per-docs provisioning line.
+  // The verb's own answer said "landed max 241" because it read the master ref at the moment of the
+  // ask, and the sibling 242 was still on a parallel branch that merged minutes later (3ae602f). Both
+  // files are on main now, so neither is safe to renumber (schema_migrations keys on FILENAME) — the
+  // repair is forward, i.e. this line. ORDER CHECKED, NOT ASSUMED: the two bodies are disjoint and
+  // order-independent — 242_infra_medic_manager.sql re-types a harness row; the other is a single
+  // COMMENT ON COLUMN container.last_build_error_class — so whichever string order a fresh database
+  // applies them in, the result is identical.
+  '242': ['242_infra_medic_manager.sql', '242_refresh_build_failure_class_column_comment_for_unknown.sql'],
   // (The EIGHTH collision was here — 090 twice, created BY a renumber escaping a different one — and it
   // is gone because somebody moved 090_restore_report.sql to 095. Its line is DELETED rather than left:
   // a grandfather entry that no longer describes a real duplicate is a standing permit for the next
