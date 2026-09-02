@@ -187,6 +187,15 @@ honeycomb — which renders xell rows — excludes them with zero code):
 - **The dispatch seams do not move:** the ⛑ buttons (needs-you bar, ProjectSetup conditions,
   PROVISION-INFRA cards) keep their exact placement and POST; the handler changes underneath
   (§6). The toast copy changes from "spawning a manager zee" to "medic attending in the bay".
+- **The EMERGENCY GATE (refined 2026-09-02, follow-up directive — "do not fill the panel with
+  tickets... the point of medic is emergency response. a dispatch button should only show when a
+  zee is being blocked").** The ⛑ dispatch affordance renders ONLY while `fleet.medic_emergency`
+  is non-empty: live zees whose xell shows infra evidence — a failing db preflight (#53), a
+  failing provision proof (236), or an INFRA-classed build failure (233). Computed once,
+  server-side (lib/fleet.js), read by both surfaces — one eligibility rule, like the CODE-fact
+  exclusion. A condition LINE is information (the editor keeps its list, with a note saying why
+  the button is absent); a BLOCKED ZEE is the emergency, and the opened panel leads with who is
+  blocked and why. `test/medic-bar-wiring.test.mjs` holds the gate on both surfaces.
 
 ## 6. Migration — a running fleet, no flag day
 

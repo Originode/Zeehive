@@ -51,5 +51,31 @@ ok(/\.needsyou \.ny-chip\.proj/.test(css), '.needsyou .ny-chip.proj is styled (t
 ok(/\.ny-blocker\s*\{/.test(css) && /\.ny-blocker-body\s*\{/.test(css), 'the opened blocker rows are styled');
 ok(/\.needsyou \.pill/.test(css), '.needsyou .pill is styled (the ⛑ button)');
 
+// ── THE EMERGENCY GATE (the follow-up directive, 2026-09-02) ─────────────────────────────────────
+// "do not fill the panel with tickets... the point of medic is emergency response. so a dispatch
+// button should only show when a zee is being blocked." The gate is ONE server-computed fact
+// (fleet.medic_emergency: live zees with a failing db preflight / failing proof / INFRA-classed
+// build failure) and BOTH surfaces must read it — a conditions list alone must render NO medic
+// button anywhere. These assertions are what keep the always-on ticket wall from growing back.
+console.log('\n── the ⛑ renders ONLY during a medic emergency (a zee is being blocked) ──');
+const fleetSrc = read('server/src/lib/fleet.js');
+ok(/medic_emergency/.test(fleetSrc) && /last_build_error_class === 'infra'/.test(fleetSrc)
+   && /preflight_error/.test(fleetSrc) && /proof_error/.test(fleetSrc),
+   'fleet.js computes medic_emergency from live-zee xells with infra evidence (preflight/proof/infra build)');
+ok(/medic_emergency,/.test(fleetSrc), 'the fleet snapshot carries medic_emergency');
+ok(/fleet\.medic_emergency/.test(app), 'App.jsx reads fleet.medic_emergency');
+ok(/medicEmergency\.length > 0 && blockers\.length > 0 &&/.test(app),
+   'the bar CHIP is gated on the emergency (never on the conditions list alone)');
+ok(/blockersOpen && medicEmergency\.length > 0 &&/.test(app),
+   'the opened dispatch panel is gated on the emergency too');
+ok(/<NeedsYouBar[\s\S]*?medicEmergency=\{medicEmergency\}/.test(app),
+   'App.jsx passes medicEmergency into the bar');
+ok(/<ProjectSetup[\s\S]*?medicEmergency=\{medicEmergency\}/.test(app),
+   'App.jsx passes medicEmergency into ProjectSetup');
+ok(/const showMedic = medicEmergency\.length > 0 &&/.test(setup),
+   'the ProjectSetup row button is gated on the SAME emergency fact');
+ok(/medic-gate-note/.test(setup),
+   'the conditions editor SAYS why the button is absent (a human who saw it yesterday will hunt for it)');
+
 console.log(fail ? `\n${fail} FAILURE(S)\n` : '\nall good\n');
 process.exit(fail ? 1 : 0);

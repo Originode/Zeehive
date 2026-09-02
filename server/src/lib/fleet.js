@@ -585,6 +585,28 @@ export async function getFleet(projectId) {
   for (const x of xells) await decorateXell(x, heads, deployed, project,
     { paused: pause.paused, projectPaused });
 
+  // THE MEDIC EMERGENCY — the one condition under which the console shows a ⛑ dispatch button
+  // (the medic-rework's follow-up directive, 2026-09-02: "the point of medic is emergency
+  // response. a dispatch button should only show when a zee is being blocked"). A condition LINE
+  // is information; a LIVE ZEE stuck behind an infra fault is an emergency. The predicate: a xell
+  // that HAS a zee (not pooled stock — a failing vacant xell is the pool's business and already
+  // renders in Project setup's readiness) AND carries infra evidence — a failing db preflight
+  // (#53), a failing provision proof (236), or a build failure the classifier called INFRA (233:
+  // "retrying will not help", which is exactly when a human should send the medic). Computed HERE,
+  // once, so the needs-you bar and the conditions editor read the SAME answer — the same
+  // one-rule-across-surfaces discipline the CODE-fact exclusion already follows.
+  const medic_emergency = xells
+    .filter((x) => x.zee_id && !['ready', 'retired', 'tearing-down'].includes(x.status))
+    .map((x) => {
+      const infraBuild = (x.stack || []).find((c) => c.last_build_error_class === 'infra');
+      const why = x.preflight_error ? `db preflight failing: ${x.preflight_error}`
+        : x.proof_error ? `provision proof failing: ${x.proof_error}`
+          : infraBuild ? `build failed [infra] on ${infraBuild.role || infraBuild.name}: ${String(infraBuild.last_build_error || '').split('\n').filter(Boolean).slice(-1)[0] || 'see the container card'}`
+            : null;
+      return why ? { xell_id: x.id, slug: x.slug, zee_name: x.zee_name || null, why: String(why).slice(0, 300) } : null;
+    })
+    .filter(Boolean);
+
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
   // figures on the client, so it also counts zees on retired xells the card list no longer shows.
@@ -837,6 +859,10 @@ export async function getFleet(projectId) {
     manager_mint: managerMint,
     credential_inject: credentialInject,
     conditions,
+    // The zees currently blocked by an INFRA fault — the ⛑ dispatch affordance's ONE gate (the
+    // emergency predicate computed above; empty = the console shows conditions as information,
+    // with no medic button anywhere).
+    medic_emergency,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,

@@ -40,7 +40,10 @@ const INGRESS_KINDS = [
 ];
 const ROLES = ['server', 'webapp', 'db', 'infra'];
 
-export default function ProjectSetup({ project: initial, onClose, onChanged, onSelect, nested = null }) {
+export default function ProjectSetup({ project: initial, onClose, onChanged, onSelect, nested = null,
+                                       // the fleet's medic-emergency list (blocked zees) — the ⛑
+                                       // dispatch gate, threaded down to the conditions editor
+                                       medicEmergency = [] }) {
   const [project, setProject] = useState(initial);         // null = create mode
   const [contexts, setContexts] = useState([]);
   useEffect(() => { getDockerContexts().then(setContexts).catch(() => setContexts([])); }, []);
@@ -489,7 +492,7 @@ function EditSections({ project, onChanged, onProject }) {
         <WireguardSection project={project} run={run} busy={busy} />
       </>}
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
-      {tab === 'conditions' && <ConditionsSection project={project} run={run} busy={busy} />}
+      {tab === 'conditions' && <ConditionsSection project={project} run={run} busy={busy} medicEmergency={medicEmergency} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'ticketapi' && <ApiKeysSection project={project} run={run} busy={busy} />}
@@ -2144,7 +2147,7 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
 // Explicitly EPHEMERAL — each line renders with the date it was last touched and deleting one is a
 // plain button, with no confirm, because stale conditions are worse than none and this list must
 // never become a second manual.
-function ConditionsSection({ project, run, busy }) {
+function ConditionsSection({ project, run, busy, medicEmergency = [] }) {
   const [conds, setConds] = useState(null);
   const [add, setAdd] = useState('');
   const [medicMsg, setMedicMsg] = useState(null);   // result of the last dispatch-medic click
@@ -2157,10 +2160,12 @@ function ConditionsSection({ project, run, busy }) {
   // fix the project's META-DB CONFIG (not this one xell) so the machine×project pair stops being
   // broken. A human clicks; nothing auto-spawns.
   const dispatch = async (c) => {
-    setMedicMsg('⛑ dispatching the infra-medic…');
+    setMedicMsg('⛑ dispatching the medic…');
     try {
       const r = await run(() => dispatchMedic(c.id));
-      setMedicMsg(`⛑ medic dispatched → xell ${r?.slug || r?.xell_id || '?'}`);
+      setMedicMsg(r?.plane === 'manager-zee'
+        ? `⛑ medic dispatched → xell ${r?.slug || r?.xell_id || '?'} (the rollback plane)`
+        : '⛑ medic attending — watch the Medic Bay (no xell, no cage)');
     } catch { setMedicMsg(null); }   // the panel's err line already told the human why
   };
   return (
@@ -2174,20 +2179,30 @@ function ConditionsSection({ project, run, busy }) {
         being true, delete it — a stale line is worse than none, so there is no archive and no confirm.
       </div>
       {medicMsg && <div className="pc" data-testid="medic-dispatch-msg">{medicMsg}</div>}
+      {/* Why there is no ⛑ button: the medic is EMERGENCY RESPONSE, and its dispatch affordance
+          appears only while a live zee is blocked by an infra fault. Said HERE because a human who
+          saw the button yesterday will otherwise hunt for it. */}
+      {(conds || []).length > 0 && medicEmergency.length === 0 && (
+        <div className="pc" data-testid="medic-gate-note">
+          (no ⛑ dispatch button: no zee is currently <b>blocked</b> by an infra fault — these lines are
+          information for briefings. The medic button appears with the emergency, on the needs-you bar
+          and here.)
+        </div>
+      )}
       {(conds || []).map((c) => {
         const d = String(c.updated_at || c.created_at || '').slice(0, 10);
         const body = String(c.body || '');
-        // The ⛑ is the medic's dispatch seam — shown on EVERY row except the rolling CODE fact
-        // ("main does not build since <sha>", proof-routing §4.6). A PROVISION-INFRA card is the
-        // auto seam, and a HAND-WRITTEN blocker line ("OMNIBIZ cannot provision — the NAS is out of
-        // addresses") is the same surface: a human wrote it BECAUSE the project's build/provision
-        // is impeded, and the medic (a manager on Zeehive, briefed with this card verbatim) is the
-        // config-fixing agent for exactly that. The CODE fact says the machine CAN build — a code
-        // fault is that project's crew, never the config-medic, so the button must not point a
-        // human at the wrong tool. The server route carries the real walls (MANAGER-only, and the
-        // medic's own scope wall once briefed); this is the affordance, and it is better to show it
-        // too wide than to hide the one button a human is looking for.
-        const showMedic = !body.startsWith('main does not build since');
+        // The ⛑ is the medic's dispatch seam — and it renders ONLY during a MEDIC EMERGENCY: a
+        // live zee of this project blocked by an infra fault (fleet.medic_emergency — the same
+        // server-computed gate the needs-you bar uses). The earlier rule showed the button on
+        // every condition row ("better too wide than hidden") and was OVERRULED by the follow-up
+        // directive (2026-09-02): "do not fill the panel with tickets... the point of medic is
+        // emergency response. a dispatch button should only show when a zee is being blocked."
+        // A condition line is INFORMATION — this editor keeps the list either way; the button is
+        // the emergency affordance. The rolling CODE fact ("main does not build since <sha>",
+        // proof-routing §4.6) stays excluded even in an emergency: a code fault is that project's
+        // crew, never the config-medic.
+        const showMedic = medicEmergency.length > 0 && !body.startsWith('main does not build since');
         return (
           <div key={c.id} className="setup-row" data-testid={`condition-${c.id}`}>
             <input value={c.body} data-condition-id={c.id}

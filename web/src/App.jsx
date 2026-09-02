@@ -1014,6 +1014,12 @@ export default function App() {
   const projectBlockers = fleetMatchesSelection
     ? (fleet.conditions || []).filter((c) => !String(c.body || '').startsWith('main does not build since'))
     : [];
+  // THE MEDIC EMERGENCY (server-computed, lib/fleet.js): the zees currently blocked by an INFRA
+  // fault. This is the ⛑ dispatch affordance's ONE gate — "the point of medic is emergency
+  // response. a dispatch button should only show when a zee is being blocked" (the medic-rework's
+  // follow-up directive). With this empty, conditions render as INFORMATION (the editor keeps its
+  // list) and no medic button appears anywhere.
+  const medicEmergency = fleetMatchesSelection ? (fleet.medic_emergency || []) : [];
   // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
   // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
   // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
@@ -1801,6 +1807,7 @@ export default function App() {
                    prodBindByXell={prodBindByXell} seedByXell={seedByXell}
                    doneSuggestByXell={doneSuggestByXell}
                    blockers={projectBlockers} blockersProjectName={project?.name || ''}
+                   medicEmergency={medicEmergency}
                    onDispatchMedic={handleDispatchMedic}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
@@ -1903,6 +1910,7 @@ export default function App() {
           legacy edit-the-selected-project behaviour. */}
       {showSetup && (
         <ProjectSetup project={setupCreate ? null : project} nested={nestedProject}
+                      medicEmergency={medicEmergency}
                       onClose={() => { setShowSetup(false); setNestedProject(null); setSetupCreate(false); }}
                       onChanged={refresh} onSelect={(id) => selectProject(id)} />
       )}
@@ -2107,7 +2115,8 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
 function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
                        prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {},
-                       blockers = [], blockersProjectName = '', onDispatchMedic = null }) {
+                       blockers = [], blockersProjectName = '', medicEmergency = [],
+                       onDispatchMedic = null }) {
   // A PROJECT's blockers are a decision on the bar WITHOUT a xell to key it on — the pool stopped
   // filling the pair, so there may be no waiting xell at all (which is exactly why this needed a
   // line of its own). They get a sibling open state and their own dispatch spinner, not the
@@ -2192,14 +2201,21 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
     <section className="needsyou">
       <div className="ny-row">
         <span className="ny-t">⚠ waiting on you:</span>
-        {/* THE PROJECT blocker — FIRST, ahead of every xell: a pair the pool stopped filling has no
-            waiting xell to raise a chip, so this is the one way the bar is ever told about it. */}
-        {blockers.length > 0 && (
+        {/* THE MEDIC EMERGENCY — FIRST, ahead of every xell. The medic is EMERGENCY RESPONSE, so
+            this chip (and the ⛑ dispatch buttons behind it) render ONLY while a LIVE ZEE is
+            actually blocked by an infra fault (fleet.medic_emergency — failing db preflight,
+            failing provision proof, or an INFRA-classed build failure). The conditions list alone
+            is NOT a reason to render it: a condition is information, and a bar full of
+            ticket-shaped medic cards trains eyes to skip the one that is a real emergency (the
+            follow-up directive, 2026-09-02). A dispatch still needs a condition LINE to brief the
+            medic with, so the chip waits for both; a blocked zee with no line shows its fault on
+            its own hexagon's chips either way. */}
+        {medicEmergency.length > 0 && blockers.length > 0 && (
           <button key="__proj-blockers__" className={`ny-chip proj${blockersOpen ? ' active' : ''}`}
                   onClick={() => { setBlockersOpen((v) => !v); if (expandedId) onJump?.(null); }}
-                  title={`${projectLabel} has ${blockers.length} medic-dispatchable condition${blockers.length === 1 ? '' : 's'} — a machine×project that cannot build or provision. Click to review and ⛑ dispatch a medic (a meta-plane loop, not a xell).`}>
+                  title={`${medicEmergency.length} zee(s) on ${projectLabel} are BLOCKED by an infra fault (${medicEmergency.map((e) => e.slug).join(', ')}). Click to review and ⛑ dispatch a medic (a meta-plane loop, not a xell).`}>
             ⚠ {projectLabel}
-            <span className="ny-n">{blockers.length} blocker{blockers.length === 1 ? '' : 's'} · ⛑ medic</span>
+            <span className="ny-n">{medicEmergency.length} zee{medicEmergency.length === 1 ? '' : 's'} blocked · ⛑ medic</span>
           </button>
         )}
         {waiting.map((w) => (
@@ -2255,14 +2271,23 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
           )}
         </div>
       )}
-      {/* The PROJECT blocker's opened form — sibling to the xell decision above. Its chips are the
-          conditions a human can dispatch the infra-medic on (a PROVISION-INFRA card or a written
-          blocker); the CODE fact is excluded at the call site, matching the ProjectSetup row. */}
-      {blockersOpen && (
+      {/* The MEDIC EMERGENCY's opened form — sibling to the xell decision above. Gated the same
+          way as its chip: it exists ONLY while a live zee is blocked (medicEmergency non-empty).
+          It leads with WHO is blocked and WHY (the emergency), then the condition lines a medic
+          can be briefed with; the CODE fact is excluded at the call site, matching ProjectSetup. */}
+      {blockersOpen && medicEmergency.length > 0 && (
         <div className="ny-decision" data-testid="ny-medic-decision">
+          <div className="ny-blocked-zees" data-testid="ny-blocked-zees">
+            {medicEmergency.map((e) => (
+              <div key={e.xell_id} className="ny-blocker-head">
+                <b>⛔ {e.slug}</b>{e.zee_name ? ` (${e.zee_name})` : ''}
+                <span className="pc"> — {e.why}</span>
+              </div>
+            ))}
+          </div>
           <div className="ny-note" data-testid="ny-medic-note">
-            <b>⚠ {projectLabel}</b> cannot build or provision — the line{blockers.length === 1 ? '' : 's'} below
-            {' '}is on its conditions list as a live impediment a human can act on here. The <b>⛑ medic</b>
+            The zee{medicEmergency.length === 1 ? ' above is' : 's above are'} <b>blocked by an infra
+            fault</b> on <b>{projectLabel}</b> — this is the medic&apos;s emergency. The <b>⛑ medic</b>
             {' '}is <b>not a zee in a xell</b>: it is a loop on the <b>meta plane</b> (the queenzee&apos;s own
             process — no worktree, no cage, no land gate). Briefed with the line verbatim and this project
             as its target, it reads the <b>whole meta-DB</b>, <b>writes this project&apos;s config rows</b>
