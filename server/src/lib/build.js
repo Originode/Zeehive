@@ -165,6 +165,57 @@ async function resolveBuildTarget(c) {
   return { runCtx, buildCtx, registry };
 }
 
+// ── ONE COMPOSE STACK, ONE `compose up` AT A TIME ─────────────────────────────────────────────
+// A xell's server and webapp are two ROWS but ONE compose project, and `docker compose up` is not
+// safe to run twice against the same project at once. omnibiz's spinoff compose says
+// `webapp: depends_on: [server]`, so `up -d webapp` creates the SERVER container too — and when the
+// proof kicks both roles off together (xell-proof.js builds every unbuilt role, `zee build` can do
+// the same) the two invocations race:
+//
+//   Network omnibiz-spin-quiet-atlas-34a97a_spinoff  Creating     ← twice, in one build's log
+//   Container omnibiz_spin_server_quiet-atlas-34a97a Creating
+//   service:server:1 Error response from daemon: Conflict. The container name
+//   "/omnibiz_spin_server_quiet-atlas-34a97a" is already in use by container "e570a1f0…".
+//
+// That Conflict is docker's "error response from daemon", so classifyBuildFailure calls it INFRA,
+// which writes build_readiness_record 'missing' and STOPS the project's pool fill (pool.js
+// fillStopReasonFor) — omnibiz stopped provisioning xells on local AND ugreen-nas for exactly this.
+// The loser's container is not even wrong: the sibling created it correctly a second earlier.
+//
+// So the docker work of one stack is serialized here — the row still flips to 'building' at once
+// (the spinner and the API answer are unchanged), it just waits its turn to touch the daemon. The
+// key is (run context, xell): one xell is one compose project, and two xells are never the same
+// stack, so different xells keep building in parallel.
+//
+// DEGRADE, NEVER DEADLOCK: a build that somehow never returns must not wedge every later build of
+// that xell forever, so the wait is bounded (BUILD_STACK_WAIT_MS, default 15min) and then we go
+// anyway — a possible race is strictly better than a permanent freeze.
+const STACK_WAIT_MS = Number(process.env.BUILD_STACK_WAIT_MS) || 15 * 60 * 1000;
+const stackQueues = new Map();
+
+export const stackKeyFor = (c) => `${c?.docker_ctx || 'default'}::${c?.owner_xell_id || c?.id}`;
+
+// Exported for the test: run `fn` after everything already queued on `key` has finished.
+export function onStack(key, fn, { maxWaitMs = STACK_WAIT_MS, onWait = null } = {}) {
+  const prev = stackQueues.get(key);
+  if (prev && onWait) { try { onWait(); } catch { /* logging must never break a build */ } }
+  let gate = prev || Promise.resolve();
+  if (prev && maxWaitMs > 0) {
+    // The timer is CLEARED the moment the previous build settles, so the only thing it can ever
+    // keep alive is a wait that is genuinely still waiting.
+    gate = new Promise((release) => {
+      const t = setTimeout(release, maxWaitMs);
+      const done = () => { clearTimeout(t); release(); };
+      prev.then(done, done);
+    });
+  }
+  const run = gate.then(fn, fn);               // the previous build's OUTCOME is not ours to inherit
+  const tail = run.then(() => {}, () => {});
+  stackQueues.set(key, tail);
+  tail.then(() => { if (stackQueues.get(key) === tail) stackQueues.delete(key); });
+  return run;
+}
+
 // Async spawn (NOT spawnSync) — a real image build would otherwise freeze the event loop.
 // `recorded` carries the meta-DB's compose/env/port facts as env overrides; the script keeps its
 // own derivation as fallback, so a bare invocation (or an old row with NULLs) still works.
@@ -344,7 +395,11 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
 
   // background — do NOT await; a real build takes minutes
   (async () => {
-    const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded });
+    const { json, err } = await onStack(stackKeyFor(c),
+      () => runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded }),
+      { onWait: () => logline('build', `${c.name}: another role of ${xell.slug} is already inside `
+          + `docker compose on ${c.docker_ctx || 'default'} — waiting for that build to finish (one `
+          + `compose project, one \`up\` at a time)`) });
     const ok = !!json && json.ok !== false;
     const failReason = ok ? null : formatBuildFailure(err);
     const failureClass = ok ? null : classifyBuildFailure(failReason);
