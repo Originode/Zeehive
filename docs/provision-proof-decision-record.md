@@ -1,6 +1,7 @@
 # Decision Record: provision proof — proven chips before a zee, and the infra-medic harness
 
-**Date:** 2026-08-31
+**Date:** 2026-08-31 (DR-5 corrected 2026-09-02 — the infra-medic was re-decided from a worker
+harness to a MANAGER zee on the orchestrator's own project; see the amendment in DR-5).
 **Author:** Architect (xell `figure-out-how-to-make-sure-the-xells-provis-aa002c`)
 **Status:** Decided — design only; implementation is cut as follow-up phases (the companion
 [provision-proof-plan.md](provision-proof-plan.md) is the plan).
@@ -137,42 +138,82 @@ check, which is strictly better information. **Reversibility:** full (advisory m
 old behaviour with a stamped verdict). **Would change our mind:** nothing foreseeable; this one
 is the cheapest correctness in the design.
 
-## DR-5 — The infra-medic is a worker harness: minted read-only meta-DB DSN, human-gated write verbs, a capability column
+## DR-5 — The infra-medic is a MANAGER zee on the orchestrator's own project: whole-meta-DB read, human-gated config writes, a capability column
 
-**Decision:** system-wide worker harness `infra-medic`; at dispatch it is bound to a per-xell
-SELECT-only role on the orchestrator's meta-DB (`prod-readonly.js` machinery, secret columns
-revoked, dropped with the xell) as `ZEEHIVE_META_RO_DSN`; all mutation goes through
-`/api/xell/self/infra/*` verbs — reads and burn-ins ungated, `bootstrap --perform` and
-`propose --change` human-gated cards the QUEENZEE performs; the routes are enabled by
-`harness.capabilities` (new jsonb column, allowlist-triggered, value `infra-troubleshoot`),
-never by anything in the bundle.
+**Correction 2026-09-02 (the medic-rework card).** This decision was first made on 2026-08-31 as
+*a worker harness* — the medic wore the harness in a worktree of the blocked project and landed
+manifest/compose fixes through the ordinary land gate. The first PROVISION-INFRA dispatches
+against that model corrected it: a PROVISION-INFRA card names a machine×project pair that cannot
+build because the project's **config** is wrong (manifest cache, pool knobs, machines, shared-dev
+db) — and the fix is a meta-DB config change, not a code change. Whoever fixes it must be able to
+read the **whole** meta-DB, because every project's config lives in the one orchestrator
+database — and no worker of any single project is. So the medic is re-typed below from worker to
+MANAGER-on-Zeehive. What survives the correction unchanged: no write DSN on any path, mutation
+stays human-gated, the capability column (not the bundle) is the grant, and project creation
+stays human (DR-6). The original "worker" text is superseded; the decision is restated in place.
+
+**Decision:** the `infra-medic` harness is MANAGER-type (migration 242 re-types the harness row
+and its bundle mirror; no new zee TYPE is invented). It is worn only by manager zees created on
+the **orchestrator's own project** (`createManagerZee` on Zeehive — whose production database IS
+the meta-DB), never as a worker of the blocked project. Because it is a manager on Zeehive, its
+manager prod-read already sees the whole fleet's config read-only; its one capability
+(`infra-troubleshoot`, a jsonb column allowlist-triggered at 237 — never a bundle field)
+additionally mints the per-xell SELECT-only meta-reader (`ZEEHIVE_META_RO_DSN`,
+`prod-readonly.js` machinery, secret columns revoked, dropped with the xell), mirroring
+`bindManagerToProdReadonly`'s lifecycle exactly. Every verb takes an **explicit TARGET project**
+(`--project <name|id>`, name or id): the reads and burn-ins (`readiness`, `proof`,
+`bootstrap-plan`, `settings`) are open across projects; the two mutations (`bootstrap --perform`,
+`propose --change`) are HUMAN-GATED `infra_request` cards filed on the target that the QUEENZEE
+performs on approval — never the medic, which holds no write DSN. The routes are the
+`/api/xell/self/infra/*` family, capability-gated through the effective harness chain.
+
+**Scope wall (the design's load-bearing line):** the medic fixes **meta-DB config rows only**.
+It never touches another project's code, repo, branches, ships or production data — its cage
+holds only the Zeehive repo (structural, not willpower). A fault needing a CODE change to
+another project is reported with the named `check` + `detail`, never fixed. A fault needing
+ZEEHIVE code is how the manager type is used: it dispatches a Zeehive worker (`zee dispatch`).
 
 **Options considered:**
-- *Chosen.* For: reuses the one precedent that already survived review (manager
-  `db-prod-readonly` — postgres enforces read-only, not a prompt); the write path keeps the
-  human between an agent and the fleet's estate, which is the product's whole design; the
-  capability column respects the structural rule that a bundle can never express a grant.
+- *Chosen (2026-09-02) — a manager zee on the orchestrator's own project.* For: ZEEHIVE's
+  production database IS the meta-DB, so a manager there already holds prod-RO over the whole
+  fleet — the read half of "read wide" needs no new machinery, and re-typing the one harness row
+  (migration 242) needs no `ZEE_TYPES` taxonomy change; managers cannot land code, which is now
+  exactly right — the medic's whole surface is meta-DB config rows, not project files; a ZEEHIVE
+  code fault stays reachable through the manager's `zee dispatch`. The 2026-08-31 rejection of
+  this option ("managers cannot land code … the medic's levers are commits, proofs and gated
+  asks") is answered by the correction: the medic's levers turned out to be **config reads and
+  gated asks**, not commits — the first live dispatches proved a PROVISION-INFRA fix is a
+  manifest-cache refresh or a settings/pool change, all queenzee-mediated verbs, none of them a
+  land gate.
+- *The original 2026-08-31 decision — a worker harness (superseded).* For (then): a worker in a
+  worktree can land manifest/compose fixes through the ordinary land gate. **Rejected
+  (2026-09-02):** a PROVISION-INFRA card is a CONFIG fault, not a code fault — landing a
+  project-file fix is the wrong surface, and the worker of the blocked project structurally
+  cannot read the WHOLE meta-DB (only its own project's rows), so it cannot even see most of the
+  config a diagnosis needs. The first dispatches against the worker model were how this surfaced.
 - *A limited write role on the meta-DB.* **Rejected:** `docs/self-project-prod-data.md` already
   rejected it with the incident behind it — any role that can UPDATE xell/DELETE container is a
   nested reaper. This is the specific cost, not a preference.
 - *A new zee TYPE (`infra`) beside worker/manager.* For: types already gate harness fit.
   **Rejected:** type is woven through dispatch, pickers, triggers and pool selection
-  (`ZEE_TYPES`); a third value is a fleet-wide change to express one route guard. The medic IS a
-  worker — it lands manifest/compose fixes through the ordinary land gate; that is most of its
-  fixes.
+  (`ZEE_TYPES`); a third value is a fleet-wide change to express one route guard. Re-typing the
+  one harness worker→manager (242) gets the whole model without the taxonomy change.
 - *Console-only troubleshooting (no harness — humans click bootstrap).* **Rejected:** that is
   today, and the estate is losing: the human is the bottleneck the directive names, and the
   diagnostic loop (read verdict → reproduce → narrow the lever → propose) is agent-shaped work.
-- *Make it a manager (managers already get prod-RO).* **Rejected:** managers cannot land code
-  and their manual teaches crew verbs; the medic's levers are commits, proofs and gated asks —
-  worker verbs. Granting by capability rather than by type also lets a future harness (e.g. an
-  onboarding concierge) carry the same grant without a taxonomy change.
+- *A manager MEDIC as a separate harness beside infra-medic.* **Rejected as redundant:** the
+  correction re-types the existing harness rather than minting a sibling — one row, one runbook,
+  one capability grant; the capability column still lets a future harness (e.g. an onboarding
+  concierge) carry the same grant without a taxonomy change.
 
-**Consequences:** makes easy: one dispatch that can diagnose any project's provisioning end to
-end, and drive onboarding to the three-light definition of done. Makes hard (deliberately):
-any agent fixing infra WITHOUT a human reading the plan first. Makes impossible: the medic
-mutating the meta-DB directly — postgres refuses. **Reversibility:** disable the harness
-(existing switch) or empty its capability; the RO role dies with each xell.
+**Consequences:** makes easy: one dispatch that can diagnose ANY project's provisioning end to
+end (reads open across projects because it lives where the whole meta-DB is readable) and drive
+onboarding to the three-light definition of done. Makes hard (deliberately): any agent fixing
+infra WITHOUT a human reading the plan first, and any agent editing a blocked project's code —
+the scope wall plus the manager refusal surface (`zee land`/`zee ship` are not the manager's
+verbs) make it impossible. Makes impossible: the medic mutating the meta-DB directly — postgres
+refuses. **Reversibility:** re-type the harness back to worker or empty its capability; the RO
+role dies with each xell.
 **Would change our mind:** if gated `propose --change` cards turn out to be so frequent and so
 rubber-stamped that the gate is pure latency, promote SPECIFIC named settings (e.g. machine
 dev_priority) to ungated — one at a time, by name, with this record superseded per setting.

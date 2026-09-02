@@ -321,44 +321,61 @@ only near-one-way door here, and it is a door we want to walk through.
 
 ## 7. The INFRA-MEDIC harness — troubleshoot any project, onboard the next one
 
-A system-wide **worker** harness, key `infra-medic`, meta-DB-owned like every harness (row is
-the harness; authored by migration via `createHarness` + `harness_memory_put`, house rule 9).
-Its memory is the runbook of THIS design: the readiness ladder, how to read a proof verdict,
-the bootstrap contract, the onboarding checklist (§5), and the refusals below.
+A system-wide harness, key `infra-medic`, **manager-type** (corrected 2026-09-02 — see DR-5;
+originally briefed as a worker), meta-DB-owned like every harness (row is the harness; authored
+by migration via `createHarness` + `harness_memory_put`, house rule 9). It is worn only by
+manager zees created on the **orchestrator's own project** (Zeehive — whose production database
+IS the meta-DB), where the medic's manager prod-read already sees the whole fleet read-only. Its
+memory is the runbook of THIS design: the readiness ladder, how to read a proof verdict, the
+bootstrap contract, the onboarding checklist (§5), and the refusals below.
 
 ### 7.1 Access — read wide, write through gates
 
 *"Access to zeehive settings and meta-db for that project"* decomposes into two different
 grants, and only one of them is a DSN:
 
-- **READ: a minted meta-DB read-only role.** The exact machinery managers already have
-  (`lib/prod-readonly.js`: per-xell `zee_ro_<slug>`, LOGIN+CONNECT+SELECT,
-  `default_transaction_read_only=on`, secret columns revoked), pointed at the orchestrator's own
-  meta-DB, injected as `ZEEHIVE_META_RO_DSN`, firewall-opened at seal time, dropped by the
-  reaper with the xell. The medic can read the whole estate — machines, pool knobs, container
-  rows, proof/readiness records, event log — which is what troubleshooting IS. Postgres enforces
-  read-only; a prompt does not.
+- **READ: manager prod-read on the orchestrator's own project, plus a minted meta-DB read-only
+  role.** The medic lives on Zeehive, so its manager prod-read (`DATABASE_URL`, read-only) IS a
+  read over the whole fleet's config — every project, machine, pool and container row. The one
+  capability additionally mints the per-xell SELECT-only meta-reader (`lib/prod-readonly.js`:
+  `zee_ro_<slug>`, LOGIN+CONNECT+SELECT, `default_transaction_read_only=on`, secret columns
+  revoked), injected as `ZEEHIVE_META_RO_DSN`, firewall-opened at seal time, dropped by the
+  reaper with the xell — the same lifecycle as `bindManagerToProdReadonly`. The medic can read
+  the whole estate — machines, pool knobs, container rows, proof/readiness records, event log —
+  which is what troubleshooting IS. Postgres enforces read-only; a prompt does not.
 - **WRITE: none, ever, by DSN.** `docs/self-project-prod-data.md` already records why: any role
   that can `UPDATE xell` or `DELETE FROM container` is a nested reaper. Every mutation is a
   queenzee-mediated verb, and every mutation that touches real infra or settings is
-  **human-gated** — the same land/ship card pattern:
+  **human-gated** — the same land/ship card pattern.
+
+Every verb takes an **explicit TARGET project** — `--project <name|id>` — because the meta-DB
+holds EVERY project's config and the medic is not "of" the project it is fixing:
 
 ```
-zee infra readiness [--machine <key>]   # run/read machine×project readiness  (NOT gated, read-only)
-zee infra proof [--xell <slug>]         # burn-in a pooled xell of this project (NOT gated — throwaway
-                                        #   containers, same class as `zee build`)
-zee infra bootstrap --plan              # the dry-run plan performBuildBootstrap already computes (NOT gated)
-zee infra bootstrap --perform           # HUMAN-GATED card → queenzee performs (the console 🔧, as a verb;
-                                        #   same contract: creates only manifest-declared DEV infra,
-                                        #   never invents, never removes, dev-only guard intact)
-zee infra settings                      # non-secret projection of this project's settings (NOT gated)
-zee infra propose --change '<patch>' --reason "…"
-                                        # HUMAN-GATED settings card (pool knobs, registry, machine
-                                        #   priority, manifest-cache refresh) → queenzee applies on approval
+zee infra readiness [--machine <key>] --project <name|id>   # run/read machine×project readiness of the TARGET  (NOT gated, read-only)
+zee infra proof [--xell <slug>] --project <name|id>         # burn-in a pooled xell of the TARGET project (NOT gated — throwaway
+                                                            #   containers, same class as `zee build`)
+zee infra bootstrap --plan --project <name|id>              # the dry-run plan performBuildBootstrap already computes (NOT gated)
+zee infra bootstrap --perform --project <name|id>           # HUMAN-GATED card → queenzee performs (the console 🔧, as a verb;
+                                                            #   same contract: creates only manifest-declared DEV infra,
+                                                            #   never invents, never removes, dev-only guard intact)
+zee infra settings --project <name|id>                      # non-secret projection of the TARGET's settings (NOT gated)
+zee infra propose --project <name|id> --change '<patch>' --reason "…"
+                                                            # HUMAN-GATED settings card on the TARGET (pool knobs, registry,
+                                                            #   machine priority, manifest-cache refresh) → queenzee applies
 ```
 
-Routes: `/api/xell/self/infra/*`, token-scoped like every self verb, project-resolved from the
-calling xell — the medic acts on ITS project and nothing else (the same wall as `zee item`).
+Routes: `/api/xell/self/infra/*`, token-scoped like every self verb, capability-gated through
+the effective harness chain. Reads are open across projects; the two mutations (`bootstrap
+--perform`, `propose --change`) file a HUMAN-GATED `infra_request` card on the TARGET project
+that performs nothing until a human approves.
+
+**The scope wall.** The medic fixes meta-DB config rows — the project's registry / pool_config,
+machine + machine_pool settings, a manifest-cache refresh, the bootstrap's infra asks. That is
+the WHOLE surface. It never touches another project's code, repo, branches, ships or production
+data (its cage holds only the Zeehive repo — structural, not willpower). A fault needing a CODE
+change to another project is reported with the named check, not fixed; a fault needing ZEEHIVE
+code is how it uses its manager type — it dispatches a Zeehive worker.
 
 ### 7.2 Authorization — a capability column, not a bundle field
 
@@ -371,19 +388,20 @@ ALTER TABLE harness ADD COLUMN IF NOT EXISTS capabilities jsonb NOT NULL DEFAULT
 ```
 
 The `/infra/*` routes check the effective harness chain for the capability; the meta-RO bind at
-dispatch is triggered by the same flag (mirroring `bindManagerToProdReadonly`). Assigning a
-capability-bearing harness is already a human/console act, so wearing the medic IS the grant —
-no second approval step is invented. A harness edit cannot self-grant (the column is not in the
-bundle, set only by migration/console).
+dispatch is triggered by the same flag (mirroring `bindManagerToProdReadonly`). Wearing the
+harness IS the grant — the harness is manager-type, and creating a manager zee is a human/console
+act (`createManagerZee`; the ⛑ dispatch-medic button is the console surface) — so no second
+approval step is invented. A harness edit cannot self-grant (the column is not in the bundle, set
+only by migration/console).
 
 ### 7.3 What the medic does with it
 
 - **Troubleshoot:** read the failed check verbatim from the records → reproduce with
-  `zee infra proof` → fix by the narrowest lever: a manifest/compose change (landed through the
-  ordinary land gate — the medic is a worker in a worktree, so project-file fixes are just
-  commits), a `bootstrap --perform` ask, or a `propose` for a settings change. Its manual's
-  standing refusals: never asks for a write DSN, never routes around a gate, reports what it
-  could not fix with the named check.
+  `zee infra proof --project <name>` → fix by the narrowest lever, all queenzee-mediated: a
+  manifest-cache refresh or settings/pool `propose` (HUMAN-GATED card), a `bootstrap --perform`
+  ask (HUMAN-GATED card), or — when the fault needs ZEEHIVE code — a `zee dispatch` of a Zeehive
+  worker. Its manual's standing refusals: never asks for a write DSN, never routes around a gate,
+  reports what it could not fix with the named check, never edits another project's code.
 - **Onboard / initiate:** drive the §5 definition of done for a new or newly-onboarded project:
   validate the manifest parse, probe every machine, raise the bootstrap asks, prove the first
   pooled xell, and hand back the three-light certificate. Project CREATION stays a human console
