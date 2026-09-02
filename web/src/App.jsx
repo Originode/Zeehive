@@ -1056,7 +1056,15 @@ export default function App() {
   const openItemById = new Map(openItems.map((i) => [i.id, i]));
   let hiveCells;
   if (hiveMode === 'projects') {
-    hiveCells = (projects || []).map((p) => ({ id: `proj:${p.id}`, hex_kind: 'project', slug: p.name, project: p }));
+    // The fleet streams ONE project at a time — the SELECTED one — so only that project's hexagon can
+    // carry its xells as the status-dot legend under the count ("5 xells" → 5 coloured dots, each the
+    // colour its own hexagon would be painted one level down). The other project hexagons have no xells
+    // loaded, so they keep the bare count until the viewer is actually looking at them.
+    const selFleet = projectId ? gridXells : [];
+    hiveCells = (projects || []).map((p) => ({
+      id: `proj:${p.id}`, hex_kind: 'project', slug: p.name, project: p,
+      project_xells: p.id === projectId ? selFleet : null,
+    }));
   } else {
     const xellById = new Map(xells.map((x) => [x.id, x]));
     const openXellItem = new Set(openItems.map((i) => i.xell_id).filter(Boolean));

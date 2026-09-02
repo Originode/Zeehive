@@ -1761,6 +1761,30 @@ export function drawProjectHex(ctx, hx, { hover, dim }) {
   ctx.fillStyle = NODE.muted;
   const n = Number(p.xell_count) || 0;
   ctx.fillText(`${n} xell${n === 1 ? '' : 's'} · open ⬡`, cx, cy + size * 0.4);
+  // Under the count, one status-coloured dot per xell in this project — the same colour its own
+  // hexagon would be painted one level down (statusColor is the hexagon-fill vocabulary), so the
+  // count and the dots read as the same fleet. project_xells rides only the SELECTED project's cell
+  // (App.jsx feeds it when p.id === projectId); the other project hexagons keep the bare count. The
+  // row is capped at what fits the bottom band; the overflow is counted in words, not crammed in.
+  const px = Array.isArray(x.project_xells) ? x.project_xells : [];
+  if (px.length) {
+    const dy = size * 0.56;                 // just below the count line, still inside the wide band
+    const y = cy + dy;
+    const r = Math.max(2, size * 0.045);
+    const gap = r * 2.7;
+    const halfW = hexHalfWidthAt(size, dy) * 0.94;
+    const shown = Math.min(px.length, Math.max(1, Math.floor((halfW * 2 - r * 2 + gap) / gap)));
+    const x0 = cx - ((shown - 1) * gap) / 2;
+    for (let i = 0; i < shown; i++) {
+      ctx.beginPath(); ctx.arc(x0 + i * gap, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = statusColor(px[i]); ctx.fill();
+    }
+    if (px.length > shown) {
+      ctx.font = `${Math.min(9.5, size * 0.12)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = NODE.muted;
+      ctx.fillText(`+${px.length - shown}`, cx, y + r * 3);
+    }
+  }
   ctx.restore();
 }
 
