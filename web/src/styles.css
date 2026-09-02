@@ -384,6 +384,27 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 /* the decision card(s) for the clicked chip, inline right under the bar */
 .ny-decision { display: flex; flex-direction: column; gap: 8px; }
+/* The PROJECT blocker chip (a machine×project that cannot build/provision, surfaced on the bar even
+   when no xell is waiting — the pool just stopped filling). Amber like every other need, but edged
+   with the fault colour: this one is a build being stopped, not a decision a zee is waiting on. */
+.needsyou .ny-chip.proj { border-color: rgba(229,85,78,.55); }
+.needsyou .ny-chip.proj.active { border-color: var(--down); background: rgba(229,85,78,.16);
+  box-shadow: 0 0 0 1px var(--down) inset; }
+/* One opened blocker: the dated condition line + its ⛑ Dispatch-medic button. The body is a
+   first-class sentence (a PROVISION-INFRA card quotes the check detail), so it is readable in full,
+   wrapped, never clipped to a head the way a chip's title has to be. */
+.ny-blocker { display: flex; flex-direction: column; gap: 5px; background: var(--panel2);
+  border: 1px solid var(--line); border-left: 2px solid rgba(229,85,78,.7); border-radius: 6px;
+  padding: 8px 10px; }
+.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ny-blocker-date { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+.ny-blocker-body { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
+  line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.needsyou .pill { background: rgba(229,85,78,.16); color: var(--text);
+  border: 1px solid rgba(229,85,78,.6); border-radius: 5px; font-size: 12px; padding: 3px 9px;
+  cursor: pointer; white-space: nowrap; }
+.needsyou .pill:hover { border-color: var(--down); background: rgba(229,85,78,.28); }
+.needsyou .pill:disabled { opacity: .55; cursor: default; }
 /* WHY a tend was raised. A tend has no Approve/Reject — the only thing it carries is the zee's
    reason, so that reason is the loudest word in the note rather than a footnote to it. */
 .ny-why { color: var(--building); }

@@ -7,7 +7,8 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
          routePrompt, deployRouter, redeployRouter,
-         squashHelps, squashOffer } from './api.js';
+         squashHelps, squashOffer,
+         dispatchMedic } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 // the ONE place the gateway-health state becomes words ("gateway unreachable at <addr>") — same
 // vocabulary in every surface, tested in plain node (web/src/gatewayHealth.js)
@@ -648,6 +649,36 @@ export default function App() {
     // state declared at the top of the component, so it is always safe to reference here.
   }, [pushToast, dismissToast, refresh, projectId, fleet]);
 
+  // Dispatch the infra-medic from a blocker condition on the NEEDS-YOU BAR — the same seam as
+  // ProjectSetup's conditions row (POST /project-conditions/:id/dispatch-medic), surfaced where a
+  // blocked project first shows up. A project whose pool stopped filling (a PROVISION-INFRA card, a
+  // hand-written blocker) often has NO waiting xell — the fill just stops — so before this the bar
+  // was the one screen that stayed silent about the exact thing it exists to say. The medic is a
+  // MANAGER zee on the Zeehive project (the orchestrator's own — its prod database IS the meta-DB),
+  // briefed with the card VERBATIM + the card's project, to drive THAT project's META-DB CONFIG to
+  // convergence — never another project's code. Spawn takes seconds, so fire-and-forget toasts like
+  // a dispatch; the bar's row button disables itself while this runs and swallows the throw (the
+  // error toast already told the human why).
+  const handleDispatchMedic = useCallback(async (cond) => {
+    const id = `medic-${cond?.id || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: '⛑ Dispatching the infra-medic…',
+      body: 'Spawning a manager zee on the Zeehive project, briefed with this condition verbatim.' });
+    try {
+      const r = await dispatchMedic(cond?.id);
+      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Infra-medic dispatched',
+        body: r?.slug ? `manager zee running in ${r.slug} — it reads the card and drives the config.`
+          : 'spawned — it reads the card and drives the project config to convergence.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 9000);
+      return r;
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Medic dispatch refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
+      throw e;
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
   // ── GitHub outbound (push / open PR) ───────────────────────────────────────
   // Same flow as ProjectSetup's BasicsSection — confirm, call API, report the outcome.
   const doGitHubPush = useCallback(async () => {
@@ -937,6 +968,17 @@ export default function App() {
   // xells on the canvas — the "remnants that linger". So only use the fleet fallback when it
   // actually belongs to the selected project; otherwise show nothing until the new data lands.
   const fleetMatchesSelection = !projectId || fleet.project?.id === projectId;
+  // The needs-you bar's PROJECT blocker chip: this project's CURRENT CONDITIONS that a human can act
+  // on there — a PROVISION-INFRA card (the auto seam: the pool stopped filling this pair) or a
+  // hand-written blocker/note a human added because the project cannot build or provision. The
+  // rolling CODE fact ("main does not build since <sha>") is EXCLUDED — it says the machine CAN
+  // build, so a code fault is that project's crew, never the config-medic, and it gets no ⛑ here
+  // (the SAME predicate as the ProjectSetup row button — one eligibility rule across both surfaces).
+  // Guarded by fleetMatchesSelection so a mid-switch stale snapshot never paints the previous
+  // project's cards under the new project's name.
+  const projectBlockers = fleetMatchesSelection
+    ? (fleet.conditions || []).filter((c) => !String(c.body || '').startsWith('main does not build since'))
+    : [];
   // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
   // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
   // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
@@ -1666,6 +1708,8 @@ export default function App() {
       <NeedsYouBar xells={xells} links={crewOfFleet} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
                    prodBindByXell={prodBindByXell} seedByXell={seedByXell}
                    doneSuggestByXell={doneSuggestByXell}
+                   blockers={projectBlockers} blockersProjectName={project?.name || ''}
+                   onDispatchMedic={handleDispatchMedic}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
@@ -1933,7 +1977,15 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
 function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
-                       prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {} }) {
+                       prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {},
+                       blockers = [], blockersProjectName = '', onDispatchMedic = null }) {
+  // A PROJECT's blockers are a decision on the bar WITHOUT a xell to key it on — the pool stopped
+  // filling the pair, so there may be no waiting xell at all (which is exactly why this needed a
+  // line of its own). They get a sibling open state and their own dispatch spinner, not the
+  // xell-chip machinery.
+  const [blockersOpen, setBlockersOpen] = useState(false);
+  const [dispatching, setDispatching] = useState(null);
+  const projectLabel = blockersProjectName || 'this project';
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -1984,10 +2036,20 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
       // without breaking anything real. Order in a sum is arbitrary; that assertion is not.
       n: held + prs + tend + bind + seed + doneSug + blocked + envAlert };
   }).filter((w) => w.n > 0);
-  if (!waiting.length) return null;
+  if (!waiting.length && !blockers.length) return null;
 
-  const go = (id) => onJump?.(id === expandedId ? null : id);  // click the open one again to collapse
+  const go = (id) => { setBlockersOpen(false); onJump?.(id === expandedId ? null : id); };  // click the open one again to collapse
   const open = waiting.find((w) => w.x.id === expandedId);
+  // One ⛑ click: hand the condition to the App-level dispatcher (progress toast + refresh) and spin
+  // this row while the manager zee spawns. Refusals are toasted by the dispatcher; the catch here
+  // just clears the spinner (the throw is swallowed so nothing silently proceeds on a refusal).
+  const dispatchOne = async (c) => {
+    if (!onDispatchMedic || dispatching) return;
+    setDispatching(c.id);
+    try { await onDispatchMedic(c); }
+    catch { /* the dispatcher's error toast already told the human why */ }
+    finally { setDispatching(null); }
+  };
   // pending decisions, PLUS an approved landing that is wedging the runway — that one is a decision
   // again (see `blocked` above), and holdsRunway is why it survives `visible` even when dismissed.
   const landings = open
@@ -2001,6 +2063,16 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
     <section className="needsyou">
       <div className="ny-row">
         <span className="ny-t">⚠ waiting on you:</span>
+        {/* THE PROJECT blocker — FIRST, ahead of every xell: a pair the pool stopped filling has no
+            waiting xell to raise a chip, so this is the one way the bar is ever told about it. */}
+        {blockers.length > 0 && (
+          <button key="__proj-blockers__" className={`ny-chip proj${blockersOpen ? ' active' : ''}`}
+                  onClick={() => { setBlockersOpen((v) => !v); if (expandedId) onJump?.(null); }}
+                  title={`${projectLabel} has ${blockers.length} medic-dispatchable condition${blockers.length === 1 ? '' : 's'} — a machine×project that cannot build or provision. Click to review and ⛑ dispatch the infra-medic.`}>
+            ⚠ {projectLabel}
+            <span className="ny-n">{blockers.length} blocker{blockers.length === 1 ? '' : 's'} · ⛑ medic</span>
+          </button>
+        )}
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
                   title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.blocked && `an APPROVED landing is holding the runway with ${w.blockedBy} zee(s) queued behind it — it never landed`, w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`, w.envAlert && `.zeehive.env could NOT be reconciled and a zee is live in it${w.envFull ? `: ${w.envFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
@@ -2052,6 +2124,36 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
               {' '}Fix the cause (usually: re-point this xell&apos;s database) and the next reconcile clears this;
               the zee cannot.</div>
           )}
+        </div>
+      )}
+      {/* The PROJECT blocker's opened form — sibling to the xell decision above. Its chips are the
+          conditions a human can dispatch the infra-medic on (a PROVISION-INFRA card or a written
+          blocker); the CODE fact is excluded at the call site, matching the ProjectSetup row. */}
+      {blockersOpen && (
+        <div className="ny-decision" data-testid="ny-medic-decision">
+          <div className="ny-note" data-testid="ny-medic-note">
+            <b>⚠ {projectLabel}</b> cannot build or provision — the line{blockers.length === 1 ? '' : 's'} below
+            {' '}is on its conditions list as a live impediment a human can act on here. The <b>⛑
+            infra-medic</b> is a <b>manager zee on the Zeehive project</b> (the orchestrator&apos;s own — its
+            production database IS the meta-DB): briefed with the line verbatim and this project as its
+            target, it reads the whole meta-DB read-only and drives <b>this project&apos;s config</b> —
+            machines, pools, manifest cache, shared dev db — to convergence. It never touches another
+            project&apos;s code. {' '}<span className="ny-why">Nothing auto-spawns — dispatch takes a few seconds;
+            delete the line once the medic confirms the pair builds again.</span>
+          </div>
+          {blockers.map((c) => (
+            <div key={c.id} className="ny-blocker" data-testid={`ny-blocker-${c.id}`}>
+              <div className="ny-blocker-head">
+                <span className="ny-blocker-date">[<b>{String(c.updated_at || c.created_at || '').slice(0, 10)}</b>]</span>
+                <button type="button" className="pill" disabled={!!dispatching}
+                        onClick={() => dispatchOne(c)}
+                        title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
+                  {dispatching === c.id ? '⛑ dispatching…' : '⛑ Dispatch medic'}
+                </button>
+              </div>
+              <div className="ny-blocker-body">{c.body}</div>
+            </div>
+          ))}
         </div>
       )}
     </section>

@@ -15,6 +15,7 @@ import { backupDue } from '../queenzee/maintenance.js';
 import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
+import { listProjectConditions } from './current-conditions.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
@@ -800,6 +801,13 @@ export async function getFleet(projectId) {
   // as a receipt so "did the new key reach the cages?" does not vanish.
   const credentialInject = await listCredentialInjectRequests(pid, { open: true });
 
+  // CURRENT CONDITIONS — the project's live-impediment list (the briefing-time injection). Rides the
+  // fleet snapshot so the console's needs-you surface (a blocked project's ⛑ medic chip — the one
+  // thing a provision halt leaves the bar silent about) and the conditions editor read the SAME poll;
+  // a condition is a slow-changing fact, and one ≤ CONDITION_LIMIT query on an already-heavy snapshot
+  // is cheaper than a second endpoint the console has to keep in step with.
+  const conditions = await listProjectConditions(pid);
+
   return {
     project,
     pool,
@@ -828,6 +836,7 @@ export async function getFleet(projectId) {
     xource,
     manager_mint: managerMint,
     credential_inject: credentialInject,
+    conditions,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,
