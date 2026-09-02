@@ -1,10 +1,11 @@
-// THE INFRA-MEDIC SURFACE (provision-proof plan §7, stage 3) — capability gate, gated cards,
-// non-secret settings projection, and the meta-RO simulate contract.
+// THE INFRA-MEDIC SURFACE (provision-proof plan §7, stage 3, meta-plane model) — capability gate,
+// gated cards, non-secret settings projection, the meta-RO simulate contract, and the EXPLICIT
+// TARGET project on every verb (the medic is a MANAGER on the Zeehive project fixing ANY project's
+// meta-DB config — migration 242 re-types the harness; 243 wires --project through the CLI).
 //
 // This is a REAL postgres test against DATABASE_URL (a clone / the db-sandbox with the full
-// schema — it must be migrated first: 237/238/239/240/241). It drives the stage-3 machinery
-// through its actual modules, not through the HTTP layer (that half is the e2e exercise against
-// `zee build server`):
+// schema — it must be migrated first: 237-242). It drives the stage-3 machinery through its actual
+// modules, not through the HTTP layer (that half is the e2e exercise against `zee build server`):
 //
 //   1. the harness.capabilities ALLOWLIST trigger (237) — empty default fine, 'infra-troubleshoot'
 //      accepted, anything else REFUSED, non-array refused;
@@ -19,7 +20,10 @@
 //   4. the settings projection leaks NO secret column — asserted against the LIVE sandbox schema
 //      (the *_hint sibling rule + the code's explicit secret list), never a hardcoded list;
 //   5. PRODRO_MODE=simulate mints NOTHING real: mintMetaReader creates no zee_ro_* role on the
-//      cluster, stores a DSN that CANNOT authenticate, and dropMetaReader clears it.
+//      cluster, stores a DSN that CANNOT authenticate, and dropMetaReader clears it;
+//   6. cross-project targeting — an explicit `project` (id or case-insensitive name) makes reads
+//      resolve and the gated cards file ON the target; a name that resolves to nothing is refused;
+//      no `project` → the calling xell's own project (the behaviour every pre-existing call uses).
 //
 // It creates its own fixture project/machine/pool_config/container/deploy_site/xell/harness rows
 // and removes them in a finally, whatever happens. Deletes are pushed as THUNKS (`() => q(...)`)
@@ -270,6 +274,38 @@ try {
   const dropped = await dropMetaReader(roX);
   ok(dropped.dropped === true && (await one(`SELECT meta_ro_dsn FROM xell WHERE id=$1`, [roX.id]))?.meta_ro_dsn === null,
      'dropMetaReader clears the stored DSN (simulate drops nothing real, like mint creates nothing)');
+
+  // ── 6. cross-project targeting (--project <name|id>) ────────────────────────
+  // The medic is a MANAGER on the Zeehive project, but it fixes ANY project's meta-DB config: every
+  // verb takes an EXPLICIT target project (id or case-insensitive name). Reads resolve the target
+  // and the two mutation verbs file their HUMAN-GATED card ON it; no --project → the calling xell's
+  // own project (the behaviour every pre-existing call relies on).
+  console.log('\n── the verbs take an EXPLICIT TARGET project: reads resolve it, cards file on it ──');
+  const pOther = await insProject(`im-o-${tag}`);
+  const sOther = await infraSettings(medic3, { project: pOther });
+  ok(sOther.project?.id === pOther, 'infraSettings { project: <id> } resolves the TARGET project');
+  const sByName = await infraSettings(medic3, { project: `IM-O-${tag.toUpperCase()}` });
+  ok(sByName.project?.id === pOther, 'the target can be a NAME (case-insensitive)');
+
+  const crossBootstrap = await infraBootstrap(medic3, { machineId: m3, project: pOther, reason: 'cross-project' });
+  ok(crossBootstrap.card?.project_id === pOther && crossBootstrap.card?.kind === 'bootstrap',
+     'a bootstrap card is filed ON the target project, not the calling xell\'s');
+  clean.push(cleanQ(`DELETE FROM infra_request WHERE id=$1`, [crossBootstrap.card.id]));
+  const crossPropose = await infraPropose(medic3,
+    { change: JSON.stringify({ pool_config: { target_ready: 3 } }), project: pOther, reason: 'cross-project' });
+  ok(crossPropose.card?.project_id === pOther && crossPropose.card?.kind === 'propose',
+     'a propose card is filed ON the target project');
+  clean.push(cleanQ(`DELETE FROM infra_request WHERE id=$1`, [crossPropose.card.id]));
+  const rejectOther = await decideInfraRequest(crossPropose.card.id, 'reject', 'human@test');
+  ok(rejectOther.status === 'rejected', 'a card filed on another project is decidable like any other');
+
+  const own = await infraSettings(medic3);
+  ok(own.project?.id === p3, 'no --project → the calling xell\'s OWN project is the target');
+
+  let noProj = null;
+  try { await infraSettings(medic3, { project: 'im-no-such-project-xyz' }); } catch (e) { noProj = e; }
+  ok(!!noProj && /no project 'im-no-such-project-xyz'/.test(noProj.message),
+     `a target that resolves to nothing is refused${noProj ? ` [${noProj.message.split('\n')[0].trim()}]` : ' — NO ERROR'}`);
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {

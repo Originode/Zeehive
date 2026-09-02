@@ -1,26 +1,30 @@
 // THE INFRA-MEDIC DISPATCH SEAM (provision-proof plan §4.6 / §7, the console button) — the
-// PROVISION-INFRA card carries a "dispatch medic" action: the queenzee claims a ready xell of the
-// card's project, wears the infra-medic harness, and briefs it to fix the PROJECT CONFIG (not the
-// one xell) so the pair stops being broken.
+// PROVISION-INFRA card carries a "dispatch medic" action. The medic is a MANAGER-type zee on the
+// ORCHESTRATOR'S OWN project (the meta-plane model, corrected 2026-09-02): the route resolves the
+// queenzee's own project (selfProjectId) and adds the medic through createManagerZee — never a
+// worker of the card's project. The brief names the card's TARGET project (name + id) and fixes its
+// META-DB CONFIG (not the one xell) so the pair stops being broken.
 //
-// This is a REAL postgres test against DATABASE_URL (the db-sandbox, migrated: 237-241 + the
+// This is a REAL postgres test against DATABASE_URL (the db-sandbox, migrated: 237-242 + the
 // conditions table). It covers:
 //
-//   1. buildMedicDispatchBrief (pure) — the mission is CONFIG, not the xell: the brief quotes the
-//      card verbatim, names the project-config fix, carries the verb family and the standing
-//      refusals, and survives an empty card body;
+//   1. buildMedicDispatchBrief (pure) — the mission is the TARGET project's META-DB CONFIG, not the
+//      xell: the brief quotes the card verbatim, places the medic as a MANAGER on Zeehive, names the
+//      target project when the cond row carries one, requires `--project <name|id>` on every verb,
+//      carries the verb family, the SCOPE WALL and the standing refusals, and survives an empty card
+//      body;
 //   2. the route guards over HTTP (real router mounted on an ephemeral port, so the response
 //      contract — not just the function — is asserted): an unknown condition → 404; an IDENTIFIED
 //      WORKER zee token → 403 (workers do not dispatch; refuseWorkerZeeToken before any spawn);
 //   3. the queenzee gate: the route carries requireQueenzeeLoops, so a valid card reached the
 //      dispatch path only on the process holding the single-queenzee lock.
 //
-// It deliberately does NOT invoke the dispatch itself: dispatchXell spawns a real provider zee, an
-// external side effect a test must not trigger. The wiring under the guards is one reviewed line —
-// `dispatchXell({ project: cond.project_id, task: buildMedicDispatchBrief(cond), harness:
-// 'infra-medic' })` — and the harness/type/meta-RO machinery it leans on is exercised end-to-end by
-// infra-medic.test.mjs. The happy-path HTTP exercise is the `zee build server` e2e the stage brief
-// calls for.
+// It deliberately does NOT invoke the dispatch itself: createManagerZee spawns a real provider
+// manager zee and binds it to production read-only — external side effects a test must not trigger.
+// The wiring under the guards is one reviewed line — `createManagerZee({ project: selfProjectId(),
+// task: buildMedicDispatchBrief(cond), harness: 'infra-medic', title: 'infra medic' })` — and the
+// harness/type/meta-RO machinery it leans on is exercised end-to-end by infra-medic.test.mjs. The
+// happy-path HTTP exercise is the `zee build server` e2e the stage brief calls for.
 //
 // It creates its own fixture project/xell/condition rows and removes them in a finally, whatever
 // happens. Deletes are pushed as THUNKS (`() => q(...)`) so they run only at teardown.
@@ -93,25 +97,40 @@ const base = `http://127.0.0.1:${server.address().port}`;
 clean.push(async () => { await new Promise((r) => server.close(r)); });
 
 try {
-  // ── 1. the dispatch brief: CONFIG, not the xell ─────────────────────────────
-  console.log('\n── buildMedicDispatchBrief: the mission is the PROJECT CONFIG, not one xell ──');
+  // ── 1. the dispatch brief: the TARGET project's META-DB CONFIG, not the xell ──
+  console.log("\n── buildMedicDispatchBrief: a MANAGER medic on Zeehive fixing the TARGET project's META-DB CONFIG ──");
   const card = `PROVISION-INFRA: this project cannot build on machine 'mardale-prod-alt' — `
     + `shared-dev-db: no shared dev db for project ZEEHIVE. Medic action: provision the project's `
     + `shared dev db on this machine.`;
   const brief = buildMedicDispatchBrief({ body: card });
   ok(brief.includes(card), 'the brief quotes the card body verbatim');
   const flat = brief.replace(/\s+/g, ' ');     // the template literal wraps lines; assert on the sense
-  ok(flat.includes('PROJECT CONFIG') && flat.includes('not one xell'),
-     'the brief names the CONFIG-fix mission (not one xell)');
+  ok(flat.includes('META-DB CONFIG') && flat.includes('not one xell'),
+     'the brief names the meta-DB-CONFIG-fix mission (not one xell)');
+  ok(flat.includes('MANAGER-type zee on the Zeehive project'),
+     'the brief places the medic as a MANAGER on the orchestrator\'s own project');
   ok(flat.includes('hold for the next xell too'), 'the brief says the fix must hold for the NEXT xell (recurrence)');
   ok(flat.includes('zee infra') && flat.includes('readiness') && flat.includes('proof'),
      'the brief carries the zee infra verb family');
+  ok(flat.includes('--project <name|id>'), 'the brief requires an explicit --project <name|id> target on every verb');
+  ok(flat.includes('reads are open across projects'), 'the brief says reads are open across the meta-DB');
   ok(flat.includes('bootstrap --perform') && flat.includes('propose'),
      'the brief names the HUMAN-GATED cards (bootstrap --perform, propose)');
+  ok(flat.includes('SCOPE WALL') && flat.includes('never another project\'s code'),
+     'the brief carries the SCOPE WALL (never another project\'s code/repo/ships/prod data)');
+  ok(flat.includes('zee dispatch'), 'a ZEEHIVE code fault is a `zee dispatch` of a Zeehive worker (the manager type)');
   ok(flat.includes('write DSN to the meta-DB') && flat.includes('never route around a gate')
      && flat.includes('never invent infrastructure') && flat.includes('stale proof as current'),
      'the brief carries the standing refusals');
   ok(!/(?:password|token|dsn)\s*[:=]\s*\S/i.test(brief), 'the brief leaks no secret value');
+
+  // The route enriches the cond with project_name/project_id — the brief must NAME that target so the
+  // medic points its --project reads and cards at the pair the card is actually about.
+  const withTarget = buildMedicDispatchBrief({
+    body: card, project_name: 'ZEEHIVE', project_id: '00000000-0000-0000-0000-0000000000ab',
+  });
+  ok(withTarget.includes("project 'ZEEHIVE'") && withTarget.includes('(id 00000000-0000-0000-0000-0000000000ab)'),
+     'a cond carrying project_name + project_id names the TARGET project (name and id) in the brief');
 
   const emptyBrief = buildMedicDispatchBrief({ body: '' });
   ok(/the card body was empty/.test(emptyBrief), 'an empty card body still produces a usable brief');
