@@ -35,7 +35,7 @@ import { buildReadinessForProject, recordedBuildReadinessForProject, recordBuild
 import { performBuildBootstrap } from '../lib/build-bootstrap.js';
 import {
   requireInfra, infraReadiness, infraProof, infraBootstrapPlan, infraBootstrap,
-  infraSettings, infraPropose, decideInfraRequest, buildMedicDispatchBrief,
+  infraSettings, infraPropose, decideInfraRequest, buildMedicDispatchBrief, selfProjectId,
 } from '../lib/infra-medic.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -668,21 +668,28 @@ router.delete('/project-conditions/:condId', async (req, res) => {
     res.json(r);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card — the card's dispatch seam (§4.6 / §7): a
-// HUMAN (or a manager) clicks the button; the queenzee claims a ready xell of the card's project,
-// wears the infra-medic harness, and briefs it to fix the PROJECT CONFIG — not the one xell — so
-// the pair stops being broken and the pool resumes filling it. Same PARTIAL worker-token wall as
-// the other conditions routes: an identified worker cannot dispatch a zee (workers do not dispatch).
-// Only the queenzee drives a spawn (requireQueenzeeLoops).
+// Dispatch the INFRA-MEDIC from a PROVISION-INFRA card — the card's dispatch seam (§4.6 / §7, the
+// console button). The medic is a MANAGER zee on the ORCHESTRATOR'S OWN project (the meta-plane
+// model, corrected 2026-09-02): only ZEEHIVE's production database IS the meta-DB, so a manager
+// there sees the whole fleet's config read-only. createManagerZee binds it to prod READ-ONLY, the
+// 'infra-medic' harness (now manager-type, migration 242) carries the 'infra-troubleshoot'
+// capability, and the brief carries the card's TARGET project (cond.project_name / project_id) so
+// the medic reads — and files human-gated cards on — the pair that is actually broken. Same PARTIAL
+// worker-token wall as the other conditions routes: an identified worker cannot dispatch a zee
+// (workers do not dispatch). Only the queenzee drives a spawn (requireQueenzeeLoops).
 router.post('/project-conditions/:condId/dispatch-medic', requireQueenzeeLoops, async (req, res) => {
   try {
     const g = await refuseWorkerZeeToken(req);
     if (g) return res.status(403).json(g);
-    const cond = await one(`SELECT id, project_id, body FROM project_condition WHERE id=$1`, [req.params.condId]);
+    const cond = await one(
+      `SELECT c.id, c.project_id, c.body, p.name AS project_name
+         FROM project_condition c JOIN project p ON p.id = c.project_id
+        WHERE c.id=$1`, [req.params.condId]);
     if (!cond) return res.status(404).json({ error: `no condition ${req.params.condId}` });
+    const selfProject = await selfProjectId();
     const task = buildMedicDispatchBrief(cond);
-    const out = await dispatchXell({ project: cond.project_id, task, harness: 'infra-medic' });
-    res.json({ ok: true, card: cond.id, project_id: cond.project_id, ...out });
+    const out = await createManagerZee({ project: selfProject, task, harness: 'infra-medic', title: 'infra medic' });
+    res.json({ ok: true, card: cond.id, condition_project_id: cond.project_id, project_id: selfProject, ...out });
   } catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
 });
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
@@ -1959,23 +1966,27 @@ router.post('/xell/self/migration-number', async (req, res) => {
 });
 
 // ── the INFRA-MEDIC surface: /api/xell/self/infra/* (provision-proof plan §7, stage 3) ───────────
-// Token-scoped like every self verb, project-resolved from the CALLING xell (the medic acts on its
-// own project and nothing else), and enabled ONLY when the calling xell's EFFECTIVE harness chain
-// carries the 'infra-troubleshoot' capability — a harness inheriting the medic counts, a disabled
-// ancestor grants nothing (lib/infra-medic.js). Read wide, write through gates (§7.1).
+// Token-scoped like every self verb, and enabled ONLY when the calling xell's EFFECTIVE harness
+// chain carries the 'infra-troubleshoot' capability — a harness inheriting the medic counts, a
+// disabled ancestor grants nothing (lib/infra-medic.js). The TARGET project is EXPLICIT: `project`
+// (query param on GETs, body field on POSTs — a project name or id) wins; otherwise it resolves
+// from the CALLING xell, which for the manager-medic on Zeehive is the orchestrator's own project.
+// Reads are open across projects; the two mutation verbs are human-gated cards filed on the target
+// (§7.1, the meta-plane model corrected 2026-09-02).
 router.get('/xell/self/infra/readiness', async (req, res) => {
   try {
     const x = await resolveSelf(req, res); if (!x) return;
     await requireInfra(x);
-    res.json(await infraReadiness(x, { refresh: req.query.refresh === '1' }));
+    res.json(await infraReadiness(x, { refresh: req.query.refresh === '1', project: req.query.project || null }));
   } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
 });
-// Burn-in a pooled xell of the project — throwaway containers, NOT gated (same class as `zee build`).
+// Burn-in a pooled xell of the TARGET project — throwaway containers, NOT gated (same class as
+// `zee build`).
 router.post('/xell/self/infra/proof', async (req, res) => {
   try {
     const x = await resolveSelf(req, res); if (!x) return;
     await requireInfra(x);
-    res.json(await infraProof(x, { xellSlug: req.body?.xell || null }));
+    res.json(await infraProof(x, { xellSlug: req.body?.xell || null, project: req.body?.project || null }));
   } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
 // The dry-run plan performBuildBootstrap already computes — performs NOTHING, NOT gated.
@@ -1983,34 +1994,36 @@ router.post('/xell/self/infra/bootstrap-plan', async (req, res) => {
   try {
     const x = await resolveSelf(req, res); if (!x) return;
     await requireInfra(x);
-    res.json(await infraBootstrapPlan(x, { machineId: req.body?.machine_id || null }));
+    res.json(await infraBootstrapPlan(x, { machineId: req.body?.machine_id || null, project: req.body?.project || null }));
   } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
-// bootstrap --perform → HUMAN-GATED card. Creates nothing; a human approves; the queenzee performs
-// with the console 🔧's exact contract (guardDevOnly intact, every step recorded).
+// bootstrap --perform → HUMAN-GATED card on the TARGET project. Creates nothing; a human approves;
+// the queenzee performs with the console 🔧's exact contract (guardDevOnly intact, every step
+// recorded).
 router.post('/xell/self/infra/bootstrap', async (req, res) => {
   try {
     const x = await resolveSelf(req, res); if (!x) return;
     await requireInfra(x);
-    res.json(await infraBootstrap(x, { machineId: req.body?.machine_id || null, reason: req.body?.reason || null }));
+    res.json(await infraBootstrap(x, { machineId: req.body?.machine_id || null, reason: req.body?.reason || null, project: req.body?.project || null }));
   } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
-// Non-secret projection of the project's settings (manifest cache, pool_config, machines + pool,
-// container rows, deploy_site) — NOT gated.
+// Non-secret projection of the TARGET project's settings (manifest cache, pool_config, machines +
+// pool, container rows, deploy_site) — NOT gated.
 router.get('/xell/self/infra/settings', async (req, res) => {
   try {
     const x = await resolveSelf(req, res); if (!x) return;
     await requireInfra(x);
-    res.json(await infraSettings(x));
+    res.json(await infraSettings(x, { project: req.query.project || null }));
   } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
 });
-// propose → HUMAN-GATED settings card (pool knobs, registry, machine priority, manifest refresh).
-// Applies nothing until a human approves; who asked, what changed, recorded.
+// propose → HUMAN-GATED settings card on the TARGET project (pool knobs, registry, machine
+// priority, manifest refresh). Applies nothing until a human approves; who asked, what changed,
+// recorded.
 router.post('/xell/self/infra/propose', async (req, res) => {
   try {
     const x = await resolveSelf(req, res); if (!x) return;
     await requireInfra(x);
-    res.json(await infraPropose(x, { change: req.body?.change || null, reason: req.body?.reason || null }));
+    res.json(await infraPropose(x, { change: req.body?.change || null, reason: req.body?.reason || null, project: req.body?.project || null }));
   } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.
