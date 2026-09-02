@@ -39,14 +39,39 @@ export function queenzeeHostCtx() { return 'default'; }
 // context strings itself.
 const withHostFlag = (rows) => rows.map((m) => ({ ...m, is_queenzee_host: m.docker_ctx === queenzeeHostCtx() }));
 
-// The host a machine's shared dev db is RECORDED at. The three explicit places first (the machine
-// row, the project, the config), then the QUEENZEE-HOST fallback: a local machine's published
-// ports ARE the host's own, so a db provisioned there is reachable at host.docker.internal from a
-// containerized queenzee/cxell, else localhost from the host. A REMOTE machine with none of the
-// three stays null — fail closed (db-dsn-needs-a-host): its address is genuinely unknown, and
-// guessing 'localhost' would point every consumer at a silent wrong database. This is what keeps a
-// freshly provisioned local dev db from wearing the chip's "no URL recorded" tooltip.
-export function machineDbHost(m, project, cfg) {
+// The dev deploy_site whose docker_ctx matches a machine's context — the site that says WHERE
+// that machine's dev tier actually runs (docs/deploy-topology-spec.md §5). deploy_site is the
+// single source of truth for a machine-placed container's host: a matching site's host WINS over
+// the machine row's host_ip (TKT-180 — before this, ugreen-nas carried host_ip=10.0.1.18 while
+// every other source said 10.1.0.18, and every spin container stamped from that row inherited an
+// address that never answered). NULL when there is no dev site for the context: the fallback
+// chain then owns the answer.
+export async function siteHostForMachine(projectId, dockerCtx) {
+  if (!projectId || !dockerCtx) return null;
+  const site = await one(
+    `SELECT host FROM deploy_site WHERE project_id=$1 AND tier='dev' AND docker_ctx=$2 LIMIT 1`,
+    [projectId, dockerCtx]).catch(() => null);
+  return site?.host || null;
+}
+
+// The host a machine's shared dev db is RECORDED at. deploy_site wins first (the dev site whose
+// docker_ctx matches the machine's context — see siteHostForMachine), then the three explicit
+// legacy places (the machine row, the project, the config), then the QUEENZEE-HOST fallback: a
+// local machine's published ports ARE the host's own, so a db provisioned there is reachable at
+// host.docker.internal from a containerized queenzee/cxell, else localhost from the host. A
+// REMOTE machine with none of the above stays null — fail closed (db-dsn-needs-a-host): its
+// address is genuinely unknown, and guessing 'localhost' would point every consumer at a silent
+// wrong database. This is what keeps a freshly provisioned local dev db from wearing the chip's
+// "no URL recorded" tooltip.
+export async function machineDbHost(m, project, cfg) {
+  const siteHost = await siteHostForMachine(project?.id, m?.docker_ctx);
+  if (siteHost) return siteHost;
+  return machineDbHostFallback(m, project, cfg);
+}
+
+// The pure legacy fallback chain, kept separate so callers with no site (or no DB) can still
+// resolve the explicit places. machineDbHost consults deploy_site first and falls back to this.
+export function machineDbHostFallback(m, project, cfg) {
   return m.host_ip || project.dev_host_ip || cfg.devHostIp
     || (m.docker_ctx === queenzeeHostCtx()
         ? (existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost')
@@ -414,7 +439,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const name = source?.name ? `${source.name}_${mkey}`
     : prodDb ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
-  const host = machineDbHost(m, project, config);
+  const host = await machineDbHost(m, project, config);
   const dbUser = project.db_user || config.prodDbUser || 'postgres';
   const dbName = project.db_name || config.prodDbName || 'omnibiz';
 
@@ -444,10 +469,11 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     // from. (Found from inside a cxell on 2026-08-03: a dev xell whose server container could not
     // boot, on a db that was listening the whole time.)
     //
-    // host now resolves through machineDbHost: the QUEENZEE-HOST (local) machine falls back to
-    // host.docker.internal / localhost so a local dev db gets a real conn_ref instead of the chip's
-    // "no URL recorded". A REMOTE machine with none of the three explicit places still leaves host
-    // null, and derivedTcpDsn is the function that owns the fail-closed rule ("no address is a
+    // host now resolves through machineDbHost: deploy_site is consulted FIRST (the dev site whose
+    // docker_ctx matches this machine — TKT-180), then the QUEENZEE-HOST (local) machine falls
+    // back to host.docker.internal / localhost so a local dev db gets a real conn_ref instead of
+    // the chip's "no URL recorded". A REMOTE machine with none of the explicit places still leaves
+    // host null, and derivedTcpDsn is the function that owns the fail-closed rule ("no address is a
     // fixable state, a guessed one is a silent wrong database") — it returns null rather than
     // compose one, and a line says exactly which of the three places to fill in.
     const conn = derivedTcpDsn({ host, host_port: port || 5432 }, { user: dbUser, name: dbName });

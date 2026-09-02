@@ -202,7 +202,7 @@ export async function healHostlessDbRows() {
       c.docker_ctx ? one(`SELECT * FROM machine WHERE docker_ctx=$1`, [c.docker_ctx]).catch(() => null) : null,
       one(`SELECT * FROM project WHERE id=$1`, [c.project_id]).catch(() => null),
     ]);
-    const host = machineDbHost(machine || {}, project || {}, config);
+    const host = await machineDbHost(machine || {}, project || {}, config);
     if (!host) continue;                       // still no derivable address — leave it, fail closed
     const conn = derivedTcpDsn({ host, host_port: c.host_port },
       { user: project?.db_user || config.prodDbUser || 'postgres',
@@ -214,6 +214,60 @@ export async function healHostlessDbRows() {
     if (row) { broadcast('container', row); healed++; }
   }
   if (healed) logline('containers', `healed ${healed} hostless db row(s) — recorded a URL for a database that had only a port`);
+  return healed;
+}
+
+// ── address reconciliation for STALE machine-placed rows (the wrong-IP heal) ──
+// TKT-180: before deploy_site was consulted for WHERE a machine's dev tier runs, a machine-placed
+// container's host came straight from machine.host_ip. ugreen-nas carried 10.0.1.18 while the
+// docker daemon and every other source said 10.1.0.18 — so every spin container row stamped from
+// that machine inherited an address that never answered, and `zee build --wait` reported a
+// genuinely-serving container as DOWN.
+//
+// deploy_site is the single source of truth (docs/deploy-topology-spec.md §5): the dev site whose
+// docker_ctx matches the machine's context WINS over the machine row's host_ip. This heals the
+// rows already stamped under the old precedence — rewrites host (+ url, and + conn_ref for db
+// rows) when the recorded host is not the site host. Skips rows that are already correct.
+// Idempotent: a healed row no longer matches, so the next tick no-ops. Mirror of
+// healHostlessDbRows — same discipline, different broken shape (wrong address vs no address).
+export async function healStaleSiteHostRows() {
+  // Machine-placed dev/spinoff rows only: a docker_ctx that names a machine row, a non-null host
+  // (hostless is healHostlessDbRows' shape), and a tier that machine placement actually stamps
+  // (spinoff per-xell roles + the machine's shared dev db). Process-runner roles have
+  // docker_ctx NULL and never join; prod rows live under their prod site and are not dev work.
+  const stale = await q(
+    `SELECT c.id, c.role, c.docker_ctx, c.host, c.host_port, c.url, c.conn_ref, c.project_id
+       FROM container c
+       JOIN machine m ON m.docker_ctx = c.docker_ctx
+      WHERE c.docker_ctx IS NOT NULL
+        AND c.tier IN ('spinoff','dev')
+        AND c.host IS NOT NULL`);
+  let healed = 0;
+  for (const c of stale) {
+    const [machine, project] = await Promise.all([
+      one(`SELECT * FROM machine WHERE docker_ctx=$1`, [c.docker_ctx]).catch(() => null),
+      one(`SELECT * FROM project WHERE id=$1`, [c.project_id]).catch(() => null),
+    ]);
+    const host = await machineDbHost(machine || {}, project || {}, config);
+    if (!host || host === c.host) continue;    // still no derivable address, or already correct
+    const sets = ['host=$2'];
+    const vals = [c.id, host];
+    if (c.host_port && c.url) {                // re-stamp the published URL it advertises
+      sets.push(`url=$${vals.length + 1}`); vals.push(`http://${host}:${c.host_port}`);
+    }
+    if (c.role === 'db' && c.conn_ref) {       // a db's DSN carries the host too — keep it in step
+      const conn = derivedTcpDsn({ host, host_port: c.host_port },
+        { user: project?.db_user || config.prodDbUser || 'postgres',
+          name: project?.db_name || config.prodDbName || 'omnibiz' });
+      if (conn) { sets.push(`conn_ref=$${vals.length + 1}`); vals.push(conn); }
+    }
+    const row = await one(
+      `UPDATE container SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals).catch(() => null);
+    if (row) { broadcast('container', row); healed++; }
+  }
+  if (healed) {
+    logline('containers', `healed ${healed} stale machine-placed row(s) — host re-stamped from the deploy_site that owns the tier`);
+  }
   return healed;
 }
 
@@ -230,8 +284,11 @@ export async function checkContainers() {
   await probeGatewayHealth().catch(() => {});
 
   // Address self-heal first: a db row that has only a port gets its URL filled in (see
-  // healHostlessDbRows). Cheap and idempotent — a healthy fleet matches no rows and skips.
+  // healHostlessDbRows), and a machine-placed row whose recorded host no longer matches its
+  // deploy_site gets re-stamped (healStaleSiteHostRows — TKT-180). Cheap and idempotent — a
+  // healthy fleet matches no rows and skips.
   await healHostlessDbRows();
+  await healStaleSiteHostRows();
 
   // project/xell identity rides along so labeled containers match exactly (sanitized project
   // token = what the compose labels carry, mirroring lib/manifest.js sanitizeName).
