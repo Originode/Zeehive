@@ -56,7 +56,10 @@ const unk = (check, detail) => ({ check, ok: false, skipped: false, unknown: tru
 // A test injects a stub here so the probe logic runs without docker.
 // Resolves { status, stdout, stderr } when the CLI answered, or
 // { unknown, reason } when it could not run at all (no docker binary, spawn error, timeout).
-export function dockerAdapter(ctx, args, { timeout = BUILD_READINESS_TIMEOUT_MS, bin = 'docker' } = {}) {
+// The `env` option is additive: when present the child is spawned with process.env plus those
+// vars (per-call context, e.g. the compose contract — never leaked into every docker call);
+// when absent the child inherits process.env exactly as before.
+export function dockerAdapter(ctx, args, { timeout = BUILD_READINESS_TIMEOUT_MS, bin = 'docker', env } = {}) {
   return new Promise((resolve) => {
     let child;
     let stdout = '';
@@ -70,7 +73,9 @@ export function dockerAdapter(ctx, args, { timeout = BUILD_READINESS_TIMEOUT_MS,
     }, timeout);
     timer.unref?.();   // never keep the process alive for a probe that may already be done
     try {
-      child = spawn(bin, ['--context', ctx, ...args], { windowsHide: true });
+      const spawnOpts = { windowsHide: true };
+      if (env) spawnOpts.env = { ...process.env, ...env };
+      child = spawn(bin, ['--context', ctx, ...args], spawnOpts);
     } catch (e) {
       finish({ unknown: true, reason: e.message });
       return;
@@ -118,11 +123,27 @@ async function checkComposeResolves(machine, project, docker) {
     return skip('compose-resolves', 'project\'s spinoff tier is runner:process — no compose stack to resolve');
   }
   const file = manifest.tiers?.spinoff?.compose || project.compose_spinoff || 'docker-compose.spinoff.yml';
-  const path = resolve(String(project.repo_root || '').replace(/\\/g, '/'), file);
+  const repoRoot = String(project.repo_root || '').replace(/\\/g, '/');
+  const path = resolve(repoRoot, file);
   if (!existsSync(path)) {
     return fail('compose-resolves', `spinoff compose '${file}' not found in the project repo (${path})`);
   }
-  const r = await docker(machine.docker_ctx, ['compose', '-f', path, 'config', '-q']);
+  // Run compose the way the harness actually invokes it (build-container.sh exports these and
+  // passes --env-file; build.js supplies SPINOFF_* from the meta-DB). Those vars are per-xell
+  // inputs — no machine "has" them — so a compose that marks the contract REQUIRED
+  // (`${SPINOFF_WEB_PORT:?}`) is legitimate authorship and must not false-fail the probe.
+  // Stub the contract (inert: `config -q` only renders, never runs) and pass the repo's env
+  // file when it exists; a compose that still fails under that contract is a real defect.
+  const PROBE_COMPOSE_ENV = {
+    SPINOFF_SLUG: 'readiness-probe',
+    SPINOFF_SERVER_PORT: '1',
+    SPINOFF_WEB_PORT: '2',
+    SPINOFF_DB_PORT: '3',
+    GIT_COMMIT_HASH: 'probe',
+  };
+  const envFile = resolve(repoRoot, manifest.env?.file || '.env');
+  const args = ['compose', ...(existsSync(envFile) ? ['--env-file', envFile] : []), '-f', path, 'config', '-q'];
+  const r = await docker(machine.docker_ctx, args, { env: PROBE_COMPOSE_ENV });
   if (r.unknown) return unk('compose-resolves', `could not run compose config for '${file}' on '${machine.docker_ctx}': ${r.reason}`);
   if (r.status !== 0) {
     const why = (r.stderr || r.stdout || '').trim().split('\n').filter(Boolean).slice(-3).join(' · ') || `compose config exited ${r.status}`;
