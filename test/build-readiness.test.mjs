@@ -52,14 +52,28 @@ const { probeBuildReadiness, buildReadinessForProject, registryForProject, docke
 // Dispatch on the first docker arg, like the real adapter's call sites. `reachable:false`
 // makes the context probe answer 'unknown' (docker could not run); missing networks/volumes
 // make the requires probe fail; composeOk:false makes the compose probe fail.
-const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true } = {}) =>
-  async (ctx, args) => {
+// `composeNeedsContract:true` simulates a project-owned compose that marks the harness env
+// contract REQUIRED (`${SPINOFF_WEB_PORT:?}`): the compose branch fails with docker's exact
+// interpolation error UNLESS the call carried opts.env with all five SPINOFF_*/GIT_COMMIT_HASH
+// contract vars — the false-negative the compose-env DR fixes. The stub records the last compose
+// call's args/opts so a test can assert `--env-file` and the env contract were passed.
+const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true, composeNeedsContract = false } = {}) => {
+  const stub = async (ctx, args, opts = {}) => {
     const [cmd] = args;
     if (cmd === 'info') {
       if (!reachable) return { unknown: true, reason: `connection refused (stub) to ${ctx}` };
       return { status: 0, stdout: '28.0.0\n', stderr: '' };
     }
     if (cmd === 'compose') {
+      stub.lastCompose = { args, opts };
+      if (composeNeedsContract) {
+        const env = opts.env || {};
+        const hasContract = ['SPINOFF_SLUG', 'SPINOFF_SERVER_PORT', 'SPINOFF_WEB_PORT', 'SPINOFF_DB_PORT', 'GIT_COMMIT_HASH']
+          .every((k) => env[k] !== undefined);
+        return hasContract
+          ? { status: 0, stdout: '', stderr: '' }
+          : { status: 1, stdout: '', stderr: 'required variable SPINOFF_WEB_PORT is missing a value: set SPINOFF_WEB_PORT' };
+      }
       return composeOk
         ? { status: 0, stdout: '', stderr: '' }
         : { status: 1, stdout: '', stderr: 'error: service "server" refers to undefined network' };
@@ -81,6 +95,8 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
     }
     return { status: 0, stdout: '', stderr: '' };
   };
+  return stub;
+};
 
 // The concurrency stub: every docker call resolves after `interval` ms (a timer, like the real
 // spawn-backed adapter would yield to). Counts calls and tracks the max number of calls IN FLIGHT
@@ -108,6 +124,27 @@ const repo = mkdtempSync(join(tmpdir(), `br-${tag}-`));
 writeFileSync(join(repo, 'docker-compose.spinoff.yml'),
   'services:\n  server:\n    image: example:latest\n  webapp:\n    image: example:latest\n');
 
+// Fixture repos for the compose-env DR (build-readiness-compose-env): a spinoff compose that
+// marks the harness env contract REQUIRED (`${SPINOFF_*:?}` / `${GIT_COMMIT_HASH}`), once with
+// no repo .env and once with one — so the probe must run compose the way a real build does
+// (stubbed contract in the call env + --env-file iff the repo has the file).
+const contractTag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
+const repoNoEnv = mkdtempSync(join(tmpdir(), `brc-${contractTag}-noenv-`));
+const repoHasEnv = mkdtempSync(join(tmpdir(), `brc-${contractTag}-hasenv-`));
+const CONTRACT_COMPOSE =
+  'services:\n' +
+  '  server:\n' +
+  '    image: ${SPINOFF_SLUG}-srv:${GIT_COMMIT_HASH}\n' +
+  '    ports:\n' +
+  '      - "${SPINOFF_SERVER_PORT}:4700"\n' +
+  '  webapp:\n' +
+  '    image: example:latest\n' +
+  '    ports:\n' +
+  '      - "${SPINOFF_WEB_PORT}:4701"\n';
+writeFileSync(join(repoNoEnv, 'docker-compose.spinoff.yml'), CONTRACT_COMPOSE);
+writeFileSync(join(repoHasEnv, 'docker-compose.spinoff.yml'), CONTRACT_COMPOSE);
+writeFileSync(join(repoHasEnv, '.env'), 'FOO=bar\n');
+
 const GREEN_CTX = `zt-green-${tag}`;
 const MISS_CTX = `zt-miss-${tag}`;
 const UNK_CTX = `zt-unk-${tag}`;
@@ -117,11 +154,11 @@ const BUILDER_CTX = `zt-builder-${tag}`;
 const createdMachines = [];
 const createdProjects = [];
 
-const insProject = async (name, manifest, registry = null) => {
+const insProject = async (name, manifest, registry = null, repoRoot = repo) => {
   const p = (await one(
     `INSERT INTO project (name, repo_root, db_user, db_name, manifest, registry)
        VALUES ($1,$2,'zeehive','zeehive',$3,$4) RETURNING id`,
-    [name, repo, JSON.stringify(manifest), registry])).id;
+    [name, repoRoot, JSON.stringify(manifest), registry])).id;
   createdProjects.push(p);
   return p;
 };
@@ -141,6 +178,7 @@ const insSharedDevDb = async (projectId, ctx, suffix) => {
 
 let pGreen, pMissing, pUnknown, pNoReg, pNoReg2;
 let mGreen, mMissing, mUnknown, mNoBuild;
+let pContractNoEnv, pContractHasEnv, mContract;
 try {
   pGreen = await insProject(`br-green-${tag}`, {}, null);
   pMissing = await insProject(`br-missing-${tag}`, { tiers: { spinoff: { requires: { networks: ['zt-net'] } } } }, null);
@@ -246,6 +284,10 @@ try {
      `timeout → unknown with the reason [${hung.reason}]`);
   const okFast = await dockerAdapter('zt-fast', ['-e', 'process.stdout.write("hi")'], { timeout: 2000, bin: wrap });
   ok(okFast.status === 0 && okFast.stdout === 'hi', `fast command → {status, stdout} [${JSON.stringify(okFast)}]`);
+  const envCarried = await dockerAdapter('zt-env', ['-e', 'process.stdout.write(process.env.SPINOFF_WEB_PORT || "unset")'],
+    { timeout: 2000, bin: wrap, env: { SPINOFF_WEB_PORT: '2', SPINOFF_SLUG: 'readiness-probe' } });
+  ok(envCarried.status === 0 && envCarried.stdout === '2',
+     `additive env option reaches the child (merged over process.env) [stdout ${JSON.stringify(envCarried.stdout)}]`);
 
   // ── db-isolated project: no shared dev db is the CORRECT state, not a missing check ─────
   console.log('\n── a db-isolated project (per-xell dev db) → shared-dev-db SKIPPED, not a red X ──');
@@ -290,6 +332,38 @@ try {
   ok(stats.maxInFlight >= 2, `docker calls genuinely OVERLAP (max ${stats.maxInFlight} in flight — a spawnSync adapter would be 1)`);
   ok(elapsed < serialMs / 2, `N machines finish in ~one probe interval, not N× [${elapsed}ms < ${serialMs / 2}ms serial-half]`);
 
+  // ── compose-resolves interpolates the harness env contract (DR build-readiness-compose-env) ──
+  console.log('\n── compose requiring the harness env contract resolves under the probe contract (DR) ──');
+  // A project-owned spinoff compose that marks the SPINOFF_*/GIT_COMMIT_HASH contract REQUIRED
+  // (`${SPINOFF_WEB_PORT:?}`) is legitimate authorship — the real harness always supplies the
+  // contract, so the probe must too. Before the fix it ran bare `compose config -q` with no env,
+  // docker answered "required variable SPINOFF_WEB_PORT is missing a value", and every machine
+  // false-failed this pair. `composeNeedsContract` reproduces that compose exactly.
+  pContractNoEnv = await insProject(`br-contract-noenv-${contractTag}`, {}, null, repoNoEnv);
+  pContractHasEnv = await insProject(`br-contract-hasenv-${contractTag}`, {}, null, repoHasEnv);
+  mContract = await insMachine(`br-contract-${contractTag}`, `zt-contract-${contractTag}`, true);
+  await insSharedDevDb(pContractNoEnv, `zt-contract-${contractTag}`, `c-noenv-${contractTag}`);
+  await insSharedDevDb(pContractHasEnv, `zt-contract-${contractTag}`, `c-hasenv-${contractTag}`);
+  const CONTRACT = ['SPINOFF_SLUG', 'SPINOFF_SERVER_PORT', 'SPINOFF_WEB_PORT', 'SPINOFF_DB_PORT', 'GIT_COMMIT_HASH'];
+
+  const cNoEnvDocker = makeDocker({ reachable: true, composeNeedsContract: true });
+  const cNoEnv = await probeBuildReadiness(await mach(mContract), await proj(pContractNoEnv), { docker: cNoEnvDocker });
+  const ccNoEnv = cNoEnv.checks.find((c) => c.check === 'compose-resolves');
+  ok(cNoEnv.status === 'ok', `verdict ok once the probe supplies the contract [${cNoEnv.status}]`);
+  ok(ccNoEnv?.ok === true, `compose-resolves passes [${ccNoEnv?.detail}]`);
+  ok(cNoEnvDocker.lastCompose && CONTRACT.every((k) => (cNoEnvDocker.lastCompose.opts.env || {})[k] !== undefined),
+     'the compose call carries the five contract vars in its env');
+  ok(!cNoEnvDocker.lastCompose.args.includes('--env-file'),
+     `no --env-file when the fixture repo has no .env [${cNoEnvDocker.lastCompose.args.join(' ')}]`);
+
+  const cEnvDocker = makeDocker({ reachable: true, composeNeedsContract: true });
+  const cHasEnv = await probeBuildReadiness(await mach(mContract), await proj(pContractHasEnv), { docker: cEnvDocker });
+  const ccHasEnv = cHasEnv.checks.find((c) => c.check === 'compose-resolves');
+  ok(cHasEnv.status === 'ok', `verdict ok with a repo .env present [${cHasEnv.status}]`);
+  ok(ccHasEnv?.ok === true, `compose-resolves passes with a repo .env [${ccHasEnv?.detail}]`);
+  ok(cEnvDocker.lastCompose.args.includes('--env-file'),
+     `--env-file passed when the fixture repo has .env [${cEnvDocker.lastCompose.args.join(' ')}]`);
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('TEST ERROR:', e);
@@ -305,5 +379,7 @@ try {
   } catch (e) { console.error('CLEANUP ERROR:', e); }
   await pool.end();
   rmSync(repo, { recursive: true, force: true });
+  rmSync(repoNoEnv, { recursive: true, force: true });
+  rmSync(repoHasEnv, { recursive: true, force: true });
 }
 process.exit(fail ? 1 : 0);
