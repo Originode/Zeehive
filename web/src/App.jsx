@@ -1193,7 +1193,15 @@ export default function App() {
   // policy. The one genuinely new path is 'project' INSIDE a project: a NESTED project, whose
   // folder is confined to the parent's repo_root and whose git behavior is forced (ProjectSetup's
   // CreateForm renders the choice). Activity/task cut under the current node (server owns legality).
-  const handlePlusAction = useCallback(async (kind) => {
+  //
+  // NOT useCallback — and do not "restore" the memoization by hoisting this above the early return.
+  // This declaration sits BELOW the `if (!fleet) return <loading/>` guard (~line 947): a hook here
+  // runs only on renders where fleet is loaded, so the first (loading) render runs fewer hooks than
+  // the next and React blanks the whole console — "Rendered more hooks than during the previous
+  // render" (minified #310). Hoisting it above the guard is not a fix either: the dep array would
+  // have to name `project`, which is destructured from `fleet` AFTER that return, so it throws a TDZ
+  // ReferenceError on every render. A stable identity is not worth a blank console — plain function.
+  const handlePlusAction = async (kind) => {
     switch (kind) {
       case 'prompt': setShowDispatch({}); return;
       case 'manager': setShowManagerMint(true); return;
@@ -1237,7 +1245,7 @@ export default function App() {
       }
       default: return;
     }
-  }, [hiveMode, rootWorkItem, project, ctxItemId, projectId, refresh]);
+  };
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
