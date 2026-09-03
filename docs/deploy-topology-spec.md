@@ -431,6 +431,13 @@ after landing ed805cc exposed both):
   checkout to the exact approved ship sha. It is defensive: genuinely-uncommitted work is
   preserved in a labeled `git stash` first, while the *expected* update-ref delta (the tree
   matching an ancestor of the ship sha) is recognised and reset without a redundant stash.
+  It also refuses to reset *backwards* — but note what "backwards" is measured against. The
+  same update-ref property means `HEAD` here is the last **land**, not the last **deploy**,
+  so the guard compares the target against the sha it last synced the tree to (recorded in
+  `../zeehive-self-ship-deployed-<checkout>.sha`, falling back to the log, then to `HEAD`
+  only while the tree still matches it). Comparing against `HEAD` refused forward ships that
+  merely waited behind a landing (`b5a7bde1`, 2026-09-03). The authoritative direction guard
+  is still the server's, in `shipgate.runShipBody`; this one is the last line of defence.
 - **Cxell-image rebuild.** New cxell-zee capabilities ship inside `zeehive/zee-agent`
   (`docker/zeehive/Dockerfile.zee-agent` — the `zee` CLI, cxell-sshd/seed/attach scripts).
   `self-ship.sh` rebuilds that image on the `default` docker context (where cxells run) as

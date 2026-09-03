@@ -29,6 +29,10 @@ REF="${2:?ship_ref}"
 
 # Log outside the tree (parent dir) so we never become an untracked file a future sync would stash.
 LOG="$(dirname "$SRC")/zeehive-self-ship-sync.log"
+# The DEPLOYED LEDGER — same reasoning for the location, but scoped by basename: the log's name
+# predates any second checkout ever living in /repos, and a ledger that two projects shared would
+# answer the direction question with the wrong project's sha.
+DEPLOYED_FILE="$(dirname "$SRC")/zeehive-self-ship-deployed-$(basename "$SRC").sha"
 say() { local m="[$(date -u +%FT%TZ 2>/dev/null || echo now)] self-ship-sync: $*"; echo "$m" >&2; echo "$m" >>"$LOG" 2>/dev/null || true; }
 
 cd "$SRC" 2>/dev/null || { say "FATAL cannot cd into repo_root '$SRC'"; exit 1; }
@@ -47,19 +51,63 @@ say "syncing working tree of $SRC → ${TARGET:0:12} (ref '$REF'); HEAD was $BEF
 #
 # The check the file already had (`merge-base --is-ancestor "$PREV" "$TARGET"`, below) is about
 # whether STASHING is needed — it guards uncommitted work, never the DIRECTION of the move. This one
-# guards the direction: if TARGET is an ancestor of the checkout's CURRENT commit, `git reset --hard
-# "$TARGET"` walks the deployment BACKWARDS, which is exactly what silently reverted two shipped
-# fixes on 2026-08-23. Refuse and leave the tree untouched; a rollback is a revert landed on main and
-# shipped forward, never a reset to an older sha.
+# guards the direction: if TARGET is behind what is DEPLOYED, `git reset --hard "$TARGET"` walks the
+# deployment BACKWARDS, which is exactly what silently reverted two shipped fixes on 2026-08-23.
+# Refuse and leave the tree untouched; a rollback is a revert landed on main and shipped forward,
+# never a reset to an older sha.
+#
+# WHAT "DEPLOYED" IS, AND WHY IT IS NOT `HEAD` (the false refusal of 2026-09-03). This check used to
+# compare TARGET against `git rev-parse HEAD`, and in THIS repo that is not what is running: the
+# landing gate advances master with `update-ref` and never touches the tree (the whole reason this
+# script exists, see the header). So HEAD is the LAST LAND, and it runs ahead of the last DEPLOY by
+# every landing that happened since. A ship approved after even one landing was refused as
+# "BACKWARDS" — b5a7bde1 on 2026-09-03 was strictly FORWARD of the running code and was bounced with
+# "would revert everything shipped since", which was never measured. The prod ledger had allowed it
+# one layer up; only this script said no.
+#
+# So the reference is the sha this script last SYNCED THE TREE TO — the tree every self-ship builds
+# its image from, which is the honest local answer to "what is production running". It is recorded
+# next to the log, outside the tree. THREE sources, most-trustworthy first:
+#   1. the ledger file (written on every successful sync below);
+#   2. failing that, the log's last "OK working tree now at <sha>" — an older queenzee wrote no
+#      ledger, and this makes the very first ship after this change correct instead of the second;
+#   3. failing that, HEAD, but ONLY when the tree still matches it. A clean tree at HEAD means no
+#      landing has moved the ref since the last sync, so HEAD does describe the deployed files.
+# Nothing known → do not refuse, and say so: the authoritative guard already ran server-side, and a
+# refusal must be definite (server/src/lib/ship-direction.js decides the same way).
 CURRENT="$(git rev-parse --verify HEAD 2>/dev/null || true)"
-if [ -n "$CURRENT" ] && [ "$CURRENT" != "$TARGET" ] \
-     && git merge-base --is-ancestor "$TARGET" "$CURRENT" 2>/dev/null; then
-  BEHIND="$(git rev-list --count "${TARGET}..${CURRENT}" 2>/dev/null || echo '?')"
-  say "REFUSED: BACKWARDS ship refused — the target ${TARGET:0:12} is an ancestor of what this checkout"
-  say "REFUSED: already has (${CURRENT:0:12}), $BEHIND commit(s) behind. Resetting to it would roll the"
-  say "REFUSED: deployment BACKWARDS and revert everything shipped since. Tree left at $BEFORE, untouched."
+DEPLOYED=""; DEPLOYED_SRC=""
+if [ -r "$DEPLOYED_FILE" ]; then
+  DEPLOYED="$(git rev-parse --verify -q "$(tr -d '[:space:]' <"$DEPLOYED_FILE")^{commit}" 2>/dev/null || true)"
+  [ -n "$DEPLOYED" ] && DEPLOYED_SRC="the last sync this script recorded"
+fi
+if [ -z "$DEPLOYED" ] && [ -r "$LOG" ]; then
+  LOGGED="$(sed -n 's/.*OK working tree now at \([0-9a-f]\{7,\}\).*/\1/p' "$LOG" 2>/dev/null | tail -1)"
+  if [ -n "$LOGGED" ]; then
+    DEPLOYED="$(git rev-parse --verify -q "${LOGGED}^{commit}" 2>/dev/null || true)"
+    [ -n "$DEPLOYED" ] && DEPLOYED_SRC="the last successful sync in $(basename "$LOG")"
+  fi
+fi
+if [ -z "$DEPLOYED" ] && [ -n "$CURRENT" ] && git diff --quiet HEAD -- 2>/dev/null; then
+  DEPLOYED="$CURRENT"; DEPLOYED_SRC="HEAD (the tree matches it, so no landing has moved the ref since)"
+fi
+
+if [ -n "$DEPLOYED" ] && [ "$DEPLOYED" != "$TARGET" ] \
+     && git merge-base --is-ancestor "$TARGET" "$DEPLOYED" 2>/dev/null; then
+  BEHIND="$(git rev-list --count "${TARGET}..${DEPLOYED}" 2>/dev/null || echo '?')"
+  say "REFUSED: BACKWARDS ship refused — the target ${TARGET:0:12} is an ancestor of what is DEPLOYED"
+  say "REFUSED: (${DEPLOYED:0:12}, per $DEPLOYED_SRC), $BEHIND commit(s) behind. Resetting to it would"
+  say "REFUSED: roll the deployment BACKWARDS and revert everything shipped since. Tree left at $BEFORE, untouched."
   say "REFUSED: re-request the ship at the current main tip (a human approves the new sha), or land a revert."
   exit 1
+fi
+if [ -z "$DEPLOYED" ]; then
+  say "direction UNCHECKED here — nothing local records what is deployed (no ledger, no prior sync in"
+  say "the log, and the tree does not match HEAD, so HEAD is only the last LANDED ref). Proceeding: the"
+  say "authoritative guard is server-side (shipgate.runShipBody), and a refusal must be definite."
+elif [ "$DEPLOYED" != "$CURRENT" ]; then
+  say "direction OK — ${TARGET:0:12} is not behind the deployed ${DEPLOYED:0:12} ($DEPLOYED_SRC);"
+  say "HEAD is ${CURRENT:0:12}, which is the last LAND, not the last deploy — that is expected here."
 fi
 
 # Decide whether to stash. THE SUBTLETY (measured 2026-07-19): after the landing gate's
@@ -101,6 +149,12 @@ fi
 # the resolved TARGET (not a ref that could move between resolve and reset).
 if git reset --hard "$TARGET" >/dev/null 2>&1; then
   AFTER="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  # Record what the tree — and so the image built from it — now holds. This is the ONE writer of the
+  # ledger the direction guard reads at the top; write it only after the reset actually succeeded, so
+  # a failed sync can never claim a deploy. A write failure is not fatal: the guard degrades to the
+  # log line below, which this same call has already emitted.
+  printf '%s\n' "$TARGET" >"$DEPLOYED_FILE" 2>/dev/null \
+    || say "WARN could not record the deployed sha in $DEPLOYED_FILE (the direction guard will fall back to the log)"
   say "OK working tree now at ${TARGET:0:12} (HEAD $BEFORE → $AFTER)"
   exit 0
 fi

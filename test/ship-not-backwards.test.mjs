@@ -20,15 +20,25 @@
 //      container builds in runShipBody) — the placement is the fix, not the check;
 //   5. the belt-and-braces refusal in scripts/self-ship-sync.sh, by RUNNING it: a backwards target
 //      must leave the checkout untouched, a forward one must still sync;
+//  5b. and what that shell guard is allowed to call "backwards" (the FALSE REFUSAL of 2026-09-03).
+//      It compared the target against `git rev-parse HEAD`. In this self-hosting checkout HEAD is
+//      the last LAND, not the last DEPLOY — the landing gate moves master with update-ref and never
+//      touches the tree — so a ship approved after any landing was bounced as "BACKWARDS ... would
+//      revert everything shipped since" when it was strictly FORWARD of the running code. b5a7bde1
+//      died that way; the server-side ledger guard had allowed it one layer up. The reference is now
+//      the sha the script last SYNCED THE TREE TO (ledger file → the log's last OK line → HEAD, but
+//      only while the tree still matches it → otherwise proceed, saying the check did not run). This
+//      section builds the exact shape with update-ref and asserts BOTH directions: the forward ship
+//      syncs, the genuinely-backwards one is still refused;
 //   6. END TO END through runShipBody against a throwaway postgres (`zee db-sandbox --migrate`) and
 //      the same real repo: the backwards ship lands 'failed' with the named cause, its build script
 //      is NEVER executed, and the site's lock gets its release countdown — while the forward control
 //      ships and DOES execute the build. Skipped loudly (never silently) without DATABASE_URL.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import pg from 'pg';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -165,6 +175,14 @@ try {
     + 'ancestor of what this checkout already has (fd3855aa), 2 commit(s) behind.' }] });
   ok(fromShell.cause === SHIP_BEHIND_LIVE_CAUSE,
      'the SHELL guard\'s refusal, arriving as a build log, classifies the same way');
+  // Both wordings, because both reach the console: a queenzee still running an older image emits the
+  // 2026-08-23 sentence, the current script emits the 2026-09-03 one. The classifier keys on
+  // "BACKWARDS ship refused", which is why that phrase is not free to change.
+  const fromShellNow = classifyShipFailure({ containers: [{ ok: false, role: 'server', log:
+    '[2026-09-03T03:05:58Z] self-ship-sync: REFUSED: BACKWARDS ship refused — the target eed2ffb8 is an '
+    + 'ancestor of what is DEPLOYED (fd3855aa, per the last sync this script recorded), 2 commit(s) behind.' }] });
+  ok(fromShellNow.cause === SHIP_BEHIND_LIVE_CAUSE,
+     'and so does the current wording — the phrase the classifier keys on survived the fix');
 
   // ── 4. the guard is asked BEFORE anything is deployed ─────────────────────────
   console.log('\n── placement: the guard runs before the deploy touches anything ──');
@@ -182,12 +200,12 @@ try {
 
   // ── 5. the shell belt-and-braces, RUN for real ────────────────────────────────
   console.log('\n── scripts/self-ship-sync.sh (executed) ──');
+  // spawnSync, not execFileSync: the script says what it decided on STDERR whether it refuses or
+  // proceeds, and the "why" of a PERMITTED sync is exactly what 5b has to read.
   const sync = (ref) => {
-    try {
-      execFileSync('bash', [join(ROOT, 'scripts/self-ship-sync.sh'), repo, ref],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-      return { code: 0, err: '' };
-    } catch (e) { return { code: e.status ?? -1, err: String(e.stderr || '') }; }
+    const r = spawnSync('bash', [join(ROOT, 'scripts/self-ship-sync.sh'), repo, ref],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { code: r.status ?? -1, err: String(r.stderr || '') };
   };
   // the checkout is at C (live); a ship targeting A would reset it BACKWARDS
   ok(g('rev-parse', 'HEAD') === C, 'the checkout starts at C');
@@ -206,6 +224,63 @@ try {
   const noop = sync(C);
   ok(noop.code === 0 && g('rev-parse', 'HEAD') === C, 're-syncing to the sha already checked out is fine');
   g('checkout', '-q', 'master');
+
+  // ── 5b. THE FALSE REFUSAL of 2026-09-03: HEAD is the last LAND, not the last DEPLOY ──────────
+  // The landing gate advances master with `update-ref` and never touches the tree (the reason this
+  // script exists at all). So between two ships HEAD runs ahead of the deployed files, and the guard
+  // used to read that gap as "production has newer code". Ship b5a7bde1 was strictly FORWARD of what
+  // was running and was refused with "would revert everything shipped since" — nothing had shipped.
+  const ledgerFile = join(parent, `zeehive-self-ship-deployed-${basename(repo)}.sha`);
+  const deploy = (sha) => { g('reset', '--hard', sha); writeFileSync(ledgerFile, `${sha}\n`); };
+  const land = (sha) => execFileSync('git', ['-C', repo, 'update-ref', 'refs/heads/master', sha],
+    { stdio: ['ignore', 'pipe', 'pipe'] });   // the gate's move: the ref only, tree untouched
+  {
+    deploy(A);                       // production is running A…
+    land(C);                         // …and two landings have moved master to C since
+    ok(g('rev-parse', 'HEAD') === C && g('status', '--porcelain') !== '',
+       'the shape: HEAD is the LANDED tip while the tree still holds the DEPLOYED commit');
+    const fwd2 = sync(B);            // B: behind HEAD, but a commit ahead of what is deployed
+    ok(fwd2.code === 0,
+       `a target BEHIND HEAD but AHEAD of the deployed sha is NOT refused (exit ${fwd2.code}) — `
+       + 'this is the ship the old check bounced');
+    ok(/direction OK/.test(fwd2.err) && /last LAND, not the last deploy/.test(fwd2.err),
+       'and it says which reference it used, so the next reader is not misled by HEAD');
+    ok(g('rev-parse', 'HEAD') === B, 'the tree really moved to the ship sha');
+  }
+  {
+    deploy(C);                       // now C IS deployed…
+    land(C);
+    const back2 = sync(A);           // …so A is genuinely backwards, ledger or no ledger
+    ok(back2.code !== 0 && /BACKWARDS ship refused/.test(back2.err),
+       'a REAL backwards ship is still refused — the fix narrows the reference, not the guard');
+    ok(/is an ancestor of what is DEPLOYED/.test(back2.err) && /2 commit\(s\) behind/.test(back2.err),
+       'and the refusal now names what it measured against, and how far');
+    ok(g('rev-parse', 'HEAD') === C, 'the checkout is untouched');
+  }
+  {
+    // The incident's own shape, with a landing on top: deployed C, master landed past it. Without a
+    // ledger this is unknowable from HEAD alone — and the old fallback would have got it WRONG.
+    rmSync(ledgerFile, { force: true });
+    const logFile = join(parent, 'zeehive-self-ship-sync.log');
+    const savedLog = existsSync(logFile) ? readFileSync(logFile, 'utf8') : '';
+    rmSync(logFile, { force: true });
+    g('reset', '--hard', A); land(C);
+    const blind = sync(B);
+    ok(blind.code === 0 && /direction UNCHECKED here/.test(blind.err),
+       'with NOTHING local to compare against, it proceeds and says the check did not run — '
+       + 'the authoritative guard is server-side, and a refusal must be definite');
+    // …and the log alone is enough to make the NEXT one definite again (an older queenzee wrote no
+    // ledger; this is what makes the first ship after this change correct, not the second).
+    rmSync(ledgerFile, { force: true });
+    g('reset', '--hard', C); land(C);
+    writeFileSync(logFile, `[t] self-ship-sync: OK working tree now at ${C.slice(0, 12)} (HEAD x → y)\n`);
+    const fromLog = sync(A);
+    ok(fromLog.code !== 0 && /per the last successful sync in zeehive-self-ship-sync\.log/.test(fromLog.err),
+       'a prior sync recorded only in the LOG still refuses a backwards ship, and names that source');
+    writeFileSync(logFile, savedLog);
+  }
+  g('checkout', '-q', 'master');
+  g('reset', '--hard', C);
 
   // ── 6. END TO END: runShipBody against a real database ────────────────────────
   // The sections above prove the DECISION and the placement; this one proves the WIRING — that the
