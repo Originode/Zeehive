@@ -40,14 +40,38 @@ const { medicRoleSql, MEDIC_ROLE, MEDIC_WRITE_TABLES, MEDIC_NO_WRITE_TABLES } =
 
 console.log('\n── F. simulate mints nothing ──');
 // The module under simulate: mintMedicRole returns an inert handle without touching the db. We
-// prove the negative on the DB ITSELF: no such role exists before the explicit real mint below.
-// (Pre-clean: a role with grants refuses a bare DROP ROLE — DROP OWNED must strip them first.)
-await owner.query(`DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${MEDIC_ROLE}') THEN
-    EXECUTE 'DROP OWNED BY ${MEDIC_ROLE}'; EXECUTE 'DROP ROLE ${MEDIC_ROLE}';
-  END IF; END $$`);
+// prove the negative on the DB ITSELF. Preferred form: no such role exists before the explicit
+// real mint below. But a ROLE is CLUSTER state while `DROP OWNED` strips only the CURRENT
+// database's grants — on a shared sandbox cluster (several `zee db-sandbox` databases, each
+// having minted the role) the DROP legitimately refuses with "objects depend on it" in a SIBLING
+// database. That is the environment, not a defect, so the pre-clean is tolerant and the
+// assertion ADAPTS: when the role survives, prove simulate-inertness by WATERMARK instead — the
+// role's stored password hash (pg_authid, superuser-readable on the sandbox) must be byte-equal
+// before and after a simulate-mode mint, because a real mint always re-mints the password.
+let preCleanDropped = true;
+try {
+  await owner.query(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${MEDIC_ROLE}') THEN
+      EXECUTE 'DROP OWNED BY ${MEDIC_ROLE}'; EXECUTE 'DROP ROLE ${MEDIC_ROLE}';
+    END IF; END $$`);
+} catch { preCleanDropped = false; }
 const pre = await owner.query(`SELECT 1 FROM pg_roles WHERE rolname=$1`, [MEDIC_ROLE]);
-ok(pre.rows.length === 0, 'no medic role exists before an explicit real mint');
+if (preCleanDropped && pre.rows.length === 0) {
+  ok(true, 'no medic role exists before an explicit real mint');
+} else {
+  const mark = async () => (await owner.query(
+    `SELECT rolpassword FROM pg_authid WHERE rolname=$1`, [MEDIC_ROLE])).rows[0]?.rolpassword || null;
+  const before = await mark();
+  const { execFileSync } = await import('node:child_process');
+  const childOut = execFileSync(process.execPath, ['-e', `
+    process.env.MEDICRW_MODE = 'simulate';
+    const { mintMedicRole } = await import(${JSON.stringify(new URL('../server/src/lib/medic-role.js', import.meta.url).href)});
+    console.log(JSON.stringify(await mintMedicRole()));
+  `], { env: { ...process.env, MEDICRW_MODE: 'simulate' }, encoding: 'utf8' });
+  const sim = JSON.parse(childOut.trim().split('\n').pop());
+  ok(sim.mode === 'simulate', 'simulate mode reports itself (role held by sibling sandbox dbs — watermark form)');
+  ok((await mark()) === before, 'a simulate mint left the role\'s password hash untouched — it minted nothing');
+}
 
 console.log('\n── A. the role mints against the real schema ──');
 const pw = randomUUID().replace(/-/g, '');
