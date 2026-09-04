@@ -29,10 +29,10 @@ REF="${2:?ship_ref}"
 
 # Log outside the tree (parent dir) so we never become an untracked file a future sync would stash.
 LOG="$(dirname "$SRC")/zeehive-self-ship-sync.log"
-# The DEPLOYED LEDGER — same reasoning for the location, but scoped by basename: the log's name
-# predates any second checkout ever living in /repos, and a ledger that two projects shared would
-# answer the direction question with the wrong project's sha.
-DEPLOYED_FILE="$(dirname "$SRC")/zeehive-self-ship-deployed-$(basename "$SRC").sha"
+# The per-slot deploy ledger and the shared refusal live in one place, because the console script
+# needs exactly the same reasoning and a second copy of it would drift (2026-09-03: it had none).
+SHIP_SLOT="self-ship"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/ship-direction-local.sh"
 say() { local m="[$(date -u +%FT%TZ 2>/dev/null || echo now)] self-ship-sync: $*"; echo "$m" >&2; echo "$m" >>"$LOG" 2>/dev/null || true; }
 
 cd "$SRC" 2>/dev/null || { say "FATAL cannot cd into repo_root '$SRC'"; exit 1; }
@@ -77,10 +77,8 @@ say "syncing working tree of $SRC → ${TARGET:0:12} (ref '$REF'); HEAD was $BEF
 # refusal must be definite (server/src/lib/ship-direction.js decides the same way).
 CURRENT="$(git rev-parse --verify HEAD 2>/dev/null || true)"
 DEPLOYED=""; DEPLOYED_SRC=""
-if [ -r "$DEPLOYED_FILE" ]; then
-  DEPLOYED="$(git rev-parse --verify -q "$(tr -d '[:space:]' <"$DEPLOYED_FILE")^{commit}" 2>/dev/null || true)"
-  [ -n "$DEPLOYED" ] && DEPLOYED_SRC="the last sync this script recorded"
-fi
+DEPLOYED="$(ship_ledger_read "$SRC" "$SHIP_SLOT")"
+[ -n "$DEPLOYED" ] && DEPLOYED_SRC="the last sync this script recorded"
 if [ -z "$DEPLOYED" ] && [ -r "$LOG" ]; then
   LOGGED="$(sed -n 's/.*OK working tree now at \([0-9a-f]\{7,\}\).*/\1/p' "$LOG" 2>/dev/null | tail -1)"
   if [ -n "$LOGGED" ]; then
@@ -92,12 +90,9 @@ if [ -z "$DEPLOYED" ] && [ -n "$CURRENT" ] && git diff --quiet HEAD -- 2>/dev/nu
   DEPLOYED="$CURRENT"; DEPLOYED_SRC="HEAD (the tree matches it, so no landing has moved the ref since)"
 fi
 
-if [ -n "$DEPLOYED" ] && [ "$DEPLOYED" != "$TARGET" ] \
-     && git merge-base --is-ancestor "$TARGET" "$DEPLOYED" 2>/dev/null; then
-  BEHIND="$(git rev-list --count "${TARGET}..${DEPLOYED}" 2>/dev/null || echo '?')"
-  say "REFUSED: BACKWARDS ship refused — the target ${TARGET:0:12} is an ancestor of what is DEPLOYED"
-  say "REFUSED: (${DEPLOYED:0:12}, per $DEPLOYED_SRC), $BEHIND commit(s) behind. Resetting to it would"
-  say "REFUSED: roll the deployment BACKWARDS and revert everything shipped since. Tree left at $BEFORE, untouched."
+if ship_is_backwards "$SRC" "$TARGET" "$DEPLOYED"; then
+  ship_say_refusal "$TARGET" "$DEPLOYED" "$DEPLOYED_SRC" "$(ship_behind_count "$SRC" "$TARGET" "$DEPLOYED")"
+  say "REFUSED: Tree left at $BEFORE, untouched."
   say "REFUSED: re-request the ship at the current main tip (a human approves the new sha), or land a revert."
   exit 1
 fi
@@ -153,8 +148,8 @@ if git reset --hard "$TARGET" >/dev/null 2>&1; then
   # ledger the direction guard reads at the top; write it only after the reset actually succeeded, so
   # a failed sync can never claim a deploy. A write failure is not fatal: the guard degrades to the
   # log line below, which this same call has already emitted.
-  printf '%s\n' "$TARGET" >"$DEPLOYED_FILE" 2>/dev/null \
-    || say "WARN could not record the deployed sha in $DEPLOYED_FILE (the direction guard will fall back to the log)"
+  ship_ledger_write "$SRC" "$SHIP_SLOT" "$TARGET" \
+    || say "WARN could not record the deployed sha in $(ship_ledger_file "$SRC" "$SHIP_SLOT") (the direction guard will fall back to the log)"
   say "OK working tree now at ${TARGET:0:12} (HEAD $BEFORE → $AFTER)"
   exit 0
 fi

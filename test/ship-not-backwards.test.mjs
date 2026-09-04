@@ -30,6 +30,12 @@
 //      only while the tree still matches it → otherwise proceed, saying the check did not run). This
 //      section builds the exact shape with update-ref and asserts BOTH directions: the forward ship
 //      syncs, the genuinely-backwards one is still refused;
+//  5c. and the OTHER leg of the same ship: scripts/ship-zeehive-web.sh, which had no direction
+//      check AT ALL — on 2026-09-03 it built and redeployed the console from the very sha the
+//      server leg was refusing, minutes apart. It is its own deploy slot, so it keeps its own
+//      ledger and shares the refusal with the server leg (scripts/lib/ship-direction-local.sh).
+//      Run for real against a PATH docker stub, so "the build never ran" is an assertion and not
+//      an inference from the exit code;
 //   6. END TO END through runShipBody against a throwaway postgres (`zee db-sandbox --migrate`) and
 //      the same real repo: the backwards ship lands 'failed' with the named cause, its build script
 //      is NEVER executed, and the site's lock gets its release countdown — while the forward control
@@ -281,6 +287,75 @@ try {
   }
   g('checkout', '-q', 'master');
   g('reset', '--hard', C);
+
+  // ── 5c. THE OTHER LEG: scripts/ship-zeehive-web.sh had NO direction check at all ─────────────
+  // One ship, two legs. On 2026-09-03 the server leg refused b5a7bde1 as backwards while THIS
+  // script — same ship, same sha, minutes apart — built the image and redeployed the console from
+  // it. The console is its own deploy slot (it moves only when a web ship succeeds), so it gets its
+  // own ledger, and both legs now share ONE copy of the reasoning and the refusal wording
+  // (scripts/lib/ship-direction-local.sh) so they cannot drift apart again.
+  console.log('\n── scripts/ship-zeehive-web.sh (executed, docker stubbed) ──');
+  const shimDir = join(parent, 'shim');
+  mkdirSync(shimDir, { recursive: true });
+  const dockerCalls = join(parent, 'docker-calls.log');
+  // A `docker` on PATH that records its argv and succeeds. The whole point of the guard is that a
+  // refused ship never REACHES a build, and this is how the test tells "never ran" from "ran and
+  // failed" — without it, an assertion on the exit code alone would pass either way.
+  writeFileSync(join(shimDir, 'docker'),
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(dockerCalls)}\nexit 0\n`);
+  execFileSync('chmod', ['+x', join(shimDir, 'docker')]);
+  const webLedger = join(parent, `zeehive-web-deployed-${basename(repo)}.sha`);
+  const serverLedgerBefore = existsSync(ledgerFile) ? readFileSync(ledgerFile, 'utf8') : null;
+  const dockerRan = () => (existsSync(dockerCalls) ? readFileSync(dockerCalls, 'utf8') : '');
+  const shipWeb = (ref) => {
+    rmSync(dockerCalls, { force: true });
+    const r = spawnSync('bash',
+      [join(ROOT, 'scripts/ship-zeehive-web.sh'), repo, 'webapp', 'testctx', 'real', ref],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` } });
+    return { code: r.status ?? -1, out: String(r.stdout || '').trim(), err: String(r.stderr || '') };
+  };
+  {
+    rmSync(webLedger, { force: true });
+    const first = shipWeb(C);            // nothing recorded yet — unknowable, so proceed and say so
+    ok(first.code === 0 && /"ok":true/.test(first.out),
+       `with no ledger the web ship proceeds (exit ${first.code})`);
+    ok(/direction UNCHECKED/.test(first.err),
+       'and says the check did not run rather than guessing — a refusal must be definite');
+    ok(/compose/.test(dockerRan()), 'it really got as far as the deploy');
+    ok(existsSync(webLedger) && readFileSync(webLedger, 'utf8').trim() === C,
+       'and a SUCCESSFUL web ship records what the console container now runs');
+  }
+  {
+    const back3 = shipWeb(A);            // C is deployed; A is genuinely behind it
+    ok(back3.code !== 0 && /BACKWARDS ship refused/.test(back3.err),
+       'a backwards web ship is refused — the leg that used to have no check at all');
+    ok(/is an ancestor of what is DEPLOYED/.test(back3.err) && /2 commit\(s\) behind/.test(back3.err),
+       'naming what it measured against, and how far, in the words the classifier knows');
+    ok(classifyShipFailure({ containers: [{ ok: false, role: 'webapp', log: back3.err }] }).cause
+       === SHIP_BEHIND_LIVE_CAUSE, 'so a refused WEB leg renders as ship-behind-live on the card too');
+    ok(back3.out.split('\n').length === 1 && /"ok":false/.test(back3.out)
+       && /"method":"direction-refused"/.test(back3.out),
+       'and the JSON contract still holds — one line, ok:false, a named method');
+    ok(dockerRan() === '', 'NOTHING WAS BUILT — docker was never invoked');
+    ok(!existsSync(join(repo, '.ship-web-ctx')), 'and no build context was even checked out');
+    ok(readFileSync(webLedger, 'utf8').trim() === C, 'a refused ship does not rewrite the ledger');
+  }
+  {
+    // The 2026-09-03 shape, on this leg: the console is running A, master has landed on to C, and
+    // the approved ship is B — behind HEAD, ahead of what is running. It must NOT be refused, and
+    // the reference is the ledger precisely so that HEAD's position is irrelevant here.
+    writeFileSync(webLedger, `${A}\n`);
+    land(C); g('checkout', '-q', 'master'); g('reset', '--hard', C);
+    const fwd3 = shipWeb(B);
+    ok(fwd3.code === 0 && /"ok":true/.test(fwd3.out),
+       `a target behind HEAD but ahead of the deployed console sha still ships (exit ${fwd3.code})`);
+    ok(/direction OK/.test(fwd3.err) && readFileSync(webLedger, 'utf8').trim() === B,
+       'the check ran, permitted it, and the ledger moved to the newly deployed sha');
+    const serverLedgerAfter = existsSync(ledgerFile) ? readFileSync(ledgerFile, 'utf8') : null;
+    ok(serverLedgerAfter === serverLedgerBefore,
+       'the two legs keep SEPARATE ledgers — a web ship never claims the server slot moved');
+  }
 
   // ── 6. END TO END: runShipBody against a real database ────────────────────────
   // The sections above prove the DECISION and the placement; this one proves the WIRING — that the
