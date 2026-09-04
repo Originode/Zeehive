@@ -1191,7 +1191,7 @@ export default function App() {
   // policy. The one genuinely new path is 'project' INSIDE a project: a NESTED project, whose
   // folder is confined to the parent's repo_root and whose git behavior is forced (ProjectSetup's
   // CreateForm renders the choice). Activity/task cut under the current node (server owns legality).
-  const handlePlusAction = useCallback(async (kind) => {
+  const handlePlusAction = async (kind) => {
     switch (kind) {
       case 'prompt': setShowDispatch({}); return;
       case 'manager': setShowManagerMint(true); return;
@@ -1235,7 +1235,7 @@ export default function App() {
       }
       default: return;
     }
-  }, [hiveMode, rootWorkItem, project, ctxItemId, projectId, refresh]);
+  };
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
