@@ -438,6 +438,17 @@ after landing ed805cc exposed both):
   only while the tree still matches it). Comparing against `HEAD` refused forward ships that
   merely waited behind a landing (`b5a7bde1`, 2026-09-03). The authoritative direction guard
   is still the server's, in `shipgate.runShipBody`; this one is the last line of defence.
+- **Two legs of one ship, and each is its own deploy slot.** The server leg (`self-ship-sync.sh`,
+  above) and the console leg (`ship-zeehive-web.sh`) move independently: a web ship rebuilds
+  `zeehive-web:prod` from a detached worktree at the ship ref and recreates only the `web` service.
+  Until 2026-09-03 only the server leg checked direction at all — so when it refused `b5a7bde1`,
+  the console leg, same ship and minutes apart, built and redeployed that sha anyway. Both legs now
+  read and write a per-slot ledger beside the checkout, `../zeehive-<slot>-deployed-<checkout>.sha`
+  (slots: `self-ship`, `web`), through one shared implementation
+  (`scripts/lib/ship-direction-local.sh`) so the reasoning and the refusal wording cannot drift
+  apart again. A slot with nothing recorded yet is *unknowable*, never *backwards*: the script says
+  the check did not run and proceeds, because a definite answer is the server-side guard's job.
+  Pinned end to end in `test/ship-not-backwards.test.mjs` (§5b, §5c), which runs both scripts.
 - **Cxell-image rebuild.** New cxell-zee capabilities ship inside `zeehive/zee-agent`
   (`docker/zeehive/Dockerfile.zee-agent` — the `zee` CLI, cxell-sshd/seed/attach scripts).
   `self-ship.sh` rebuilds that image on the `default` docker context (where cxells run) as
