@@ -48,6 +48,18 @@ export function busyReason(c) {
 }
 export const isBusy = (c) => busyReason(c) != null;
 
+// A database decommission is the one decommission that demands a typed word — its data dies with
+// it. The word used to have to be the container's FULL name, which on a shared dev db reads like
+// zeehive_db_dev_mardale_prod_ugreen_nas_local: long enough to be a copy-paste chore and a
+// fat-finger trap. The gate exists to prove the click is deliberate, so the word "decommission" —
+// the label of the very button being pressed — arms it too, case-insensitively. The exact name
+// still arms it (muscle memory, and the strongest proof you are aimed at the right database).
+export function dbDecommissionArmed(typed, name) {
+  const t = String(typed || '').trim();
+  if (!t) return false;
+  return t === name || t.toLowerCase() === 'decommission';
+}
+
 const BUSY_LABEL = { building: 'building…', backup: 'backing up…', restore: 'restoring from backup…', busy: 'working…' };
 
 // ── schema drift vs production (container.prod_diff, written by queenzee/proddiff.js) ──────────
@@ -271,7 +283,8 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   const [ctxs, setCtxs] = useState(null);
   // Decommission is a two-stage flow: the menu item flips to an in-menu confirmation panel (a
   // clearly destructive button, not a default-focused OK), and a db additionally requires typing
-  // its name. Reset whenever the menu targets a different container so state can't bleed across.
+  // the word "decommission" (or its full name). Reset whenever the menu targets a different
+  // container so state can't bleed across.
   const [confirming, setConfirming] = useState(false);
   const [typed, setTyped] = useState('');
   const [busyAct, setBusyAct] = useState(false);
@@ -355,8 +368,8 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   if (runCtx) picker.push({ name: runCtx, run: true });
   for (const k of (ctxs || [])) if (k.name && k.name !== runCtx) picker.push({ name: k.name, endpoint: k.endpoint });
 
-  // Decommission wiring. Production is never a candidate. A db needs its name typed (it deletes
-  // data); anything else just needs the destructive button pressed.
+  // Decommission wiring. Production is never a candidate. A db needs the word "decommission" (or
+  // its full name) typed — it deletes data; anything else just needs the destructive button pressed.
   const prod = isProdContainer(c);
   const isDb = c.role === 'db';
   // A device chip decommissions too (035). Distinguish the two shapes so the wording is honest:
@@ -365,7 +378,7 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   // ('uses' = a linked shared device) is the fallback for chips that don't carry isolation.
   const isDevice = c.role === 'device';
   const devicePhysical = isDevice && (c.isolation === 'shared' || c.relation === 'uses');
-  const canConfirm = !isDb || typed.trim() === c.name;
+  const canConfirm = !isDb || dbDecommissionArmed(typed, c.name);
   const runDecommission = async () => {
     if (!canConfirm || busyAct) return;
     setBusyAct(true); setErr(null);
@@ -495,9 +508,9 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
           </div>
           {isDb && (
             <label className="ctxwarn-type">
-              To confirm, type the container name:
+              To confirm, type decommission:
               <input autoFocus data-testid="decommission-type" value={typed}
-                     placeholder={c.name} spellCheck={false} autoComplete="off"
+                     placeholder="decommission" spellCheck={false} autoComplete="off"
                      onChange={(e) => setTyped(e.target.value)}
                      onKeyDown={(e) => { if (e.key === 'Enter') runDecommission(); }} />
             </label>
