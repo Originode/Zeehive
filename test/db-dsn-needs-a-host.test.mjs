@@ -47,7 +47,7 @@ for (const [what, row] of [
 
 section('the dev-db provisioner composes through it, so it cannot mint a hostless conn_ref');
 const machines = readFileSync(join(ROOT, 'server', 'src', 'lib', 'machines.js'), 'utf8');
-ok(/import \{ derivedTcpDsn \} from '\.\/xell-db\.js'/.test(machines),
+ok(/import \{[^}]*\bderivedTcpDsn\b[^}]*\} from '\.\/xell-db\.js'/.test(machines),
    'lib/machines.js uses the shared composer');
 ok(/const conn = derivedTcpDsn\(/.test(machines),
    'the dev db conn_ref is composed by it, not by a template literal');

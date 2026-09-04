@@ -19,7 +19,7 @@ import { logline } from './logbus.js';
 import { resolveContext, contextEndpoint, dockerPs } from './docker.js';
 import { resolveBash } from './bash.js';
 import { namingFor, sanitizeName } from './manifest.js';
-import { derivedTcpDsn } from './xell-db.js';
+import { derivedTcpDsn, resolveRealDbContainer } from './xell-db.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -439,14 +439,36 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     `SELECT name, image_tag FROM container
       WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared'
       ORDER BY (image_tag IS NOT NULL) DESC LIMIT 1`, [projectId]);
-  const prodDb = source ? null : await one(
-    `SELECT name, image_tag, docker_ctx FROM container
+  // Consult prod for the IMAGE whenever the dev lineage cannot answer — no shared dev db at all,
+  // OR one modeled with no image_tag (`source ? null :` used to skip prod in that second case and
+  // silently take the hardcoded fallback).
+  const prodDb = source?.image_tag ? null : await one(
+    `SELECT name, image_tag, docker_ctx, host_port FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [projectId]);
-  // A modeled prod db row often has no image_tag — the LIVE container knows what it runs.
+  // A modeled prod db row often has no image_tag — the LIVE container knows what it runs. But the
+  // row's LOGICAL name (omnibiz_db_prod) is NOT the live container: the daemon runs a VERSIONED
+  // one (omnibiz_db_prod_v184), and `docker inspect` on the logical name reads whatever container
+  // still wears it — on omnibiz that is the EXITED stock postgres:18beta1 husk. Inspecting the
+  // husk provisioned a dev db with NO postgis, and every prod duplicate/restore into it then
+  // failed with `extension "postgis" is not available` (2026-09-04). Resolve by registry identity
+  // first — the same rule every other prod-db reader follows — and on an unresolvable/ambiguous
+  // prod fall through to the default rather than inspect a container that may be the wrong one.
   let prodImage = prodDb?.image_tag || null;
   if (prodDb && !prodImage && MODE === 'real') {
-    prodImage = (spawnSync('docker', ['--context', prodDb.docker_ctx || 'default', 'inspect', '-f', '{{.Config.Image}}', prodDb.name],
-      { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim() || null;
+    const prodCtx = prodDb.docker_ctx || 'default';
+    try {
+      const real = await resolveRealDbContainer(prodCtx, prodDb.name, { row: prodDb });
+      // Only trust a RUNNING container's image: with prod down the resolver falls back to the
+      // logical name, and inspecting that reads the exited husk — the very container this exists
+      // to avoid. running=false ⇒ leave prodImage null and take the default below.
+      const [running, img] = (spawnSync('docker',
+        ['--context', prodCtx, 'inspect', '-f', '{{.State.Running}}\t{{.Config.Image}}', real],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim().split('\t');
+      prodImage = running === 'true' ? (img || '').trim() || null : null;
+    } catch (e) {
+      logline('machine', `could not resolve the live prod db for ${project.name} to read its image `
+        + `(${e.message}) — falling back to the default dev db image`);
+    }
   }
   const image = source?.image_tag || prodImage || 'omnibiz-postgis:18-3.6-h3';
 
