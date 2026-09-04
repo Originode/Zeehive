@@ -29,8 +29,6 @@ import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
 import { itemReachable } from './hive/level.js';
-// the project-scoping filter for the fleet render surfaces (honeycomb and everything fed from it)
-import { projectScoped } from './projectFilter.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
@@ -1020,14 +1018,14 @@ export default function App() {
   // follow-up directive). With this empty, conditions render as INFORMATION (the editor keeps its
   // list) and no medic button appears anywhere.
   const medicEmergency = fleetMatchesSelection ? (fleet.medic_emergency || []) : [];
-  // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
-  // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
-  // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
-  // but a xell from the previous project's LAST update stream must never paint — the filter is the
-  // final gate, and it costs one pass over an already-small list.
-  const gridXells = projectScoped(
-    streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []),
-    projectId);
+  // No per-xell project filter here: the fleet stream, the fleet snapshot and the SSE updates are
+  // all scoped to ONE project on the server (`WHERE x.project_id = $1`), so a xell that reaches this
+  // render path is this project's by construction. What a project SWITCH can still do is deliver
+  // yesterday's data late, and that is a STALENESS question, not a scoping one — it is answered
+  // where the data lands: the streamed map force-clears on the new projectId and drops any stream or
+  // snapshot from the previous selection, and the fleet fallback below is used only while the
+  // snapshot in state actually belongs to the selected project.
+  const gridXells = streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []);
   const carded = new Set(gridXells.map((x) => x.id));
   // THE APPROACH QUEUE, by ref (067). One runway per ref, so the queue belongs under the card that
   // is holding it up — keyed the same way, and never merged into `landing` (a holding row is not a
