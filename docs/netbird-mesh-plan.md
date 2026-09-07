@@ -2,8 +2,8 @@
 
 **Date:** 2026-09-07
 **Author:** Architect (bright-grove-d665cf)
-**Status:** Proposed (plan only — no feature is built in this xell; the Architect harness
-delivers structure, interfaces, data shape, migration strategy and the rejected alternatives)
+**Status:** Phases 0–1 implemented, phase 3–4 seams built (see §11 — added when the human asked
+this xell to implement; the plan sections below are the original decision record, unedited)
 **Supersedes/extends:** `docs/common-xell-network-plan.md` Decision 5.4 (the WireGuard
 transport layer) — this plan is that decision, made concrete with a managed control plane.
 
@@ -496,3 +496,50 @@ one more peer kind).
    phase 5.
 4. Retire `wireguard_server`/`wireguard_peer` + `lib/wireguard.js` once the dashboard covers
    the human-download case (supersession note goes in that change's DR).
+
+---
+
+## 11. Implementation status (2026-09-07, same xell, on the human's instruction)
+
+### Delivered
+
+- **Phase 0 — pruning** (`f83608ad`): `lib/docker.js removeNetwork` (daemon API, in-use refusal
+  is a verdict, SSH refused); `reaper.js xellNetworkCandidates` (pure, slug-guarded) + network
+  removal after the owned containers, before the rows drop; `lib/docker-repair.js
+  sweepDockerLeftovers` + `startDockerJanitor` (hourly; auto-performs ONLY stale-network +
+  stale-container; dry-run unless `PROVISION_MODE=real`; knobs `DOCKER_JANITOR_ENABLED/_MS/
+  _DRY_RUN`), registered in `index.js`. Test: `test/docker-janitor.test.mjs`.
+- **Phase 1 — control-plane client + registry** (`106b8690`): migration 249 `mesh_peer`
+  (intent/live split, active-hostname partial unique index, kind binding); `lib/netbird.js`
+  (bounded injected adapter; setup keys one-off/usage-1/ephemeral; the key is returned once and
+  never stored; `deregisterXellPeers` rides the reap's destructive verdict and a failed delete
+  keeps the row active for retry; `sweepOrphanMeshPeers` deletes only removed-row / retired-slug
+  peers — unknown hostnames are reported, never deleted); config `NETBIRD_API_URL` /
+  `NETBIRD_API_TOKEN` / `MESH_DOMAIN` (both unset = every entry point a legible no-op). The
+  docker janitor tick runs the mesh pass (non-dry-run only). Test: `test/netbird-mesh.test.mjs`.
+- **Router, directory half** (`1de5d32a`): `GET /api/xell/self/routes` + `zee routes` +
+  migration 250 (worker manual, anchored `harness_memory_put`). `lib/mesh-routes.js` is the pure
+  derivation; contract as §3.4 (source telemetry, owned-roles-only mesh answers, fallback
+  dual-stack, DSN re-addressed keeping credentials, bounded db probe). Live-verified in-cage:
+  real server on loopback against a sandbox meta-DB, real bearer token, legacy AND mesh answers
+  over HTTP and via the CLI. `cxell-cli-drift` green.
+- **Phase 3 seam — the sidecar** (`c9c1150b`): `compose-gen.js` generates the `mesh` service
+  behind `tiers.spinoff.mesh.enabled` (netbird agent, hostname = slug, canonical-port DNAT
+  wrapper exec'ing the image's own entrypoint, idle-without-key guard). Opt-in only; the
+  committed spinoff compose is untouched; role ports still publish (dual-stack until phase 5).
+
+### NOT done (the honest list — each is a follow-up work item)
+
+1. **Standing up the control plane** (§3.1): the NetBird management/signal/relay services in the
+   queenzee's own compose, the API token in its env, the datastore backup. Needs the queenzee
+   machine — a human/host concern, the natural first card.
+2. **Provisioner integration**: minting the per-xell peer at provision and passing
+   `SPINOFF_MESH_SETUP_KEY` / `SPINOFF_MESH_MGMT_URL` into the build env + `.zeehive.env`
+   (mesh-DSN projection with `DATABASE_URL_FALLBACK`). Deliberately not wired: the hottest path
+   in the repo, and unverifiable until (1) exists.
+3. **Machine peers via the bootstrap card** (§3.2 phase 2) and the **mesh-gateway + cage route
+   line + default-deny prod policies** (§3.5 phase 4).
+4. **Phase 5** (stop publishing ports, delete the allocator) — gated on `source` telemetry, as
+   planned.
+5. The **current backlog** on the wedged hosts still needs one human prune (or a medic
+   `docker_repair` dispatch per machine) — the janitor keeps it flat only from then on.
