@@ -233,6 +233,39 @@ services:
       AUTH_CLIENT_SECRET: ${NETBIRD_AUTH_CLIENT_SECRET:-}
       AUTH_REDIRECT_URI: ${NETBIRD_AUTH_REDIRECT_URI:-}
 
+  # ── MESH GATEWAY (docs/netbird-mesh-plan.md §3.5) — the cxells' data-plane hop ────────────────
+  # A NetBird AGENT (a peer — not control plane) on zee-hive-net, the one network every cxell is
+  # already on. It is the queenzee machine's `gateway` peer: ip_forward toward the mesh, so a caged
+  # zee (no TUN device, no per-cage agent) reaches mesh addresses by routing 100.64.0.0/10 through
+  # this container — the one `ip route` line cxell-firewall.sh adds. Profile-gated like the control
+  # plane; an unscoped `up -d` boots the exact pre-mesh stack.
+  #
+  # Live stand-up is a HUMAN's deploy: the peer needs a one-time gateway setup key minted against
+  # the running control plane (NETBIRD_GATEWAY_SETUP_KEY — never committed), and the management URL
+  # must be the endpoint the operator's management actually serves. Attached to BOTH the compose
+  # network (so `netbird-management` resolves for the agent's control connection) and zee-hive-net
+  # (so cages can route through it). zee-hive-net is EXTERNAL: the queenzee's entrypoint creates it
+  # idempotently, and compose must never own it.
+  mesh-gateway:
+    profiles: ["mesh"]
+    image: netbirdio/netbird:${NETBIRD_CLIENT_TAG:-latest}
+    container_name: zeehive_mesh_gateway
+    restart: unless-stopped
+    hostname: zeehive-gw
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      NB_SETUP_KEY: ${NETBIRD_GATEWAY_SETUP_KEY:-}
+      NB_MANAGEMENT_URL: ${NETBIRD_MGMT_API_URL:-https://netbird-management:443}
+      NB_HOSTNAME: zeehive-gw
+    networks:
+      - default
+      - zee-hive-net
+
 volumes:
   # explicit names: scripts (e.g. the self-ship sibling) mount these by bare name
   zeehive_meta_data: { name: zeehive_meta_data }
@@ -243,3 +276,12 @@ volumes:
   # sibling and the mesh README steps mount these by bare name.
   netbird_management_data: { name: netbird_management_data }
   netbird_signal_data: { name: netbird_signal_data }
+
+networks:
+  default: {}
+  # The one network every cxell is already on — EXTERNAL by design: the queenzee's entrypoint
+  # creates it idempotently, and compose must never own it (a compose-owned network would refuse a
+  # pre-existing one). Only the mesh-gateway joins it from compose.
+  zee-hive-net:
+    external: true
+    name: zee-hive-net

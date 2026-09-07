@@ -113,6 +113,110 @@ export async function ensureGroup(name, { request = netbirdRequest } = {}) {
   return { ok: true, id: mk.json?.id, created: true };
 }
 
+// ── access policies (docs/netbird-mesh-plan.md §3.5 / §5) ───────────────────────────────────────
+// NetBird is default-deny BETWEEN GROUPS: no policy naming a group pair = no flow between them.
+// So the PROD SEAL DOES NOT WEAKEN at the transport: the mesh never grants the `xells`/`gateway`
+// group any path to `prod` except the NARROW, named db-port grant a human-approved prod bind
+// flips (decideProdBind in queenzee/self.js). Everything here is the bounded injected-adapter
+// shape, and every entry point is a legible no-op when the mesh is unset.
+const PROD_GROUP = 'prod';
+
+// PURE default-deny guard: a policy that names the prod group as a DESTINATION may only grant
+// specific ports — never "all" (an empty or '*' port list would open prod wholesale). Every
+// other destination is unrestricted (default-deny already protects them by omission).
+export function policyIsDefaultDenySafe({ destGroups = [], ports = [] }) {
+  if (!destGroups.includes(PROD_GROUP)) return { ok: true };
+  const granted = ports && ports.length ? ports.map(String) : ['*'];
+  if (granted.includes('*') || granted.length === 0) {
+    return { ok: false, reason: `refusing a policy that names '${PROD_GROUP}' as a destination on `
+      + `ALL ports — prod stays default-deny on the mesh (only a narrow, named port grant is ever `
+      + `ensured; docs/netbird-mesh-plan.md §3.5).` };
+  }
+  return { ok: true };
+}
+
+export async function listPolicies({ request = netbirdRequest } = {}) {
+  if (!meshEnabled()) return { ok: false, disabled: true, reason: 'mesh disabled' };
+  const r = await request('GET', '/api/policies');
+  if (r.status !== 200 || !Array.isArray(r.json)) return failed(r, 'list policies');
+  return { ok: true, policies: [...r.json] };
+}
+
+// Find-or-create an ACCEPT policy by name. Idempotent: a policy that already carries the name is
+// returned as-is (a re-bind or a reconcile must not stack duplicates). Group names are resolved to
+// ids through ensureGroup, so the caller can speak the fleet's names ('xells', 'prod') and this
+// module owns the mapping. Never creates a BROAD prod grant — policyIsDefaultDenySafe refuses it
+// before a single control-plane call, so the "prod seal does not weaken" line is structural, not a
+// hope. Mesh disabled → a legible no-op, exactly like every other entry point here.
+export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], ports = [],
+                                     description = null },
+                                   { request = netbirdRequest } = {}) {
+  if (!meshEnabled()) return { ok: false, disabled: true, reason: 'mesh disabled' };
+  if (!name || !sourceGroups.length || !destGroups.length) {
+    return { ok: false, reason: 'ensurePolicy needs name, sourceGroups, destGroups' };
+  }
+  const safe = policyIsDefaultDenySafe({ destGroups, ports });
+  if (!safe.ok) return safe;
+  const ls = await listPolicies({ request });
+  if (!ls.ok) return ls;
+  const existing = ls.policies.find((p) => p.name === name);
+  if (existing) return { ok: true, id: existing.id, existing: true };
+  const srcIds = [];
+  for (const g of sourceGroups) {
+    const rg = await ensureGroup(g, { request });
+    if (!rg.ok) return rg;
+    srcIds.push(rg.id);
+  }
+  const dstIds = [];
+  for (const g of destGroups) {
+    const rg = await ensureGroup(g, { request });
+    if (!rg.ok) return rg;
+    dstIds.push(rg.id);
+  }
+  const body = {
+    name,
+    description: description || `ZEEHIVE mesh policy '${name}' (docs/netbird-mesh-plan.md §3.5)`,
+    enabled: true,
+    rules: [{
+      name,
+      description: description || null,
+      action: 'accept',
+      bidirectional: false,
+      source: srcIds,
+      destination: dstIds,
+      ports: ports.length ? ports.map(String) : [],
+    }],
+  };
+  const r = await request('POST', '/api/policies', body);
+  if (r.status !== 200 && r.status !== 201) return failed(r, `ensure policy '${name}'`);
+  return { ok: true, id: r.json?.id, created: true };
+}
+
+export function prodBindPolicyName(xellSlug) {
+  return `prod-db-for-${xellSlug}`;
+}
+
+// The prod-bind flip (docs/netbird-mesh-plan.md §3.5): a human approved binding this xell to
+// production, so the mesh grants the `xells` group the ONE narrow path to the `prod` group the
+// bind needs — the db port. Default-deny holds everywhere else. Nothing here runs when the mesh is
+// unset (the cage seal is then — as before the mesh existed — the whole story).
+export async function ensureProdBindMeshPolicy(xellSlug, { dbPort = 5432, request = netbirdRequest } = {}) {
+  if (!meshEnabled()) return { ok: true, skipped: 'mesh disabled' };
+  const name = prodBindPolicyName(xellSlug);
+  const r = await ensurePolicy({
+    name,
+    sourceGroups: ['xells'],
+    destGroups: ['prod'],
+    ports: [String(dbPort)],
+    description: `A human approved binding xell '${xellSlug}' to production — the narrow db-port `
+      + `grant that bind flips (default-deny otherwise; docs/netbird-mesh-plan.md §3.5).`,
+  }, { request });
+  if (!r.ok) return r;
+  logline('mesh', `prod-bind policy '${name}' ${r.existing ? 'already present' : 'ensured'} — `
+    + `xells→prod:${dbPort} (the only prod grant the mesh carries)`);
+  return r;
+}
+
 // ── the peer lifecycle against the meta-DB (mesh_peer, migration 249) ───────────────────────────
 
 // Mint a peer for a fleet noun: group ensured, one-shot setup key created, INTENT row inserted.

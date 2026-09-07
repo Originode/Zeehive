@@ -180,6 +180,31 @@ for (const file of FILES) {
      `${file.name}: the named datastore volumes are declared explicitly (bare-name mountable by scripts)`);
 }
 
+section('the mesh-gateway (the cages\' data-plane hop, §3.5) is profile-gated on zee-hive-net');
+for (const file of FILES) {
+  const doc = parse(readFileSync(file.path, 'utf8'));
+  const g = doc.services?.['mesh-gateway'];
+  ok(!!g, `${file.name}: service 'mesh-gateway' exists`);
+  ok(!!g && Array.isArray(g.profiles) && g.profiles.includes('mesh'),
+     `${file.name}: 'mesh-gateway' is gated behind the mesh profile (an unscoped up never starts it)`);
+  ok(/netbirdio\/netbird/.test(g?.image || ''), `${file.name}: uses the netbirdio/netbird AGENT image (a peer, not control plane)`);
+  ok(g?.container_name === 'zeehive_mesh_gateway', `${file.name}: container_name zeehive_mesh_gateway`);
+  ok(g?.hostname === 'zeehive-gw', `${file.name}: the gateway peer hostname is zeehive-gw`);
+  ok(Array.isArray(g?.cap_add) && g.cap_add.includes('NET_ADMIN'), `${file.name}: cap_add NET_ADMIN (it must forward)`);
+  ok(Array.isArray(g?.devices) && g.devices.some((d) => /net\/tun/.test(String(d))),
+     `${file.name}: /dev/net/tun device (the WireGuard interface)`);
+  ok(Array.isArray(g?.sysctls) && g.sysctls.some((s) => /ip_forward/.test(String(s))),
+     `${file.name}: net.ipv4.ip_forward=1 (cages route mesh traffic through it)`);
+  ok(g?.environment?.NB_SETUP_KEY === '${NETBIRD_GATEWAY_SETUP_KEY:-}'
+     && g?.environment?.NB_HOSTNAME === 'zeehive-gw',
+     `${file.name}: NB_SETUP_KEY passes through EMPTY by default (mesh stays off) with the fixed gateway hostname`);
+  ok(Array.isArray(g?.networks) && g.networks.includes('zee-hive-net'),
+     `${file.name}: attached to zee-hive-net — the one network every cxell is already on`);
+  ok(doc.networks?.['zee-hive-net']?.external === true && doc.networks?.['zee-hive-net']?.name === 'zee-hive-net',
+     `${file.name}: zee-hive-net is declared EXTERNAL (the queenzee's entrypoint owns it; compose never re-creates it)`);
+  ok(!(g?.ports || []).length, `${file.name}: the gateway publishes NO ports — it is a data-plane hop, not a service`);
+}
+
 section('live stand-up is a human deploy (documented, not verified here)');
 const readme = readFileSync(resolve(ROOT, 'docker/zeehive/README.md'), 'utf8');
 ok(/The NetBird mesh control plane/.test(readme), 'README documents the section');

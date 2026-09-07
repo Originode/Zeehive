@@ -41,14 +41,25 @@ export function dsnAt(dsn, host, port) {
 }
 
 // The payload. rows: owned/used container rows; peer: the xell's ACTIVE mesh_peer row or null;
-// legacyDsn/dsnSource: resolveXellDsn's current answer (the projection .zeehive.env carries).
+// machinePeers: the ACTIVE kind='machine' mesh_peer rows (each with its machine's docker_ctx) that
+// answer for USED shared containers (a shared dev db is the MACHINE's peer to answer for, never the
+// xell's — phase 2, docs/netbird-mesh-plan.md §3.2); legacyDsn/dsnSource: resolveXellDsn's current
+// answer (the projection .zeehive.env carries).
 export function deriveXellRoutes({ xell, manifest, owned = [], used = [], peer = null,
-                                   legacyDsn = null, dsnSource = null, meshDomain = null,
-                                   meshEnabled = false }) {
+                                   machinePeers = [], legacyDsn = null, dsnSource = null,
+                                   meshDomain = null, meshEnabled = false }) {
   const fqdn = peer && meshDomain ? `${peer.hostname}.${meshDomain}` : peer?.hostname || null;
   const meshReady = Boolean(peer && (peer.ip || peer.status === 'joined'));
+  const machineReady = (mp) => Boolean(mp && (mp.ip || mp.status === 'joined'));
   const roleRow = (role) =>
     owned.find((c) => c.role === role) || used.find((c) => c.role === role) || null;
+  // A USED shared container answers mesh through the MACHINE peer that shares its docker context
+  // (the host's own agent — reach the shared singleton at the host peer's mesh IP + published port).
+  const machinePeerFor = (row) => {
+    if (!row || row.docker_ctx == null) return null;
+    return machinePeers.find((mp) => mp.docker_ctx === row.docker_ctx) || null;
+  };
+  const fqdnOf = (hostname) => (hostname && meshDomain ? `${hostname}.${meshDomain}` : hostname || null);
 
   const legacyOf = (row) => (row ? {
     host: row.host != null ? String(row.host) : null,
@@ -63,6 +74,7 @@ export function deriveXellRoutes({ xell, manifest, owned = [], used = [], peer =
     const row = roleRow(role);
     const legacy = legacyOf(row);
     const ownsRole = owned.some((c) => c.role === role);
+    const hostPeer = !ownsRole ? machinePeerFor(row) : null;   // used shared → machine's to answer
     if (meshReady && ownsRole) {
       const port = canonicalPort(role, manifest);
       const addr = peer.ip != null ? String(peer.ip) : fqdn;
@@ -72,6 +84,20 @@ export function deriveXellRoutes({ xell, manifest, owned = [], used = [], peer =
         port,
         source: 'mesh',
         ...(role === 'db' ? {} : { url: `http://${addr}:${port}` }),
+      };
+      if (legacy) fallback[role] = legacy;
+    } else if (hostPeer && machineReady(hostPeer)) {
+      // A shared singleton keeps its published port (it is few and static — not the exhaustion
+      // source, §3.2); the MESH moves the packets to the host, the port stays the same.
+      const hpFqdn = fqdnOf(hostPeer.hostname);
+      const addr = hostPeer.ip != null ? String(hostPeer.ip) : hpFqdn;
+      const port = row.host_port != null ? Number(row.host_port) : null;
+      routes[role] = {
+        hostname: hpFqdn,
+        ip: hostPeer.ip != null ? String(hostPeer.ip) : null,
+        port,
+        source: 'mesh',
+        ...(role === 'db' ? {} : (port ? { url: `http://${addr}:${port}` } : {})),
       };
       if (legacy) fallback[role] = legacy;
     } else {

@@ -527,19 +527,43 @@ one more peer kind).
   behind `tiers.spinoff.mesh.enabled` (netbird agent, hostname = slug, canonical-port DNAT
   wrapper exec'ing the image's own entrypoint, idle-without-key guard). Opt-in only; the
   committed spinoff compose is untouched; role ports still publish (dual-stack until phase 5).
+- **Control-plane compose** (§3.1, `30840ab3`): the NetBird management/signal/relay/dashboard
+  services behind the `mesh` profile in BOTH queenzee compose files (bootstrap + prod twin, same
+  container names + ports in lockstep), named datastore volumes declared (`netbird_management_data`
+  is the documented one-way door), and the server env passing `NETBIRD_API_URL`/`NETBIRD_API_TOKEN`
+  through EMPTY by default + `MESH_DOMAIN`. An unscoped `up -d` boots the exact pre-mesh stack.
+  Test: `test/netbird-compose.test.mjs`. Live stand-up stays a human deploy (write
+  `netbird/management.json`, set the token, back up the datastore).
+- **Provisioner integration** (§6 phase 3, `9e8c95c1`): the provision path mints the per-xell peer
+  and relays `SPINOFF_MESH_SETUP_KEY` / `SPINOFF_MESH_MGMT_URL` into the build env + `.zeehive.env`
+  (mesh-DSN projection with `DATABASE_URL_FALLBACK`), guards on the manifest's
+  `tiers.spinoff.mesh.enabled` opt-in, and re-checks the join before every emit. Mesh unset → every
+  relay is a legible no-op. Test: `test/netbird-provision-env.test.mjs`.
+- **Machine peers via the bootstrap card** (§3.2 phase 2) + the **gateway + cage route +
+  default-deny prod policies** (§3.5) — this increment: the human-gated bootstrap card
+  (`planBuildBootstrap`/`performBuildBootstrap`) plans and performs a `mesh-machine-peer` step —
+  mints the machine's kind=`machine` intent row + a one-off setup key that rides the step receipt
+  and is never stored; `selfRoutes` answers USED shared containers through their machine's joined
+  peer (kept published port, DSN re-addressed) while owned roles still answer through the xell's own
+  peer; the `mesh-gateway` agent service joins zee-hive-net (external; compose never owns it) and
+  `cxell-firewall.sh` adds the one `ip route replace` of `100.64.0.0/10` via the gateway when
+  `MESH_GATEWAY_IP` is set (unset = no mesh line, legacy ports stay the whole story);
+  `netbird.js` grows the default-deny policy guard (`policyIsDefaultDenySafe` refuses any
+  prod-destination grant that is not a narrow named port BEFORE a control-plane call) and
+  `decideProdBind` flips the one narrow `xells→prod:<db>` policy a human-approved prod bind needs.
+  Tests: `test/build-bootstrap.test.mjs`, `test/mesh-routes.test.mjs`, `test/netbird-policies.test.mjs`,
+  `test/netbird-compose.test.mjs`. The committed `docker-compose.spinoff.yml` is untouched.
 
 ### NOT done (the honest list — each is a follow-up work item)
 
-1. **Standing up the control plane** (§3.1): the NetBird management/signal/relay services in the
-   queenzee's own compose, the API token in its env, the datastore backup. Needs the queenzee
-   machine — a human/host concern, the natural first card.
-2. **Provisioner integration**: minting the per-xell peer at provision and passing
-   `SPINOFF_MESH_SETUP_KEY` / `SPINOFF_MESH_MGMT_URL` into the build env + `.zeehive.env`
-   (mesh-DSN projection with `DATABASE_URL_FALLBACK`). Deliberately not wired: the hottest path
-   in the repo, and unverifiable until (1) exists.
-3. **Machine peers via the bootstrap card** (§3.2 phase 2) and the **mesh-gateway + cage route
-   line + default-deny prod policies** (§3.5 phase 4).
-4. **Phase 5** (stop publishing ports, delete the allocator) — gated on `source` telemetry, as
-   planned.
-5. The **current backlog** on the wedged hosts still needs one human prune (or a medic
+1. **Standing up the control plane LIVE** (§3.1): a human on the queenzee machine runs
+   `docker compose --profile mesh up -d`, writes `netbird/management.json`, sets
+   `NETBIRD_API_URL`/`NETBIRD_API_TOKEN` (and `NETBIRD_GATEWAY_SETUP_KEY` for the gateway) in the
+   install's `.env`, and does the datastore backup. The compose seam is shipped; the running
+   control plane is not.
+2. **Per-cage mesh agents and in-cage mesh DNS** — named seams (DR-3, §3.5), not built. The cage's
+   path to the mesh is the gateway route, not an in-cage agent.
+3. **Phase 5** (stop publishing ports, delete the allocator) — gated on `source: legacy-port`
+   telemetry, as planned.
+4. The **current backlog** on the wedged hosts still needs one human prune (or a medic
    `docker_repair` dispatch per machine) — the janitor keeps it flat only from then on.

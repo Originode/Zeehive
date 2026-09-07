@@ -85,6 +85,39 @@ ok(shared.routes.db.source === 'legacy-port' && shared.routes.db.port === 32773,
    'the shared dev db is the MACHINE peer\'s to answer for, not this xell\'s');
 ok(shared.routes.server.source === 'mesh', 'while the owned server still answers mesh');
 
+section('a USED shared db answers mesh through its MACHINE peer (phase 2, §3.2)');
+const MACHINE_DB = [{ role: 'db', host: '10.1.0.15', host_port: 32773, docker_ctx: 'zt-local' }];
+const viaMachine = deriveXellRoutes({ manifest: MANIFEST, owned: OWNED, used: MACHINE_DB,
+                                      peer: JOINED,
+                                      machinePeers: [{ hostname: 'zt-local', status: 'joined',
+                                                       ip: '100.64.0.20', docker_ctx: 'zt-local' }],
+                                      legacyDsn: 'postgresql://z@10.1.0.15:32773/zeehive',
+                                      dsnSource: 'shared-dev-container',
+                                      meshDomain: 'netbird.selfhosted', meshEnabled: true });
+ok(viaMachine.routes.db.source === 'mesh' && viaMachine.routes.db.port === 32773
+   && viaMachine.routes.db.hostname === 'zt-local.netbird.selfhosted',
+   'the shared dev db answers mesh at the MACHINE peer, KEEPING the published port');
+ok(viaMachine.routes.db.dsn === 'postgresql://z@100.64.0.20:32773/zeehive',
+   'the DSN is re-addressed to the machine peer, credentials intact');
+ok(viaMachine.fallback?.db?.port === 32773, 'the legacy pair rides as fallback (dual-stack)');
+ok(viaMachine.routes.server.source === 'mesh', 'the owned server still answers mesh (its own peer)');
+const mintedMachine = deriveXellRoutes({ manifest: MANIFEST, owned: OWNED, used: MACHINE_DB,
+                                         peer: JOINED,
+                                         machinePeers: [{ hostname: 'zt-local', status: 'minted',
+                                                          ip: null, docker_ctx: 'zt-local' }],
+                                         legacyDsn: 'postgresql://z@10.1.0.15:32773/zeehive',
+                                         dsnSource: 'shared-dev-container',
+                                         meshDomain: 'netbird.selfhosted', meshEnabled: true });
+ok(mintedMachine.routes.db.source === 'legacy-port',
+   'a minted-but-not-joined machine peer does not claim the shared db before it is true');
+const noHostPeer = deriveXellRoutes({ manifest: MANIFEST, owned: OWNED, used: MACHINE_DB,
+                                      peer: JOINED, machinePeers: [],
+                                      legacyDsn: 'postgresql://z@10.1.0.15:32773/zeehive',
+                                      dsnSource: 'shared-dev-container',
+                                      meshDomain: 'netbird.selfhosted', meshEnabled: true });
+ok(noHostPeer.routes.db.source === 'legacy-port',
+   'a machine with no mesh peer keeps the legacy answer (the standing invariant)');
+
 section('a minted-but-not-joined peer answers legacy');
 const minted = deriveXellRoutes({ manifest: MANIFEST, owned: [...OWNED, ...OWNED_DB], used: [],
                                   peer: { hostname: 'x', status: 'minted', ip: null },

@@ -36,6 +36,7 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
+const { config } = await import('../server/src/config.js');
 const { planBuildBootstrap, performBuildBootstrap, guardDevOnly } = await import('../server/src/lib/build-bootstrap.js');
 const { probeBuildReadiness, dockerAdapter } = await import('../server/src/lib/build-readiness.js');
 
@@ -352,6 +353,89 @@ try {
   const plan11 = await planBuildBootstrap(await row('machine', m11), await row('project', p11), { docker: docker11 });
   ok(!plan11.steps.some((s) => s.kind === 'shared-dev-db'),
      `no shared-dev-db step for a db-isolated project [${plan11.steps.map((s) => s.kind).join(', ') || 'none'}]`);
+
+  // ── MESH MACHINE PEER via the bootstrap CARD (§3.2 phase 2) ─────────────────
+  // A fully-build-ready machine's plan stays EMPTY while the mesh is unset (the standing
+  // invariant); with the mesh configured and no active kind='machine' peer, the plan names the
+  // peer step and the perform mints the intent row + one-time setup key (which rides the result,
+  // never the row).
+  console.log('\n── the bootstrap CARD mints a machine mesh peer when the mesh is on (§3.2) ──');
+  const meshMeshApi = ({ failKeys = false } = {}) => {
+    const state = { groups: [], keys: [], calls: [] };
+    const request = async (method, path, body) => {
+      state.calls.push(`${method} ${path}`);
+      if (method === 'GET' && path === '/api/groups') return { status: 200, json: state.groups };
+      if (method === 'POST' && path === '/api/groups') {
+        const g = { id: `g-${state.groups.length + 1}`, name: body.name };
+        state.groups.push(g);
+        return { status: 200, json: g };
+      }
+      if (method === 'POST' && path === '/api/setup-keys') {
+        if (failKeys) return { status: 500, json: { message: 'control plane refuses (stub)' } };
+        const k = { id: `sk-${state.keys.length + 1}`, key: `KEY-${state.keys.length + 1}`, ...body };
+        state.keys.push(k);
+        return { status: 200, json: k };
+      }
+      return { status: 500, json: { message: `stub: unhandled ${method} ${path}` } };
+    };
+    return { request, state };
+  };
+  const meshOn = () => { config.netbirdApiUrl = 'http://mesh.invalid'; config.netbirdApiToken = 't'; };
+  const meshOff = () => { config.netbirdApiUrl = null; config.netbirdApiToken = null; };
+  meshOff();
+
+  const pMesh = await insProject(`bs-mesh-${tag}`, {}, null);
+  const mMesh = await insMachine(`bs-mesh-${tag}`, `zt-bs-mesh-${tag}`, true);
+  await insDevDb(pMesh, `zt-bs-mesh-${tag}`, `bs_${tag}_mesh_db`);
+  const greenDocker = makeDocker({ reachable: true, networks: new Set(), composeOk: true });
+
+  const planOff = await planBuildBootstrap(await row('machine', mMesh), await row('project', pMesh), { docker: greenDocker });
+  ok(planOff.probe.status === 'ok' && planOff.steps.length === 0,
+     'a build-ready machine with the mesh UNSET plans nothing (the standing invariant)');
+
+  meshOn();
+  const planMesh = await planBuildBootstrap(await row('machine', mMesh), await row('project', pMesh), { docker: greenDocker });
+  const meshStep = planMesh.steps.find((s) => s.kind === 'mesh-machine-peer');
+  ok(planMesh.probe.status === 'ok' && !!meshStep && meshStep.target === `bs-mesh-${tag}`,
+     'with the mesh ON the plan names the machine-peer step even when the build probe is green');
+
+  const apiDry = meshMeshApi();
+  const meshDry = await performBuildBootstrap(pMesh, mMesh, { dryRun: true, docker: greenDocker,
+    provisionDb: makeProvision(), mesh: { request: apiDry.request } });
+  ok(meshDry.status === 'planned' && !(await one(
+    `SELECT id FROM mesh_peer WHERE machine_id=$1 AND kind='machine' AND removed_at IS NULL`, [mMesh])),
+     'a DRY run shows the step and mints NOTHING');
+
+  const apiGo = meshMeshApi();
+  const meshPerf = await performBuildBootstrap(pMesh, mMesh, { dryRun: false, docker: greenDocker,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { request: apiGo.request } });
+  const perfMesh = meshPerf.results.find((s) => s.kind === 'mesh-machine-peer');
+  ok(meshPerf.status === 'performed' && perfMesh?.status === 'created'
+     && /KEY-1/.test(perfMesh?.detail || ''),
+     `the perform mints the machine peer and returns the ONE-TIME key in the step result [${perfMesh?.status}]`);
+  const mpRow = await one(`SELECT * FROM mesh_peer WHERE machine_id=$1 AND kind='machine'`, [mMesh]);
+  ok(mpRow?.hostname === `bs-mesh-${tag}` && mpRow.status === 'minted' && mpRow.nb_setup_key_id === 'sk-1'
+     && mpRow.machine_id === mMesh,
+     'the kind=machine intent row exists (hostname = machine key, setup-key id for audit)');
+  ok(!JSON.stringify(mpRow).includes('KEY-1'), 'the key itself is NEVER stored on the row');
+
+  const meshPerf2 = await performBuildBootstrap(pMesh, mMesh, { dryRun: false, docker: greenDocker,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { request: meshMeshApi().request } });
+  const dupCount = await q(`SELECT id FROM mesh_peer WHERE machine_id=$1 AND kind='machine' AND removed_at IS NULL`, [mMesh]);
+  ok(meshPerf2.status === 'already-present' && dupCount.length === 1,
+     'a second perform is idempotent — no duplicate peer row');
+
+  meshOn();
+  const apiFail = meshMeshApi({ failKeys: true });
+  const pMesh2 = await insProject(`bs-mesh2-${tag}`, {}, null);
+  const mMesh2 = await insMachine(`bs-mesh2-${tag}`, `zt-bs-mesh2-${tag}`, true);
+  await insDevDb(pMesh2, `zt-bs-mesh2-${tag}`, `bs_${tag}_mesh2_db`);
+  const perfFail = await performBuildBootstrap(pMesh2, mMesh2, { dryRun: false, docker: greenDocker,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { request: apiFail.request } });
+  ok(perfFail.results.some((s) => s.kind === 'mesh-machine-peer' && s.status === 'failed')
+     && !(await one(`SELECT id FROM mesh_peer WHERE machine_id=$1 AND kind='machine'`, [mMesh2])),
+     'a mint failure degrades the mesh STEP to failed, never blocks the bootstrap, and leaves no row');
+  meshOff();
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {

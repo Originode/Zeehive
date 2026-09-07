@@ -45,7 +45,7 @@ import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migra
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv, resolveXellDsn } from '../lib/provision.js';
 import { deriveXellRoutes, probeTcp } from '../lib/mesh-routes.js';
-import { meshEnabled } from '../lib/netbird.js';
+import { meshEnabled, ensureProdBindMeshPolicy } from '../lib/netbird.js';
 import { providerRunEnv } from '../lib/provider-tokens.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
@@ -1263,6 +1263,13 @@ export async function decideProdBind(id, decision, by = 'human@console') {
   // xell's db_coupling just became 'db-shared-prod', so resolveEnvironmentFor now picks the prod
   // env; re-emit .zeehive.env to swap dev secrets for prod ones (migration 043). Best-effort.
   await emitXellEnv(row.xell_id).catch((e) => logline('xell-prod', `${bind.xell}: .zeehive.env not re-emitted with prod env — ${e.message}`));
+  // The MESH half of the prod bind (docs/netbird-mesh-plan.md §3.5): NetBird is default-deny
+  // between groups, so reaching prod over the mesh needs the narrow db-port policy this flip
+  // ensures. Mesh disabled → a legible no-op (the cage re-seal above is then the whole story,
+  // exactly as before the mesh existed). Best-effort like the re-seal: a control-plane outage must
+  // never half-finish a bind a human already approved.
+  await ensureProdBindMeshPolicy(bind.xell)
+    .catch((e) => logline('mesh', `${bind.xell}: prod-bind mesh policy not ensured — ${e.message}`));
   const done = await one(
     `UPDATE prod_bind_request SET result=$2::jsonb WHERE id=$1 RETURNING *`,
     [id, JSON.stringify({ bind, reseal })]);
@@ -4039,16 +4046,23 @@ export async function selfRoutes(xell) {
     `SELECT role, name, host, host_port, url, conn_ref, conn_pw, docker_ctx
        FROM container WHERE owner_xell_id=$1 AND role IN ('db','server','webapp')`, [xell.id]);
   const used = await q(
-    `SELECT c.role, c.name, c.host, c.host_port, c.url
+    `SELECT c.role, c.name, c.host, c.host_port, c.url, c.docker_ctx
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id=$1 AND uc.relation='uses' AND c.role IN ('db','server','webapp')`, [xell.id]);
   const peer = await one(
     `SELECT * FROM mesh_peer WHERE xell_id=$1 AND kind='xell' AND removed_at IS NULL
       ORDER BY created_at DESC LIMIT 1`, [xell.id]);
+  // Active MACHINE peers (each carrying the docker context its agent is on): a USED shared
+  // container is that host's to answer for over the mesh (phase 2, §3.2).
+  const machinePeers = await q(
+    `SELECT mp.hostname, mp.ip, mp.status, m.docker_ctx
+       FROM mesh_peer mp
+       JOIN machine m ON m.id = mp.machine_id
+      WHERE mp.kind='machine' AND mp.removed_at IS NULL AND m.docker_ctx IS NOT NULL`);
   const { dsn: legacyDsn, source: dsnSource } = await resolveXellDsn(xell, project, owned);
 
   const payload = deriveXellRoutes({
-    xell, manifest: project?.manifest || {}, owned, used, peer,
+    xell, manifest: project?.manifest || {}, owned, used, peer, machinePeers,
     legacyDsn, dsnSource, meshDomain: config.meshDomain, meshEnabled: meshEnabled(),
   });
 
