@@ -731,7 +731,20 @@ async function resolveUpstream(xell, kind, providerKey) {
         WHERE xell_id = $1 AND provider = $2`, [xell.id, p.key]);
     tokenId = grant?.provider_token_id || null;
   } catch { /* grant table missing in ancient DBs — fall through */ }
-  const acct = await tokenForSpawn(xell.project_id, p.key, { tokenId }).catch(() => null);
+  // A meta-plane MEDIC spends the ORCHESTRATOR'S OWN account, never the patient's. Its subject
+  // carries the PATIENT's project_id (attribution: recordRequest stamps the ledger row with the
+  // project it attends, medic_id is the billing key), but the patient is by definition a broken
+  // project and usually holds no provider account at all — resolving the account from
+  // xell.project_id made every medic's FIRST model call 502 `cannot forward`, so a dispatched
+  // medic errored before its first tool ran ("deployed medics do nothing", reproduced 2026-09-06).
+  // medic-spawn.js medicCreds already bills the medic's own creds to the self project; this makes
+  // the gateway's forward-token resolution agree with it.
+  let accountProjectId = xell.project_id;
+  if (xell.medic_id) {
+    const { selfProjectId } = await import('./infra-medic.js');
+    accountProjectId = await selfProjectId().catch(() => xell.project_id);
+  }
+  const acct = await tokenForSpawn(accountProjectId, p.key, { tokenId }).catch(() => null);
   if (!acct) {
     logline('gateway', `xell ${xell.slug}: no ${p.label} account — refusing to forward`);
     return null;

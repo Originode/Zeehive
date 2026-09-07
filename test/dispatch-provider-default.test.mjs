@@ -60,6 +60,20 @@ const CASES = [
     in: { allowProviders: ['kimi'], accounts: [] }, want: ['kimi', 'harness-policy'] },
   { what: 'github is an infra credential, never a provider a zee runs on',
     in: { accounts: [A('github')] }, want: ['claude', 'fallback'] },
+  // The LANGCHAIN planes (meta-plane medic, langchain zee) call the raw provider API, where a
+  // Claude OAuth (Claude Code CLI) account cannot authenticate — verified against api.anthropic.com
+  // 2026-09-06 (x-api-key → 401; Bearer+oauth beta outside the CLI's exact request shape → a
+  // refusal dressed as rate_limit_error). needsApiKey makes such an account not count, so the
+  // decision moves on to a usable one instead of dispatching a medic that 401s on its first call.
+  { what: 'needsApiKey: a claude OAUTH account does not count for a raw-API (langchain/medic) dispatch',
+    in: { needsApiKey: true, accounts: [{ provider: 'claude', paused: false, oauth: true }, A('deepseek')] },
+    want: ['deepseek', 'only-connected-provider'] },
+  { what: 'needsApiKey: a claude API-KEY account still counts (oauth false)',
+    in: { needsApiKey: true, accounts: [{ provider: 'claude', paused: false, oauth: false }] },
+    want: ['claude', 'claude-account'] },
+  { what: 'without needsApiKey the oauth flag changes nothing (CLI dispatches keep claude-first)',
+    in: { accounts: [{ provider: 'claude', paused: false, oauth: true }, A('deepseek')] },
+    want: ['claude', 'claude-account'] },
 ];
 for (const c of CASES) {
   const got = decideDispatchProvider(c.in);

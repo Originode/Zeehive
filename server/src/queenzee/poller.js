@@ -23,7 +23,12 @@ export function startPoller() {
              -- the host session registry can never see it — this pass would stamp every one
              -- 'session-gone' within a tick (seen live 2026-07-21 on a codex probe). Their
              -- liveness check is the monitor's in-container pgrep, not host session files.
-             AND entrypoint <> 'cxell-cli'`);
+             -- langchain + medic zees are IN-PROCESS loops (their claude_session_id is a synthetic
+             -- short id, not a host session): there is no session file to find, so this pass would
+             -- stamp them 'session-gone' mid-turn too (seen live 2026-09-06 — a medic's zee read
+             -- 'stopped' four seconds after dispatch while its turn was still running). Their
+             -- liveness is the driver's own await; the driver writes idle/errored when the turn ends.
+             AND entrypoint NOT IN ('cxell-cli', 'langchain', 'medic')`);
       for (const zee of zees) {
         const s = byId.get(zee.claude_session_id);
         const isLive = !!(s && s.alive);

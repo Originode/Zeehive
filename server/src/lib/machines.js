@@ -436,41 +436,49 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   // (bootstrapping a project's FIRST dev db: Zeehive's meta-db is stock postgres, and guessing
   // another project's image would stand up a database its dumps can't even restore into).
   const source = await one(
-    `SELECT image_tag FROM container
+    `SELECT name, image_tag FROM container
       WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared'
       ORDER BY (image_tag IS NOT NULL) DESC LIMIT 1`, [projectId]);
-  // Consult prod for the IMAGE whenever the dev lineage cannot answer — no shared dev db at all,
-  // OR one modeled with no image_tag (`source ? null :` used to skip prod in that second case and
-  // silently take the hardcoded fallback).
-  const prodDb = source?.image_tag ? null : await one(
+  const prodDb = await one(
     `SELECT name, image_tag, docker_ctx, host_port FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [projectId]);
+  // The IMAGE comes from PROD FIRST, dev siblings LAST. A dev db exists to restore prod's dumps,
+  // so "which image can load them" is a fact about prod — a sibling's recorded image_tag is
+  // hearsay, and on omnibiz EVERY sibling lied: the first dev db was cut from the exited
+  // postgres:18beta1 husk (the logical-name-inspect defect, fixed below), all three machines'
+  // rows recorded that stock tag, and sibling-first meant each re-provision re-created the fault
+  // no matter what prod actually ran — the 2026-09-07 recurrence of `extension "postgis" is not
+  // available`. Order: the LIVE prod container's image (resolved by registry identity, trusted
+  // only while RUNNING), else the prod row's recorded tag, else the dev sibling's tag (prod
+  // unreachable — degraded, and it may re-propagate a stale sibling, so the log says which
+  // source won), else the hardcoded default.
+  //
   // A modeled prod db row often has no image_tag — the LIVE container knows what it runs. But the
   // row's LOGICAL name (omnibiz_db_prod) is NOT the live container: the daemon runs a VERSIONED
   // one (omnibiz_db_prod_v184), and `docker inspect` on the logical name reads whatever container
-  // still wears it — on omnibiz that is the EXITED stock postgres:18beta1 husk. Inspecting the
-  // husk provisioned a dev db with NO postgis, and every prod duplicate/restore into it then
-  // failed with `extension "postgis" is not available` (2026-09-04). Resolve by registry identity
-  // first — the same rule every other prod-db reader follows — and on an unresolvable/ambiguous
-  // prod fall through to the default rather than inspect a container that may be the wrong one.
-  let prodImage = prodDb?.image_tag || null;
-  if (prodDb && !prodImage && MODE === 'real') {
+  // still wears it — on omnibiz that is the EXITED stock postgres:18beta1 husk. Resolve by
+  // registry identity first — the same rule every other prod-db reader follows — and only trust a
+  // RUNNING container's image: with prod down the resolver falls back to the logical name, and
+  // inspecting that reads the husk again.
+  let liveProdImage = null;
+  if (prodDb && MODE === 'real') {
     const prodCtx = prodDb.docker_ctx || 'default';
     try {
       const real = await resolveRealDbContainer(prodCtx, prodDb.name, { row: prodDb });
-      // Only trust a RUNNING container's image: with prod down the resolver falls back to the
-      // logical name, and inspecting that reads the exited husk — the very container this exists
-      // to avoid. running=false ⇒ leave prodImage null and take the default below.
       const [running, img] = (spawnSync('docker',
         ['--context', prodCtx, 'inspect', '-f', '{{.State.Running}}\t{{.Config.Image}}', real],
         { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim().split('\t');
-      prodImage = running === 'true' ? (img || '').trim() || null : null;
+      liveProdImage = running === 'true' ? (img || '').trim() || null : null;
     } catch (e) {
       logline('machine', `could not resolve the live prod db for ${project.name} to read its image `
-        + `(${e.message}) — falling back to the default dev db image`);
+        + `(${e.message}) — falling back to recorded tags / the default`);
     }
   }
-  const image = source?.image_tag || prodImage || 'omnibiz-postgis:18-3.6-h3';
+  const [image, imageVia] =
+      liveProdImage ? [liveProdImage, 'live prod container']
+    : prodDb?.image_tag ? [prodDb.image_tag, 'prod row']
+    : source?.image_tag ? [source.image_tag, `dev sibling ${source.name} — prod unreachable/unmodeled, may be stale`]
+    : ['omnibiz-postgis:18-3.6-h3', 'default'];
 
   // Data: the requested snapshot, else the latest completed prod backup. No dump is allowed but
   // loudly so — an empty dev db is only schema-less postgres, useless until something fills it.
@@ -505,7 +513,9 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   // <family root> + THIS machine, and the family root is always the project's own dev identity: a
   // second machine's db is omnibiz_db_dev_<other machine>, never an extension of the first's.
   // `source` still hands over its IMAGE (a prod dump needs the custom postgis build); it never
-  // lends its NAME.
+  // lends its NAME. That also settles what main's shape check existed for: a sibling that extends
+  // the PROD name (omnibiz_db_prod_dev_local_…) is excluded as a matter of course, since no
+  // sibling name is ever inherited.
   const devLogical = `${sanitizeName(project.name)}_db_dev`;
   const name = (source || prodDb) ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
@@ -522,7 +532,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const dbPw = project.manifest?.db?.password || 'omnibiz';
 
   provisioning.add(lockKey);
-  logline('machine', `provisioning dev db for ${project.name} on ${m.key} (${image}${snap ? `, restore ${String(snap.dump_path).split(/[\\/]/).pop()}` : ', NO DUMP — empty db'}${network ? `, network ${network} alias ${alias}` : ''})…`);
+  logline('machine', `provisioning dev db for ${project.name} on ${m.key} (${image} via ${imageVia}${snap ? `, restore ${String(snap.dump_path).split(/[\\/]/).pop()}` : ', NO DUMP — empty db'}${network ? `, network ${network} alias ${alias}` : ''})…`);
 
   (async () => {
     let port = 0;
