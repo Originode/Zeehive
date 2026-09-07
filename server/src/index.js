@@ -33,6 +33,7 @@ import { startRevive } from './queenzee/revive.js';
 import { startCxellRecovery } from './queenzee/cxell-recover.js';
 import { startSpinDetector } from './queenzee/spin.js';
 import { startImageJanitor } from './lib/images.js';
+import { startDockerJanitor } from './lib/docker-repair.js';
 import { logline } from './lib/logbus.js';
 
 // LAST-RESORT BACKSTOP. The queenzee is the thing that keeps every xell honest: if it dies, the
@@ -239,6 +240,11 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // tell its manager (queenzee/spin.js — the interim alarm; the lease/await model is the cure).
   startSpinDetector();
   startImageJanitor();
+  // What best-effort reap-time cleanup misses (a context down, a killed queenzee) becomes a
+  // wedged daemon: retired xells' spin networks exhaust the address pools and husks squat host
+  // ports (TKT-178 / TKT-85). This sweep auto-performs ONLY docker-repair's two provably-
+  // throwaway step kinds; everything else stays a medic/human call (netbird-mesh-plan DR-2).
+  startDockerJanitor();
   startProdDiff();
   startDbCloneWatch();
   // The work tracker's board follows the fleet: every item with a zee on it takes that zee's live

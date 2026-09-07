@@ -190,6 +190,27 @@ export async function stopAndRemoveContainer(ctx, name, { removeVolumes = false,
   return { stopped, removed, alreadyGone };
 }
 
+// Remove a docker NETWORK by name. Best-effort and idempotent like stopAndRemoveContainer: a 404
+// (already gone) counts as done. Docker itself refuses to remove a network that still has attached
+// containers ("has active endpoints") — that refusal is the authority on "in use", the same
+// philosophy as removeImage's never-force, so the caller gets a verdict, never a throw, for an
+// in-use network. REFUSES an SSH context (a destructive action, same as stopAndRemoveContainer).
+export async function removeNetwork(ctx, name, { timeout = 15000 } = {}) {
+  if (!name) return { removed: false, reason: 'no network name' };
+  const conn = await resolveContext(ctx);   // resolveContext THROWS on ssh:// — a destructive action
+  let r;
+  try {
+    r = await reqNoBody(conn, 'DELETE', `/networks/${encodeURIComponent(name)}`, timeout);
+  } catch (e) {
+    // reqNoBody rejects on 5xx — which is exactly how the daemon says "has active endpoints".
+    // In-use is a verdict here, not a transport failure.
+    return { removed: false, reason: e.message };
+  }
+  if (r.status >= 200 && r.status < 300) return { removed: true };
+  if (r.status === 404) return { removed: false, alreadyGone: true };
+  return { removed: false, reason: `HTTP ${r.status}: ${(r.body || '').slice(0, 200)}` };
+}
+
 // Remove an image by tag. NEVER force (see lib/images.js): force UNTAGS an image a container still
 // uses, and the next restart of that environment then fails "image not found". Plain remove makes
 // docker the judge — it refuses (409) while any container depends on it, which is the only

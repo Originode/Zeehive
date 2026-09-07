@@ -209,3 +209,78 @@ export async function performDockerRepair(machineId, { dryRun = false, docker = 
     + (results.map((s) => `${s.kind}:${s.target}=${s.status}`).join(', ') || 'nothing to do'));
   return { status, machine: machine.key, results };
 }
+
+// ── the JANITOR — the reaper's reconciler (docs/netbird-mesh-plan.md §3.6, DR-2) ─────────────────
+//
+// Reap-time cleanup is best-effort by contract: a context down at reap time, a queenzee killed
+// mid-teardown, a despawn script that half-ran — each leaves a leftover the reaper will never
+// revisit, and leftovers are what wedged both build hosts (TKT-178: address pools exhausted by
+// retired xells' spin networks; TKT-85: husks squatting host ports). This sweep runs the SAME plan
+// the medic's button runs, on a schedule, and auto-performs ONLY the two step kinds that are
+// provably throwaway by the safety line at the top of this file:
+//
+//   stale-network    an empty '-spin-' network no manifest requires
+//   stale-container  a spin-named husk whose slug is a RETIRED xell of this meta-DB
+//
+// Everything else the plan finds — a db to start, a 'cannot' — is REPORTED (logged) and left for
+// the medic plane and its human gates: starting things and judging the unknown are not a tick's
+// call. A single verified case of this sweep removing something live demotes it to plan-and-report
+// (DR-2's "what would change our mind").
+export const AUTO_REPAIR_KINDS = ['stale-network', 'stale-container'];
+
+export async function sweepDockerLeftovers({ dryRun = true, docker = dockerAdapter } = {}) {
+  const machines = await q(
+    `SELECT * FROM machine WHERE enabled AND docker_ctx IS NOT NULL ORDER BY key`);
+  const summary = [];
+  for (const machine of machines) {
+    const { steps, refused } = await planDockerRepair(machine, { docker });
+    if (refused) {
+      // An unreachable daemon is bootstrap's rule ("never act blind") doing its job — quiet at
+      // janitor cadence; the readiness probe and the medic plane already surface a down host.
+      summary.push({ machine: machine.key, refused });
+      continue;
+    }
+    const auto = steps.filter((s) => s.status === 'planned' && AUTO_REPAIR_KINDS.includes(s.kind));
+    const held = steps.filter((s) => !auto.includes(s));
+    if (!auto.length) { summary.push({ machine: machine.key, results: [], held: held.length }); continue; }
+    if (dryRun) {
+      logline('maint', `docker janitor (dry run) on ${machine.key}: would remove `
+        + auto.map((s) => `${s.kind}:${s.target}`).join(', ')
+        + (held.length ? ` (+${held.length} step(s) left for the medic plane)` : ''));
+      summary.push({ machine: machine.key, planned: auto, held: held.length });
+      continue;
+    }
+    const results = [];
+    for (const step of auto) {
+      results.push({ ...step, ...(await performStep(step, machine.docker_ctx, { docker })) });
+    }
+    const removed = results.filter((s) => s.status === 'removed' || s.status === 'already-gone');
+    const failed = results.filter((s) => s.status === 'failed');
+    if (removed.length || failed.length) {
+      logline('maint', `docker janitor on ${machine.key}: `
+        + results.map((s) => `${s.kind}:${s.target}=${s.status}`).join(', ')
+        + (held.length ? ` (+${held.length} step(s) left for the medic plane)` : ''));
+    }
+    summary.push({ machine: machine.key, results, held: held.length });
+  }
+  return summary;
+}
+
+// Periodic janitor, the same knobs and stance as lib/images.js startImageJanitor: on by default
+// (the leak is silent and unbounded), disableable, and DRY RUN unless this queenzee is allowed to
+// touch machines at all (PROVISION_MODE=real — a simulate queenzee's meta-DB is a clone, so its
+// 'retired' verdicts describe somebody else's fleet).
+export function startDockerJanitor() {
+  if (process.env.DOCKER_JANITOR_ENABLED === 'false') {
+    console.log('[queenzee] docker janitor DISABLED (DOCKER_JANITOR_ENABLED=false)');
+    return;
+  }
+  const interval = Number(process.env.DOCKER_JANITOR_MS) || 3600000; // hourly
+  const dryRun = process.env.DOCKER_JANITOR_DRY_RUN === 'true'
+    || (process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate') !== 'real';
+  const tick = () => sweepDockerLeftovers({ dryRun })
+    .catch((e) => console.error('[docker-repair] janitor sweep:', e.message));
+  setTimeout(tick, 90000);          // not at boot — let the fleet settle first (after images' 60s)
+  setInterval(tick, interval);
+  console.log(`[queenzee] docker janitor started (${interval}ms${dryRun ? ', DRY RUN' : ''})`);
+}
