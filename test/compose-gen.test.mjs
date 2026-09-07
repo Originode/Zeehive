@@ -57,6 +57,37 @@ const committed = readFileSync(join(ROOT, 'docker-compose.spinoff.yml'), 'utf8')
 ok(committed === yaml,
    'docker-compose.spinoff.yml in the repo is byte-identical to the generator output — regenerable, not a hand-fork');
 
+console.log('\n── the MESH SIDECAR (netbird-mesh-plan §3.3): manifest opt-in, canonical ports, idle without a key ──');
+// Opt-in only: the repo manifest declares no mesh, so the projection above (and the committed
+// file it must stay byte-identical to) carries NO sidecar — asserted on the yaml already parsed.
+ok(!doc.services.mesh, 'no tiers.spinoff.mesh in the manifest → no sidecar (the committed file is untouched)');
+const meshManifest = JSON.parse(JSON.stringify(repo.manifest));
+meshManifest.tiers.spinoff.mesh = { enabled: true };
+const meshed = parse(generateSpinoffCompose({ name: 'Zeehive', manifest: meshManifest }).yaml);
+const side = meshed.services.mesh;
+ok(!!side && side.container_name === 'zeehive_spin_mesh_${SPINOFF_SLUG:-dev}',
+   'mesh.enabled generates the sidecar, spin-named (so janitor/reaper husk rules already cover it)');
+ok(side.hostname === '${SPINOFF_SLUG:-dev}',
+   'the peer hostname IS the slug — the xell\'s mesh identity');
+ok(side.cap_add?.includes('NET_ADMIN') && side.devices?.includes('/dev/net/tun:/dev/net/tun'),
+   'NET_ADMIN + tun — what a WireGuard agent needs, on the sidecar only');
+ok(!side.ports, 'the sidecar publishes NO host ports — reachability is the peer, not the host');
+ok(side.environment.NB_SETUP_KEY === '${SPINOFF_MESH_SETUP_KEY:-}'
+   && side.environment.NB_MANAGEMENT_URL === '${SPINOFF_MESH_MGMT_URL:-}',
+   'setup key + management URL are interpolations the provisioner supplies — no machine facts');
+const script = side.entrypoint?.[2] || '';
+ok(/if \[ -z "\$\$NB_SETUP_KEY" \]/.test(script) && /exec sleep infinity/.test(script),
+   'without a setup key the sidecar SAYS SO and idles — the file stays standalone-workable');
+ok(script.includes('server:4700') && script.includes('webapp:5180') && script.includes('db:5432'),
+   'the forwards are the CANONICAL internal ports — the same port on every xell, per role');
+ok(/DNAT --to-destination/.test(script) && script.trimEnd().endsWith('exec /usr/local/bin/netbird-entrypoint.sh'),
+   'DNAT one hop to the role services, then exec the image\'s own entrypoint');
+ok(!/[^$]\$\{t%%/.test(script) && !/[^$]\$\{t##/.test(script),
+   'every shell ${…} is $$-escaped so compose interpolation never eats it');
+const meshedServerPorts = (meshed.services.server.ports || [])[0];
+ok(meshedServerPorts === '${SPINOFF_SERVER_PORT:-4800}:4700',
+   'dual-stack during migration: the role services still publish (phase 5 removes this, not phase 3)');
+
 console.log('\n── ownership: generated files are ZEEHIVE\'s, project files are not ──');
 const tmp = mkdtempSync(join(ROOT, '.composegen-'));
 try {

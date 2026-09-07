@@ -174,12 +174,20 @@ export async function infraProof(xell, { xellSlug = null, project = null } = {})
 }
 
 // ── bootstrap-plan (NOT gated — performBuildBootstrap dryRun verbatim) ───────
+// A machine is named by KEY or id — readiness and settings both lead with the key, and the first
+// live medic passed one straight into `WHERE id=$1` and got postgres's raw uuid parse error back
+// ("cannot reach any machine"). Resolve like projects are resolved.
+async function machineByKeyOrId(named) {
+  if (!named) throw new Error('a machine is required — name it by key or id (see settings/readiness)');
+  const m = await one(`SELECT id, key FROM machine WHERE id::text=$1 OR key=$1`, [String(named)]);
+  if (!m) throw new Error(`no machine '${named}' on the estate — name it by key or id`);
+  return m;
+}
+
 export async function infraBootstrapPlan(xell, { machineId = null, project = null } = {}) {
   const projectId = await targetProjectId(xell, project);
-  if (!machineId) throw new Error('a machine is required — pass the machine id you saw in `zee infra settings` (or readiness)');
-  const machine = await one(`SELECT id FROM machine WHERE id=$1`, [machineId]);
-  if (!machine) throw new Error('no such machine');
-  return performBuildBootstrap(projectId, machineId, { dryRun: true, actor: `medic@${xell.slug}` });
+  const machine = await machineByKeyOrId(machineId);
+  return performBuildBootstrap(projectId, machine.id, { dryRun: true, actor: `medic@${xell.slug}` });
 }
 
 // ── settings (NOT gated — non-secret projection) ─────────────────────────────
@@ -236,10 +244,8 @@ async function fileInfraRequest({ projectId, xell, kind, payload, reason }) {
 // recorded in build_bootstrap_action).
 export async function infraBootstrap(xell, { machineId = null, reason = null, project = null } = {}) {
   const projectId = await targetProjectId(xell, project);
-  if (!machineId) throw new Error('a machine is required for a bootstrap card — pass the machine id you saw in settings');
-  const machine = await one(`SELECT id, key FROM machine WHERE id=$1`, [machineId]);
-  if (!machine) throw new Error('no such machine');
-  return fileInfraRequest({ projectId, xell, kind: 'bootstrap', payload: { machine_id: machineId }, reason });
+  const machine = await machineByKeyOrId(machineId);
+  return fileInfraRequest({ projectId, xell, kind: 'bootstrap', payload: { machine_id: machine.id }, reason });
 }
 
 // ── propose — the settings patch the queenzee may apply, and the validation ──

@@ -93,7 +93,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
-         selfProviderEnv } from '../queenzee/self.js';
+         selfProviderEnv, selfRoutes } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
@@ -742,15 +742,17 @@ router.post('/medics/:id/message', requireQueenzeeLoops, async (req, res) => {
     if (g) return res.status(403).json(g);
     const text = String(req.body?.message || '').trim();
     if (!text) return res.status(400).json({ error: 'a message is required — it becomes the medic\'s next turn' });
-    const medic = await one(`SELECT * FROM medic WHERE id=$1`, [req.params.id]);
+    const medic = await one(`SELECT id, status FROM medic WHERE id=$1`, [req.params.id]);
     if (!medic) return res.status(404).json({ error: 'no such medic' });
     if (medic.status === 'retired') return res.status(400).json({ error: 'this medic is retired — dispatch a fresh one from the condition' });
-    const { updateMedicStatus } = await import('../lib/medics.js');
-    await updateMedicStatus(medic.id, 'diagnosing');   // the ask is answered; the flag comes down
-    import('../queenzee/medic-spawn.js')
-      .then(({ runMedicTurn }) => runMedicTurn(medic, { task: text, kind: 'resume' }))
-      .catch((e) => logline('medic', `medic ${String(medic.id).slice(0, 8)} resume failed to start: ${e.message}`));
-    res.json({ ok: true, medic_id: medic.id, message: 'resumed — the answer is its next turn' });
+    // resumeMedic is the ONE resume path: it clears `awaiting-human`, composes the answer into the
+    // next turn's task, and runs the turn in the background. The previous hand-rolled call passed
+    // the medic ROW where runMedicTurn takes an OPTIONS OBJECT ({ medic, task, … }), so every human
+    // answer threw 'runMedicTurn needs the medic ROW' before the turn started — the Bay's reply box
+    // did nothing at all.
+    const { resumeMedic } = await import('../queenzee/medic-spawn.js');
+    const out = await resumeMedic(medic.id, { message: text });
+    res.json({ ...out, message: 'resumed — the answer is its next turn' });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
@@ -2224,6 +2226,14 @@ router.get('/xell/self/provider-env', async (req, res) => {
     const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfProviderEnv(x, { provider: req.query.provider || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// The ROUTER's directory half (docs/netbird-mesh-plan.md §3.4) — `zee routes`. How this xell
+// reaches its OWN stack and the containers it uses, derived at call time (mesh answer when its
+// peer is joined, legacy host:port otherwise, fallback carried during migration). Read-only,
+// self-scoped, opens no gate — the live counterpart of the .zeehive.env snapshot.
+router.get('/xell/self/routes', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfRoutes(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.get('/xell/self/env', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }

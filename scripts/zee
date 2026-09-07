@@ -569,6 +569,7 @@ function usage() {
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee env [--export]                  which ENVIRONMENT your xell is loaded with (its key + var names; values live in .zeehive.env, never echoed). --export dumps the FULL current env text. Read-only. A live-prod/production xell gets the prod env, else the dev env
   zee creds [--provider <key>] [--export] [--json]   what PROVIDER CREDENTIALS this cage holds — every connected provider's key, each under its own ZEE_PROVIDER_<KEY>_TOKEN (not just the one this dispatch runs on). Read straight from the cage's own env, no API. --provider prints the source-able env for one; --provider <key> --export prints the RUNNABLE vendor env for that provider (server-computed through the runtime adapter — the exact KIMI_MODEL_*/OPENAI_API_KEY/ANTHROPIC_* vars the vendor CLI needs; codex's in-cage install is PRINTED, never run); --json prints the list. Read-only, opens no gate
+  zee routes                          HOW TO REACH YOUR STUFF, resolved LIVE from the meta-DB (never baked): your db/server/webapp, each with a source — 'mesh' (your xell's joined mesh peer: hostname + canonical port) or 'legacy-port' (the recorded host:port) — the legacy pair kept as fallback while both are true, and a bounded liveness probe on the db answer. Read-only, opens no gate. Your .zeehive.env is a SNAPSHOT stamped at provision; when the two disagree, THIS answer is the current one — reach for it the moment a recorded address refuses
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
   zee turn --start | --end           report an INTERACTIVE turn boundary (a human or a manager typing into this cage's pane) — the ONE kind of turn the queenzee does not start and cannot see. The vendor CLI's own turn hooks call this for you; NOT gated, and it records NO cost (a hook knows a turn happened, not what it cost)
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
@@ -839,6 +840,14 @@ switch (cmd) {
     // var NAMES only. `--export` extracts the FULL current env (.zeehive.env values), for piping to
     // a file. Read-only, opens no gate.
     out(await req('GET', rest.includes('--export') ? '/api/xell/self/env/export' : '/api/xell/self/env'));
+    break;
+  }
+  case 'routes': {
+    // The router's directory half (docs/netbird-mesh-plan.md §3.4): the LIVE "how do I reach my
+    // db/server/webapp". The .zeehive.env DSN is a snapshot stamped at provision and never
+    // re-minted (the cage-age reality) — this answer is derived at call time, so a dead snapshot
+    // address stops being a dead end. Read-only, opens no gate.
+    out(await req('GET', '/api/xell/self/routes'));
     break;
   }
   case 'creds': {
