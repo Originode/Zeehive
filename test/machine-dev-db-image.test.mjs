@@ -11,10 +11,20 @@
 //     omnibiz_db_prod_v184 (that half is registry-identity resolution + a State.Running check,
 //     real-mode docker, pinned by reading; this test pins the lineage half).
 //
+// SECOND RECURRENCE (2026-09-07): the identity fix alone did not cure omnibiz, because all THREE
+// of its dev sibling rows had already recorded the husk's stock image — and sibling-first
+// precedence meant every re-provision inherited the poison no matter what prod ran. The image now
+// comes from PROD FIRST (live container by identity, else the prod row's tag), and a sibling's
+// tag is only the fallback when prod is unreachable/unmodeled. Sibling NAMES that are
+// prefix-extensions of the prod name (the 2026-07-23 ship-to-clone shape) are not inherited
+// either.
+//
 // This drives the REAL provisionDevDb in simulate mode and reads the container rows it inserts:
 //   • a project whose ONLY image knowledge is its prod row → the new dev db wears prod's image;
-//   • a project with a shared dev sibling that has NO image_tag + a prod row that HAS one → the
-//     prod image is STILL consulted (the `source ? null :` hole), never the hardcoded fallback.
+//   • a tagless dev sibling + a prod row with a tag → prod's image, never the hardcoded fallback;
+//   • a POISONED sibling (stock tag, prod-extension name) + a prod row → prod's image wins and
+//     the new name is not a prod extension;
+//   • a tagged sibling with NO prod row at all → the sibling is still a usable fallback.
 //
 // Requires a migrated postgres at DATABASE_URL (like machine-dev-db-provision.test.mjs).
 import { randomUUID } from 'node:crypto';
@@ -92,23 +102,47 @@ try {
     `prod's image is consulted despite the tagless sibling (got ${rowB?.image_tag ?? 'NULL'}, `
     + `want ${PROD_IMAGE} — the defect hands back the hardcoded fallback here)`);
 
-  console.log('\n── a dev sibling WITH an image_tag still wins (lineage unchanged) ──');
+  console.log('\n── PROD beats a POISONED sibling: image from prod, name not a prod extension ──');
+  // The 2026-09-07 recurrence: every omnibiz dev sibling recorded the husk's stock image AND wore
+  // a prefix-extension of the prod name (omnibiz_db_prod_dev_local_mardale_prod…). Sibling-first
+  // meant each re-provision re-created the fault; prod-first heals it without row surgery.
   const projC = await mkProject(`zt-img-c-${tag}`);
-  const SIB_IMAGE = `zt-postgis:dev-${tag}`;
+  const POISON_IMAGE = `zt-stock:pg18-${tag}`;
+  const prodNameC = `zt_img_c_${tag}_db_prod`;
   await q(`INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx)
            VALUES ($1,'db','prod','shared',$2,$3,'prod-ctx')`,
-    [projC, `zt_img_c_${tag}_db_prod`, PROD_IMAGE]);
+    [projC, prodNameC, PROD_IMAGE]);
   await q(`INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx)
            VALUES ($1,'db','dev','shared',$2,$3,$4)`,
-    [projC, `zt_img_c_${tag}_db_dev`, SIB_IMAGE, `zt-img-elsewhere-${tag}`]);
+    [projC, `${prodNameC}_dev_local`, POISON_IMAGE, `zt-img-elsewhere-${tag}`]);
   await provisionDevDb(projC, m);
   const rowC = await waitFor(() => one(
-    `SELECT image_tag FROM container
+    `SELECT name, image_tag FROM container
       WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' AND docker_ctx=$2`,
     [projC, queenzeeHostCtx()]));
   ok(!!rowC, `the dev db container row appears (got ${rowC ? 'row' : 'NOTHING'})`);
-  ok(rowC?.image_tag === SIB_IMAGE,
-    `the tagged dev sibling's image wins (got ${rowC?.image_tag ?? 'NULL'}, want ${SIB_IMAGE})`);
+  ok(rowC?.image_tag === PROD_IMAGE,
+    `prod's image beats the poisoned sibling tag (got ${rowC?.image_tag ?? 'NULL'}, want ${PROD_IMAGE})`);
+  ok(!!rowC?.name && !rowC.name.startsWith(prodNameC),
+    `the name is not a prefix-extension of prod's (got ${rowC?.name ?? 'NULL'})`);
+
+  console.log('\n── with NO prod row at all, a tagged sibling is still a usable fallback ──');
+  const projD = await mkProject(`zt-img-d-${tag}`);
+  const SIB_IMAGE = `zt-postgis:dev-${tag}`;
+  const sibNameD = `zt_img_d_${tag}_db_dev`;
+  await q(`INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx)
+           VALUES ($1,'db','dev','shared',$2,$3,$4)`,
+    [projD, sibNameD, SIB_IMAGE, `zt-img-elsewhere-${tag}`]);
+  await provisionDevDb(projD, m);
+  const rowD = await waitFor(() => one(
+    `SELECT name, image_tag FROM container
+      WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' AND docker_ctx=$2`,
+    [projD, queenzeeHostCtx()]));
+  ok(!!rowD, `the dev db container row appears (got ${rowD ? 'row' : 'NOTHING'})`);
+  ok(rowD?.image_tag === SIB_IMAGE,
+    `the sibling's image is used when prod is unmodeled (got ${rowD?.image_tag ?? 'NULL'}, want ${SIB_IMAGE})`);
+  ok(rowD?.name === `${sibNameD}_${m ? (await one(`SELECT key FROM machine WHERE id=$1`, [m])).key.replace(/-/g, '_') : ''}`,
+    `a clean sibling name is still the lineage (got ${rowD?.name ?? 'NULL'})`);
 } finally {
   for (const m of machines) await q(`DELETE FROM machine WHERE id=$1`, [m]).catch(() => {});
   for (const p of projects) {
