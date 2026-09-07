@@ -28,6 +28,7 @@ const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || 
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
+import { createXellCache } from './hive/xellCache.js';
 import { itemReachable } from './hive/level.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
@@ -154,71 +155,75 @@ function useOrientation() {
 //                requests — the "spamming the fleet stream per event" this refactor stops.
 // Each pass upserts by id while it streams — existing hexes never flicker — then prunes ids the
 // pass didn't see.
+//
+// The store is PER PROJECT (hive/xellCache.js), and that is the whole reason a project switch no
+// longer tears the comb down. ONE shared map has to be emptied on every switch — every hexagon
+// removed and then recreated off the wire, so coming BACK to a project you were looking at a moment
+// ago rebuilds it from nothing. Keyed by project, a switch is a LOOKUP: that project's hexes are
+// already in hand and paint in the same frame, and the stream that follows reconciles them in
+// place. Cross-project bleed is then structurally impossible rather than guarded against — a stream
+// or snapshot from the project you just left files its rows under that project and doesn't repaint.
 function useStreamedXells(projectId) {
-  const [xells, setXells] = useState([]);
-  const mapRef = useRef(new Map());
-  const acRef = useRef(null);
-  // FORCE-CLEAR on switch, synchronously. The effect below also resets, but effects run AFTER the
-  // render that already saw the new projectId — so for one frame the grid would still hold the
-  // PREVIOUS project's hexes (the lingering remnants). Reset-on-prop-change during render (React's
-  // documented pattern) drops them before paint, so a switch never flashes the old project.
-  const [prevPid, setPrevPid] = useState(projectId);
-  if (projectId !== prevPid) {
-    setPrevPid(projectId);
-    mapRef.current = new Map();
-    acRef.current?.abort();
-    setXells([]);
+  const cacheRef = useRef(null);
+  if (!cacheRef.current) cacheRef.current = createXellCache();
+  const cache = cacheRef.current;
+  const key = projectId || '';           // the default project: no id until the fleet resolves it
+  const [xells, setXells] = useState(() => cache.list(projectId));
+  // Swap to the new project's rows DURING render (React's documented reset-on-prop-change): the very
+  // frame that first sees the new projectId already draws that project's hexes — no blank frame to
+  // rebuild out of, and no frame of the previous project's.
+  const [prevKey, setPrevKey] = useState(key);
+  if (key !== prevKey) {
+    setPrevKey(key);
+    setXells(cache.list(projectId));
   }
-  // Always-current selected project, written during render so an ASYNC stream from a PREVIOUS
-  // selection can tell it is stale before it writes a single hex into the NEW project's grid. A
-  // stale runStream — the previous project's LAST update stream landing after the switch — would
-  // otherwise abort the fresh stream, stream the OLD project's xells into the SAME map, and paint
-  // the remnants that linger across a project switch.
-  const pidRef = useRef(projectId);
-  pidRef.current = projectId;
+  // The current selection, written during render, so an in-flight stream or a late snapshot can ask
+  // whether it is what the screen is showing. It never DROPS that data — it is filed under its own
+  // project either way, which is what makes switching back instant — it only decides what paints.
+  const keyRef = useRef(key);
+  keyRef.current = key;
+  const acRef = useRef(new Map());       // project selection → its in-flight stream's controller
   const runStream = useCallback(async () => {
-    acRef.current?.abort();
+    const pid = projectId;
+    const k = pid || '';
+    acRef.current.get(k)?.abort();       // one stream per project at a time; the others keep going
     const ac = new AbortController();
-    acRef.current = ac;
+    acRef.current.set(k, ac);
     const seen = new Set();
-    const streamProjectId = projectId;         // this stream's project — the staleness witness
-    const stillCurrent = () => pidRef.current === streamProjectId;
+    const paint = () => { if (keyRef.current === k) setXells(cache.list(pid)); };
     try {
-      await streamFleetXells(streamProjectId, {
+      await streamFleetXells(pid, {
         signal: ac.signal,
         onXell: (x) => {
           if (ac.signal.aborted) return;
-          if (!stillCurrent()) { ac.abort(); return; }   // stale — drop this stream, keep the new grid
           seen.add(x.id);
-          mapRef.current.set(x.id, x);
-          setXells(Array.from(mapRef.current.values()));
+          cache.upsert(pid, x);          // upsert by id — a hexagon already drawn is UPDATED
+          paint();
         },
       });
       if (ac.signal.aborted) return;
-      if (!stillCurrent()) return;   // stale at completion — never prune the new project's map
-      for (const id of Array.from(mapRef.current.keys())) if (!seen.has(id)) mapRef.current.delete(id);
-      setXells(Array.from(mapRef.current.values()));
+      cache.prune(pid, seen);            // …and only now drop what this pass never saw
+      paint();
     } catch (e) { /* aborted or transient — keep the last good set */ }
-  }, [projectId]);
+    finally { if (acRef.current.get(k) === ac) acRef.current.delete(k); }
+  }, [projectId, cache]);
 
-  // Adopt a whole decorated xells array (from a fleet snapshot) into the map, dropping the ids the
-  // snapshot doesn't carry. The snapshot IS the authoritative fleet read, so this keeps the map in
-  // lockstep with it — the same prune a stream completion does.
-  const syncXells = useCallback((rows) => {
-    if (pidRef.current !== projectId) return;   // a stale snapshot must not paint the new project
+  // Adopt a whole decorated xells array (from a fleet snapshot) as that project's set. `pid` is the
+  // SELECTION the snapshot was fetched under (callers know it, and it is the same key the stream
+  // used — which is why it is the selection and not the resolved default-project id). A snapshot
+  // that lands after a switch still updates its own project's rows; it just doesn't repaint.
+  const syncXells = useCallback((rows, pid) => {
     if (!Array.isArray(rows)) return;
-    const next = new Map();
-    for (const x of rows) next.set(x.id, x);
-    mapRef.current = next;
-    setXells(Array.from(next.values()));
-  }, [projectId]);
+    const p = pid === undefined ? projectId : pid;
+    cache.adopt(p, rows);
+    if (keyRef.current === (p || '')) setXells(cache.list(p));
+  }, [projectId, cache]);
 
+  // A selection change re-streams that project — a REFRESH of its rows, not a rebuild of the grid.
   useEffect(() => {
-    mapRef.current = new Map();
-    setXells([]);
     runStream();
-    return () => acRef.current?.abort();
-  }, [projectId, runStream]);
+    return () => { for (const ac of acRef.current.values()) ac.abort(); acRef.current.clear(); };
+  }, [runStream]);
 
   return [xells, runStream, syncXells];
 }
@@ -486,7 +491,7 @@ export default function App() {
       applyFleet(f);
       if (t) setTimeline(t);
       if (d) setDiffs(d);
-      syncXells(f?.xells || []);    // adopt the snapshot's decorated xells — no extra NDJSON stream
+      syncXells(f?.xells || [], pid);   // adopt the snapshot's decorated xells — no extra NDJSON stream
       loadProjects();               // keep the switcher's xell counts fresh
       loadWorkItemsFor(pid || f?.project?.id);   // …and the plan the honeycomb's node levels read
       loadMedics();                 // the Medic Bay (fleet-wide — a full resolve refreshes it too)
@@ -517,7 +522,7 @@ export default function App() {
       const f = getFleet(pid).then((fl) => {
         if (projectIdRef.current !== pid) return;
         applyFleet(fl);
-        syncXells(fl?.xells || []);
+        syncXells(fl?.xells || [], pid);
       });
       if (git) {
         getTimeline(pid).then((t) => { if (projectIdRef.current === pid && t) { setTimeline(t); setVersion((v) => v + 1); } });
@@ -888,7 +893,7 @@ export default function App() {
     const unsub = subscribe(projectId, {
       // The snapshot delivers the WHOLE fleet read model (the server sends one per connection), so
       // it adopts the xells straight into the honeycomb — no separate NDJSON re-stream per event.
-      onSnapshot: (f) => { applyFleet(f); syncXells(f?.xells || []); setConn('live'); },
+      onSnapshot: (f) => { applyFleet(f); syncXells(f?.xells || [], projectId); setConn('live'); },
       // Every later event names its type; re-read only what that type can have moved (fleet alone
       // for most; the git graph too for land/ship/project). Debounced, so a burst collapses.
       onChange: streamChange,
@@ -1018,13 +1023,15 @@ export default function App() {
   // follow-up directive). With this empty, conditions render as INFORMATION (the editor keeps its
   // list) and no medic button appears anywhere.
   const medicEmergency = fleetMatchesSelection ? (fleet.medic_emergency || []) : [];
-  // No per-xell project filter here: the fleet stream, the fleet snapshot and the SSE updates are
-  // all scoped to ONE project on the server (`WHERE x.project_id = $1`), so a xell that reaches this
-  // render path is this project's by construction. What a project SWITCH can still do is deliver
-  // yesterday's data late, and that is a STALENESS question, not a scoping one — it is answered
-  // where the data lands: the streamed map force-clears on the new projectId and drops any stream or
-  // snapshot from the previous selection, and the fleet fallback below is used only while the
-  // snapshot in state actually belongs to the selected project.
+  // No per-xell project filter here, and no teardown either: the fleet stream, the fleet snapshot
+  // and the SSE updates are all scoped to ONE project on the server (`WHERE x.project_id = $1`), so
+  // a xell that reaches this render path is this project's by construction. What a project SWITCH
+  // can still do is deliver yesterday's data late, and that is a STALENESS question, not a scoping
+  // one — it is answered where the data lands: the streamed map is KEYED by project, so a switch
+  // paints that project's hexes straight out of its own map (no clear, no rebuild) while a late
+  // stream or snapshot updates the map it belongs to. The fleet fallback is the one place with no
+  // key of its own — `fleet` is a single snapshot in state — so it is used only while that snapshot
+  // actually belongs to the selected project.
   const gridXells = streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []);
   const carded = new Set(gridXells.map((x) => x.id));
   // THE APPROACH QUEUE, by ref (067). One runway per ref, so the queue belongs under the card that
