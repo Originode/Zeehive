@@ -1,0 +1,29 @@
+{
+  "Stuns": [],
+  "TURNConfig": { "Turns": [], "CredentialsTTL": "12h", "TimeBasedCredentials": false },
+  "Relay": {
+    "Addresses": ["relay://localhost:33080"],
+    "CredentialsTTL": "24h",
+    "Secret": "CHANGE-ME-relay-auth-secret"
+  },
+  "Signal": { "Proto": "http", "URI": "localhost:10000", "Username": "", "Password": null },
+  "ReverseProxy": { "TrustedHTTPProxies": [], "TrustedHTTPProxiesCount": 0, "TrustedPeers": ["0.0.0.0/0"] },
+  "DisableDefaultPolicy": false,
+  "Datadir": "",
+  "DataStoreEncryptionKey": "CHANGE-ME-32-byte-datastore-encryption-key",
+  "StoreConfig": { "Engine": "sqlite" },
+  "HttpConfig": {
+    "Address": "0.0.0.0:443",
+    "AuthIssuer": "http://localhost:33074",
+    "AuthAudience": "",
+    "AuthKeysLocation": "",
+    "AuthUserIDClaim": "",
+    "CertFile": "",
+    "CertKey": "",
+    "IdpSignKeyRefreshEnabled": true,
+    "OIDCConfigEndpoint": ""
+  },
+  "IdpManagerConfig": { "ManagerType": "none", "ClientConfig": null },
+  "DeviceAuthorizationFlow": { "Provider": "none", "ProviderConfig": null },
+  "PKCEAuthorizationFlow": { "ProviderConfig": null }
+}

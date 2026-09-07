@@ -114,6 +114,14 @@ services:
       # (that means the caller's own docker host). Pass through the operator's explicit answer;
       # unset, the server falls back to DEV_HOST_IP or reports base_url:null.
       EXT_API_BASE: ${EXT_API_BASE:-}
+      # The NetBird mesh control plane (docs/netbird-mesh-plan.md). BOTH NETBIRD_API_URL and
+      # NETBIRD_API_TOKEN unset (the default) = the mesh is disabled and every mesh path in the
+      # queenzee is a legible no-op — today's behaviour on a mesh-less install is unchanged. Set
+      # them in the .env next to this file (never in a committed compose) after the mesh profile's
+      # control plane is up; the token is a real secret — config.js surfaces presence only.
+      NETBIRD_API_URL: ${NETBIRD_API_URL:-}
+      NETBIRD_API_TOKEN: ${NETBIRD_API_TOKEN:-}
+      MESH_DOMAIN: ${MESH_DOMAIN:-netbird.selfhosted}
       ZEEHIVE_CXELL_SSH: network
     # host-gateway: a containerized queenzee reaches host-published services (e.g. the shared dev
     # database port) at host.docker.internal:<port>. Docker Desktop adds that name automatically;
@@ -139,9 +147,99 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on: [server]
 
+  # ── NETBIRD MESH control plane (docs/netbird-mesh-plan.md §3.1) — profile-gated ──────────────
+  # Self-hosted NetBird — management (the REST/gRPC API lib/netbird.js drives), signal (the
+  # coordination service agents negotiate through), relay (the NAT-traversal fallback) and the
+  # optional dashboard — on the SAME compose project, so the queenzee's server container can reach
+  # management by service name (netbird-management) on this network. They are gated behind the
+  # `mesh` PROFILE: an unscoped `up -d` boots the exact pre-mesh stack, and the mesh stays off
+  # until a human deliberately stands it up (docker/zeehive/README.md → "The NetBird mesh
+  # control plane") AND sets NETBIRD_API_URL/NETBIRD_API_TOKEN on the server service.
+  #
+  # Live stand-up is a HUMAN's deploy, not the queenzee's: NetBird moves fast — pin the tags and
+  # verify the management.json shape against the NetBird docs for the tag you chose before you
+  # rely on it. The management DATABASE (netbird_management_data) is a ONE-WAY DOOR: losing it
+  # orphans every joined peer (the meta-DB only records intent; the control plane is the live
+  # truth). Back it up before any teardown — see the README section above.
+  netbird-management:
+    profiles: ["mesh"]
+    image: netbirdio/management:${NETBIRD_MANAGEMENT_TAG:-latest}
+    container_name: zeehive_netbird_management
+    restart: unless-stopped
+    # 33073 is the agents' gRPC API; the published HTTPS port is the management HTTP API (the one
+    # lib/netbird.js speaks). Defaults avoid every queenzee/spin port (4700/4701/5180/5300-5389).
+    ports:
+      - "${NETBIRD_MGMT_GRPC_PORT:-33073}:33073"
+      - "${NETBIRD_MGMT_API_PORT:-33074}:443"
+    volumes:
+      - netbird_management_data:/var/lib/netbird
+      # The management needs a management.json (signal/relay/stun + datastore + auth). Stand-alone
+      # installs create ./netbird/management.json next to this file from the shipped example
+      # (docker/zeehive/netbird/management.json.example in a repo checkout). `config -q` does not
+      # stat host paths, so the mesh profile can stay defined here whether or not the file exists;
+      # `up --profile mesh` refuses until a human writes it.
+      - ./netbird/management.json:/etc/netbird/management.json:ro
+    command:
+      - "--port"
+      - "443"
+      - "--log-file"
+      - "console"
+      - "--dns-domain"
+      - "${MESH_DOMAIN:-netbird.selfhosted}"
+      - "--disable-anonymous-metrics=${NETBIRD_DISABLE_ANONYMOUS_METRICS:-true}"
+
+  netbird-signal:
+    profiles: ["mesh"]
+    image: netbirdio/signal:${NETBIRD_SIGNAL_TAG:-latest}
+    container_name: zeehive_netbird_signal
+    restart: unless-stopped
+    ports:
+      - "${NETBIRD_SIGNAL_PORT:-10000}:80"
+    volumes:
+      - netbird_signal_data:/var/lib/netbird
+    command: ["--port", "80", "--log-file", "console"]
+
+  netbird-relay:
+    profiles: ["mesh"]
+    image: netbirdio/relay:${NETBIRD_RELAY_TAG:-latest}
+    container_name: zeehive_netbird_relay
+    restart: unless-stopped
+    ports:
+      - "${NETBIRD_RELAY_PORT:-33080}:${NETBIRD_RELAY_PORT:-33080}"
+    environment:
+      NB_LOG_LEVEL: info
+      NB_LISTEN_ADDRESS: ":${NETBIRD_RELAY_PORT:-33080}"
+      NB_EXPOSED_ADDRESS: ${NETBIRD_RELAY_ENDPOINT:-}
+      NB_AUTH_SECRET: ${NETBIRD_RELAY_AUTH_SECRET:-}
+
+  netbird-dashboard:
+    profiles: ["mesh"]
+    image: netbirdio/dashboard:${NETBIRD_DASHBOARD_TAG:-latest}
+    container_name: zeehive_netbird_dashboard
+    restart: unless-stopped
+    # OPTIONAL — the human UI only. The mesh works without it (the API + agents never need it),
+    # and it needs an OIDC provider (AUTH_AUTHORITY/AUTH_CLIENT_ID/…) before it can sign anyone
+    # in. Published on 33081 by default so it never fights the web dashboard's 5180.
+    ports:
+      - "${NETBIRD_DASH_HTTP_PORT:-33081}:80"
+    environment:
+      # Flat passthroughs only — compose does NOT recursively interpolate a default that itself
+      # contains ${…}, so the operator sets these to the endpoints they actually publish.
+      NETBIRD_MGMT_API_ENDPOINT: ${NETBIRD_MGMT_API_ENDPOINT:-}
+      NETBIRD_MGMT_GRPC_API_ENDPOINT: ${NETBIRD_MGMT_GRPC_API_ENDPOINT:-}
+      AUTH_AUTHORITY: ${NETBIRD_AUTH_AUTHORITY:-}
+      AUTH_AUDIENCE: ${NETBIRD_AUTH_AUDIENCE:-}
+      AUTH_CLIENT_ID: ${NETBIRD_AUTH_CLIENT_ID:-}
+      AUTH_CLIENT_SECRET: ${NETBIRD_AUTH_CLIENT_SECRET:-}
+      AUTH_REDIRECT_URI: ${NETBIRD_AUTH_REDIRECT_URI:-}
+
 volumes:
   # explicit names: scripts (e.g. the self-ship sibling) mount these by bare name
   zeehive_meta_data: { name: zeehive_meta_data }
   zeehive_repos: { name: zeehive_repos }
   zeehive_ssh: { name: zeehive_ssh }
   zeehive_backups: { name: zeehive_backups }
+  # NetBird control-plane data. Explicit names, same rule as the zeehive_* volumes — the self-ship
+  # sibling and the mesh README steps mount these by bare name.
+  netbird_management_data: { name: netbird_management_data }
+  netbird_signal_data: { name: netbird_signal_data }
