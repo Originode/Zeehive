@@ -93,7 +93,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
-         selfProviderEnv } from '../queenzee/self.js';
+         selfProviderEnv, selfRoutes } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
@@ -2226,6 +2226,14 @@ router.get('/xell/self/provider-env', async (req, res) => {
     const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfProviderEnv(x, { provider: req.query.provider || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// The ROUTER's directory half (docs/netbird-mesh-plan.md §3.4) — `zee routes`. How this xell
+// reaches its OWN stack and the containers it uses, derived at call time (mesh answer when its
+// peer is joined, legacy host:port otherwise, fallback carried during migration). Read-only,
+// self-scoped, opens no gate — the live counterpart of the .zeehive.env snapshot.
+router.get('/xell/self/routes', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfRoutes(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.get('/xell/self/env', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }

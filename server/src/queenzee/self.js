@@ -43,7 +43,9 @@ import { attachXellDb, projectProdIsManagingMeta, managingMetaWritableRefusal } 
 import { probeRoleUpstream } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
-import { emitXellEnv } from '../lib/provision.js';
+import { emitXellEnv, resolveXellDsn } from '../lib/provision.js';
+import { deriveXellRoutes, probeTcp } from '../lib/mesh-routes.js';
+import { meshEnabled } from '../lib/netbird.js';
 import { providerRunEnv } from '../lib/provider-tokens.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
@@ -4024,4 +4026,39 @@ export async function selfHarnessDelete(xell, key) {
   logline('crew', `${xell.slug} deleted project harness "${found.harness.key}"`);
   return { ok: true, deleted: true, key: found.harness.key,
            message: `Deleted "${found.harness.key}". Nothing was wearing it, or inheriting it.` };
+}
+
+// ── zee routes — the router's DIRECTORY half (docs/netbird-mesh-plan.md §3.4) ────────────────────
+// The one answer to "how do I reach my db / server / webapp?", derived at call time from the
+// meta-DB + mesh_peer, never baked. Self-scoped like every /xell/self verb: a xell only ever hears
+// about its OWN stack and the containers it USES — never a sibling's. The .zeehive.env snapshot
+// stays what it is; when they disagree, THIS answer is the current one.
+export async function selfRoutes(xell) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  const owned = await q(
+    `SELECT role, name, host, host_port, url, conn_ref, conn_pw, docker_ctx
+       FROM container WHERE owner_xell_id=$1 AND role IN ('db','server','webapp')`, [xell.id]);
+  const used = await q(
+    `SELECT c.role, c.name, c.host, c.host_port, c.url
+       FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+      WHERE uc.xell_id=$1 AND uc.relation='uses' AND c.role IN ('db','server','webapp')`, [xell.id]);
+  const peer = await one(
+    `SELECT * FROM mesh_peer WHERE xell_id=$1 AND kind='xell' AND removed_at IS NULL
+      ORDER BY created_at DESC LIMIT 1`, [xell.id]);
+  const { dsn: legacyDsn, source: dsnSource } = await resolveXellDsn(xell, project, owned);
+
+  const payload = deriveXellRoutes({
+    xell, manifest: project?.manifest || {}, owned, used, peer,
+    legacyDsn, dsnSource, meshDomain: config.meshDomain, meshEnabled: meshEnabled(),
+  });
+
+  // Liveness ADVICE on the db answer only (the address the task most depends on) — a bounded
+  // dial, never a gate: 'refused' tells the zee to trust the fallback / raise the fault, it
+  // refuses nothing here.
+  if (payload.routes.db) {
+    payload.routes.db.probed =
+      await probeTcp(payload.routes.db.ip || payload.routes.db.host || payload.routes.db.hostname,
+                     payload.routes.db.port);
+  }
+  return payload;
 }
