@@ -105,4 +105,12 @@ export const config = {
   // container from the inventory, so only user/name need overriding for an off-convention prod.
   prodDbName: process.env.PROD_DB_NAME || null,
   prodDbUser: process.env.PROD_DB_USER || 'postgres',
+  // The NetBird control plane (docs/netbird-mesh-plan.md) — the self-hosted management API the
+  // queenzee drives peer lifecycle through. BOTH unset = the mesh is disabled and every mesh
+  // consumer degrades to legacy host:port answers; the token is a real secret and lives only in
+  // the queenzee's env (surfaced as PRESENCE ONLY by `zee infra settings`, never the value).
+  netbirdApiUrl: process.env.NETBIRD_API_URL || null,
+  netbirdApiToken: process.env.NETBIRD_API_TOKEN || null,
+  // The mesh DNS domain peers resolve under (<hostname>.<domain>). NetBird's self-hosted default.
+  meshDomain: process.env.MESH_DOMAIN || 'netbird.selfhosted',
 };

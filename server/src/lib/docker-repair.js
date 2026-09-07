@@ -278,8 +278,18 @@ export function startDockerJanitor() {
   const interval = Number(process.env.DOCKER_JANITOR_MS) || 3600000; // hourly
   const dryRun = process.env.DOCKER_JANITOR_DRY_RUN === 'true'
     || (process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate') !== 'real';
-  const tick = () => sweepDockerLeftovers({ dryRun })
-    .catch((e) => console.error('[docker-repair] janitor sweep:', e.message));
+  const tick = async () => {
+    await sweepDockerLeftovers({ dryRun })
+      .catch((e) => console.error('[docker-repair] janitor sweep:', e.message));
+    // The mesh pass (netbird-mesh-plan §3.6): control-plane peers the meta-DB no longer intends.
+    // A control-plane write, so it obeys the same dry-run verdict as the docker side; disabled
+    // mesh is a silent no-op inside the sweep.
+    if (!dryRun) {
+      const { sweepOrphanMeshPeers } = await import('./netbird.js');
+      await sweepOrphanMeshPeers()
+        .catch((e) => console.error('[docker-repair] mesh sweep:', e.message));
+    }
+  };
   setTimeout(tick, 90000);          // not at boot — let the fleet settle first (after images' 60s)
   setInterval(tick, interval);
   console.log(`[queenzee] docker janitor started (${interval}ms${dryRun ? ', DRY RUN' : ''})`);

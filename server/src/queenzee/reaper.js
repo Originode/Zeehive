@@ -14,6 +14,7 @@ import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
 import { removeCxell, cxellName } from '../lib/cxell.js';
 import { stopAndRemoveContainer, removeNetwork } from '../lib/docker.js';
+import { deregisterXellPeers } from '../lib/netbird.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
 import { releaseXellShips } from './shipgate.js';
 import { collectDispatchLoss, reportDispatchLoss } from '../lib/dispatch-loss.js';
@@ -399,6 +400,13 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
       }
     }
   }
+
+  // A mesh peer must never outlive its xell (docs/netbird-mesh-plan.md §3.6). Row stamping is
+  // bookkeeping and always happens (like the container-row delete below); the control-plane
+  // DELETE rides the same destructive verdict as every other machine touch. Best-effort: a
+  // failure leaves the row active so the janitor's mesh pass retries, and never sinks the reap.
+  await deregisterXellPeers(xellId, { controlPlane: destructive })
+    .catch((e) => logline('reaper', `mesh peer cleanup failed for ${xell.slug}: ${e.message}`));
 
   // drop this xell's per-xell containers from the meta DB
   await q(`DELETE FROM container WHERE owner_xell_id = $1`, [xellId]);
