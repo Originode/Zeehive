@@ -31,6 +31,7 @@ import { deviceConfig } from './devices.js';
 import { logline, activity } from './logbus.js';
 import { raiseEnvAlert, clearEnvAlert } from './status.js';
 import { processRoleReachableHost, processRolePublishedUrl } from '../queenzee/containers.js';
+import { meshEnabled, mintPeer, netbirdRequest } from './netbird.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines): 'real'
 // touches machines, anything else models. The fleet-wide .zeehive.env reconcile below obeys it.
@@ -577,15 +578,77 @@ export async function resolveXellDsn(xell, project, containers = []) {
   return { dsn: dbUrl, source, binding_is_prod: bindingIsProd };
 }
 
+// ── the MESH env block (docs/netbird-mesh-plan.md §3.3 / §6 phase 3) ─────────────────────────────
+// A project whose manifest opts tiers.spinoff.mesh.enabled AND whose queenzee has the mesh
+// configured (meshEnabled) gets a per-xell mesh block in .zeehive.env: SPINOFF_MESH_MGMT_URL
+// always (it is queenzee config), and SPINOFF_MESH_SETUP_KEY ONLY while the intent row is still
+// 'minted'. The sidecar CONSUMES the key at join, so a stale consumed key is worse than none — a
+// recreated sidecar would try to re-join with an already-used one-off key instead of idling. The
+// key value lives ONLY in this file (never the meta-DB — migration 249 records its id for audit),
+// so a re-emit before the sidecar has joined must read the current file and preserve the key, or a
+// rename/reconcile would strip the one carrier the joining agent has not yet consumed.
+function meshOptIn(project) {
+  return project?.manifest?.tiers?.spinoff?.mesh?.enabled === true;
+}
+
+function envValueInText(text, name) {
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (line.startsWith(`${name}=`)) return line.slice(name.length + 1).trim();
+  }
+  return null;
+}
+
+async function meshEnvLines({ xell, project, meshSetupKey = null, previousText = null }) {
+  if (!meshOptIn(project) || !meshEnabled()) return [];
+  const peer = await one(
+    `SELECT status FROM mesh_peer
+      WHERE xell_id=$1 AND kind='xell' AND removed_at IS NULL
+      ORDER BY created_at DESC LIMIT 1`, [xell.id]);
+  if (!peer) return [];   // no live intent → the sidecar stays idle; nothing mesh in the file
+  const lines = ['# —— mesh sidecar (docs/netbird-mesh-plan.md §3.3): the generated compose\'s mesh '
+    + 'service joins the control plane with these; the setup key is ONE-TIME and never stored, so '
+    + 'this file is its only carrier until the sidecar consumes it ——'];
+  lines.push(`SPINOFF_MESH_MGMT_URL=${config.netbirdApiUrl}`);
+  if (peer.status === 'minted') {
+    const key = meshSetupKey || envValueInText(previousText, 'SPINOFF_MESH_SETUP_KEY');
+    if (key) lines.push(`SPINOFF_MESH_SETUP_KEY=${key}`);
+  }
+  return lines;
+}
+
+// The BUILD-path relay (the build-container.sh env contract the generated compose interpolates):
+// build.js puts the mesh service's two interpolation names (NB_SETUP_KEY/NB_MANAGEMENT_URL ←
+// SPINOFF_MESH_SETUP_KEY/SPINOFF_MESH_MGMT_URL) into `recorded` env, and THIS is where they come
+// from. The management URL is queenzee config; the one-time setup key is read from the worktree's
+// .zeehive.env — the ONE carrier the key ever rides (never the meta-DB), written by writeXellEnv
+// at provision. Returns {} for a mesh-less xell/queenzee, so a legacy build env is byte-identical.
+export function meshBuildEnv(worktreePath, project) {
+  if (!meshOptIn(project) || !meshEnabled()) return {};
+  const out = { SPINOFF_MESH_MGMT_URL: config.netbirdApiUrl };
+  try {
+    const key = envValueInText(
+      readFileSync(`${String(worktreePath).replace(/\\/g, '/')}/.zeehive.env`, 'utf8'),
+      'SPINOFF_MESH_SETUP_KEY');
+    if (key) out.SPINOFF_MESH_SETUP_KEY = key;
+  } catch { /* no file yet → URL-only; the sidecar idles without a key (compose default) */ }
+  return out;
+}
+
 // Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
 // The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
 // ordinary state of a pooled xell, not a projection failure worth flagging to a human.
-async function writeXellEnv(xellId, { dryRun = false } = {}) {
+async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell?.worktree_path) throw Object.assign(new Error('xell has no worktree'), { no_worktree: true });
   if (!existsSync(xell.worktree_path)) {
     throw Object.assign(new Error(`worktree does not exist: ${xell.worktree_path}`), { no_worktree: true });
   }
+  // The file as it is on disk NOW — read ONCE, for two jobs: the mesh block below preserves the
+  // one-time setup key across a re-emit before the sidecar has consumed it, and the final
+  // no-op-if-identical write comparison reuses it instead of reading the file a second time.
+  const projectedPath = `${xell.worktree_path.replace(/\\/g, '/')}/.zeehive.env`;
+  let previousText = null;
+  try { previousText = readFileSync(projectedPath, 'utf8'); } catch { /* absent → first projection */ }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   const site = await resolveSite(xell.project_id, 'dev');
   const cs = await q(
@@ -704,6 +767,10 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
     lines.push('QUEENZEE_INPROC=false');
   }
 
+  // The mesh sidecar env block (meshEnvLines above): a no-op [] for a mesh-less xell/queenzee, so
+  // today's file is byte-identical on every mesh-less path.
+  for (const line of await meshEnvLines({ xell, project, meshSetupKey, previousText })) lines.push(line);
+
   // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
   // Resolved by tier: a xell ON PRODUCTION (environments.isOnProduction — writing it, reading it
   // read-only, or being it) gets the project's default PROD environment, else the default DEV one;
@@ -736,6 +803,9 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
       const reserved = new Set([
         'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', 'QUEENZEE_INPROC',
         'ZEEHIVE_META_RO_DSN',
+        // The mesh block's two names are never an environment's to set either — reserve them even on
+        // a mesh-less xell, so a later mesh opt-in can't be pre-poisoned by a stale env var.
+        'SPINOFF_MESH_MGMT_URL', 'SPINOFF_MESH_SETUP_KEY',
         serverEnv, webEnv,
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);
@@ -761,9 +831,9 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // A projection identical to what is already on disk is a NO-OP, not a write. The reconcile below
   // runs over the whole fleet, and a queenzee that rewrites an unchanged file under every working
   // zee is indistinguishable (mtime, watchers, "did I do that?") from the zee having edited it —
-  // the same rule reinjectHarnessIntoLiveXells holds for harness files.
-  let changed = true;
-  try { changed = readFileSync(path, 'utf8') !== text; } catch { changed = true; }   // unreadable/absent → write
+  // the same rule reinjectHarnessIntoLiveXells holds for harness files. previousText was read once
+  // at the top (the mesh block needed it); an absent/unreadable file reads null → write.
+  const changed = previousText !== text;
   // The zee in the cage reads a COPY of this file, not this file (refreshLiveCxellEnv below). That
   // copy does its OWN comparison, so it runs whether or not the HOST file moved — see the comment
   // there for why keying it off `changed` would leave the affected zees unreachable forever.
@@ -885,9 +955,9 @@ export async function prewarmCage({ slug, worktree, project, prep }) {
   }
 }
 
-export async function emitXellEnv(xellId, { dryRun = false } = {}) {
+export async function emitXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}) {
   try {
-    const r = await writeXellEnv(xellId, { dryRun });
+    const r = await writeXellEnv(xellId, { dryRun, meshSetupKey });
     if (!dryRun) await noteEnvProjection(xellId, null, r.cxell);
     return r;
   } catch (e) {
@@ -1212,7 +1282,7 @@ export async function makeSlug(projectId) {
 // Provision one pooled (empty, ready) xell for a project. machineCtx (optional) pins the target
 // machine — the pool maintainer passes it when filling per-machine targets; omitted, the
 // highest-priority machine with room is chosen (or legacy site placement when no machines exist).
-export async function provisionXell({ projectId, mode = 'simulate', sourceCoupling, dbCoupling, machineCtx }) {
+export async function provisionXell({ projectId, mode = 'simulate', sourceCoupling, dbCoupling, machineCtx, mesh }) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
   const xource = await one(`SELECT * FROM xource WHERE project_id=$1 AND ref=$2`, [projectId, project.main_branch]);
   const cfg = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);
@@ -1578,6 +1648,29 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     broadcast('xell', xell);
     // the honeycomb's queenzee→xell line: the queenzee just provisioned this xell
     activity('q2x', xell.id, 'provision', projectId);
+    // ── MESH SIDECAR INTENT (docs/netbird-mesh-plan.md §3.3 / §6 phase 3) ─────────────────────────
+    // A project whose manifest opts tiers.spinoff.mesh.enabled AND whose queenzee has the mesh
+    // configured mints the per-xell peer at provision. The one-time setup key is passed straight
+    // into the .zeehive.env projection below (real mode) and is NEVER stored — only its id rides
+    // the row. A mint failure must degrade this provision to LEGACY-ONLY, logged, never block: a
+    // control-plane outage is not a reason a pooled xell does not exist. A SIMULATE provision mints
+    // only when a caller injects a request adapter (a test double) — a bare simulate (a nested
+    // queenzee) must not mint a REAL control-plane peer it will never hand a key to.
+    let meshSetupKey = null;
+    if (meshOptIn(project) && meshEnabled() && (mode === 'real' || mesh?.request)) {
+      try {
+        const mint = await mintPeer({ projectId, kind: 'xell', hostname: slug, xellId: xell.id },
+                                    { request: mesh?.request || netbirdRequest });
+        if (mint.ok) {
+          meshSetupKey = mint.setupKey;
+        } else {
+          logline('mesh', `${slug}: mesh peer mint ${mint.disabled ? 'disabled' : 'failed'} `
+            + `(${mint.reason}) — provisioning continues LEGACY-ONLY`);
+        }
+      } catch (e) {
+        logline('mesh', `${slug}: mesh peer mint errored (${e.message}) — provisioning continues LEGACY-ONLY`);
+      }
+    }
     // the harness-free projection rides every REAL provision; failure is logged, never fatal
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {
@@ -1592,7 +1685,8 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
         await ensureDbContainerConnPw(sharedDevContainerId, { mode })
           .catch((e) => logline('provision', `${slug}: shared dev db conn_pw backfill failed (ignored): ${e.message}`));
       }
-      await emitXellEnv(xell.id).catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
+      await emitXellEnv(xell.id, { meshSetupKey })
+        .catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
       // …and OPEN what was just written, before anyone treats this xell as ready (#53). Writing a
       // DATABASE_URL and that DATABASE_URL answering are two different facts, and the gap is what
       // let seven zees in one night be handed a credential the shared dev db rejects (#47).

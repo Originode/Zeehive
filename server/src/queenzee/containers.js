@@ -11,6 +11,7 @@ import { machineDbHost } from '../lib/machines.js';
 import { derivedTcpDsn } from '../lib/xell-db.js';
 import { config } from '../config.js';
 import { probeGatewayHealth } from './gateway-health.js';
+import { markJoinedMeshPeers } from '../lib/netbird.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
 // role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
@@ -381,6 +382,16 @@ export async function checkContainers() {
       changed++;
     }
   }
+
+  // ── mesh join sweep (docs/netbird-mesh-plan.md §3.3 / §6 phase 3) ──────────────
+  // The monitor's OTHER half of the mesh lifecycle: provision mints the intent row, but stamping
+  // 'joined' has to wait until the xell's mesh sidecar agent actually came up with its stack and
+  // registered with the control plane. A sidecar has NO container row (its health is the control
+  // plane's business, not docker ps), so this asks the control plane whether each minted xell peer
+  // answers yet and stamps the ones that do. Best-effort by contract — an unreachable control
+  // plane is a legible no-op here (mesh disabled is the same no-op), never a reason this tick
+  // fails. Runs unconditionally and returns immediately when the mesh is off.
+  await markJoinedMeshPeers().catch(() => {});
 
   const unreach = Object.entries(psByCtx).filter(([, m]) => m == null).map(([k]) => k);
   // Change-only: this ran every 30s and said the same thing every 30s, which in a shared

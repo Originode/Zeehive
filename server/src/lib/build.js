@@ -14,7 +14,7 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
-import { spinComposeDbPort, repairCollidedAppPorts } from './provision.js';
+import { spinComposeDbPort, repairCollidedAppPorts, meshBuildEnv } from './provision.js';
 import { npmCacheEnv } from '../lib/npm-cache.js';
 import {
   processRoleReachableHost, processRolePublishedUrl,
@@ -406,6 +406,11 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     BUILD_BUILD_CTX: target.buildCtx,
     BUILD_REGISTRY: target.registry,
     BUILD_IMAGE: c.image_tag,
+    // Mesh env relay (docs/netbird-mesh-plan.md §3.3): the generated compose's mesh service
+    // interpolates these two names. The management URL is queenzee config; the one-time setup key
+    // rides from the worktree .zeehive.env — its ONLY carrier (never the meta-DB). A no-op {} for a
+    // mesh-less xell/queenzee, so a legacy build env is byte-identical.
+    ...meshBuildEnv(xell.worktree_path, project),
   };
 
   // Clear any prior failure when a fresh build starts — the chip must not keep showing a stale

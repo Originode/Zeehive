@@ -147,6 +147,52 @@ export async function markPeerJoined(hostname, { request = netbirdRequest } = {}
   return { ok: true, row };
 }
 
+// The health-monitor companion to markPeerJoined (docs/netbird-mesh-plan.md §3.3 / §6 phase 3):
+// a MINTED xell sidecar row says "this xell intends a mesh peer, and the sidecar agent should
+// register with the control plane shortly after its stack comes up". The monitor asks the control
+// plane whether it has — stamps JOINED the ones that answer, leaves the rest minted for the next
+// tick. A sidecar has no container row (its health is the control plane's business, not docker
+// ps), so this control-plane probe IS the monitor path for the mesh half of the lifecycle.
+//
+// Best-effort by contract, same as every mesh entry point: an unreachable control plane is a
+// legible no-op here, never a reason the health tick fails. Only transitions are logged — a peer
+// that has not registered yet (sidecar still starting) is the normal state of a fresh provision,
+// and shouting about it every 30s would be the health line's "changed only" discipline broken in
+// a new place.
+export async function markJoinedMeshPeers({ request = netbirdRequest } = {}) {
+  if (!meshEnabled()) return { ok: true, skipped: 'mesh disabled', joined: [], pending: 0 };
+  const rows = await q(
+    `SELECT mp.hostname
+       FROM mesh_peer mp
+       JOIN xell x ON x.id = mp.xell_id
+      WHERE mp.kind = 'xell' AND mp.status = 'minted' AND mp.removed_at IS NULL
+        AND x.status <> 'retired'
+      ORDER BY mp.created_at`);
+  if (!rows.length) return { ok: true, joined: [], pending: 0 };
+  const joined = [];
+  const waiting = [];
+  const problems = [];
+  for (const row of rows) {
+    const r = await markPeerJoined(row.hostname, { request });
+    if (r.ok) { joined.push(row.hostname); continue; }
+    // The only "no peer yet" answer markPeerJoined gives is the control plane not listing the
+    // hostname; every other failure (an unreachable plane, a 401, a row that vanished) is a
+    // problem. A failure to READ the peer list is systemic — every remaining row would hit the
+    // same wall, so report it once and stop rather than hammer a down plane once per pending row
+    // (each bounded by the adapter's timeout) inside a 30s health tick.
+    if (r.reason && r.reason.includes('answers to')) { waiting.push(row.hostname); continue; }
+    problems.push(`${row.hostname}: ${r.reason}`);
+    if (r.reason && /^list peers/.test(r.reason)) break;
+  }
+  for (const h of joined) {
+    logline('mesh', `peer '${h}' is on the mesh — status stamped joined (sidecar answered)`);
+  }
+  if (problems.length) {
+    logline('mesh', `mesh join sweep problems: ${problems.join('; ')}`);
+  }
+  return { ok: problems.length === 0, joined, pending: waiting.length + problems.length, problems };
+}
+
 // The reap-time step (docs/netbird-mesh-plan.md §3.6): a control-plane peer must never outlive
 // its xell. Row stamping is bookkeeping and always happens (like the container-row delete);
 // the control-plane DELETE only when the caller may touch the world (`controlPlane` — the
