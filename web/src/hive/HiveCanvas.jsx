@@ -1624,7 +1624,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     hoverWorldRef.current = { x: NaN, y: NaN };   // queenzee-node hover glow fades
     if (tipRef.current.el) { tipRef.current.kind = null; tipRef.current.el.style.display = 'none'; }
     hideXellTooltip();
-    setPlusMenu(null); setPlusSub(false);
+    // NOT the + menu. It is a DOM overlay ON TOP of the canvas, and the canvas cannot contain it —
+    // so the moment the pointer moves off the canvas towards the menu, this mouseleave fires.
+    // Closing here made the menu unusable: it opened under the cursor and vanished on the first
+    // move towards an item ("moving mouse removes the dropdown menu and i cant click menu items").
+    // It closes the way the xell and queenzee menus do, which never closed on leave: a click
+    // anywhere outside, another context menu, a scroll, Escape, or a left-press back on the canvas.
   };
 
   useEffect(() => {

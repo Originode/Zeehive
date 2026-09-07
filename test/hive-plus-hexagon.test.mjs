@@ -99,6 +99,29 @@ ok(/\.hive-plus-ctx/.test(css), 'the + menu is styled');
 ok(/if \(plusMenu\) \{ setPlusMenu\(null\); setPlusSub\(false\); return; \}/.test(hive),
    'Escape dismisses the + menu before anything else');
 
+// THE MENU MUST SURVIVE THE MOUSE MOVING TOWARDS IT. The report: "after clicking it, moving mouse
+// removes the dropdown menu and i cant click menu items." The menu is a DOM overlay ON TOP of the
+// canvas — a canvas cannot contain elements — so the pointer moving off the canvas towards an item
+// fires the canvas's mouseleave. onLeave used to close the + menu there, which meant it vanished
+// before any item could be clicked: an affordance that opened and could never be USED. The xell and
+// queenzee menus were never closed on leave; this one now behaves the same.
+console.log('\nthe + menu is not dismissed by the pointer leaving the canvas');
+const onLeaveBody = (hive.match(/const onLeave = \(\) => \{([\s\S]*?)\n  \};/) || [])[1] || '';
+ok(onLeaveBody.length > 0, 'the canvas mouseleave handler is where it was (onLeave)');
+ok(!/setPlusMenu/.test(onLeaveBody),
+   'onLeave does NOT close the + menu — moving the pointer onto it is not a dismissal');
+ok(/onMouseLeave=\{onLeave\}/.test(hive) && /\.ctxmenu \{ position: fixed/.test(css),
+   'and the menu really is a fixed overlay outside the canvas — which is why mouseleave fires at all');
+// What DOES dismiss it, all still wired: a click/contextmenu/scroll outside (attached on the next
+// tick so the opening click cannot close it), Escape, a left-press back on the canvas, or a choice.
+ok(/document\.addEventListener\('click', close\)/.test(hive)
+   && /window\.addEventListener\('scroll', close, true\)/.test(hive),
+   'a click or scroll outside still dismisses it');
+ok(/if \(plusMenu && e\.button === 0\) setPlusMenu\(null\)/.test(hive),
+   'a left-press back on the canvas still dismisses it');
+ok(/onClick=\{\(e\) => e\.stopPropagation\(\)\}/.test(hive),
+   'a click INSIDE the menu does not reach that outside-click listener');
+
 // ── 4. App routes the four options ────────────────────────────────────────────
 console.log('\nApp opens the four surfaces the menu names');
 ok(/handlePlusAction/.test(app) && /onPlusAction=\{handlePlusAction\}/.test(app),
