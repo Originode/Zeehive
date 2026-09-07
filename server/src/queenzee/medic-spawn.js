@@ -34,11 +34,33 @@ import { selfProjectId } from '../lib/infra-medic.js';
 // project that is already broken would be the wrong ledger.
 async function medicCreds({ provider = null, model = null } = {}) {
   const pid = await selfProjectId();
-  const decided = provider ? { provider } : await dispatchProviderFor(pid, { claudeNeedsNoToken: false });
+  // needsApiKey: the medic loop is langchain against the raw provider API, where a Claude OAuth
+  // (Claude Code CLI) account cannot authenticate — the decision must skip those or the medic's
+  // first model call 401s and the medic errors before its first tool runs.
+  const decided = provider ? { provider } : await dispatchProviderFor(pid, { claudeNeedsNoToken: false, needsApiKey: true });
   const p = decided.provider || 'claude';
   const creds = await spawnCreds(pid, p);
-  return { projectId: pid, provider: p, model, ...creds };
+  if (/^sk-ant-oat/.test(String(creds.token || ''))) {
+    throw new Error(`the ${p} account "${creds.accountLabel || '?'}" is a Claude OAuth (CLI) token — `
+      + 'the medic plane calls the raw API and cannot authenticate with it. Connect an API-key '
+      + 'account (sk-ant-api…) or another provider (e.g. DeepSeek) to the orchestrator project.');
+  }
+  // The model default is per-provider, same rule as cxell-runtimes' deepseekModel: a null model on
+  // deepseek's Anthropic-compatible endpoint would send langchain's own claude default, which
+  // deepseek does not serve.
+  const m = model || (p === 'deepseek' ? (process.env.DEEPSEEK_DEFAULT_MODEL || 'deepseek-chat') : null);
+  return { projectId: pid, provider: p, model: m, ...creds };
 }
+
+// The medic's own tool budget. The loop's default cap (MAX_TOOL_ITERATIONS = 8) fits a wave-1 zee
+// turn (a status call, an item update); a medic turn IS the diagnosis — its own brief orders
+// "read the evidence first (readiness, settings, meta_select on the exact rows…), fix, re-prove,
+// delete the condition, report", which is easily dozens of tool calls. At 8, every dispatched
+// medic stopped mid-diagnosis with a visible capHit that NOTHING resumes (the driver runs turns
+// only on dispatch and on a human's answer), i.e. it sat at 'acting' having done nothing — seen
+// live on the first sandbox exercise, 2026-09-06. The cap stays a hard, visible stop; it is just
+// sized for this plane's work.
+export const MEDIC_MAX_TOOL_ITERATIONS = 40;
 
 // Run ONE turn for an EXISTING medic row. Separate from dispatch below because a medic is RESUMED
 // the same way it is started — a human answering an `awaiting-human` ask runs another turn against
@@ -47,8 +69,18 @@ export async function runMedicTurn({ medic, task = null, provider = null, model 
                                       kind = 'spawn' } = {}) {
   if (!medic?.id) throw new Error('runMedicTurn needs the medic ROW — the identity comes from the turn');
   const creds = await medicCreds({ provider, model });
+  model = creds.model ?? model;   // the per-provider default (medicCreds) — what the turn really runs
   const short = String(medic.id).slice(0, 8);
 
+  // ONE ACTIVE ZEE PER MEDIC (245: one_active_zee_per_medic counts 'idle' as active). The driver
+  // mints a fresh zee row per turn, and a finished turn parks its row at 'idle' — so the previous
+  // turn's row must be CLOSED here or the insert below violates the index and every RESUME throws
+  // before its turn starts (seen live 2026-09-06; it was masked before because the passive poller
+  // wrongly stamped the row 'stopped' within a tick — fixed in poller.js the same day).
+  await q(
+    `UPDATE zee SET status='stopped',
+            last_stop_reason=COALESCE(last_stop_reason, 'superseded by the next medic turn')
+      WHERE medic_id=$1 AND status IN ('spawning','online','working','idle')`, [medic.id]);
   const zee = await one(
     `INSERT INTO zee (medic_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
                       model, permission_mode, cwd, title, provider_token_id)
@@ -62,7 +94,10 @@ export async function runMedicTurn({ medic, task = null, provider = null, model 
   const medicToken = await mintMedicToken(medic.id);
   const turn = await startTurn({ zee, xell: { id: null, project_id: medic.target_project_id },
                                  kind, model, meta: { medic_id: medic.id } });
-  const sid = short;
+  // The session id is the ZEE row's short id, not the medic's (langchain-spawn.js does the same):
+  // zee.claude_session_id is globally UNIQUE, and a medic mints a zee row per turn — the medic's
+  // short id repeats on every resume, which made the second turn die on zee_claude_session_id_key.
+  const sid = String(zee.id).slice(0, 8);
 
   const feed = (ev) => {
     if (turn?.id) void recordFeedEvent({ turnId: turn.id, zeeId: zee.id, xellId: null, event: ev, sessionId: sid });
@@ -86,6 +121,7 @@ export async function runMedicTurn({ medic, task = null, provider = null, model 
       xell: medic, task: task || medic.brief, provider: creds.provider, model,
       apiKey: creds.token, xellToken: medicToken, system,
       registry: MEDIC_TOOLS, runToolFn: runMedicTool, convKey: { medicId: medic.id },
+      maxIterations: MEDIC_MAX_TOOL_ITERATIONS,
       onAssistant: (msg) => {
         const content = [];
         for (const b of msg?.content || []) {

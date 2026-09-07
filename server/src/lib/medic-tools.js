@@ -227,6 +227,42 @@ export const MEDIC_TOOLS = {
       return out;
     },
   },
+  docker_repair: {
+    name: 'docker_repair',
+    description: 'Repair WEDGED docker state on ONE machine (by key or id) — the lever for the '
+      + 'stale-leftover fault family: prunes EMPTY *-spin-* networks (the address-pool exhaustion '
+      + 'fix), removes RETIRED xells\' husk containers (port squatters), and STARTS stopped dev '
+      + 'dbs the meta-DB already models. The queenzee performs it on its own docker contexts; the '
+      + 'guards are code (a required external network is never pruned, an unknown container is '
+      + 'never touched, nothing is ever stopped). dry_run:true returns the plan and performs '
+      + 'NOTHING. Same acts-immediately class as proof (throwaway spin leftovers only). AUDITED.',
+    schema: { type: 'object', properties: { machine: { type: 'string' }, dry_run: { type: 'boolean' } },
+              required: ['machine'] },
+    run: async (medic, args) => {
+      const { performDockerRepair } = await import('./docker-repair.js');
+      const dryRun = !!args?.dry_run;
+      // Audit FIRST, meta_write's discipline: a docker mutation must never run unrecorded.
+      let actionId = null;
+      if (!dryRun) {
+        try {
+          actionId = await recordMedicAction(medic.id, { tool: 'docker_repair',
+            statement: JSON.stringify({ machine: args?.machine }) });
+        } catch (e) {
+          return refuse(`the audit ledger refused (${e.message}) — no repair runs unrecorded`);
+        }
+      }
+      try {
+        const out = await performDockerRepair(args?.machine, { dryRun,
+          actor: `medic:${String(medic.id).slice(0, 8)}` });
+        if (actionId) await finishMedicAction(actionId, { result: { status: out.status,
+          steps: (out.results || []).map((s) => `${s.kind}:${s.target}=${s.status}`) } });
+        return { ok: out.status !== 'refused' && out.status !== 'failed', ...out };
+      } catch (e) {
+        if (actionId) await finishMedicAction(actionId, { result: { ok: false, reason: e.message } }).catch(() => {});
+        return refuse(String(e.message).slice(0, 300));
+      }
+    },
+  },
   settings: {
     name: 'settings',
     description: 'The TARGET project\'s settings projection: project row, pool_config, machines, '

@@ -109,9 +109,17 @@ try {
      VALUES ($1, 'deepseek', $2, $3, 'medic-spawn-test') RETURNING id`,
     [zeehive.id, DEEPSEEK_KEY, `…${DEEPSEEK_KEY.slice(-4)}`]);
   cleanups.push(() => q(`DELETE FROM provider_token WHERE id=$1`, [tok.id]));
+  // The condition sits on a PATIENT project that holds NO provider account — the real dispatch
+  // shape (a medic attends someone else's broken project). The gateway must resolve the forward
+  // account from the ORCHESTRATOR'S OWN project (resolveUpstream's medic branch): resolving it
+  // from the patient made every medic's first model call 502 `cannot forward`, so a dispatched
+  // medic errored before its first tool ran (2026-09-06 — "deployed medics do nothing").
+  const patient = await one(
+    `INSERT INTO project (name, repo_root) VALUES ('medic-spawn-patient', '/tmp/patient') RETURNING id`);
+  cleanups.push(() => q(`DELETE FROM project WHERE id=$1`, [patient.id]));
   const cond = await one(
     `INSERT INTO project_condition (project_id, body)
-     VALUES ($1, '[test] the pair cannot build — medic-spawn e2e') RETURNING id, project_id, body`, [zeehive.id]);
+     VALUES ($1, '[test] the pair cannot build — medic-spawn e2e') RETURNING id, project_id, body`, [patient.id]);
   cleanups.push(() => q(`DELETE FROM project_condition WHERE id=$1`, [cond.id]));
 
   console.log('\n── the whole turn: dispatchMedic --wait against the scripted upstream ──');
@@ -150,6 +158,21 @@ try {
   const call2 = modelCalls()[1]?.body || {};
   const toolResults = JSON.stringify(call2.messages || []).toLowerCase();
   ok(/zeehive/.test(toolResults), 'call ② carries a tool_result naming the fixture project');
+
+  console.log('\n── G. the RESUME path (the Bay reply box drives a second turn) ──');
+  // A resume mints a SECOND zee row for the same medic: the driver must close the first (245's
+  // one_active_zee_per_medic counts 'idle' as active) and mint a fresh claude_session_id (the
+  // column is globally unique). Both broke the first live resume, 2026-09-06.
+  const { resumeMedic } = await import('../server/src/queenzee/medic-spawn.js');
+  const before = modelCalls().length;
+  const r = await resumeMedic(medicId, { message: 'a human answers: thanks — confirm and finish', wait: true });
+  ok(r.ok === true && r.resumed === true, 'resume answered a receipt');
+  ok(modelCalls().length > before, `the answer became a real next turn (${modelCalls().length - before} more model call(s))`);
+  const zees = await q(`SELECT status, last_stop_reason FROM zee WHERE medic_id=$1 ORDER BY created_at`, [medicId]);
+  ok(zees.length === 2, `one zee row per turn (${zees.length})`);
+  ok(zees[0].status === 'stopped', `the first turn's row was closed, not left 'active' (${zees[0].status})`);
+  ok(zees[1].status === 'idle' && zees[1].last_stop_reason === 'end_turn',
+    `the resume turn ended cleanly (${zees[1].status}, ${zees[1].last_stop_reason})`);
 } finally {
   for (const c of cleanups.reverse()) { try { await c(); } catch { /* best-effort teardown */ } }
   process.env.DEEPSEEK_ANTHROPIC_BASE_URL = '';

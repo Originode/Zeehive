@@ -461,12 +461,19 @@ export async function assertProviderDispatchable(projectId, provider, { tokenId 
 // Returns { provider, reason } — the reason is logged at dispatch, because a provider nobody named
 // must never be a silent choice.
 export function decideDispatchProvider({ requested = null, claudeNeedsNoToken = false,
-                                         allowProviders = [], accounts = [] } = {}) {
+                                         allowProviders = [], accounts = [], needsApiKey = false } = {}) {
   const asked = String(requested || '').trim();
   if (asked) return { provider: asked, reason: 'requested' };
   if (claudeNeedsNoToken) return { provider: 'claude', reason: 'host-auth-runtime' };
   const allowed = (p) => !allowProviders.length || allowProviders.includes(p);
-  const active = accounts.filter((a) => !a.paused && PROVIDERS[a.provider]?.dispatch && allowed(a.provider));
+  // needsApiKey: the LANGCHAIN planes (meta-plane medic, langchain zee) call the raw provider API,
+  // where a Claude OAuth account (sk-ant-oat…) cannot authenticate — Anthropic accepts those only
+  // from the Claude Code CLI (verified against api.anthropic.com 2026-09-06: x-api-key → 401,
+  // Bearer+oauth-beta without the CLI's exact request shape → a refusal dressed as
+  // rate_limit_error). Such an account is simply not usable for this dispatch, so it does not count.
+  const usable = (a) => !(needsApiKey && a.provider === 'claude' && a.oauth);
+  const active = accounts.filter((a) => !a.paused && PROVIDERS[a.provider]?.dispatch && allowed(a.provider)
+    && usable(a));
   if (allowed('claude') && active.some((a) => a.provider === 'claude')) {
     return { provider: 'claude', reason: 'claude-account' };
   }
@@ -487,7 +494,7 @@ export function decideDispatchProvider({ requested = null, claudeNeedsNoToken = 
 // the fallback, and the spawn path's own error says what to connect.
 export async function dispatchProviderFor(projectId, { requested = null, tokenId = null,
                                                        claudeNeedsNoToken = false,
-                                                       allowProviders = [] } = {}) {
+                                                       allowProviders = [], needsApiKey = false } = {}) {
   const asked = String(requested || '').trim();
   if (asked) return { provider: asked, reason: 'requested' };
   // An ACCOUNT id with no provider beside it still names a provider — the account's own. A surface
@@ -501,12 +508,13 @@ export async function dispatchProviderFor(projectId, { requested = null, tokenId
   let accounts = [];
   try {
     accounts = await q(
-      `SELECT provider, paused_at FROM provider_token WHERE project_id = $1 ORDER BY created_at DESC`,
+      `SELECT provider, paused_at, token LIKE 'sk-ant-oat%' AS oauth
+         FROM provider_token WHERE project_id = $1 ORDER BY created_at DESC`,
       [projectId]);
   } catch { /* unreadable = nothing connected as far as this decision goes */ }
   return decideDispatchProvider({
-    claudeNeedsNoToken, allowProviders,
-    accounts: accounts.map((r) => ({ provider: r.provider, paused: !!r.paused_at })),
+    claudeNeedsNoToken, allowProviders, needsApiKey,
+    accounts: accounts.map((r) => ({ provider: r.provider, paused: !!r.paused_at, oauth: !!r.oauth })),
   });
 }
 

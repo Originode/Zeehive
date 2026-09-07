@@ -29,8 +29,6 @@ import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
 import { itemReachable } from './hive/level.js';
-// the project-scoping filter for the fleet render surfaces (honeycomb and everything fed from it)
-import { projectScoped } from './projectFilter.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
@@ -1020,14 +1018,14 @@ export default function App() {
   // follow-up directive). With this empty, conditions render as INFORMATION (the editor keeps its
   // list) and no medic button appears anywhere.
   const medicEmergency = fleetMatchesSelection ? (fleet.medic_emergency || []) : [];
-  // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
-  // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
-  // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
-  // but a xell from the previous project's LAST update stream must never paint — the filter is the
-  // final gate, and it costs one pass over an already-small list.
-  const gridXells = projectScoped(
-    streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []),
-    projectId);
+  // No per-xell project filter here: the fleet stream, the fleet snapshot and the SSE updates are
+  // all scoped to ONE project on the server (`WHERE x.project_id = $1`), so a xell that reaches this
+  // render path is this project's by construction. What a project SWITCH can still do is deliver
+  // yesterday's data late, and that is a STALENESS question, not a scoping one — it is answered
+  // where the data lands: the streamed map force-clears on the new projectId and drops any stream or
+  // snapshot from the previous selection, and the fleet fallback below is used only while the
+  // snapshot in state actually belongs to the selected project.
+  const gridXells = streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []);
   const carded = new Set(gridXells.map((x) => x.id));
   // THE APPROACH QUEUE, by ref (067). One runway per ref, so the queue belongs under the card that
   // is holding it up — keyed the same way, and never merged into `landing` (a holding row is not a
@@ -1193,7 +1191,15 @@ export default function App() {
   // policy. The one genuinely new path is 'project' INSIDE a project: a NESTED project, whose
   // folder is confined to the parent's repo_root and whose git behavior is forced (ProjectSetup's
   // CreateForm renders the choice). Activity/task cut under the current node (server owns legality).
-  const handlePlusAction = useCallback(async (kind) => {
+  //
+  // NOT useCallback — and do not "restore" the memoization by hoisting this above the early return.
+  // This declaration sits BELOW the `if (!fleet) return <loading/>` guard (~line 947): a hook here
+  // runs only on renders where fleet is loaded, so the first (loading) render runs fewer hooks than
+  // the next and React blanks the whole console — "Rendered more hooks than during the previous
+  // render" (minified #310). Hoisting it above the guard is not a fix either: the dep array would
+  // have to name `project`, which is destructured from `fleet` AFTER that return, so it throws a TDZ
+  // ReferenceError on every render. A stable identity is not worth a blank console — plain function.
+  const handlePlusAction = async (kind) => {
     switch (kind) {
       case 'prompt': setShowDispatch({}); return;
       case 'manager': setShowManagerMint(true); return;
@@ -1237,7 +1243,7 @@ export default function App() {
       }
       default: return;
     }
-  }, [hiveMode, rootWorkItem, project, ctxItemId, projectId, refresh]);
+  };
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
