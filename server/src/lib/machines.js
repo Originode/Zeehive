@@ -436,7 +436,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   // (bootstrapping a project's FIRST dev db: Zeehive's meta-db is stock postgres, and guessing
   // another project's image would stand up a database its dumps can't even restore into).
   const source = await one(
-    `SELECT name, image_tag FROM container
+    `SELECT image_tag FROM container
       WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared'
       ORDER BY (image_tag IS NOT NULL) DESC LIMIT 1`, [projectId]);
   // Consult prod for the IMAGE whenever the dev lineage cannot answer — no shared dev db at all,
@@ -495,9 +495,19 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   // project's OWN db identity instead (omnibiz_db_dev_<machine>), which can never be read as an
   // extension of prod. Bootstrapping from the prod row still borrows its IMAGE (above), never its
   // name.
+  //
+  // NOR by extending the previous DEV sibling's whole name. `${source.name}_${mkey}` re-seeds a
+  // new machine's db from the last sibling's ENTIRE name, so every extra machine appends one more
+  // key onto the one before it (2026-09-07): zeehive_db_dev_mardale_prod →
+  // zeehive_db_dev_mardale_prod_ugreen_nas → …_mardale_prod_ugreen_nas_local, and on a lineage that
+  // had once been bootstrapped from the prod name the polluted root was re-seeded every time too
+  // (omnibiz_db_prod_dev_local_mardale_prod_ugreen_nas_local_mardale_prod). A sibling is
+  // <family root> + THIS machine, and the family root is always the project's own dev identity: a
+  // second machine's db is omnibiz_db_dev_<other machine>, never an extension of the first's.
+  // `source` still hands over its IMAGE (a prod dump needs the custom postgis build); it never
+  // lends its NAME.
   const devLogical = `${sanitizeName(project.name)}_db_dev`;
-  const name = source?.name ? `${source.name}_${mkey}`
-    : prodDb ? `${devLogical}_${mkey}`
+  const name = (source || prodDb) ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
   const host = await machineDbHost(m, project, config);
   const dbUser = project.db_user || config.prodDbUser || 'postgres';
