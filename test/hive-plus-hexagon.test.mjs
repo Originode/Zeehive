@@ -128,11 +128,11 @@ ok(/handlePlusAction/.test(app) && /onPlusAction=\{handlePlusAction\}/.test(app)
    'the canvas is handed the App handler');
 ok(/case 'prompt': setShowDispatch\(\{\}\); return;/.test(app), "'prompt' opens the dispatch composer");
 ok(/case 'manager': setShowManagerMint\(true\); return;/.test(app), "'manager' opens the manager mint");
-ok(/setWorkInitialTab\('tickets'\)/.test(app) && /setShowWork\(true\)/.test(app),
-   "'ticket' opens the work tracker on the TICKETS tab");
+ok(/case 'ticket': setHoneyView\('tickets'\); return;/.test(app),
+   "'ticket' switches the honeycomb pane to the tracker's TICKETS view");
 ok(/showManagerMint && \(\s*<Dispatch manager/.test(app), 'the manager variant renders the Dispatch composer');
-ok(/initialTab=\{workInitialTab\}/.test(app) && /WorkConsole/.test(app),
-   'the tracker receives the forced tab');
+ok(/tab=\{honeyView\}/.test(app) && /WorkConsole/.test(app),
+   'the tracker draws the view the pane is on (the tracker is a pane VIEW now, not a modal)');
 ok(/createWorkItem\(\{ project: projectId \|\| project\?\.id, parent_id: parentId, kind/.test(app),
    'activity/task create through the same createWorkItem verb the board uses');
 ok(/Open a node first/.test(app), '…and refuse with a sentence when no node is open');

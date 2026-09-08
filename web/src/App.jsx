@@ -55,7 +55,7 @@ import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 // a zee's badge: the AI PROVIDER's coin, wearing its harness (the honeycomb draws the same thing)
 import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
-import WorkConsole from './work/WorkConsole.jsx';
+import WorkConsole, { WORK_VIEWS } from './work/WorkConsole.jsx';
 // The ⛑ MEDIC BAY — medics have no xell, so they appear in NO xell-shaped surface (not the
 // snapshot, not the honeycomb, not the pool). This is their separate UI (docs/medic-meta-plane-plan.md §5).
 import MedicBay from './MedicBay.jsx';
@@ -67,6 +67,15 @@ import Toasts from './Toasts.jsx';
 import { findProject, formatPath, legacyProjectParam, parsePath, pathSegments, resolveNodes } from './route.js';
 
 const PROJECT_KEY = 'zeehive.project';
+
+// THE HONEYCOMB PANE'S VIEWS — the honeycomb itself, then the work tracker's own views, taken from
+// the tracker rather than retyped here (WORK_VIEWS in web/src/work/WorkConsole.jsx). A selector on
+// the pane switches between them, which is why the tracker is no longer a modal: the plan and the
+// hive are two ways of looking at the same work, so they share a pane instead of covering it.
+const HONEY_VIEW_KEY = 'zeehive.honey.view';
+const HONEY_VIEWS = [{ id: 'hive', label: '⬢ honeycomb', title: 'the fleet: one hexagon per xell' },
+                     ...WORK_VIEWS];
+const HONEY_VIEW_IDS = HONEY_VIEWS.map((v) => v.id);
 
 // Display only — the DB role is still 'webapp'. "App" is what the thing IS; "webapp" was naming
 // its delivery mechanism, which is the least interesting fact about it.
@@ -251,8 +260,16 @@ export default function App() {
   // without flipping the truthy check.)
   const [showDispatch, setShowDispatch] = useState(false);
   const [showManagerMint, setShowManagerMint] = useState(false); // the Dispatch manager-variant, from the + hexagon
-  const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
-  const [workInitialTab, setWorkInitialTab] = useState(null); // force a tracker tab when opened from the + hexagon
+  // WHICH VIEW the honeycomb pane is drawing: the hive itself, or one of the work tracker's views
+  // (tickets · reflections · board · timeline). The tracker used to be a full-screen modal you left
+  // the fleet view to visit; it is a VIEW OF THE SAME PANE now, picked with the selector drawn on
+  // it, so the plan and the hive are two ways of looking at one thing rather than two places.
+  // Persisted, because "which view I work in" is a preference, not a per-visit decision.
+  const [honeyView, setHoneyView] = useState(() => {
+    try { const v = localStorage.getItem(HONEY_VIEW_KEY); return HONEY_VIEW_IDS.includes(v) ? v : 'hive'; }
+    catch { return 'hive'; }
+  });
+  useEffect(() => { try { localStorage.setItem(HONEY_VIEW_KEY, honeyView); } catch { /* private mode */ } }, [honeyView]);
   // ── a NESTED project being onboarded from the + hexagon (project inside this project's tree) ──
   // { parent_id, parent_name, parent_repo_root } — the CreateForm confines its folder picker to the
   // parent's repo_root and forces the git-behavior choice. null = the plain "+ add provider" setup.
@@ -1210,7 +1227,9 @@ export default function App() {
     switch (kind) {
       case 'prompt': setShowDispatch({}); return;
       case 'manager': setShowManagerMint(true); return;
-      case 'ticket': setWorkInitialTab('tickets'); setShowWork(true); return;
+      // the + hexagon's TICKET option switches the pane to the tracker's TICKETS view — the menu
+      // asks for the ticket composer, so it names the view rather than "wherever you left it".
+      case 'ticket': setHoneyView('tickets'); return;
       case 'project': {
         // Inside a project (hiveMode 'nodes') the new project is NESTED — confine its folder to the
         // parent's repo_root and force the git-behavior choice. At the top level it is a plain new
@@ -1459,8 +1478,22 @@ export default function App() {
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey" style={split != null ? { flex: `${split} 1 0` } : undefined}>
+        {/* THE VIEW SELECTOR — what this pane draws: the honeycomb, or one of the work tracker's
+            views over the same plan (tickets · reflections · board · timeline). The tracker used to
+            be a full-screen modal; a modal made the plan somewhere you GO, and the honeycomb is the
+            plan with zees standing on it. Floats over the pane exactly like the breadcrumb, so the
+            canvas geometry (absolute, inset 0) is untouched. */}
+        <div className="hive-views" data-testid="hive-views">
+          {HONEY_VIEWS.map((v) => (
+            <button key={v.id} className={`hive-view${honeyView === v.id ? ' on' : ''}`}
+                    data-testid={`hive-view-${v.id}`} title={v.title}
+                    onClick={() => setHoneyView(v.id)}>{v.label}</button>
+          ))}
+        </div>
         {/* the LEVEL breadcrumb: where in the work-node tree this honeycomb is, and the way back up.
-            Every new prompt is cut under the level you are standing on (parent_work_item). */}
+            Every new prompt is cut under the level you are standing on (parent_work_item). It is the
+            HONEYCOMB's navigation, so it goes with the honeycomb. */}
+        {honeyView === 'hive' && (
         <div className="hive-crumbs">
           <button className={`hive-crumb${hiveMode === 'projects' ? ' on' : ''}`}
                   onClick={() => { setHiveMode('projects'); setExpandedId(null); }}>⬢ projects</button>
@@ -1480,6 +1513,16 @@ export default function App() {
             </>
           )}
         </div>
+        )}
+        {/* THE WORK TRACKER, in the pane rather than over it. Mounted only for a work view: the
+            honeycomb's canvas and this share one pane, and a tracker kept alive behind the canvas
+            would keep polling a screen nobody is looking at. */}
+        {honeyView !== 'hive' && (
+          <WorkConsole projectId={projectId || project.id} projectName={project.name}
+                       tab={honeyView} onTabChange={setHoneyView}
+                       onClose={() => setHoneyView('hive')} />
+        )}
+        {honeyView === 'hive' && (
         <HiveCanvas xells={hiveCells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
@@ -1494,6 +1537,7 @@ export default function App() {
                     onQueenzeeTerminal={openQueenzeeTerminal}
                     qzTerminalStatus={qzTerminal.status}
                     onQueenzeeLogs={() => setShowTerm(true)} />
+        )}
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
@@ -1589,10 +1633,15 @@ export default function App() {
                  projectId={projectId || project?.id || null}
                  onXourceChanged={refresh} />
 
-      <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
-                  hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
-                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
-                  hoverRef={hoverRef} subscribeHover={subscribeHover} showHarness={showHarness} />
+      {/* The wires bridge a commit dot on the graph to its HEXAGON, so they only mean anything while
+          the honeycomb is the pane's view: hexPosRef keeps the last positions after the canvas
+          unmounts, and drawing to them would hang wires over the board. */}
+      {honeyView === 'hive' && (
+        <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
+                    hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
+                    expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                    hoverRef={hoverRef} subscribeHover={subscribeHover} showHarness={showHarness} />
+      )}
 
       <section className="hive-pane panels" style={split != null ? { flex: `${1 - split} 1 0` } : undefined}>
       <div className="content">
@@ -1793,12 +1842,9 @@ export default function App() {
             composer reads them itself. */}
         <AddManagerButton projectId={projectId || project.id} projectName={project.name}
                           onAdded={refresh} />
-        {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it. It sits with the
-            prompt button because it is the other half of the same question: the prompt button
-            starts work, this is where the work being done is decided and tracked. It opens as a
-            portalled overlay (no router in this console), so nothing else on this page moves. */}
-        <button className="work-btn-open" data-testid="work-btn" title="Open the work tracker — tickets, board, timeline"
-                onClick={() => setShowWork(true)}>▦ work</button>
+        {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it — is NOT a button
+            here anymore: it is a VIEW of the honeycomb pane, picked with the selector drawn on that
+            pane (data-testid="hive-view-board"). One door, where the work is shown. */}
         {/* DELIVERY TELEMETRY — the same altitude as the work tracker, and the other half of the
             same question: the tracker says what work exists, this says how that work is actually
             going (cycle time, rework, what dies, what a landing costs, how long a human takes).
@@ -1926,13 +1972,6 @@ export default function App() {
                       medicEmergency={medicEmergency}
                       onClose={() => { setShowSetup(false); setNestedProject(null); setSetupCreate(false); }}
                       onChanged={refresh} onSelect={(id) => selectProject(id)} />
-      )}
-      {/* the WORK TRACKER, opened from the toolbar OR the + hexagon's TICKET option. The + menu
-          forces the Tickets tab (workInitialTab); the toolbar keeps the last-used tab. */}
-      {showWork && (
-        <WorkConsole projectId={projectId || project.id} projectName={project.name}
-                     initialTab={workInitialTab}
-                     onClose={() => { setShowWork(false); setWorkInitialTab(null); }} />
       )}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}

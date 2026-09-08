@@ -60,13 +60,26 @@ for (const f of FILES) {
   ok(/\/\/ [^\n]{40,}/.test(head), `${f} opens with a WHY comment`);
 }
 
-// ── 2. App.jsx wires it up (import AND render), plus the button ──
+// ── 2. App.jsx wires it up (import AND render), plus the view selector ──
+// The tracker is no longer a modal behind a toolbar button: it is a VIEW of the honeycomb pane,
+// chosen with the selector drawn on that pane. So the wiring to guard is the selector — one button
+// per view, the tracker mounted only when a work view is picked, and the view handed in as `tab`.
 const app = read('web/src/App.jsx');
-ok(/import\s+WorkConsole\s+from\s+['"]\.\/work\/WorkConsole\.jsx['"]/.test(app), 'App.jsx imports WorkConsole');
+ok(/import\s+WorkConsole(\s*,\s*\{[^}]*\})?\s+from\s+['"]\.\/work\/WorkConsole\.jsx['"]/.test(app),
+   'App.jsx imports WorkConsole');
 ok(/<WorkConsole[\s/>]/.test(app), 'App.jsx RENDERS <WorkConsole> (an import nothing renders is the old bug)');
-ok(/data-testid="work-btn"/.test(app), 'App.jsx has the ▦ work button (data-testid="work-btn")');
 ok(/projectId=\{[^}]*\}[\s\S]{0,120}projectName=/.test(app.slice(app.indexOf('<WorkConsole'))),
    'the console is given projectId + projectName');
+ok(/tab=\{honeyView\}/.test(app) && /onTabChange=\{setHoneyView\}/.test(app),
+   'which view is showing is the PANE\'s state, handed in (tab) and reported back (onTabChange)');
+ok(/data-testid="hive-views"/.test(app) && /data-testid=\{`hive-view-\$\{v\.id\}`\}/.test(app),
+   'App.jsx draws the view selector on the honeycomb pane (data-testid="hive-view-<id>")');
+ok(/import\s+WorkConsole\s*,\s*\{\s*WORK_VIEWS\s*\}/.test(app) && /\.\.\.WORK_VIEWS/.test(app),
+   'the selector reads the tracker\'s OWN view list (WORK_VIEWS) — not a second copy of it');
+ok(/honeyView !== 'hive'/.test(app) && /honeyView === 'hive'/.test(app),
+   'the honeycomb canvas and the tracker share the pane — exactly one of them is mounted');
+ok(!/work-btn/.test(app) && !/work-overlay/.test(read('web/src/work/WorkConsole.jsx')),
+   'the old modal door is gone (no ▦ work button, no overlay) — the selector is the one door');
 
 // ── the STREAM seam: `work` must be a type the live stream listens for ──
 // subscribe() went WebSocket-first (docs/live-stream-websocket-decision-record.md): the event-type

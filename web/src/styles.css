@@ -2041,6 +2041,23 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-crumbs .hive-crumb:hover { color: #e6ebf2; border-color: #7f95c2; }
 .hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
+/* ── the pane's VIEW SELECTOR (honeycomb · tickets · reflections · board · timeline) ───────────
+   Top-RIGHT, opposite the breadcrumb and in the same chip language, floating over the pane so the
+   honeycomb canvas (absolute, inset 0) keeps every pixel it had. A work view fills the same pane
+   and keeps the RIGHT half of its head row empty, so these chips land in that strip rather than on
+   top of anything (see the WORK TRACKER section below). */
+.hive-views {
+  position: absolute; top: 8px; right: 10px; z-index: 6;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end;
+  max-width: calc(100% - 20px);
+}
+.hive-views .hive-view {
+  background: rgba(22, 27, 36, 0.88); color: #8b97a8;
+  border: 1px solid #2a3242; border-radius: 12px;
+  font: 600 11px 'Segoe UI', sans-serif; padding: 3px 10px; cursor: pointer; white-space: nowrap;
+}
+.hive-views .hive-view:hover { color: #e6ebf2; border-color: #7f95c2; }
+.hive-views .hive-view.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-pane.panels { flex: 2 1 0; overflow: auto; }
 
 /* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
@@ -2712,27 +2729,23 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
    orange/red = touching something irreversible, grey = closed).
    ═══════════════════════════════════════════════════════════════════════════════════════════ */
 
-/* the button in the status line that opens it */
-.work-btn-open { margin-left: 12px; background: var(--panel2); border: 1px solid var(--line);
-  color: var(--text); font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
-.work-btn-open:hover { border-color: var(--accent); color: var(--accent); }
-
-/* ── the overlay shell ─────────────────────────────────────────────────────── */
-.work-overlay { position: fixed; inset: 0; z-index: 70; background: rgba(6,8,12,.72);
-  display: flex; padding: 26px; }
+/* ── the shell, INSIDE the honeycomb pane ──────────────────────────────────────
+   Not an overlay: the tracker is a VIEW of that pane now (App.jsx's view selector), so it fills the
+   pane the way the canvas does — absolute, inset 0 — with the top strip left clear for the floating
+   selector and breadcrumb chips. `padding-right` keeps the head's scope chip from sliding under the
+   selector, which sits at the pane's top-right. */
+.work-embed { position: absolute; inset: 0; display: flex; overflow: hidden; }
 .work-shell { flex: 1; min-width: 0; display: flex; flex-direction: column;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
-  box-shadow: 0 24px 70px rgba(0,0,0,.6); overflow: hidden; }
-.work-head { display: flex; align-items: center; gap: 14px; padding: 10px 14px;
-  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto; }
-.work-h-title { font-size: 15px; letter-spacing: .02em; }
-.work-tabs { display: flex; gap: 4px; }
-.work-tab { background: none; border: 1px solid transparent; color: var(--muted); font-size: 13px;
-  padding: 4px 14px; border-radius: 7px; cursor: pointer; }
-.work-tab:hover { color: var(--text); }
-.work-tab.on { color: var(--accent); border-color: var(--accent); background: rgba(91,140,255,.10); }
-.work-scope { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  background: var(--bg); overflow: hidden; }
+/* The head keeps its RIGHT half empty on purpose: that is where the pane's view selector floats,
+   and the head is exactly tall enough to read as the strip those chips sit in. */
+.work-head { display: flex; align-items: center; gap: 14px; padding: 7px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto; min-height: 34px; }
+.work-h-title { font-size: 13.5px; letter-spacing: .02em; }
+.work-scope { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px;
+  min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; max-width: 45%; }
 .work-scope b { color: var(--text); }
+/* the ✕ on the tracker's own inner panels (the drawer, a ticket, a gantt bar's detail) */
 .work-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer; padding: 2px 6px; }
 .work-x:hover { color: var(--text); }
 .work-main { flex: 1 1 auto; min-height: 0; display: flex; }
