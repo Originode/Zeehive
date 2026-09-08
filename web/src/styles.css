@@ -2731,9 +2731,9 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 
 /* ── the shell, INSIDE the honeycomb pane ──────────────────────────────────────
    Not an overlay: the tracker is a VIEW of that pane now (App.jsx's view selector), so it fills the
-   pane the way the canvas does — absolute, inset 0 — with the top strip left clear for the floating
-   selector and breadcrumb chips. `padding-right` keeps the head's scope chip from sliding under the
-   selector, which sits at the pane's top-right. */
+   pane the way the canvas does — absolute, inset 0. Its head row is the strip the pane's view
+   selector floats in (top-right), which is why everything in the head stays LEFT: the right half of
+   that row belongs to the chips. */
 .work-embed { position: absolute; inset: 0; display: flex; overflow: hidden; }
 .work-shell { flex: 1; min-width: 0; display: flex; flex-direction: column;
   background: var(--bg); overflow: hidden; }

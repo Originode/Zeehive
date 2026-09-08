@@ -235,12 +235,13 @@ const smoke = async () => {
       contents: `
         const React = require('react');
         const { renderToString } = require('react-dom/server');
+        const WorkConsole = require('./WorkConsole.jsx').default;
         const Board = require('./Board.jsx').default;
         const Tickets = require('./Tickets.jsx').default;
         const Gantt = require('./Gantt.jsx').default;
         const Drawer = require('./WorkItemDrawer.jsx').default;
         const DeployZee = require('./DeployZee.jsx').default;
-        module.exports = { React, renderToString, Board, Tickets, Gantt, Drawer, DeployZee };
+        module.exports = { React, renderToString, WorkConsole, Board, Tickets, Gantt, Drawer, DeployZee };
       `,
       resolveDir: resolve(here, '..', 'web/src/work'),
       loader: 'js',
@@ -255,6 +256,10 @@ const smoke = async () => {
   const statuses = [...server].map((key, i) => ({ key, label: key, order: i, terminal: false }));
   globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '[]' });
   const html = [
+    // The console SHELL itself, which only became renderable here when it stopped being a portal:
+    // it is an ordinary child of the honeycomb pane now, so a first-paint crash in it fails here.
+    renderToString(React.createElement(screens.WorkConsole,
+      { projectId: 'p', projectName: 'a project', tab: 'board', onTabChange: () => {}, onClose: () => {} })),
     renderToString(React.createElement(screens.Board, { projectId: 'p', rootId: null, statuses })),
     renderToString(React.createElement(screens.Tickets, { projectId: 'p', statuses, kinds: ['bug'] })),
     renderToString(React.createElement(screens.Gantt, { projectId: 'p', rootId: null })),

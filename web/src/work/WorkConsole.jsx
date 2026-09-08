@@ -59,7 +59,6 @@ export const WORK_VIEWS = [
   { id: 'board', label: '▦ board', title: 'the plan as a kanban board' },
   { id: 'timeline', label: '▤ timeline', title: 'the plan as a gantt timeline' },
 ];
-export const WORK_VIEW_IDS = WORK_VIEWS.map((v) => v.id);
 
 export default function WorkConsole({ projectId, projectName, tab, onTabChange, onClose }) {
   const [vocab, setVocab] = useState({ statuses: [], itemKinds: [], ticketKinds: [] });
