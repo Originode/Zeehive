@@ -19,6 +19,12 @@
 //      that medic and marked 'attended' (the warm resume itself is the driver's business; this test
 //      asserts the row routing, not the model turn).
 process.env.MEDICRW_MODE = 'real';
+// The dispatch route is gated by requireQueenzeeLoops — only the process holding the single-queenzee
+// lock drives a spawn. config.js loads .zeehive.env at import (an API-only cxell projects
+// QUEENZEE_INPROC=false there), but dotenv never overrides a key already in the environment — so set
+// it TRUE here, before the pool import that loads config, to mount the route the way the real
+// queenzee would. (Same convention as test/medic-dispatch-seam.test.mjs.)
+process.env.QUEENZEE_INPROC = 'true';
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
 
@@ -87,6 +93,9 @@ try {
   await q(`UPDATE xell SET preflight_error=$2 WHERE id=$1`,
           [xell.id, 'db preflight failed: could not connect to shared dev db']);
   await insCondition(project.id, 'PROVISION-INFRA: no shared dev db for this project on this machine');
+  // A GENERAL impediment — NOT a proof-routing fault card. The conditions list on a live project is
+  // mostly these; they must not ride a medic call as "provision fault card" evidence.
+  await insCondition(project.id, 'grok auth is down — the console login flow is degraded');
 
   // ── 1. evidence — the SAME fleet trusts, collected server-side ─────────────
   console.log('\n── evidence: the recorded facts, stamped at call time ──');
@@ -97,6 +106,27 @@ try {
      'the failing db preflight (xell.preflight_error) is the db-preflight trust');
   ok(evidence.some((e) => e.trust === 'condition' && /PROVISION-INFRA/.test(e.detail)),
      'a live provision fault card is folded in (the brief a medic would be handed)');
+  ok(!evidence.some((e) => e.trust === 'condition' && /grok auth/.test(e.detail)),
+     'a NON-PROVISION-INFRA condition (a general impediment) is NOT folded in as evidence');
+
+  // ── 1b. empty evidence: no infra facts → the honest advice fires ───────────
+  console.log('\n── empty evidence: no infra facts on the xell → the plain "no evidence" advice ──');
+  // A FRESH project with NO fault cards and NO preflight/proof errors (its own project, so the
+  // PROVISION-INFRA card on `project` above is not in scope) — but WITH a general impediment, to
+  // prove even that does not manufacture evidence for a xell that has none.
+  const plainProject = { id: await insProject(`mc-plain-p-${tag}`) };
+  const plain = await insXell(plainProject.id, `mc-plain-x-${tag}`);
+  await insCondition(plainProject.id, 'grok auth is down — the console login flow is degraded');
+  const plainEv = await collectCallEvidence(plain);
+  ok(Array.isArray(plainEv) && plainEv.length === 0,
+     `a xell with no infra facts has ${plainEv.length} evidence items (its project\'s general impediment is not evidence)`);
+  const rPlain = await raiseMedicCall({ xell: plain, reason: 'pool stopped filling — is the dev db down?',
+                                        kind: 'db', zeeId: null });
+  ok(rPlain.ok === true && rPlain.routed === 'raised', 'a raise with no evidence still routes raised');
+  ok(rPlain.evidence === 0, 'the raise answer reports evidence.length 0');
+  ok(/No infra evidence was found on this xell/.test(rPlain.message)
+     && /`zee tend`/.test(rPlain.message),
+     'the raise answer carries the empty-evidence advice (own code/test fault is `zee tend`, not a medic)');
 
   // ── 2. raise with NO live medic → 'raised' ─────────────────────────────────
   console.log('\n── raise: no live medic → an OPEN call (a human dispatches; nothing auto-spawns) ──');

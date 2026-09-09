@@ -17,6 +17,11 @@
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { broadcast } from './events.js';
+// The INFRA card marker, imported from proof-routing.js — the ONE source of truth for what a
+// provision fault card looks like. collectCallEvidence folds in ONLY cards carrying this marker;
+// the project_conditions list on a live project also carries general impediments (grok auth, an
+// a2a boundary, an address…), and those are NOT infra evidence a medic should be briefed with.
+import { INFRA_MARK } from './proof-routing.js';
 
 export const MEDIC_CALL_KINDS = ['db', 'build', 'provision', 'network', 'other'];
 export const MEDIC_CALL_STATUSES = ['open', 'attended', 'resolved', 'declined', 'withdrawn'];
@@ -67,11 +72,17 @@ export async function collectCallEvidence(xell) {
                              || c.name });
   }
   if (projectId) {
-    const cards = await q(
+    // Fold in ONLY the FAULT cards — the project_conditions list on a live project is mostly
+    // general impediments (grok auth, an a2a boundary, an address…), and those are not infra a
+    // medic should be briefed with. proof-routing raises fault cards with INFRA_MARK; matched here
+    // in JS (the same fetch-and-match discipline proof-routing uses, so the marker lives once) and
+    // capped at the call-time briefing width of 5.
+    const rows = await q(
       `SELECT id, body FROM project_condition
-        WHERE project_id=$1 AND body NOT LIKE 'main does not build since%'
-        ORDER BY created_at DESC LIMIT 5`, [projectId]);
-    for (const card of cards) {
+        WHERE project_id=$1
+        ORDER BY created_at DESC LIMIT 25`, [projectId]);
+    const faultCards = rows.filter((r) => INFRA_MARK.test(r.body)).slice(0, 5);
+    for (const card of faultCards) {
       evidence.push({ trust: 'condition', label: 'provision fault card',
                       detail: String(card.body).slice(0, 500) });
     }
