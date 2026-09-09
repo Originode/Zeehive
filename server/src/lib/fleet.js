@@ -620,6 +620,7 @@ export async function getFleet(projectId) {
          LEFT JOIN zee z ON z.id = mc.zee_id
          LEFT JOIN medic m ON m.id = mc.medic_id
         WHERE mc.project_id=$1
+          AND x.status NOT IN ('ready','retired','tearing-down')
           AND (mc.status='open'
                OR (mc.status='attended' AND (mc.medic_id IS NULL OR m.status IS NULL
                                              OR m.status NOT IN ('diagnosing','acting','awaiting-human','worker-dispatched'))))

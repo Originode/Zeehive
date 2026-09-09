@@ -26,8 +26,10 @@ import { INFRA_MARK } from './proof-routing.js';
 export const MEDIC_CALL_KINDS = ['db', 'build', 'provision', 'network', 'other'];
 export const MEDIC_CALL_STATUSES = ['open', 'attended', 'resolved', 'declined', 'withdrawn'];
 // A medic that is ATTENDING a project — the attach target. Terminal medic statuses mean the project
-// has no live medic, so a call must RAISE rather than attach to a corpse.
-const LIVE_MEDIC_STATUSES = ['diagnosing', 'acting', 'awaiting-human', 'worker-dispatched'];
+// has no live medic, so a call must RAISE rather than attach to a corpse. Exported so the dispatch
+// route and the tools read the SAME live-set: a call whose medic is no longer live is dispatchable
+// again, never stranded behind an errored/retired medic (SHOULD-5).
+export const MEDIC_LIVE_STATUSES = ['diagnosing', 'acting', 'awaiting-human', 'worker-dispatched'];
 
 const liveZeeOf = (xellId) => one(
   `SELECT id, name FROM zee WHERE xell_id=$1
@@ -98,14 +100,15 @@ export async function liveMedicForProject(projectId) {
        FROM medic m JOIN project p ON p.id = m.target_project_id
       WHERE m.target_project_id=$1 AND m.status = ANY($2::text[])
       ORDER BY m.created_at DESC LIMIT 1`,
-    [projectId, LIVE_MEDIC_STATUSES]);
+    [projectId, MEDIC_LIVE_STATUSES]);
 }
 
 // ── the text the medic receives ─────────────────────────────────────────────────────────────────
 // ATTACH: the medic is already warm (same medic, same project) — the message is the call verbatim
 // plus the evidence, so it re-engages with the zee's actual words rather than the original card.
 export function buildCallAttachMessage(call, xellSlug = null) {
-  const lines = [`A BLOCKED ZEE CALLED FOR YOU on ${xellSlug || 'this project'} (${call.kind}):`,
+  const lines = [`A BLOCKED ZEE CALLED FOR YOU on ${xellSlug || 'this project'} (${call.kind}).`,
+                 `Call id: ${call.id}`,
                  '', String(call.reason || ''), '',
                  'Evidence stamped at call time:',
                  ...formatEvidence(call.evidence),
@@ -120,6 +123,7 @@ export function buildCallAttachMessage(call, xellSlug = null) {
 // built FROM THE CALL, not from a condition line.
 export function buildCallDispatchBrief(call, xellSlug = null) {
   const lines = ['A BLOCKED ZEE CALLED FOR A MEDIC — attend the CALL (not a condition card).',
+                 `Call id: ${call.id}`,
                  '',
                  `The zee on ${xellSlug || 'this project'} says (kind: ${call.kind}):`,
                  '',
@@ -157,28 +161,29 @@ export async function raiseMedicCall({ xell, reason = null, kind = 'other', zeeI
   const zid = zeeId || await liveZeeForCall(xell.id);
   const evidence = await collectCallEvidence(xell);
 
-  // The live call lane for THIS xell (one per xell — the rate limit).
-  const existing = await one(
-    `SELECT * FROM medic_call WHERE xell_id=$1 AND status IN ('open','attended')`, [xell.id]);
   // The live medic attending THIS project, if any.
   const medic = await liveMedicForProject(xell.project_id);
 
-  // ATTACH — a live medic is attending the project.
+  // ATTACH — a live medic is attending the project. ONE LIVE CALL PER XELL is the rate limit and it
+  // is the partial unique index (xell_id WHERE status IN ('open','attended')), so the write is an
+  // INSERT … ON CONFLICT DO UPDATE — idempotent against a concurrent raise that got there first
+  // (SHOULD-3). There is deliberately no read-then-write race here: the index IS the lock.
   if (medic) {
-    const call = existing
-      ? await one(
-          `UPDATE medic_call SET kind=$2, reason=$3, evidence=$4::jsonb, status='attended',
-                  medic_id=$5, zee_id=$6, resolution=NULL, updated_at=now()
-           WHERE id=$1 RETURNING *`,
-          [existing.id, k, why.slice(0, 20000), JSON.stringify(evidence), medic.id, zid])
-      : await one(
-          `INSERT INTO medic_call (project_id, xell_id, zee_id, kind, reason, evidence, status, medic_id)
-           VALUES ($1,$2,$3,$4,$5,$6::jsonb,'attended',$7) RETURNING *`,
-          [xell.project_id, xell.id, zid, k, why.slice(0, 20000), JSON.stringify(evidence), medic.id]);
+    const call = await one(
+      `INSERT INTO medic_call (project_id, xell_id, zee_id, kind, reason, evidence, status, medic_id)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,'attended',$7)
+       ON CONFLICT (xell_id) WHERE status IN ('open','attended')
+       DO UPDATE SET kind=EXCLUDED.kind, reason=EXCLUDED.reason, evidence=EXCLUDED.evidence,
+                     status='attended', medic_id=EXCLUDED.medic_id, zee_id=EXCLUDED.zee_id,
+                     resolution=NULL, updated_at=now()
+       RETURNING *`,
+      [xell.project_id, xell.id, zid, k, why.slice(0, 20000), JSON.stringify(evidence), medic.id]);
     broadcast('medic-call', call);
     logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} ATTACHED to medic ${String(medic.id).slice(0, 8)}`);
     // Resume that medic with the call verbatim + evidence, in the background. The driver owns the
-    // medic turn; an attach error lands on the medic row ('errored') like any resume failure.
+    // medic turn; an attach error lands on the medic row ('errored') like any resume failure. The
+    // call is re-dispatchable if that happens — the dispatch route treats an attended call whose
+    // medic is no longer LIVE as open again (SHOULD-5).
     const { resumeMedic } = await import('../queenzee/medic-spawn.js');
     const msg = buildCallAttachMessage(call, xell.slug);
     resumeMedic(medic.id, { message: msg }).catch((e) => {
@@ -192,34 +197,23 @@ export async function raiseMedicCall({ xell, reason = null, kind = 'other', zeeI
     };
   }
 
-  // RAISE — no live medic. A stale 'attended' row whose medic is gone is re-raised (back to open).
-  if (existing) {
-    const call = await one(
-      `UPDATE medic_call SET kind=$2, reason=$3, evidence=$4::jsonb,
-              status = CASE WHEN status = 'attended' THEN 'open' ELSE status END,
-              medic_id = CASE WHEN status = 'attended' THEN NULL ELSE medic_id END,
-              zee_id=$5, resolution=NULL, updated_at=now()
-       WHERE id=$1 RETURNING *`,
-      [existing.id, k, why.slice(0, 20000), JSON.stringify(evidence), zid]);
-    broadcast('medic-call', call);
-    logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} RE-RAISED (open)`);
-    return {
-      ok: true, routed: 'raised', call_id: call.id, evidence: evidence.length,
-      message: `Your medic call is on record (${call.status}). No live medic is attending this `
-        + 'project, so it now shows as a CALLED emergency in the console ⛑ — a human dispatches; '
-        + 'nothing auto-spawns. ' + adviceForEvidence(evidence),
-    };
-  }
-
+  // RAISE — no live medic. A stale 'attended' row whose medic is gone is re-raised (back to open,
+  // medic cleared) by the same ON CONFLICT DO UPDATE; a concurrent raise on an already-open row
+  // UPDATES it in place instead of racing the partial index.
   const call = await one(
-    `INSERT INTO medic_call (project_id, xell_id, zee_id, kind, reason, evidence)
-     VALUES ($1,$2,$3,$4,$5,$6::jsonb) RETURNING *`,
+    `INSERT INTO medic_call (project_id, xell_id, zee_id, kind, reason, evidence, status)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,'open')
+     ON CONFLICT (xell_id) WHERE status IN ('open','attended')
+     DO UPDATE SET kind=EXCLUDED.kind, reason=EXCLUDED.reason, evidence=EXCLUDED.evidence,
+                   status='open', medic_id=NULL, zee_id=EXCLUDED.zee_id,
+                   resolution=NULL, updated_at=now()
+     RETURNING *`,
     [xell.project_id, xell.id, zid, k, why.slice(0, 20000), JSON.stringify(evidence)]);
   broadcast('medic-call', call);
-  logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} RAISED (${k})`);
+  logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} RAISED/RE-RAISED (open)`);
   return {
     ok: true, routed: 'raised', call_id: call.id, evidence: evidence.length,
-    message: 'Your medic call is recorded. No live medic is attending this project, so it now shows '
+    message: 'Your medic call is on record. No live medic is attending this project, so it now shows '
       + 'as a CALLED emergency in the console ⛑ naming your zee — a human dispatches a medic from '
       + 'the call; NOTHING auto-spawns. ' + adviceForEvidence(evidence),
   };
@@ -272,6 +266,11 @@ export async function withdrawMedicCall(xellId, { by = null } = {}) {
 // withdrawn calls are history and do not nag.
 export async function listProjectMedicCalls(projectId, { liveOnly = true } = {}) {
   if (liveOnly) {
+    // The live-only EMERGENCY feed: OPEN calls (awaiting a human dispatch) plus ATTENDED calls whose
+    // medic is no longer LIVE (the emergency is real again). A retired/tearing-down/ready xell's stale
+    // CALLED row is NOT an emergency (a dead xell cannot be blocked) — it is filtered here so it stops
+    // nagging the ⛑ bar (SHOULD-4). The live-status set is bound from MEDIC_LIVE_STATUSES, the SAME
+    // one source the dispatch route and the attach path read.
     return q(
       `SELECT mc.*, x.slug AS xell_slug, z.name AS zee_name, m.status AS medic_status
          FROM medic_call mc
@@ -279,10 +278,11 @@ export async function listProjectMedicCalls(projectId, { liveOnly = true } = {})
          LEFT JOIN zee z ON z.id = mc.zee_id
          LEFT JOIN medic m ON m.id = mc.medic_id
         WHERE mc.project_id=$1
+          AND x.status NOT IN ('ready','retired','tearing-down')
           AND (mc.status='open'
                OR (mc.status='attended' AND (mc.medic_id IS NULL OR m.status IS NULL
-                                             OR m.status NOT IN ('diagnosing','acting','awaiting-human','worker-dispatched'))))
-        ORDER BY mc.created_at DESC`, [projectId]);
+                                             OR NOT (m.status = ANY($2::text[])))))
+        ORDER BY mc.created_at DESC`, [projectId, MEDIC_LIVE_STATUSES]);
   }
   return q(
     `SELECT mc.*, x.slug AS xell_slug, z.name AS zee_name, m.status AS medic_status

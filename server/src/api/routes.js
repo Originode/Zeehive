@@ -773,15 +773,21 @@ router.post('/medic-calls/:callId/dispatch', requireQueenzeeLoops, async (req, r
     const g = await refuseWorkerZeeToken(req);
     if (g) return res.status(403).json(g);
     const { dispatchMedic } = await import('../queenzee/medic-spawn.js');
-    const { readMedicCall, buildCallDispatchBrief } = await import('../lib/medic-calls.js');
+    const { readMedicCall, buildCallDispatchBrief, MEDIC_LIVE_STATUSES } =
+      await import('../lib/medic-calls.js');
     const call = await readMedicCall(req.params.callId);
     if (!call) return res.status(404).json({ error: 'no such medic call' });
-    if (call.status === 'attended') {
+    const medicLive = call.medic_status && MEDIC_LIVE_STATUSES.includes(call.medic_status);
+    if (call.status === 'attended' && medicLive) {
       return res.status(400).json({ error: 'this call is already attended — the medic is in the Bay' });
     }
-    if (call.status !== 'open') {
-      return res.status(400).json({ error: `this call is ${call.status} — only an OPEN call can be dispatched` });
+    if (!['open', 'attended'].includes(call.status)) {
+      return res.status(400).json({ error: `this call is ${call.status} — only an OPEN call (or an `
+        + `attended call whose medic is no longer LIVE) can be dispatched` });
     }
+    // An ATTENDED call whose medic is no longer LIVE is dispatchable again — a failed attach-resume
+    // leaves the call 'attended' against an errored medic, and that must not strand the emergency
+    // (SHOULD-5). The UPDATE below re-links the call to the fresh medic and keeps status 'attended'.
     const task = buildCallDispatchBrief(call, call.xell_slug);
     const out = await dispatchMedic({ targetProjectId: call.project_id, task });
     const updated = await one(

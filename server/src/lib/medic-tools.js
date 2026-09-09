@@ -398,15 +398,31 @@ export const MEDIC_TOOLS = {
   },
   calls: {
     name: 'calls',
-    description: 'List the open/attended MEDIC CALLS on the TARGET project (defaults to the one you '
-      + 'were dispatched for): each carries the blocked zee\'s OWN WORDS, its kind, its xell slug and '
-      + 'the infra evidence stamped at call time. A call is a blocked zee asking for YOU — read this '
-      + 'before or after diagnosing, and ANSWER an attended call with call_answer.',
+    description: 'List the OPEN medic calls on the TARGET project (defaults to the one you were '
+      + 'dispatched for) PLUS the calls YOU are attending: each carries the blocked zee\'s OWN WORDS, '
+      + 'its kind, its xell slug, its CALL ID and the infra evidence stamped at call time. A call is a '
+      + 'blocked zee asking for YOU — read this before or after diagnosing, and ANSWER an attended '
+      + 'call with call_answer.',
     schema: { type: 'object', properties: { project: { type: 'string' } }, required: [] },
     run: async (medic, args) => {
-      const { listProjectMedicCalls } = await import('./medic-calls.js');
+      const { listProjectMedicCalls, listMedicAttendedCalls } = await import('./medic-calls.js');
       const target = targetOf(medic, args);
-      const calls = await listProjectMedicCalls(target, { liveOnly: true });
+      // TWO reads, never a widened emergency filter: the project's live-only emergency feed (OPEN
+      // calls + attended calls whose medic is no longer LIVE) AND the medic's OWN attended calls.
+      // The feed EXCLUDES an attended call whose medic IS live by design — it is being handled — so
+      // without the second read a medic could never discover the very call it is attending
+      // (BLOCKING-1). Merge + dedupe on id.
+      const [projectCalls, mine] = await Promise.all([
+        listProjectMedicCalls(target, { liveOnly: true }),
+        medic?.id ? listMedicAttendedCalls(medic.id) : Promise.resolve([]),
+      ]);
+      const seen = new Set();
+      const calls = [];
+      for (const c of [...projectCalls, ...mine]) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        calls.push(c);
+      }
       return { ok: true, calls: calls.map((c) => ({
         id: c.id, xell_slug: c.xell_slug, zee_name: c.zee_name || null, kind: c.kind,
         reason: c.reason, status: c.status, evidence: c.evidence,

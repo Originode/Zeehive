@@ -80,6 +80,10 @@ ok(!/GRANT[^;]*ON xell TO/i.test(sql) && !/GRANT[^;]*ON zee TO/i.test(sql),
    'the mint SQL grants nothing on xell/zee (reading is the blanket SELECT, never a write grant)');
 ok(!MEDIC_WRITE_TABLES.container?.includes('DELETE'), 'container has no DELETE (the reaper act)');
 ok(MEDIC_NO_WRITE_TABLES.includes('medic_action'), 'the audit ledger is on the no-write list');
+// BLOCKING-2: medic_call is NOT in the table-wide write surface (a bare UPDATE on any call row would
+// bypass answerMedicCall's row guard) and IS on the no-write list so the REVOKE half is explicit.
+ok(!MEDIC_WRITE_TABLES.medic_call, 'medic_call is NOT in the table-wide write surface (row-scoped call_answer is the only door)');
+ok(MEDIC_NO_WRITE_TABLES.includes('medic_call'), 'medic_call is on the no-write list (the REVOKE half is explicit)');
 await owner.query(sql);
 const post = await owner.query(`SELECT 1 FROM pg_roles WHERE rolname=$1`, [MEDIC_ROLE]);
 ok(post.rows.length === 1, 'the role exists after the mint');
@@ -105,6 +109,7 @@ for (const [q, label] of [
   ["INSERT INTO medic_action (medic_id, tool, statement) VALUES (gen_random_uuid(), 'x', 'x')", 'INSERT INTO medic_action (forging a receipt)'],
   ['UPDATE zee SET status=status WHERE false', 'UPDATE zee'],
   ['UPDATE medic SET status=status WHERE false', 'UPDATE medic (its own row!)'],
+  ['UPDATE medic_call SET status=status WHERE false', 'UPDATE medic_call (BLOCKING-2 — no table-wide grant; call_answer is row-scoped on the owner pool)'],
   ["INSERT INTO land_request (xell_id) VALUES (NULL)", 'INSERT INTO land_request (a gate)'],
   ['UPDATE harness SET key=key WHERE false', 'UPDATE harness (no self-grant)'],
 ]) {

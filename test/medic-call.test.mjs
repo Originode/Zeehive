@@ -35,6 +35,7 @@ const { mintXellToken } = await import('../server/src/lib/xell-token.js');
 const {
   raiseMedicCall, collectCallEvidence, readMedicCallForXell,
   listProjectMedicCalls, withdrawMedicCall, answerMedicCall,
+  buildCallAttachMessage, buildCallDispatchBrief,
 } = await import('../server/src/lib/medic-calls.js');
 
 let fail = 0;
@@ -220,6 +221,14 @@ try {
   ok(c4 && c4.status === 'attended' && c4.medic_id === medicLive.id,
      'the live call is attended, linked to the live medic (the emergency is being handled)');
   ok((await countLive(xell.id)).n === 1, 'still one live call — attach updated the same row');
+  // BLOCKING-1: a medic can never discover the call it is attending if neither brief carries the
+  // call id — the attach resume and the dispatch brief must both name it.
+  const attachMsg = buildCallAttachMessage(c4, xell.slug);
+  ok(attachMsg.includes(String(c4.id)),
+     'the attach resume message names the CALL ID (the medic knows which call to answer)');
+  const dispatchBrief = buildCallDispatchBrief(c4, xell.slug);
+  ok(dispatchBrief.includes(String(c4.id)),
+     'the human-dispatch brief names the CALL ID (the dispatched medic knows which call it is on)');
   // The exclusion assertion needs a medic that STAYS live: the background resume above has no
   // provider creds on this sandbox, so it may error medicLive moments after the attach. Re-point
   // the call at the never-resumed live `medic` row from section 6 and re-assert the list logic.
@@ -229,6 +238,42 @@ try {
   const attendedList = await listProjectMedicCalls(project.id, { liveOnly: true });
   ok(!attendedList.some((c) => c.id === c4.id),
      'an ATTENDED call whose medic is live does not nag the live-only emergency list');
+  // BLOCKING-1 (the tool side): the live-only feed EXCLUDES an attended call whose medic is live BY
+  // DESIGN — so a medic that only read that feed could never discover the very call it is attending.
+  // The calls tool must ALSO return the medic's OWN attended calls (a separate read, never by
+  // widening the emergency filter). `medic` is the live medic now holding c4.
+  const { runMedicTool } = await import('../server/src/lib/medic-tools.js');
+  const ownCalls = JSON.parse(await runMedicTool(medic, { name: 'calls', args: {} }));
+  ok(ownCalls.ok === true && (ownCalls.calls || []).some((c) => c.id === c4.id),
+     'the attending medic\'s calls tool returns the call it is ATTENDING (the loop closes)');
+
+  // ── 7b. SHOULD-3: concurrent raises race the partial unique index ──────────
+  console.log('\n── concurrent raises: idempotent against the one-live-call-per-xell index ──');
+  const concProject = { id: await insProject(`mc-conc-p-${tag}`) };
+  const concXell = await insXell(concProject.id, `mc-conc-${tag}`);
+  const concurrency = await Promise.allSettled([
+    raiseMedicCall({ xell: concXell, reason: 'concurrent raise one', kind: 'db', zeeId: null }),
+    raiseMedicCall({ xell: concXell, reason: 'concurrent raise two', kind: 'build', zeeId: null }),
+  ]);
+  ok(concurrency.every((r) => r.status === 'fulfilled'),
+     'both concurrent raises SETTLE (neither rejects with a unique-violation)');
+  const concValues = concurrency.map((r) => (r.status === 'fulfilled' ? r.value : null));
+  ok(concValues.every((v) => v && v.ok) && new Set(concValues.map((v) => v?.call_id)).size === 1,
+     'both concurrent raises land on the SAME live call id (one live call per xell held)');
+  ok((await countLive(concXell.id)).n === 1, 'exactly one live call row survives the concurrency');
+
+  // ── 7c. SHOULD-4: a retired xell's stale CALLED row does not nag the ⛑ bar ──
+  console.log('\n── dead xells: a retired xell\'s open call does not nag the emergency list ──');
+  const deadProject = { id: await insProject(`mc-dead-p-${tag}`) };
+  const deadXell = await insXell(deadProject.id, `mc-dead-${tag}`);
+  await q(`UPDATE xell SET status='retired' WHERE id=$1`, [deadXell.id]);
+  const deadCall = await raiseMedicCall({ xell: deadXell, reason: 'stale call after retirement',
+                                          kind: 'other', zeeId: null });
+  ok(deadCall.ok === true && deadCall.routed === 'raised',
+     'a retired xell raising still records (the row is history)');
+  const deadList = await listProjectMedicCalls(deadProject.id, { liveOnly: true });
+  ok(!deadList.some((c) => c.id === deadCall.call_id),
+     'the retired xell\'s OPEN call is NOT in the live-only emergency feed');
 
   // ── 8. the ROUTES over real HTTP (a fresh project with NO live medic) ──────
   console.log('\n── the routes: zee medic (token-scoped), console list + dispatch (real HTTP) ──');
@@ -267,6 +312,23 @@ try {
   const dispatched = await one(`SELECT status, medic_id FROM medic_call WHERE id=$1`, [raised.call_id]);
   ok(dispatched.status === 'attended' && dispatched.medic_id !== null,
      'the dispatched call is ATTENDED and linked to the medic (the Bay will show it)');
+  // SHOULD-5: a failed attach-resume leaves the call 'attended' against an ERRORED medic — the
+  // dispatch route must not strand the emergency behind that status; an attended call whose medic is
+  // no longer LIVE is dispatchable again (a fresh medic is dispatched).
+  await q(`UPDATE medic SET status='errored' WHERE id=$1`, [dispatchBody.medic_id]);
+  const reDispatchRes = await post(`/medic-calls/${raised.call_id}/dispatch`, {},
+                                   { 'content-type': 'application/json' });
+  const reDispatchBody = await reDispatchRes.json();
+  ok(reDispatchRes.status === 200 && !!reDispatchBody.medic_id
+     && reDispatchBody.medic_id !== dispatchBody.medic_id,
+     'an ATTENDED call whose medic ERRORED is dispatchable again (a fresh medic is dispatched)');
+
+  // ── 9. BLOCKING-2 (doc half): the infra-medic manual documents calls/call_answer ──
+  console.log('\n── the infra-medic manual documents calls/call_answer (house rule 9, by migration) ──');
+  const man = await one(`SELECT harness_memory_get('infra-medic','memory/infra-medic-manual.md') AS manual`);
+  ok(!!man && !!man.manual && /call_answer/.test(man.manual) && /calls/.test(man.manual)
+     && /medic_call.*REFUSE|REFUSE.*medic_call/s.test(man.manual),
+     'the infra-medic manual (harness memory) names calls + call_answer and puts medic_call on the REFUSE list');
 } catch (e) {
   console.error('UNCAUGHT', e);
   fail++;
