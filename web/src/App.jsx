@@ -8,7 +8,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
          routePrompt, deployRouter, redeployRouter, addManagerZee,
          squashHelps, squashOffer,
-         dispatchMedic, listMedics } from './api.js';
+         dispatchMedic, dispatchMedicFromCall, listMedics } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 // the ONE place the gateway-health state becomes words ("gateway unreachable at <addr>") — same
 // vocabulary in every surface, tested in plain node (web/src/gatewayHealth.js)
@@ -734,6 +734,28 @@ export default function App() {
     }
   }, [pushToast, updateToast, dismissToast, refresh]);
 
+  // Dispatch a medic from a CALLED emergency (medic_call, 251): the medic is briefed FROM THE CALL —
+  // the blocked zee's own words + the evidence stamped at call time — and the call is linked and
+  // marked attended. Same progress-toast contract as the condition dispatch.
+  const handleDispatchCall = useCallback(async (call) => {
+    const id = `medic-call-${call?.call_id || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: '⛑ Dispatching the medic…',
+      body: `A meta-plane medic, briefed from ${call?.slug || 'the call'}'s own words — no xell, no cage.` });
+    try {
+      const r = await dispatchMedicFromCall(call?.call_id);
+      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Medic attending from the call',
+        body: 'attending in the ⛑ Medic Bay — its answer goes back to the calling zee as a message.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 9000);
+      return r;
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Medic dispatch refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
+      throw e;
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
   // ── GitHub outbound (push / open PR) ───────────────────────────────────────
   // Same flow as ProjectSetup's BasicsSection — confirm, call API, report the outcome.
   const doGitHubPush = useCallback(async () => {
@@ -1040,6 +1062,9 @@ export default function App() {
   // follow-up directive). With this empty, conditions render as INFORMATION (the editor keeps its
   // list) and no medic button appears anywhere.
   const medicEmergency = fleetMatchesSelection ? (fleet.medic_emergency || []) : [];
+  // CALLED emergencies (medic_call, 251) — the subset of medicEmergency where a zee called in its
+  // own words (source 'called'). These brief a medic FROM THE CALL, so they need no condition line.
+  const calledCalls = medicEmergency.filter((e) => e.source === 'called');
   // No per-xell project filter here, and no teardown either: the fleet stream, the fleet snapshot
   // and the SSE updates are all scoped to ONE project on the server (`WHERE x.project_id = $1`), so
   // a xell that reaches this render path is this project's by construction. What a project SWITCH
@@ -1868,13 +1893,15 @@ export default function App() {
                    blockers={projectBlockers} blockersProjectName={project?.name || ''}
                    medicEmergency={medicEmergency}
                    onDispatchMedic={handleDispatchMedic}
+                   calls={calledCalls} onDispatchCall={handleDispatchCall}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       {/* THE MEDIC BAY — its own surface, directly under the needs-you bar (the two answer the same
           question: what is waiting on a human). Medics are NOT xells, so they are in no snapshot and
           no honeycomb; the Bay reads /api/medics itself and hides entirely when no medic exists.
           Clicking a dispatched worker jumps to that worker's REAL hexagon. */}
-      <MedicBay medics={medics} onChanged={loadMedics} bump={medicRev} onOpenXell={setExpandedId} />
+      <MedicBay medics={medics} onChanged={loadMedics} bump={medicRev} onOpenXell={setExpandedId}
+                calls={calledCalls} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
 
@@ -2168,7 +2195,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
                        prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {},
                        blockers = [], blockersProjectName = '', medicEmergency = [],
-                       onDispatchMedic = null }) {
+                       onDispatchMedic = null, calls = [], onDispatchCall = null }) {
   // A PROJECT's blockers are a decision on the bar WITHOUT a xell to key it on — the pool stopped
   // filling the pair, so there may be no waiting xell at all (which is exactly why this needed a
   // line of its own). They get a sibling open state and their own dispatch spinner, not the
@@ -2176,6 +2203,10 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
   const [blockersOpen, setBlockersOpen] = useState(false);
   const [dispatching, setDispatching] = useState(null);
   const projectLabel = blockersProjectName || 'this project';
+  // A CALLED medic call is an emergency even with no condition blockers (medic_call, 251): the
+  // server folds it into fleet.medic_emergency as source:'called', and the bar must show it with a
+  // dispatch button — a human dispatches; nothing auto-spawns.
+  const calledCalls = medicEmergency.filter((e) => e.source === 'called');
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -2226,7 +2257,7 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
       // without breaking anything real. Order in a sum is arbitrary; that assertion is not.
       n: held + prs + tend + bind + seed + doneSug + blocked + envAlert };
   }).filter((w) => w.n > 0);
-  if (!waiting.length && !blockers.length) return null;
+  if (!waiting.length && !blockers.length && !calledCalls.length) return null;
 
   const go = (id) => { setBlockersOpen(false); onJump?.(id === expandedId ? null : id); };  // click the open one again to collapse
   const open = waiting.find((w) => w.x.id === expandedId);
@@ -2237,6 +2268,14 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
     if (!onDispatchMedic || dispatching) return;
     setDispatching(c.id);
     try { await onDispatchMedic(c); }
+    catch { /* the dispatcher's error toast already told the human why */ }
+    finally { setDispatching(null); }
+  };
+  // A CALLED emergency dispatches FROM THE CALL (brief = the zee's own words + evidence).
+  const dispatchCallOne = async (c) => {
+    if (!onDispatchCall || dispatching) return;
+    setDispatching(c.id);
+    try { await onDispatchCall(c); }
     catch { /* the dispatcher's error toast already told the human why */ }
     finally { setDispatching(null); }
   };
@@ -2256,18 +2295,19 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
         {/* THE MEDIC EMERGENCY — FIRST, ahead of every xell. The medic is EMERGENCY RESPONSE, so
             this chip (and the ⛑ dispatch buttons behind it) render ONLY while a LIVE ZEE is
             actually blocked by an infra fault (fleet.medic_emergency — failing db preflight,
-            failing provision proof, or an INFRA-classed build failure). The conditions list alone
-            is NOT a reason to render it: a condition is information, and a bar full of
-            ticket-shaped medic cards trains eyes to skip the one that is a real emergency (the
-            follow-up directive, 2026-09-02). A dispatch still needs a condition LINE to brief the
-            medic with, so the chip waits for both; a blocked zee with no line shows its fault on
-            its own hexagon's chips either way. */}
-        {medicEmergency.length > 0 && blockers.length > 0 && (
+            failing provision proof, an INFRA-classed build failure) OR a zee CALLED for a medic in
+            its own words (medic_call, 251 — source 'called', an emergency by definition). The
+            conditions list alone is NOT a reason to render it: a condition is information, and a
+            bar full of ticket-shaped medic cards trains eyes to skip the one that is a real
+            emergency (the follow-up directive, 2026-09-02). An infra dispatch still needs a
+            condition LINE to brief the medic with; a CALLED emergency briefs the medic from the
+            call, so no condition line is needed for it. */}
+        {medicEmergency.length > 0 && (blockers.length > 0 || calledCalls.length > 0) && (
           <button key="__proj-blockers__" className={`ny-chip proj${blockersOpen ? ' active' : ''}`}
                   onClick={() => { setBlockersOpen((v) => !v); if (expandedId) onJump?.(null); }}
-                  title={`${medicEmergency.length} zee(s) on ${projectLabel} are BLOCKED by an infra fault (${medicEmergency.map((e) => e.slug).join(', ')}). Click to review and ⛑ dispatch a medic (a meta-plane loop, not a xell).`}>
+                  title={`${medicEmergency.length} zee(s) on ${projectLabel} need the ⛑ medic (${medicEmergency.map((e) => e.slug).join(', ')}). Click to review and dispatch a medic (a meta-plane loop, not a xell).`}>
             ⚠ {projectLabel}
-            <span className="ny-n">{medicEmergency.length} zee{medicEmergency.length === 1 ? '' : 's'} blocked · ⛑ medic</span>
+            <span className="ny-n">{medicEmergency.length} zee{medicEmergency.length === 1 ? '' : 's'} · ⛑ medic</span>
           </button>
         )}
         {waiting.map((w) => (
@@ -2338,16 +2378,45 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
             ))}
           </div>
           <div className="ny-note" data-testid="ny-medic-note">
-            The zee{medicEmergency.length === 1 ? ' above is' : 's above are'} <b>blocked by an infra
-            fault</b> on <b>{projectLabel}</b> — this is the medic&apos;s emergency. The <b>⛑ medic</b>
-            {' '}is <b>not a zee in a xell</b>: it is a loop on the <b>meta plane</b> (the queenzee&apos;s own
-            process — no worktree, no cage, no land gate). Briefed with the line verbatim and this project
-            as its target, it reads the <b>whole meta-DB</b>, <b>writes this project&apos;s config rows</b>
-            {' '}— machines, pools, manifest cache, shared dev db — on a GRANT-scoped postgres role, and
-            dispatches a real Zeehive worker only when the fix needs <b>code</b>. It sees Zeehive&apos;s source
-            read-only and never touches another project&apos;s code. {' '}<span className="ny-why">Nothing
-            auto-spawns — watch it in the ⛑ Medic Bay; delete the line once it confirms the pair builds again.</span>
+            {calledCalls.length > 0
+              ? <>The zee{calledCalls.length === 1 ? ' above' : 's above'} <b>called the ⛑ medic in its own
+                  words</b> on <b>{projectLabel}</b> — a CALLED emergency, an emergency by definition. The
+                  <b> ⛑ medic</b> is <b>not a zee in a xell</b>: a loop on the <b>meta plane</b> (no worktree,
+                  no cage, no land gate). Dispatching from a call briefs it <b>from the call</b> (the zee&apos;s
+                  own words + the infra evidence stamped at call time). <span className="ny-why">Nothing
+                  auto-spawns — a human dispatches; the answer goes back to the calling zee as a message.</span></>
+              : <>The zee{medicEmergency.length === 1 ? ' above is' : 's above are'} <b>blocked by an infra
+                  fault</b> on <b>{projectLabel}</b> — this is the medic&apos;s emergency. The <b>⛑ medic</b>
+                  {' '}is <b>not a zee in a xell</b>: it is a loop on the <b>meta plane</b> (the queenzee&apos;s own
+                  process — no worktree, no cage, no land gate). Briefed with the line verbatim and this project
+                  as its target, it reads the <b>whole meta-DB</b>, <b>writes this project&apos;s config rows</b>
+                  {' '}— machines, pools, manifest cache, shared dev db — on a GRANT-scoped postgres role, and
+                  dispatches a real Zeehive worker only when the fix needs <b>code</b>. It sees Zeehive&apos;s source
+                  read-only and never touches another project&apos;s code. <span className="ny-why">Nothing
+                  auto-spawns — watch it in the ⛑ Medic Bay; delete the line once it confirms the pair builds again.</span></>}
           </div>
+          {calledCalls.map((c) => (
+            <div key={c.call_id} className="ny-blocker ny-called" data-testid={`ny-called-${c.call_id}`}>
+              <div className="ny-blocker-head">
+                <span className="ny-blocker-date">[<b>{String(c.created_at || '').slice(0, 10)}</b>]</span>
+                <b>⛑ {c.slug}</b>{c.zee_name ? ` (${c.zee_name})` : ''}
+                <span className="pc"> · {c.kind || 'other'} call{Array.isArray(c.evidence) && c.evidence.length ? ` · ${c.evidence.length} evidence item${c.evidence.length === 1 ? '' : 's'}` : ' · no infra evidence'}</span>
+                <button type="button" className="pill" disabled={!!dispatching}
+                        onClick={() => dispatchCallOne(c)}
+                        title="Dispatch the medic FROM THE CALL (the zee's own words + evidence brief the loop). Nothing auto-spawns — this click is the dispatch.">
+                  {dispatching === c.call_id ? '⛑ dispatching…' : '⛑ Dispatch medic'}
+                </button>
+              </div>
+              <div className="ny-blocker-body">{c.reason}</div>
+              {Array.isArray(c.evidence) && c.evidence.length > 0 && (
+                <div className="ny-called-evidence">
+                  {c.evidence.map((ev, i) => (
+                    <div key={i} className="ny-called-ev">[{ev.trust}] {ev.label}: {String(ev.detail || '').slice(0, 300)}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
           {blockers.map((c) => (
             <div key={c.id} className="ny-blocker" data-testid={`ny-blocker-${c.id}`}>
               <div className="ny-blocker-head">

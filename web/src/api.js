@@ -462,6 +462,12 @@ export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditi
 // and, on the rollback value, the superseded manager-zee. The receipt says which: { plane:'meta',
 // medic_id } or { plane:'manager-zee', slug, … }. The BUTTON does not move; only what answers it.
 export const dispatchMedic = (condId) => siteCall(`/api/project-conditions/${condId}/dispatch-medic`, 'POST');
+// Dispatch the medic from a CALLED emergency (medic_call, 251): briefs the new medic FROM THE CALL
+// (the blocked zee's own words + evidence), links call.medic_id and marks it attended.
+export const dispatchMedicFromCall = (callId) => siteCall(`/api/medic-calls/${callId}/dispatch`, 'POST');
+// Read a project's live medic calls (open + orphaned-attended) — the console's ⛑ panel feed.
+export const getMedicCalls = (projectId) => fetch(`/api/medic-calls?project=${encodeURIComponent(projectId)}`)
+  .then((r) => (r.ok ? r.json() : { ok: true, calls: [] }));
 
 // ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) — medics are NOT xells, so they appear in
 // NO xell-shaped read model: not the fleet snapshot, not the honeycomb, not the pool. These four

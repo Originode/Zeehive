@@ -603,9 +603,43 @@ export async function getFleet(projectId) {
         : x.proof_error ? `provision proof failing: ${x.proof_error}`
           : infraBuild ? `build failed [infra] on ${infraBuild.role || infraBuild.name}: ${String(infraBuild.last_build_error || '').split('\n').filter(Boolean).slice(-1)[0] || 'see the container card'}`
             : null;
-      return why ? { xell_id: x.id, slug: x.slug, zee_name: x.zee_name || null, why: String(why).slice(0, 300) } : null;
+      return why ? { source: 'infra', xell_id: x.id, slug: x.slug, zee_name: x.zee_name || null, why: String(why).slice(0, 300) } : null;
     })
     .filter(Boolean);
+
+  // A CALLED medic call (251) IS an emergency by definition — a blocked zee reached for the ⛑ in
+  // its own words. Fold those in: an OPEN call (awaiting a human dispatch) always shows, and an
+  // ATTENDED call shows too while its medic is no longer LIVE (the medic retired/converged/errored
+  // — the emergency is real again). A called xell SUPERSEDES its infra-derived row (same xell_id):
+  // the zee's own words are what a human should read first.
+  {
+    const calls = await q(
+      `SELECT mc.*, x.slug AS xell_slug, z.name AS zee_name, m.status AS medic_status
+         FROM medic_call mc
+         JOIN xell x ON x.id = mc.xell_id
+         LEFT JOIN zee z ON z.id = mc.zee_id
+         LEFT JOIN medic m ON m.id = mc.medic_id
+        WHERE mc.project_id=$1
+          AND (mc.status='open'
+               OR (mc.status='attended' AND (mc.medic_id IS NULL OR m.status IS NULL
+                                             OR m.status NOT IN ('diagnosing','acting','awaiting-human','worker-dispatched'))))
+        ORDER BY mc.created_at DESC`, [pid]);
+    if (calls.length) {
+      const byXell = new Map();
+      for (const e of medic_emergency) if (e.source !== 'called') byXell.set(e.xell_id, e);
+      for (const c of calls) {
+        byXell.set(c.xell_id, {
+          source: 'called', call_id: c.id, xell_id: c.xell_id, slug: c.xell_slug,
+          zee_name: c.zee_name || null, kind: c.kind, reason: c.reason,
+          evidence: c.evidence, call_status: c.status, medic_id: c.medic_id || null,
+          created_at: c.created_at,
+          why: `medic call [${c.kind}] from ${c.xell_slug}: ${String(c.reason || '').slice(0, 300)}`,
+        });
+      }
+      medic_emergency.length = 0;
+      medic_emergency.push(...byXell.values());
+    }
+  }
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell

@@ -56,7 +56,7 @@ function MedicHex({ medic, active, onClick }) {
   );
 }
 
-export default function MedicBay({ medics = [], onChanged, bump = 0, onOpenXell = null }) {
+export default function MedicBay({ medics = [], onChanged, bump = 0, onOpenXell = null, calls = [] }) {
   const [openId, setOpenId] = useState(null);
   const [detail, setDetail] = useState(null);
   const [tab, setTab] = useState('ledger');
@@ -104,6 +104,12 @@ export default function MedicBay({ medics = [], onChanged, bump = 0, onOpenXell 
         <span className="medic-bay-t">⛑ Medic Bay</span>
         <span className="medic-bay-n">{medics.length} medic{medics.length === 1 ? '' : 's'}</span>
         {asking > 0 && <span className="medic-bay-ask">· {asking} waiting on you</span>}
+        {calls.length > 0 && (
+          <span className="medic-bay-ask" data-testid="medic-bay-called"
+                title={calls.map((c) => `${c.slug}: ${c.reason}`).join('\n\n')}>
+            · {calls.length} CALLED zee{calls.length === 1 ? '' : 's'} await dispatch (⛑ on the needs-you bar)
+          </span>
+        )}
         <span className="medic-bay-note"
               title={'A medic is not a zee in a xell: it runs on the meta plane (the queenzee\'s own '
                 + 'process), reads the whole meta-DB, writes config rows on a GRANT-scoped postgres '
@@ -215,6 +221,20 @@ export default function MedicBay({ medics = [], onChanged, bump = 0, onOpenXell 
                   <span key={c.id} className={`medic-card${c.status === 'pending' ? ' pending' : ''}`}>
                     {c.kind} — {c.status}
                     {c.status === 'pending' && <span className="medic-gate"> · a human decides, not the medic</span>}
+                  </span>
+                ))}
+              </div>
+            )}
+            {(open.calls || []).length > 0 && (
+              <div className="medic-calls">
+                <span className="medic-note">calls {open.medic.target_project_name ? 'this medic answers' : ''}:</span>
+                {open.calls.map((c) => (
+                  <span key={c.id} className={`medic-call${c.status === 'attended' ? ' attended' : ''}`}
+                        title={`${c.xell_slug || c.xell_id} · ${c.kind}: ${c.reason || ''}\n${c.resolution || ''}`}>
+                    ⛑ {c.xell_slug || String(c.xell_id).slice(0, 8)}
+                    {c.zee_name ? ` (${c.zee_name})` : ''} — {c.kind}: {c.reason || '(no reason)'}
+                    <span className="medic-gate"> · {c.status}</span>
+                    {c.resolution && <span className="medic-call-res"> → {c.resolution}</span>}
                   </span>
                 ))}
               </div>

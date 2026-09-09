@@ -101,7 +101,16 @@ export async function medicDetail(medicId) {
     `SELECT w.id, w.title, w.status, w.xell_id, x.slug AS xell_slug
        FROM work_item w LEFT JOIN xell x ON x.id = w.xell_id
       WHERE w.created_by = $1 ORDER BY w.created_at DESC`, [`medic:${String(medicId).slice(0, 8)}`]);
-  return { medic, actions, transcript, cards, workers };
+  // The medic CALLS this medic is attending (251) — the patient-voice asks it answered or is on.
+  const calls = await q(
+    `SELECT mc.id, mc.xell_id, mc.kind, mc.reason, mc.evidence, mc.status, mc.resolution,
+            mc.created_at, mc.updated_at, x.slug AS xell_slug, z.name AS zee_name
+       FROM medic_call mc
+       JOIN xell x ON x.id = mc.xell_id
+       LEFT JOIN zee z ON z.id = mc.zee_id
+      WHERE mc.medic_id=$1 AND mc.status IN ('open','attended','resolved','declined')
+      ORDER BY mc.updated_at DESC`, [medicId]);
+  return { medic, actions, transcript, cards, workers, calls };
 }
 
 // ── the audit ledger (OWNER pool — see the header) ───────────────────────────────────────────────

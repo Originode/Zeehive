@@ -396,6 +396,44 @@ export const MEDIC_TOOLS = {
       return { ok: true, message: reason };
     },
   },
+  calls: {
+    name: 'calls',
+    description: 'List the open/attended MEDIC CALLS on the TARGET project (defaults to the one you '
+      + 'were dispatched for): each carries the blocked zee\'s OWN WORDS, its kind, its xell slug and '
+      + 'the infra evidence stamped at call time. A call is a blocked zee asking for YOU — read this '
+      + 'before or after diagnosing, and ANSWER an attended call with call_answer.',
+    schema: { type: 'object', properties: { project: { type: 'string' } }, required: [] },
+    run: async (medic, args) => {
+      const { listProjectMedicCalls } = await import('./medic-calls.js');
+      const target = targetOf(medic, args);
+      const calls = await listProjectMedicCalls(target, { liveOnly: true });
+      return { ok: true, calls: calls.map((c) => ({
+        id: c.id, xell_slug: c.xell_slug, zee_name: c.zee_name || null, kind: c.kind,
+        reason: c.reason, status: c.status, evidence: c.evidence,
+        medic_id: c.medic_id || null, created_at: c.created_at, updated_at: c.updated_at,
+      })) };
+    },
+  },
+  call_answer: {
+    name: 'call_answer',
+    description: 'Answer a MEDIC CALL you are ATTENDING: resolve (fixed) or decline (not yours — a '
+      + 'fault in the zee\'s own code/tests is zee tend, not a medic). The NOTE is required and is '
+      + 'POSTED BACK to the calling zee as a message, so say plainly what you found and did. Audited.',
+    schema: { type: 'object', properties: { call: { type: 'string' },
+              decision: { type: 'string', enum: ['resolved', 'declined'] },
+              note: { type: 'string' } }, required: ['call', 'decision', 'note'] },
+    run: async (medic, args) => {
+      const { answerMedicCall } = await import('./medic-calls.js');
+      const actionId = await recordMedicAction(medic.id, { tool: 'call_answer',
+        statement: JSON.stringify({ call: args?.call, decision: args?.decision,
+                                    note: String(args?.note || '').slice(0, 2000) }),
+        tables: ['medic_call'] });
+      const out = await answerMedicCall({ medic, callId: args?.call,
+                                          decision: args?.decision, note: args?.note });
+      await finishMedicAction(actionId, { result: out });
+      return out;
+    },
+  },
 };
 
 export function medicToolList() {

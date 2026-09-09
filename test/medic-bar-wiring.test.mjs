@@ -30,12 +30,20 @@ const css = read('web/src/styles.css');
 console.log('\n── App.jsx imports the dispatcher and RENDERS the bar with the blockers payload ──');
 const imp = app.match(/import\s+([^;]*?)\s+from\s+['"]\.\/api\.js['"]/);
 ok(!!imp && /dispatchMedic/.test(imp[1]), 'App.jsx imports dispatchMedic from ./api.js');
+ok(!!imp && /dispatchMedicFromCall/.test(imp[1]),
+   'App.jsx imports dispatchMedicFromCall from ./api.js (the CALLED-zee dispatch seam, medic_call 251)');
 ok(/<NeedsYouBar[\s\S]*?blockers=\{projectBlockers\}/.test(app),
    'App.jsx renders <NeedsYouBar> with blockers={projectBlockers}');
 ok(/<NeedsYouBar[\s\S]*?onDispatchMedic=\{handleDispatchMedic\}/.test(app),
    '…and an onDispatchMedic handler (a prop nothing passes is the old bug one layer down)');
 ok(/handleDispatchMedic\s*=\s*useCallback[\s\S]*?await\s+dispatchMedic\(/.test(app),
    'the handler actually calls the API seam');
+ok(/<NeedsYouBar[\s\S]*?onDispatchCall=\{handleDispatchCall\}/.test(app),
+   'the bar ALSO gets an onDispatchCall handler for CALLED zees (medic_call 251)');
+ok(/handleDispatchCall\s*=\s*useCallback[\s\S]*?await\s+dispatchMedicFromCall\(/.test(app),
+   'the CALLED-call handler actually calls the dispatchMedicFromCall API seam');
+ok(/<MedicBay[\s\S]*?calls=\{calledCalls\}/.test(app),
+   'App.jsx passes the CALLED calls into the Medic Bay (its header names them)');
 
 console.log('\n── ONE eligibility predicate across the two ⛑ surfaces ──');
 ok(app.includes("startsWith('main does not build since')"),
@@ -63,9 +71,14 @@ ok(/medic_emergency/.test(fleetSrc) && /last_build_error_class === 'infra'/.test
    && /preflight_error/.test(fleetSrc) && /proof_error/.test(fleetSrc),
    'fleet.js computes medic_emergency from live-zee xells with infra evidence (preflight/proof/infra build)');
 ok(/medic_emergency,/.test(fleetSrc), 'the fleet snapshot carries medic_emergency');
+ok(/source: 'called'/.test(fleetSrc) && /FROM medic_call/.test(fleetSrc)
+   && /byXell\.set\(c\.xell_id/.test(fleetSrc),
+   'fleet.js FOLDS medic_call rows (251) into medic_emergency as source:"called", superseding the infra row for the same xell');
 ok(/fleet\.medic_emergency/.test(app), 'App.jsx reads fleet.medic_emergency');
-ok(/medicEmergency\.length > 0 && blockers\.length > 0 &&/.test(app),
-   'the bar CHIP is gated on the emergency (never on the conditions list alone)');
+ok(/medicEmergency\.length > 0 && \(blockers\.length > 0 \|\| calledCalls\.length > 0\) &&/.test(app),
+   'the bar CHIP is gated on the emergency (a condition blocker OR a zee CALLED in — never on a list alone)');
+ok(/const calledCalls = medicEmergency\.filter\(\(e\) => e\.source === 'called'\)/.test(app),
+   'App.jsx derives calledCalls from medicEmergency (source==="called", the medic_call fold-in)');
 ok(/blockersOpen && medicEmergency\.length > 0 &&/.test(app),
    'the opened dispatch panel is gated on the emergency too');
 ok(/<NeedsYouBar[\s\S]*?medicEmergency=\{medicEmergency\}/.test(app),

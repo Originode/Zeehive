@@ -413,6 +413,12 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-blocker-date { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 .ny-blocker-body { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
   line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+/* A CALLED zee (medic_call 251) — the blocker row carries the zee's own words plus the infra
+   evidence stamped at call time, so a human can decide from the row itself. */
+.ny-called-evidence { display: flex; flex-direction: column; gap: 3px; margin-top: 2px;
+  padding-left: 8px; border-left: 1px solid var(--line); }
+.ny-called-ev { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted);
+  white-space: pre-wrap; word-break: break-word; }
 .needsyou .pill { background: rgba(229,85,78,.16); color: var(--text);
   border: 1px solid rgba(229,85,78,.6); border-radius: 5px; font-size: 12px; padding: 3px 9px;
   cursor: pointer; white-space: nowrap; }
@@ -474,9 +480,11 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .medic-msg-role { color: var(--muted); }
 .medic-msg-text { white-space: pre-wrap; word-break: break-word; }
 .medic-msg.user .medic-msg-text { color: var(--muted); }
-.medic-cards, .medic-workers { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
-.medic-card { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.medic-cards, .medic-workers, .medic-calls { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.medic-card, .medic-call { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .medic-card.pending { border-color: rgba(224,161,58,.55); }
+.medic-call.attended { border-color: rgba(234,85,78,.55); }
+.medic-call-res { color: var(--down); }
 .medic-gate { color: var(--muted); }
 .medic-tabs { display: flex; gap: 6px; }
 .medic-tabs .pill { margin-left: 0; }

@@ -51,6 +51,7 @@ export const MEDIC_WRITE_TABLES = {
   deploy_site: ['INSERT', 'UPDATE'],
   project_condition: ['INSERT', 'UPDATE', 'DELETE'],
   build_readiness_record: ['INSERT', 'UPDATE'],
+  medic_call: ['UPDATE'],             // the medic answers (resolve/decline) the calls IT is attending
 };
 
 // project's writable CONFIG columns (column-scoped UPDATE — postgres supports it natively).
