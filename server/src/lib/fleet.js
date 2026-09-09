@@ -16,6 +16,7 @@ import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { listProjectConditions } from './current-conditions.js';
+import { fingerprintMedicText } from './medic-dismissals.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
@@ -607,11 +608,41 @@ export async function getFleet(projectId) {
     })
     .filter(Boolean);
 
+  // A HUMAN CAN SAY NO — the rowless suggestions (the infra rows above, and the condition dispatch
+  // cards below) are dismissed into medic_dismissal, fingerprinted on the exact `why`/body text the
+  // human was shown. The SAME fault stops nagging; a DIFFERENT fault (a changed preflight error, an
+  // edited condition body) has a different fingerprint and raises again by itself. `active` is the
+  // subset of dismissal rows CURRENTLY suppressing a would-be emergency — the console's muted
+  // "N dismissed · UNDO" line is built from it, so an UNDO restores exactly what is hidden.
+  const dismissals = await q(
+    `SELECT * FROM medic_dismissal WHERE project_id=$1 ORDER BY dismissed_at DESC`, [pid]).catch(() => []);
+  const dismissedXellFp = new Map();      // xell_id -> Set(fingerprint)
+  const dismissalByKey = new Map();      // `${target_id}:${fingerprint}` -> row
+  const active = [];
+  for (const d of dismissals) {
+    if (d.target_kind === 'xell') {
+      if (!dismissedXellFp.has(d.target_id)) dismissedXellFp.set(d.target_id, new Set());
+      dismissedXellFp.get(d.target_id).add(d.fingerprint);
+      dismissalByKey.set(`${d.target_id}:${d.fingerprint}`, d);
+    }
+  }
+  for (let i = medic_emergency.length - 1; i >= 0; i--) {
+    const e = medic_emergency[i];
+    if (e.source !== 'infra') continue;
+    const fp = fingerprintMedicText(e.why);
+    if (!dismissedXellFp.get(e.xell_id)?.has(fp)) continue;
+    const d = dismissalByKey.get(`${e.xell_id}:${fp}`);
+    if (d) { d._active = true; active.push(d); }
+    medic_emergency.splice(i, 1);
+  }
+
   // A CALLED medic call (251) IS an emergency by definition — a blocked zee reached for the ⛑ in
   // its own words. Fold those in: an OPEN call (awaiting a human dispatch) always shows, and an
   // ATTENDED call shows too while its medic is no longer LIVE (the medic retired/converged/errored
   // — the emergency is real again). A called xell SUPERSEDES its infra-derived row (same xell_id):
-  // the zee's own words are what a human should read first.
+  // the zee's own words are what a human should read first. A DISMISSED call is a DECLINE
+  // (status='declined', dismissed_at set) — it drops out of this query by construction, and the
+  // calling zee already has the human's note.
   {
     const calls = await q(
       `SELECT mc.*, x.slug AS xell_slug, z.name AS zee_name, m.status AS medic_status
@@ -862,8 +893,29 @@ export async function getFleet(projectId) {
   // fleet snapshot so the console's needs-you surface (a blocked project's ⛑ medic chip — the one
   // thing a provision halt leaves the bar silent about) and the conditions editor read the SAME poll;
   // a condition is a slow-changing fact, and one ≤ CONDITION_LIMIT query on an already-heavy snapshot
-  // is cheaper than a second endpoint the console has to keep in step with.
+  // is cheaper than a second endpoint the console has to keep in step with. A condition whose DISPATCH
+  // a human dismissed (medic_dismissal target_kind='condition', fingerprinted on the body) is removed
+  // from THIS needs-you feed — the conditions EDITOR (ProjectSetup, its own endpoint) still lists the
+  // line; dismissal never deletes a condition.
   const conditions = await listProjectConditions(pid);
+  if (dismissals.some((d) => d.target_kind === 'condition')) {
+    const condFp = new Map();                 // condition_id -> Set(fingerprint)
+    const condByKey = new Map();
+    for (const d of dismissals) {
+      if (d.target_kind !== 'condition') continue;
+      if (!condFp.has(d.target_id)) condFp.set(d.target_id, new Set());
+      condFp.get(d.target_id).add(d.fingerprint);
+      condByKey.set(`${d.target_id}:${d.fingerprint}`, d);
+    }
+    for (let i = conditions.length - 1; i >= 0; i--) {
+      const c = conditions[i];
+      const fp = fingerprintMedicText(String(c.body || ''));
+      if (!condFp.get(c.id)?.has(fp)) continue;
+      const d = condByKey.get(`${c.id}:${fp}`);
+      if (d) { d._active = true; active.push(d); }
+      conditions.splice(i, 1);
+    }
+  }
 
   return {
     project,
@@ -898,6 +950,10 @@ export async function getFleet(projectId) {
     // emergency predicate computed above; empty = the console shows conditions as information,
     // with no medic button anywhere).
     medic_emergency,
+    // The dismissal receipts CURRENTLY suppressing a would-be emergency (a matched infra row or
+    // condition card) — the console's muted "N dismissed · UNDO" line. A row here is the reason an
+    // emergency is NOT on the bar; UNDO deletes it and the emergency raises again.
+    medic_dismissals: active,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,

@@ -332,23 +332,69 @@ export async function answerMedicCall({ medic, callId, decision = 'resolved', no
   broadcast('medic-call', row);
   logline('medic-call', `medic ${String(medic.id).slice(0, 8)} ${d} call ${String(call.id).slice(0, 8)}`);
 
-  // The note goes BACK to the calling zee as a zee_message (kind 'message' — the medic has no xell
-  // id, so from.id is null and the slug names it). Delivery is best-effort like every postMessage.
+  await deliverCallDecision(call, d, text, {
+    fromSlug: `⛑medic:${String(medic.id).slice(0, 8)}`,
+    by: `⛑medic:${String(medic.id).slice(0, 8)}`,
+  });
+  return { ok: true, call_id: call.id, status: d };
+}
+
+// ── the HUMAN declines a CALLED emergency (console Dismiss) ─────────────────────────────────────
+// A third actor beside the medic's own answer and the zee's own retraction: the human who was asked
+// to dispatch a medic says NO. It is a DECLINE, not a hide — a live zee is waiting on the answer, so
+// the note is REQUIRED (it is what the calling zee receives, exactly the answerMedicCall contract)
+// and is POSTED BACK to the calling zee as a zee_message. The row is final history like any decline;
+// a still-blocked zee raises a FRESH call.
+export async function dismissMedicCall({ callId = null, note = null, by = 'human@console' } = {}) {
+  const text = String(note || '').trim();
+  if (!text) {
+    return { ok: false, refused: true,
+             reason: 'a note is required — it is what the calling zee receives (and a declined call must say why)' };
+  }
+  const call = await one(
+    `SELECT mc.*, x.slug AS xell_slug, m.status AS medic_status
+       FROM medic_call mc
+       JOIN xell x ON x.id = mc.xell_id
+       LEFT JOIN medic m ON m.id = mc.medic_id
+      WHERE mc.id=$1`, [callId]);
+  if (!call) return { ok: false, refused: true, reason: 'no such medic call' };
+  if (call.status === 'declined') return { ok: false, refused: true, reason: 'this call is already declined' };
+  if (call.status === 'attended' && call.medic_status && MEDIC_LIVE_STATUSES.includes(call.medic_status)) {
+    return { ok: false, refused: true,
+             reason: 'this call is already being attended in the Medic Bay — it is not nagging the ⛑ bar' };
+  }
+  if (!['open', 'attended'].includes(call.status)) {
+    return { ok: false, refused: true,
+             reason: `this call is ${call.status} — only a live (open/attended) call can be dismissed` };
+  }
+  const row = await one(
+    `UPDATE medic_call SET status='declined', resolution=$2, dismissed_at=now(), dismissed_by=$3, updated_at=now()
+      WHERE id=$1 RETURNING *`,
+    [call.id, text, String(by).slice(0, 200)]);
+  broadcast('medic-call', row);
+  logline('medic-call', `human ${by} DECLINED call ${String(call.id).slice(0, 8)} (dismissed)`);
+
+  await deliverCallDecision(call, 'declined', text, { fromSlug: '⛑human', by });
+  return { ok: true, call_id: row.id, status: 'declined' };
+}
+
+// The note goes BACK to the calling zee as a zee_message (kind 'message' — neither the medic nor a
+// human has an xell id, so from.id is null and the slug names the sender). Delivery is best-effort
+// like every postMessage. Shared by answerMedicCall (the medic's resolve/decline) and
+// dismissMedicCall (the human's decline) so the calling zee reads the SAME shape whoever decided.
+async function deliverCallDecision(call, decision, text, { fromSlug = '⛑medic', by = fromSlug } = {}) {
   try {
     const { postMessage } = await import('./managers.js');
-    const note = `${d === 'resolved'
-      ? `⛑ Your medic call was RESOLVED.`
-      : `⛑ Your medic call was DECLINED.`}\n\n${text}\n\n`
-      + (d === 'declined'
-        ? '(A medic fixes ZEEHIVE config/infra. If the fault is in your own code or tests, that is `zee tend`, not a medic.)'
-        : '');
+    const resolved = decision === 'resolved';
+    const body = `${resolved ? '⛑ Your medic call was RESOLVED.' : '⛑ Your medic call was DECLINED.'}\n\n`
+      + `${String(text || '').trim()}\n\n`
+      + (resolved ? '' : '(A medic fixes ZEEHIVE config/infra. If the fault is in your own code or tests, that is `zee tend`, not a medic.)');
     await postMessage({
-      from: { id: null, slug: `⛑medic:${String(medic.id).slice(0, 8)}`, project_id: call.project_id },
+      from: { id: null, slug: fromSlug, project_id: call.project_id },
       to: { id: call.xell_id, slug: call.xell_slug, project_id: call.project_id },
-      body: note, by: `⛑medic:${String(medic.id).slice(0, 8)}`,
+      body, by,
     });
   } catch (e) {
-    logline('medic-call', `answer delivery to ${call.xell_slug} failed: ${String(e.message).slice(0, 200)}`);
+    logline('medic-call', `resolution delivery to ${call.xell_slug} failed: ${String(e.message).slice(0, 200)}`);
   }
-  return { ok: true, call_id: call.id, status: d };
 }

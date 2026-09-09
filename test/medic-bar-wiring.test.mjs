@@ -45,6 +45,36 @@ ok(/handleDispatchCall\s*=\s*useCallback[\s\S]*?await\s+dispatchMedicFromCall\(/
 ok(/<MedicBay[\s\S]*?calls=\{calledCalls\}/.test(app),
    'App.jsx passes the CALLED calls into the Medic Bay (its header names them)');
 
+console.log('\n── the DISMISS seams are imported and wired (a human can say NO to all three ask-places) ──');
+ok(!!imp && /dismissMedicCall/.test(imp[1]),
+   'App.jsx imports dismissMedicCall from ./api.js (a CALLED zee is declined, not hidden)');
+ok(!!imp && /dismissMedicSuggestion/.test(imp[1]) && /undoMedicDismissal/.test(imp[1]),
+   'App.jsx imports dismissMedicSuggestion + undoMedicDismissal (the rowless suggestions and their way back)');
+ok(/<NeedsYouBar[\s\S]*?medicDismissals=\{medicDismissals\}/.test(app),
+   'App.jsx passes medicDismissals into the bar (the muted "N dismissed · UNDO" line)');
+ok(/<NeedsYouBar[\s\S]*?onDismissMedicCall=\{handleDismissMedicCall\}/.test(app)
+   && /<NeedsYouBar[\s\S]*?onDismissMedicSuggestion=\{handleDismissMedicSuggestion\}/.test(app)
+   && /<NeedsYouBar[\s\S]*?onUndoMedicDismissal=\{handleUndoMedicDismissal\}/.test(app),
+   'the bar gets all three dismiss handlers (call decline, suggestion dismiss, undo)');
+ok(/<ProjectSetup[\s\S]*?medicDismissals=\{medicDismissals\}/.test(app)
+   && /<ProjectSetup[\s\S]*?onDismissMedicSuggestion=\{handleDismissMedicSuggestion\}/.test(app)
+   && /<ProjectSetup[\s\S]*?onUndoMedicDismissal=\{handleUndoMedicDismissal\}/.test(app),
+   'ProjectSetup gets the dismiss props too (its conditions rows carry the same ⛑ buttons)');
+ok(/onDismissMedicCall={handleDismissMedicCall}/.test(app)
+   && /await dismissMedicCall\(/.test(app)
+   && /A note is required/.test(app),
+   'the CALL dismiss handler prompts for a REQUIRED note and calls the decline seam');
+ok(/medicDismissals={medicDismissals}/.test(setup)
+   && /medicEmergency={medicEmergency}/.test(setup)
+   && /onDismissMedicSuggestion=\{onDismissMedicSuggestion\}/.test(setup)
+   && /onUndoMedicDismissal=\{onUndoMedicDismissal\}/.test(setup),
+   'ProjectSetup threads the medic payload + dismiss handlers down to the conditions editor');
+ok(/ConditionsSection\([^)]*medicDismissals/.test(setup),
+   'ConditionsSection accepts medicDismissals (the latent missing-prop bug is closed: medicEmergency reaches the rows)');
+ok(/ny-dismissed/.test(app) && /ny-dismissed/.test(setup) && /ny-dismissed/.test(css),
+   'the muted "N dismissed · UNDO" line renders on BOTH the bar and the conditions editor, and is styled');
+ok(/✕ Decline/.test(app), 'a CALLED card carries a "✕ Decline" control beside its ⛑ Dispatch button');
+
 console.log('\n── ONE eligibility predicate across the two ⛑ surfaces ──');
 ok(app.includes("startsWith('main does not build since')"),
    'the bar filters conditions by the CODE-fact prefix');
@@ -89,6 +119,24 @@ ok(/const showMedic = medicEmergency\.length > 0 &&/.test(setup),
    'the ProjectSetup row button is gated on the SAME emergency fact');
 ok(/medic-gate-note/.test(setup),
    'the conditions editor SAYS why the button is absent (a human who saw it yesterday will hunt for it)');
+
+console.log('\n── the SERVER carries the dismissal surface (fleet + role wall + routes) ──');
+const routesSrc = read('server/src/api/routes.js');
+const roleSrc = read('server/src/lib/medic-role.js');
+const dismissLib = read('server/src/lib/medic-dismissals.js');
+ok(/medic_dismissals: active/.test(fleetSrc),
+   'the fleet snapshot returns medic_dismissals (the muted UNDO line\'s payload)');
+ok(/medic_dismissal/.test(fleetSrc) && /fingerprintMedicText/.test(fleetSrc),
+   'fleet.js filters dismissed infra rows and condition cards by fingerprint');
+ok(/'medic_dismissal'/.test(roleSrc),
+   'the medic role gets NO write on medic_dismissal (MEDIC_NO_WRITE_TABLES — a HUMAN\'s verb on the owner pool)');
+ok(/router\.post\('\/medic-calls\/:callId\/dismiss'/.test(routesSrc)
+   && /router\.post\('\/medic-dismissals'/.test(routesSrc)
+   && /router\.delete\('\/medic-dismissals\/:id'/.test(routesSrc),
+   'routes.js exposes the three dismissal routes (call decline, suggestion store, undo)');
+ok(/export function fingerprintMedicText/.test(dismissLib)
+   && /ON CONFLICT \(project_id, target_kind, target_id, fingerprint\)/.test(dismissLib),
+   'medic-dismissals.js fingerprints the shown text and upserts per target (no timers — the fingerprint IS the expiry)');
 
 console.log(fail ? `\n${fail} FAILURE(S)\n` : '\nall good\n');
 process.exit(fail ? 1 : 0);

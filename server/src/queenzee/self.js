@@ -1382,10 +1382,23 @@ export async function selfMedicCall(xell, { reason = null, kind = null, clear = 
   }
   if (status) {
     const row = await readMedicCallForXell(xell.id);
-    return { ok: true, call: row, message: row
-      ? `Your medic call is ${row.status}${row.medic_id ? ` (medic ${String(row.medic_id).slice(0, 8)})` : ''} — `
-        + `"${row.reason}"`.slice(0, 500)
-      : 'No medic call on record for this xell.' };
+    if (!row) return { ok: true, call: null, message: 'No medic call on record for this xell.' };
+    const lines = [`Your medic call is ${row.status}${row.medic_id ? ` (medic ${String(row.medic_id).slice(0, 8)})` : ''} — `,
+                   `"${row.reason}"`];
+    // A DECLINED call (the medic declined it with call_answer, OR a HUMAN dismissed it) always says
+    // WHY: the resolution note is exactly what the calling zee receives, and a zee reading its own
+    // status later must not have to guess whether the decline was "not a medic job" or something it
+    // can fix. The note is also delivered as a zee_message at decline time; this is the durable copy.
+    if (row.status === 'declined' && row.resolution) {
+      lines.push('', `Why it was declined: ${row.resolution}`);
+      lines.push('(A medic fixes ZEEHIVE config/infra. If the fault is in your own code or tests, '
+        + 'that is `zee tend`, not a medic. If you are still blocked, raise a FRESH `zee medic --reason "…"`.)');
+    } else if (row.status === 'withdrawn' && row.resolution) {
+      lines.push('', `Withdrawn: ${row.resolution}`);
+    } else if (row.status === 'resolved' && row.resolution) {
+      lines.push('', `Resolution: ${row.resolution}`);
+    }
+    return { ok: true, call: row, message: lines.join('\n').slice(0, 2000) };
   }
   return raiseMedicCall({ xell, reason, kind: kind || 'other', zeeId: zee?.id || null });
 }

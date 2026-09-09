@@ -68,7 +68,7 @@ export const MEDIC_PROJECT_COLUMNS = ['registry', 'manifest', 'manifest_hash', '
 // restated here so the REVOKE half is explicit and testable (write grants never existed; this is
 // belt and braces against a future blanket grant).
 export const MEDIC_NO_WRITE_TABLES = [
-  'xell', 'zee', 'medic', 'medic_action', 'medic_call', 'harness', 'provider_token',
+  'xell', 'zee', 'medic', 'medic_action', 'medic_call', 'medic_dismissal', 'harness', 'provider_token',
   'land_request', 'ship_request', 'prod_seed_request', 'prod_bind_request', 'infra_request',
   'credential_inject_request', 'manager_mint_request', 'done_suggestion',
   'zee_turn', 'llm_gateway_request',

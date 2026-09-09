@@ -43,7 +43,12 @@ const ROLES = ['server', 'webapp', 'db', 'infra'];
 export default function ProjectSetup({ project: initial, onClose, onChanged, onSelect, nested = null,
                                        // the fleet's medic-emergency list (blocked zees) — the ⛑
                                        // dispatch gate, threaded down to the conditions editor
-                                       medicEmergency = [] }) {
+                                       medicEmergency = [],
+                                       // the fleet's active medic_dismissals (currently-silenced
+                                       // infra/condition suggestions) + the App's dismiss/undo handlers
+                                       medicDismissals = [],
+                                       onDismissMedicSuggestion = null,
+                                       onUndoMedicDismissal = null }) {
   const [project, setProject] = useState(initial);         // null = create mode
   const [contexts, setContexts] = useState([]);
   useEffect(() => { getDockerContexts().then(setContexts).catch(() => setContexts([])); }, []);
@@ -63,7 +68,10 @@ export default function ProjectSetup({ project: initial, onClose, onChanged, onS
             {contexts.map((c) => <option key={c.name} value={c.name}>{c.description || c.endpoint}</option>)}
           </datalist>
           {project
-            ? <EditSections project={project} onChanged={onChanged} onProject={setProject} />
+            ? <EditSections project={project} onChanged={onChanged} onProject={setProject}
+                             medicEmergency={medicEmergency} medicDismissals={medicDismissals}
+                             onDismissMedicSuggestion={onDismissMedicSuggestion}
+                             onUndoMedicDismissal={onUndoMedicDismissal} />
             : <CreateForm onCreated={(p) => { setProject(p); onChanged?.(); onSelect?.(p.id); }} nested={nested} />}
         </div>
       </div>
@@ -454,7 +462,9 @@ const SETUP_TABS = [
 ];
 const tabForGate = (key) => SETUP_TABS.find((t) => t.gates.includes(key))?.key || null;
 
-function EditSections({ project, onChanged, onProject }) {
+function EditSections({ project, onChanged, onProject, medicEmergency = [],
+                        medicDismissals = [], onDismissMedicSuggestion = null,
+                        onUndoMedicDismissal = null }) {
   const [readiness, setReadiness] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -492,7 +502,11 @@ function EditSections({ project, onChanged, onProject }) {
         <WireguardSection project={project} run={run} busy={busy} />
       </>}
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
-      {tab === 'conditions' && <ConditionsSection project={project} run={run} busy={busy} medicEmergency={medicEmergency} />}
+      {tab === 'conditions' && <ConditionsSection project={project} run={run} busy={busy}
+                                                   medicEmergency={medicEmergency}
+                                                   medicDismissals={medicDismissals}
+                                                   onDismissMedicSuggestion={onDismissMedicSuggestion}
+                                                   onUndoMedicDismissal={onUndoMedicDismissal} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'ticketapi' && <ApiKeysSection project={project} run={run} busy={busy} />}
@@ -2147,7 +2161,9 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
 // Explicitly EPHEMERAL — each line renders with the date it was last touched and deleting one is a
 // plain button, with no confirm, because stale conditions are worse than none and this list must
 // never become a second manual.
-function ConditionsSection({ project, run, busy, medicEmergency = [] }) {
+function ConditionsSection({ project, run, busy, medicEmergency = [],
+                             medicDismissals = [], onDismissMedicSuggestion = null,
+                             onUndoMedicDismissal = null }) {
   const [conds, setConds] = useState(null);
   const [add, setAdd] = useState('');
   const [medicMsg, setMedicMsg] = useState(null);   // result of the last dispatch-medic click
@@ -2168,6 +2184,17 @@ function ConditionsSection({ project, run, busy, medicEmergency = [] }) {
         : '⛑ medic attending — watch the Medic Bay (no xell, no cage)');
     } catch { setMedicMsg(null); }   // the panel's err line already told the human why
   };
+  // A human says NO to a condition's ⛑ suggestion. Same fingerprinted dismissal as the needs-you
+  // bar (target_kind 'condition' on the condition's exact body): the same line stops nagging here
+  // too, an edited body re-raises, and UNDO is on the muted line below. Nothing is dispatched and
+  // the condition line is NOT deleted — this only silences the ask.
+  const dismissOne = (c) => {
+    if (!onDismissMedicSuggestion) return;
+    const body = String(c?.body || '').trim();
+    onDismissMedicSuggestion('condition', c?.id, body, 'this condition');
+  };
+  const undoOne = (d) => { if (onUndoMedicDismissal) onUndoMedicDismissal(d); };
+  const conditionDismissals = (medicDismissals || []).filter((d) => d.target_kind === 'condition');
   return (
     <div className="setup-sec" data-testid="conditions-section">
       <h3>Current conditions <span className="pc">(the short, dated list of LIVE IMPEDIMENTS injected into every briefing — EPHEMERAL, the opposite of the docs)</span></h3>
@@ -2213,11 +2240,18 @@ function ConditionsSection({ project, run, busy, medicEmergency = [] }) {
                      if (v && v !== c.body) wrapped(() => updateProjectCondition(c.id, v, 'human')); }}
                    style={{ minWidth: 360 }} />
             {showMedic && (
-              <button type="button" className="pill" disabled={busy}
-                      onClick={() => dispatch(c)}
-                      title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
-                ⛑ Dispatch medic
-              </button>
+              <>
+                <button type="button" className="pill" disabled={busy}
+                        onClick={() => dispatch(c)}
+                        title="Dispatch the infra-medic (a manager zee on Zeehive) to fix this project's meta-DB config so the machine×project pair stops being broken">
+                  ⛑ Dispatch medic
+                </button>
+                <button type="button" className="pill pill-ghost" disabled={busy}
+                        onClick={() => dismissOne(c)}
+                        title="Dismiss this suggestion — the same condition text stops nagging you (a changed condition re-raises by itself). Nothing is dispatched and the condition line is NOT deleted — dismissing hides the ask, it does not fix the fault. Undo is on the dismissed line below.">
+                  ✕ Dismiss
+                </button>
+              </>
             )}
             <span className="pc" title="last touched (the date injected into briefings)">[<b>{d}</b>]</span>
             <span className="pc">{c.updated_by || ''}</span>
@@ -2231,6 +2265,22 @@ function ConditionsSection({ project, run, busy, medicEmergency = [] }) {
         <div className="pc">No current conditions — nothing is known to be broken right now. When a
           zee reports a broken environment it cannot fix, add one line here (with a ticket ref) so
           the next zee does not rediscover it.</div>
+      )}
+      {/* Muted way back for condition dismissals made HERE (or on the needs-you bar) whose
+          fingerprint still matches a condition body. Each UNDO deletes that one dismissal row, so
+          the ⛑ ask comes back at the next snapshot. */}
+      {conditionDismissals.length > 0 && (
+        <div className="ny-dismissed" data-testid="ny-medic-dismissed">
+          <span className="ny-dismissed-label">✕ {conditionDismissals.length} dismissed</span>
+          {conditionDismissals.map((d) => (
+            <span key={d.id} className="ny-dismissed-one"
+                  title={`Dismissed ${d.dismissed_at ? new Date(d.dismissed_at).toLocaleString() : ''} by ${d.dismissed_by || 'a human'}. This hides only the exact condition text shown — a changed body re-raises by itself.`}>
+              <b>{d.display || d.target_id}</b>
+              {d.reason ? <span className="ny-why"> — {String(d.reason).slice(0, 80)}</span> : null}
+              <button type="button" className="undolink" onClick={() => undoOne(d)}>UNDO</button>
+            </span>
+          ))}
+        </div>
       )}
       <div className="setup-row">
         <input value={add} placeholder='e.g. "the shared dev DSN is stale (TKT-47) — use `zee db-sandbox`"'

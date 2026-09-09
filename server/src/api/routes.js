@@ -798,6 +798,62 @@ router.post('/medic-calls/:callId/dispatch', requireQueenzeeLoops, async (req, r
                message: 'medic attending from the CALL — watch the Bay; its answer goes back to the calling zee' });
   } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
 });
+// A HUMAN says NO to a CALLED emergency — dismiss = DECLINE (distinct from the zee's own
+// withdrawMedicCall and the medic's answerMedicCall). A live zee is waiting on the answer, so the
+// note is REQUIRED (it is what the calling zee receives — the same contract answerMedicCall
+// enforces) and is POSTED BACK to the calling zee as a zee_message. Declined is final history like
+// any decline; a still-blocked zee raises a FRESH call. Same partial worker wall as dispatch: a
+// caged worker does not dismiss a medic ask.
+router.post('/medic-calls/:callId/dismiss', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { dismissMedicCall } = await import('../lib/medic-calls.js');
+    const out = await dismissMedicCall({
+      callId: req.params.callId,
+      note: String(req.body?.reason ?? req.body?.note ?? '').trim() || null,
+      by: String(req.body?.actor || 'human@console').slice(0, 200),
+    });
+    if (!out.ok) return res.status(400).json({ ...out, error: out.reason || out.error });
+    res.json({ ...out, message: 'Medic call DECLINED — the calling zee has been told why. '
+      + 'It no longer shows in the ⛑ needs-you panel; a still-blocked zee raises a fresh call.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// A HUMAN says NO to the ROWLESS suggestions — an INFRA emergency row (fleet medic_emergency,
+// source 'infra') or a CONDITION dispatch card. No call row to decline, so the dismissal is
+// persisted into medic_dismissal, fingerprinted on the EXACT text the human was shown: the same
+// fault stops nagging, a different fault (or edited body) raises again by itself. The project is
+// derived from the target row server-side — the caller never names a project to write into.
+// Same partial worker wall as the dispatch seams (an identified worker does not dismiss).
+router.post('/medic-dismissals', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { createMedicDismissal } = await import('../lib/medic-dismissals.js');
+    const out = await createMedicDismissal({
+      targetKind: req.body?.target_kind || null,
+      targetId: req.body?.target_id || null,
+      text: String(req.body?.text ?? req.body?.why ?? '').trim() || null,
+      reason: String(req.body?.reason || '').trim() || null,
+      by: String(req.body?.actor || 'human@console').slice(0, 200),
+    });
+    if (!out.ok) return res.status(400).json({ ...out, error: out.reason || out.error });
+    res.json({ ...out, message: 'Dismissed — this exact fault stops nagging the ⛑ bar. '
+      + 'A different fault on the same xell (or an edited condition) raises again by itself.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// UNDO a fingerprinted dismissal: the emergency it was hiding raises again at the next snapshot.
+router.delete('/medic-dismissals/:id', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { undoMedicDismissal } = await import('../lib/medic-dismissals.js');
+    const row = await undoMedicDismissal(req.params.id);
+    if (!row) return res.status(404).json({ error: 'no such dismissal' });
+    res.json({ ok: true, undone: row,
+               message: 'UNDONE — the dismissed fault raises again in the ⛑ panel at the next snapshot.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
 // sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same
 // rules: a worker xell has no standing orders (it does not dispatch), the text is bounded (SHORT by

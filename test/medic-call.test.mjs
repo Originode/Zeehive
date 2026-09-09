@@ -34,9 +34,11 @@ const { q, one } = await import('../server/src/db/pool.js');
 const { mintXellToken } = await import('../server/src/lib/xell-token.js');
 const {
   raiseMedicCall, collectCallEvidence, readMedicCallForXell,
-  listProjectMedicCalls, withdrawMedicCall, answerMedicCall,
+  listProjectMedicCalls, withdrawMedicCall, answerMedicCall, dismissMedicCall,
   buildCallAttachMessage, buildCallDispatchBrief,
 } = await import('../server/src/lib/medic-calls.js');
+const { fingerprintMedicText, createMedicDismissal, undoMedicDismissal, listMedicDismissals } =
+  await import('../server/src/lib/medic-dismissals.js');
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -86,6 +88,29 @@ const insCondition = async (projectId, body) => {
 const countLive = (xellId) => one(
   `SELECT count(*)::int AS n FROM medic_call WHERE xell_id=$1 AND status IN ('open','attended')`,
   [xellId]);
+// An UNPOOLED, WORKING xell WITH a live zee and a failing db preflight — the exact shape fleet.js
+// turns into medic_emergency source:'infra' (a live zee blocked by an infra fault). getFleet needs
+// no real git checkout (the fleet-conditions test drives the same function from a /tmp repo_root),
+// but the emergency gate is "a zee is live AND the xell is not pooled stock", so the fixture must
+// carry both.
+const insLiveBlockedXell = async (projectId, slug, preflight) => {
+  const xo = (await one(
+    `INSERT INTO xource (project_id, ref, head_commit) VALUES ($1,'main','deadbeef') RETURNING id`,
+    [projectId])).id;
+  clean.push(cleanQ(`DELETE FROM xource WHERE id=$1`, [xo]));
+  const x = await one(
+    `INSERT INTO xell (project_id, xource_id, slug, branch, status, zee_type, is_pooled, worktree_path)
+       VALUES ($1,$2,$3,'spinoff/'||$3,'working','worker',false,'/tmp/'||$3) RETURNING *`,
+    [projectId, xo, slug]);
+  clean.push(cleanQ(`DELETE FROM xell WHERE id=$1`, [x.id]));
+  const z = await one(
+    `INSERT INTO zee (xell_id, attach_mode, entrypoint, status, viewer_kind)
+       VALUES ($1,'headless-spawn','cxell-cli','working','ssh-terminal') RETURNING id`,
+    [x.id]);
+  clean.push(cleanQ(`DELETE FROM zee WHERE id=$1`, [z.id]));
+  await q(`UPDATE xell SET preflight_error=$2 WHERE id=$1`, [x.id, preflight]);
+  return x;
+};
 
 try {
   // ── fixture project + xell ──────────────────────────────────────────────────
@@ -329,6 +354,154 @@ try {
   ok(!!man && !!man.manual && /call_answer/.test(man.manual) && /calls/.test(man.manual)
      && /medic_call.*REFUSE|REFUSE.*medic_call/s.test(man.manual),
      'the infra-medic manual (harness memory) names calls + call_answer and puts medic_call on the REFUSE list');
+
+  // ── 10. the HUMAN dismisses a CALLED emergency (dismiss = DECLINE, a THIRD actor) ──
+  console.log('\n── human dismiss of a CALLED emergency: decline + note, never a dispatch ──');
+  const humanProject = { id: await insProject(`mc-hum-p-${tag}`) };
+  const humanXell = await insXell(humanProject.id, `mc-hum-${tag}`);
+  await q(`UPDATE xell SET preflight_error=$2 WHERE id=$1`,
+          [humanXell.id, 'human-dismiss preflight failing']);
+  const hCall = await raiseMedicCall({ xell: humanXell, reason: 'shared dev db is down',
+                                       kind: 'db', zeeId: null });
+  const emptyNote = await dismissMedicCall({ callId: hCall.call_id, note: '   ' });
+  ok(emptyNote.refused === true && /note is required/.test(emptyNote.reason),
+     'an EMPTY note is refused — a declined call must say why (the note is what the zee receives)');
+  const medicsBefore = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  const hd = await dismissMedicCall({ callId: hCall.call_id,
+    note: 'fixing the db myself — re-open with a fresh call if still stuck', by: 'human@console' });
+  ok(hd.ok === true && hd.status === 'declined',
+     'dismissMedicCall declines the call (a HUMAN — distinct from the zee\'s withdraw and the medic\'s answer)');
+  const hrow = await one(`SELECT * FROM medic_call WHERE id=$1`, [hCall.call_id]);
+  ok(hrow.status === 'declined' && !!hrow.dismissed_at && hrow.dismissed_by === 'human@console',
+     'the call row is declined with dismissed_at + dismissed_by stamped');
+  const medicsAfter = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  ok(medicsAfter === medicsBefore, 'a dismissal does NOT dispatch a medic (the medic count is unchanged)');
+  const hmsg = await one(
+    `SELECT * FROM zee_message WHERE to_xell_id=$1 AND kind='message'
+      ORDER BY created_at DESC LIMIT 1`, [humanXell.id]);
+  clean.push(cleanQ(`DELETE FROM zee_message WHERE id=$1`, [hmsg.id]));
+  ok(hmsg && /DECLINED/.test(hmsg.body) && /⛑human/.test(hmsg.from_slug),
+     'the decline is POSTED BACK to the calling zee as a zee_message from ⛑human');
+  ok(/fixing the db myself/.test(hmsg.body),
+     'the note itself is the message body — the calling zee reads WHY it was declined');
+  ok(/zee tend/.test(hmsg.body),
+     'a human DECLINE carries the same `zee tend` pointer as the medic\'s decline (own-code faults are not a medic)');
+  const again = await dismissMedicCall({ callId: hCall.call_id, note: 'trying twice' });
+  ok(again.refused === true && /already declined/.test(again.reason),
+     'a second dismiss of the same call is refused (declined is final history)');
+  ok(!(await listProjectMedicCalls(humanProject.id, { liveOnly: true })).some((c) => c.id === hCall.call_id),
+     'a declined call no longer nags the live-only emergency feed');
+  const { selfMedicCall } = await import('../server/src/queenzee/self.js');
+  const st = await selfMedicCall(humanXell, { status: true });
+  ok(st.ok === true && /declined/.test(st.message)
+     && /Why it was declined: fixing the db myself/.test(st.message),
+     '`zee medic --status` on a human-declined call shows the declined note (the durable copy, not just the one-shot message)');
+
+  // ── 10b. the dismiss ROUTES over real HTTP (console = no worker token; worker = refused) ──
+  console.log('\n── the dismiss routes (real HTTP, console vs an identified worker) ──');
+  const http2Project = { id: await insProject(`mc-http2-p-${tag}`) };
+  const http2Xell = await insXell(http2Project.id, `mc-http2-${tag}`);
+  await q(`UPDATE xell SET preflight_error=$2 WHERE id=$1`,
+          [http2Xell.id, 'http2 dismiss preflight failing']);
+  const http2Token = await mintXellToken(http2Xell.id);
+  const auth2 = { 'content-type': 'application/json', authorization: `Bearer ${http2Token}` };
+  const raised2 = await (await post('/xell/self/medic', { reason: 'db is down', kind: 'db' }, auth2)).json();
+  ok(raised2.ok === true && raised2.routed === 'raised', 'fresh CALLED emergency raised for the route test');
+  const workerDismiss = await (await post(`/medic-calls/${raised2.call_id}/dismiss`,
+                                          { reason: 'worker sneaking a dismiss' }, auth2)).json();
+  ok(workerDismiss.ok === false && workerDismiss.status === 'refused',
+     'an identified WORKER token is REFUSED on the dismiss route (workers do not dismiss)');
+  const noNoteRes = await (await post(`/medic-calls/${raised2.call_id}/dismiss`, { reason: '' },
+                                      { 'content-type': 'application/json' })).json();
+  ok(noNoteRes.ok === false && /note is required/.test(noNoteRes.error || ''),
+     'POST dismiss with an empty note → refused with a legible error (siteCall throws it)');
+  const noAuthDismiss = await (await post(`/medic-calls/${raised2.call_id}/dismiss`,
+                                          { reason: 'will re-provision by hand' },
+                                          { 'content-type': 'application/json' })).json();
+  ok(noAuthDismiss.ok === true && noAuthDismiss.status === 'declined',
+     'POST dismiss from the console (no token) declines the call');
+  const dismRow = await one(`SELECT status, dismissed_by FROM medic_call WHERE id=$1`, [raised2.call_id]);
+  ok(dismRow.status === 'declined' && dismRow.dismissed_by === 'human@console',
+     'the route decline is recorded as human@console on the row');
+  const sugRes = await (await post('/medic-dismissals',
+      { target_kind: 'xell', target_id: http2Xell.id, text: 'db preflight failing: http2 dismiss preflight failing',
+        reason: 'hand-fixing' }, { 'content-type': 'application/json' })).json();
+  ok(sugRes.ok === true && !!sugRes.dismissed?.id && !!sugRes.dismissed?.fingerprint,
+     'POST /medic-dismissals stores a fingerprinted xell dismissal');
+  const sugId = sugRes.dismissed.id;
+  const delRes = await (await fetch(`${base}/medic-dismissals/${sugId}`,
+                                   { method: 'DELETE' })).json();
+  ok(delRes.ok === true && delRes.undone?.id === sugId,
+     'DELETE /medic-dismissals/:id undoes it (the emergency raises again)');
+
+  // ── 11. fingerprint: same fault hides, a changed fault re-raises (the FLEET layer) ──
+  console.log('\n── fingerprinted dismissal at the FLEET layer (same fault hides; a changed fault re-raises) ──');
+  const { getFleet } = await import('../server/src/lib/fleet.js');
+  const WHY = 'db preflight failing: cannot reach the shared dev db';
+  const fleetProject = { id: await insProject(`mc-fleet-p-${tag}`) };
+  const fleetXell = await insLiveBlockedXell(fleetProject.id, `mc-fleet-${tag}`, WHY);
+  const f1 = await getFleet(fleetProject.id);
+  const infraRow = (f1.medic_emergency || []).find((e) => e.xell_id === fleetXell.id && e.source === 'infra');
+  ok(!!infraRow && /shared dev db/.test(infraRow.why),
+     'fleet medic_emergency carries the infra row BEFORE any dismissal');
+  const fp = fingerprintMedicText(infraRow.why);
+  ok(fp.length === 64 && fp !== fingerprintMedicText('a completely different fault'),
+     'fingerprintMedicText is a sha256 hex that differs across fault texts');
+  const created = await createMedicDismissal({ targetKind: 'xell', targetId: fleetXell.id,
+                                               text: infraRow.why, reason: 'hand-fixing the db' });
+  ok(created.ok === true && created.dismissed.fingerprint === fp,
+     'createMedicDismissal fingerprints the EXACT shown text');
+  const f2 = await getFleet(fleetProject.id);
+  ok(!(f2.medic_emergency || []).some((e) => e.xell_id === fleetXell.id),
+     'the SAME infra fault stops nagging the ⛑ panel after dismissal');
+  const activeRow = (f2.medic_dismissals || []).find((d) => d.target_kind === 'xell'
+                     && d.target_id === fleetXell.id);
+  ok(!!activeRow && activeRow._active === true && /hand-fixing/.test(activeRow.reason || ''),
+     'fleet reports the dismissal as ACTIVE (the muted "N dismissed · UNDO" line)');
+  const undone = await undoMedicDismissal(activeRow.id);
+  ok(!!undone && undone.id === activeRow.id,
+     'undoMedicDismissal deletes the row (the visible way back)');
+  const f2b = await getFleet(fleetProject.id);
+  ok((f2b.medic_emergency || []).some((e) => e.xell_id === fleetXell.id),
+     'UNDO restores the ask at the next snapshot — hiding a real emergency always has a way back');
+  // Re-dismiss, then let the fault CHANGE: the dismissal row stays but stops matching, so the
+  // DIFFERENT fault re-raises by itself. No timers — the fingerprint IS the expiry.
+  await createMedicDismissal({ targetKind: 'xell', targetId: fleetXell.id,
+                               text: infraRow.why, reason: 'hand-fixing again' });
+  await q(`UPDATE xell SET preflight_error=$2 WHERE id=$1`,
+          [fleetXell.id, 'cannot reach the shared dev db ANYMORE']);
+  const f3 = await getFleet(fleetProject.id);
+  ok((f3.medic_emergency || []).some((e) => e.xell_id === fleetXell.id),
+     'a CHANGED fault raises again by itself (a different fingerprint no longer matches)');
+  ok(!(f3.medic_dismissals || []).some((d) => d._active === true && d.target_id === fleetXell.id),
+     'the stale dismissal is no longer ACTIVE — it still exists but hides nothing');
+  const stale = await listMedicDismissals(fleetProject.id);
+  ok(stale.some((d) => d.target_id === fleetXell.id),
+     'the stale row is still in the table (dismissal never resolves the fault — only the fingerprint expires)');
+
+  // ── 12. condition-card dismissal is fingerprinted on the body, never deletes the line ──
+  console.log('\n── condition-card dismissal: fingerprint on the body; the line survives ──');
+  const condProject = { id: await insProject(`mc-cond-p-${tag}`) };
+  const condXell = await insLiveBlockedXell(condProject.id, `mc-cond-${tag}`,
+                                            'provision proof failing: no addresses');
+  const condLine = await insCondition(condProject.id, 'PROVISION-INFRA: address pool exhausted on this machine');
+  const cf1 = await getFleet(condProject.id);
+  ok((cf1.medic_emergency || []).some((e) => e.xell_id === condXell.id)
+     && (cf1.conditions || []).some((c) => c.id === condLine.id),
+     'fleet carries both the infra zee and the condition card before dismissal');
+  const condD = await createMedicDismissal({ targetKind: 'condition', targetId: condLine.id,
+                                             text: String(condLine.body || ''), reason: 'fixing by hand' });
+  ok(condD.ok === true && condD.dismissed.target_kind === 'condition',
+     'a condition-card dismissal is stored with target_kind condition');
+  const cf2 = await getFleet(condProject.id);
+  ok(!(cf2.conditions || []).some((c) => c.id === condLine.id),
+     'the dismissed condition leaves the needs-you CONDITIONS feed (the ⛑ card hides)');
+  ok((cf2.medic_dismissals || []).some((d) => d.target_kind === 'condition' && d.target_id === condLine.id
+     && d._active === true),
+     '…and is reported ACTIVE for the muted UNDO line');
+  const lineStill = await one(`SELECT body FROM project_condition WHERE id=$1`, [condLine.id]);
+  ok(!!lineStill && lineStill.body.includes('PROVISION-INFRA'),
+     'dismissal NEVER deletes the condition line — it only hides the dispatch ask');
 } catch (e) {
   console.error('UNCAUGHT', e);
   fail++;

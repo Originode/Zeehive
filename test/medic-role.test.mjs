@@ -84,6 +84,8 @@ ok(MEDIC_NO_WRITE_TABLES.includes('medic_action'), 'the audit ledger is on the n
 // bypass answerMedicCall's row guard) and IS on the no-write list so the REVOKE half is explicit.
 ok(!MEDIC_WRITE_TABLES.medic_call, 'medic_call is NOT in the table-wide write surface (row-scoped call_answer is the only door)');
 ok(MEDIC_NO_WRITE_TABLES.includes('medic_call'), 'medic_call is on the no-write list (the REVOKE half is explicit)');
+ok(MEDIC_NO_WRITE_TABLES.includes('medic_dismissal'),
+   'medic_dismissal is on the no-write list too — dismissing a suggestion is a HUMAN\'s verb on the owner pool, never a medic tool');
 await owner.query(sql);
 const post = await owner.query(`SELECT 1 FROM pg_roles WHERE rolname=$1`, [MEDIC_ROLE]);
 ok(post.rows.length === 1, 'the role exists after the mint');
@@ -110,6 +112,8 @@ for (const [q, label] of [
   ['UPDATE zee SET status=status WHERE false', 'UPDATE zee'],
   ['UPDATE medic SET status=status WHERE false', 'UPDATE medic (its own row!)'],
   ['UPDATE medic_call SET status=status WHERE false', 'UPDATE medic_call (BLOCKING-2 — no table-wide grant; call_answer is row-scoped on the owner pool)'],
+  ["INSERT INTO medic_dismissal (project_id, target_kind, target_id, fingerprint) VALUES (gen_random_uuid(),'xell',gen_random_uuid(),'x')",
+   'INSERT INTO medic_dismissal (a human dismissal is not a medic verb)'],
   ["INSERT INTO land_request (xell_id) VALUES (NULL)", 'INSERT INTO land_request (a gate)'],
   ['UPDATE harness SET key=key WHERE false', 'UPDATE harness (no self-grant)'],
 ]) {
