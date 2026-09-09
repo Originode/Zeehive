@@ -130,6 +130,49 @@ export function generateSpinoffCompose(project) {
     };
   }
 
+  // ── the MESH SIDECAR (docs/netbird-mesh-plan.md §3.3) — manifest OPT-IN (tiers.spinoff.mesh) ──
+  // The xell's network identity: a NetBird agent joins the mesh as peer `<slug>` and DNATs the
+  // CANONICAL role ports (the same `internal` values above) one hop to the role services, so
+  // `<slug>.<mesh-domain>:5432/:<server>/:<webapp>` reaches this stack on ANY machine with no
+  // published host ports. Rules 1–2 hold: no machine facts (the management URL and the per-xell
+  // setup key are interpolations the provisioner supplies), and the file stays standalone-workable
+  // — with no setup key the sidecar SAYS SO and idles, so `docker compose up` without the harness
+  // still brings the stack up exactly as before. NB_SETUP_KEY/NB_MANAGEMENT_URL/NB_HOSTNAME are
+  // read by the netbird binary itself; the wrapper execs the image's own entrypoint
+  // (/usr/local/bin/netbird-entrypoint.sh — verified against netbirdio/netbird client/Dockerfile).
+  const mesh = spin.mesh || {};
+  if (mesh.enabled) {
+    const forwards = ['server', 'webapp', 'db']
+      .filter((role) => services[role])
+      .map((role) => `${role}:${portOf(role).internal}`)
+      .join(' ');
+    // Shell vars are $$-escaped (compose folds $$ to $); plain strings, because a JS template
+    // literal would try to interpolate the shell's own ${…} forms.
+    const run = [
+      'if [ -z "$$NB_SETUP_KEY" ]; then echo \'mesh sidecar idle: no SPINOFF_MESH_SETUP_KEY (mesh disabled for this xell)\'; exec sleep infinity; fi',
+      'for t in ' + forwards + '; do s=$${t%%:*}; p=$${t##*:}; ip=$$(getent hosts "$$s" | awk \'{print $$1}\' | head -1); if [ -n "$$ip" ]; then'
+        + ' iptables -t nat -A PREROUTING -p tcp --dport "$$p" -j DNAT --to-destination "$$ip:$$p";'
+        + ' iptables -t nat -A POSTROUTING -d "$$ip" -p tcp --dport "$$p" -j MASQUERADE;'
+        + ' else echo "mesh sidecar: no address for $$s — not forwarding :$$p"; fi; done',
+      'exec /usr/local/bin/netbird-entrypoint.sh',
+    ].join('\n');
+    services.mesh = {
+      image: mesh.image || 'netbirdio/netbird:latest',
+      container_name: nameFor(project, 'container', 'mesh'),
+      hostname: slugVar,
+      restart: 'unless-stopped',
+      cap_add: ['NET_ADMIN'],
+      devices: ['/dev/net/tun:/dev/net/tun'],
+      environment: {
+        NB_SETUP_KEY: '${SPINOFF_MESH_SETUP_KEY:-}',
+        NB_MANAGEMENT_URL: '${SPINOFF_MESH_MGMT_URL:-}',
+        NB_HOSTNAME: slugVar,
+      },
+      entrypoint: ['/bin/sh', '-c', run],
+      labels: labels('mesh'),
+    };
+  }
+
   const header = `${GENERATED_MARKER} from zeehive.yml — do not hand-edit; regenerate via the console
 # (Project setup → Manifest) or POST /api/projects/:id/compose/generate. A compose file WITHOUT
 # this marker is the project's own and ZEEHIVE will never overwrite it.

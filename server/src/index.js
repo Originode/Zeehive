@@ -14,6 +14,7 @@ import { startWorkSync } from './queenzee/worksync.js';
 import { startHeldDoneReaper } from './queenzee/done-held.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
+import { refreshMedicRoleAtBoot } from './lib/medic-role.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { logHarnessSummary } from './lib/harness.js';
@@ -24,7 +25,7 @@ import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { startPreviewPorts } from './lib/preview-ports.js';
 import { attachStreamWebSocket } from './lib/stream.js';
-import { gatewayProxy, gatewayHello, GATEWAY_PORT } from './lib/gateway.js';
+import { gatewayProxy, gatewayHello, gatewayHealth, GATEWAY_PORT, verifyGatewayReachable } from './lib/gateway.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -32,6 +33,7 @@ import { startRevive } from './queenzee/revive.js';
 import { startCxellRecovery } from './queenzee/cxell-recover.js';
 import { startSpinDetector } from './queenzee/spin.js';
 import { startImageJanitor } from './lib/images.js';
+import { startDockerJanitor } from './lib/docker-repair.js';
 import { logline } from './lib/logbus.js';
 
 // LAST-RESORT BACKSTOP. The queenzee is the thing that keeps every xell honest: if it dies, the
@@ -209,6 +211,11 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // ones that are provably stale (lib/provision.reconcileXellEnvs).
   reconcileXellEnvs({ reason: 'boot' })
     .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
+  // The medic role's GRANTs move with the schema (a table created since the last mint is not
+  // covered by an old blanket grant), and boot is exactly when a schema change arrives — so
+  // re-mint here. Best-effort: a failed mint retries lazily on first medic use (medic-role.js),
+  // and MEDICRW_MODE=simulate mints nothing (the nested-queenzee contract).
+  refreshMedicRoleAtBoot();
   // AND THE RECONCILE FOR THE MACHINE ITSELF. The app tier restarts with the host; the CXELLS DO
   // NOT (intake runs them with no restart policy, deliberately — a cage dockerd brought back would
   // have no firewall and no ssh door, because both are runtime state inside its namespace). So the
@@ -233,6 +240,11 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // tell its manager (queenzee/spin.js — the interim alarm; the lease/await model is the cure).
   startSpinDetector();
   startImageJanitor();
+  // What best-effort reap-time cleanup misses (a context down, a killed queenzee) becomes a
+  // wedged daemon: retired xells' spin networks exhaust the address pools and husks squat host
+  // ports (TKT-178 / TKT-85). This sweep auto-performs ONLY docker-repair's two provably-
+  // throwaway step kinds; everything else stays a medic/human call (netbird-mesh-plan DR-2).
+  startDockerJanitor();
   startProdDiff();
   startDbCloneWatch();
   // The work tracker's board follows the fleet: every item with a zee on it takes that zee's live
@@ -265,11 +277,21 @@ if (config.gatewayPort !== config.port) {
   // express mounts a wildcard; gatewayProxy parses the identity/provider from req.url.
   gatewayApp.get('/api/hello', gatewayHello);
   gatewayApp.head('/api/hello', gatewayHello);
+  // The gateway's SIGNATURE route — the reachability probe's identification half. Tiny, no auth,
+  // no provider path: it exists so the probe can tell "the port serves a server" apart from "the
+  // port serves OUR gateway", without ever turning an answering address into a refusal.
+  gatewayApp.get('/_gw/health', gatewayHealth);
   gatewayApp.all('/x/*', gatewayProxy);
   gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: expected /x/<xell-token>/<provider>/v1/…' }));
   const gatewayServer = gatewayApp.listen(GATEWAY_PORT, '0.0.0.0', () => {
     console.log(`[zeehive] LLM gateway on http://0.0.0.0:${GATEWAY_PORT}  (cxells point their provider base-urls here)`);
     logline('api', `LLM gateway online — :${GATEWAY_PORT} (/v1/messages, /v1/chat/completions)`);
+    // STARTUP PROBE (TKT-179): prove the gateway address a cage will actually be handed, once,
+    // before any dispatch — the incident was a gateway that answered on 127.0.0.1:4701 inside the
+    // container but whose port was NOT published, so every cage got host.docker.internal:4701 and
+    // every provider failed with the vendor's words for 13h. Best-effort: logs the verdict loudly,
+    // never crashes the boot (the dispatch path still refuses per-mint if the state persists).
+    void verifyGatewayReachable();
   });
   gatewayServer.on('error', (e) => {
     console.error(`[zeehive] LLM gateway could not bind :${GATEWAY_PORT} — ${e.message}`);

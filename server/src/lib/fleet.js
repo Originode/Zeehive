@@ -15,9 +15,11 @@ import { backupDue } from '../queenzee/maintenance.js';
 import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
+import { listProjectConditions } from './current-conditions.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
+import { gatewayHealth } from '../queenzee/gateway-health.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -353,6 +355,9 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     // The readiness preflight's verdict (#53): a vacant xell whose DSN the queenzee wrote does not
     // open must not read `ready`. The named check itself rides on x.preflight_error for the card.
     preflightFailed: !!x.preflight_error,
+    // The provision proof's verdict (§4.8): a vacant xell whose burn-in found a broken chip must
+    // equally not read `ready`. proof_error rides on x.proof_* (fetchXellRows reads x.*) for the card.
+    proofFailed: !!x.proof_error,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
@@ -580,6 +585,28 @@ export async function getFleet(projectId) {
   for (const x of xells) await decorateXell(x, heads, deployed, project,
     { paused: pause.paused, projectPaused });
 
+  // THE MEDIC EMERGENCY — the one condition under which the console shows a ⛑ dispatch button
+  // (the medic-rework's follow-up directive, 2026-09-02: "the point of medic is emergency
+  // response. a dispatch button should only show when a zee is being blocked"). A condition LINE
+  // is information; a LIVE ZEE stuck behind an infra fault is an emergency. The predicate: a xell
+  // that HAS a zee (not pooled stock — a failing vacant xell is the pool's business and already
+  // renders in Project setup's readiness) AND carries infra evidence — a failing db preflight
+  // (#53), a failing provision proof (236), or a build failure the classifier called INFRA (233:
+  // "retrying will not help", which is exactly when a human should send the medic). Computed HERE,
+  // once, so the needs-you bar and the conditions editor read the SAME answer — the same
+  // one-rule-across-surfaces discipline the CODE-fact exclusion already follows.
+  const medic_emergency = xells
+    .filter((x) => x.zee_id && !['ready', 'retired', 'tearing-down'].includes(x.status))
+    .map((x) => {
+      const infraBuild = (x.stack || []).find((c) => c.last_build_error_class === 'infra');
+      const why = x.preflight_error ? `db preflight failing: ${x.preflight_error}`
+        : x.proof_error ? `provision proof failing: ${x.proof_error}`
+          : infraBuild ? `build failed [infra] on ${infraBuild.role || infraBuild.name}: ${String(infraBuild.last_build_error || '').split('\n').filter(Boolean).slice(-1)[0] || 'see the container card'}`
+            : null;
+      return why ? { xell_id: x.id, slug: x.slug, zee_name: x.zee_name || null, why: String(why).slice(0, 300) } : null;
+    })
+    .filter(Boolean);
+
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
   // figures on the client, so it also counts zees on retired xells the card list no longer shows.
@@ -796,6 +823,13 @@ export async function getFleet(projectId) {
   // as a receipt so "did the new key reach the cages?" does not vanish.
   const credentialInject = await listCredentialInjectRequests(pid, { open: true });
 
+  // CURRENT CONDITIONS — the project's live-impediment list (the briefing-time injection). Rides the
+  // fleet snapshot so the console's needs-you surface (a blocked project's ⛑ medic chip — the one
+  // thing a provision halt leaves the bar silent about) and the conditions editor read the SAME poll;
+  // a condition is a slow-changing fact, and one ≤ CONDITION_LIMIT query on an already-heavy snapshot
+  // is cheaper than a second endpoint the console has to keep in step with.
+  const conditions = await listProjectConditions(pid);
+
   return {
     project,
     pool,
@@ -824,11 +858,20 @@ export async function getFleet(projectId) {
     xource,
     manager_mint: managerMint,
     credential_inject: credentialInject,
+    conditions,
+    // The zees currently blocked by an INFRA fault — the ⛑ dispatch affordance's ONE gate (the
+    // emergency predicate computed above; empty = the console shows conditions as information,
+    // with no medic button anywhere).
+    medic_emergency,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,
     // Per-project pause state (migration 101) — alongside the fleet-wide `pause` above.
     project_pause: projPause,
+    // GATEWAY REACHABILITY at the address cages are actually given — the cached verdict of the
+    // health-monitor's best-effort probe (queenzee/gateway-health.js). Read from the cache, never
+    // a fetch here: a probe failure must never fail the fleet read or a page render.
+    gateway_health: gatewayHealth(),
   };
 }
 

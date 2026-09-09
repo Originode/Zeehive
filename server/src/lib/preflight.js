@@ -86,7 +86,7 @@ export async function preflightXell(xellId, { timeout = PREFLIGHT_TIMEOUT_MS } =
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   // The same rows writeXellEnv reads, so resolveXellDsn answers the same string the zee was handed.
   const containers = await q(
-    `SELECT role, host_port, conn_ref, docker_ctx FROM container
+    `SELECT role, host_port, conn_ref, conn_pw, docker_ctx FROM container
       WHERE owner_xell_id=$1 AND role IN ('server','webapp','db')`, [xellId]);
 
   const checks = [];

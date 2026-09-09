@@ -5,6 +5,11 @@
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+// The one async docker adapter (lib/build-readiness.js) — the ONLY sanctioned way this module
+// shells out to docker asynchronously. The TKT-85 port-allocation fix reads the daemon's bound
+// ports with it (never spawnSync on the event loop, and bounded); build-readiness.js imports
+// nothing from here, so there is no cycle.
+import { dockerAdapter } from './build-readiness.js';
 import { resolve, dirname } from 'node:path';
 import pg from 'pg';
 import { pool, q, one } from '../db/pool.js';
@@ -15,7 +20,7 @@ import { resolveSite } from './sites.js';
 import { namingFor, serverRoleIsProcess } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx,
-         implicitPoolMachine, liveXellCount } from './machines.js';
+         implicitPoolMachine, liveXellCount, siteHostForMachine, ensureDbContainerConnPw } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
@@ -26,6 +31,7 @@ import { deviceConfig } from './devices.js';
 import { logline, activity } from './logbus.js';
 import { raiseEnvAlert, clearEnvAlert } from './status.js';
 import { processRoleReachableHost, processRolePublishedUrl } from '../queenzee/containers.js';
+import { meshEnabled, mintPeer, netbirdRequest } from './netbird.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines): 'real'
 // touches machines, anything else models. The fleet-wide .zeehive.env reconcile below obeys it.
@@ -72,6 +78,222 @@ export function computePorts(slug, project = {}) {
     serverPort: (Number(project.port_server_base) || 3100) + slot,
     webPort: (Number(project.port_web_base) || 5200) + slot,
   };
+}
+
+// ── HOST-PORT ALLOCATION (TKT-85 family, provision-proof plan §4.5) ─────────────────────────────
+// The per-xell db host-port used to be a PURE FORMULA (base + slot). A pure formula cannot see the
+// two things that actually own host ports: the daemon's published ports (another xell's db, a human
+// postgres, a container from a different code path — everything `docker ps` shows) and the rows
+// OTHER xells recorded in the meta-DB (including a row that was never bound yet — a modeled
+// compose-era db — and a row on a daemon that is currently down). Two xells whose slugs hash to the
+// same slot collided silently: the second `docker run -p` died with "port is already allocated"
+// (and provisioning failed), or the compose-era path recorded a row whose port nobody could bind.
+//
+// So the slot is the STARTING guess; the actual port is the first free one walking UP from it,
+// checked against the UNION of (meta-DB recorded db host ports on this context) and (one bounded
+// `docker ps --format '{{.Ports}}'` read of the daemon's published ports). An unreachable daemon
+// DEGRADES to meta-DB-only allocation, logged, never a hang — and never a spawnSync on the event
+// loop. Every probe is bounded (a docker ps against a remote context is a network round-trip).
+
+// The host port of every published mapping in `docker ps --format '{{.Ports}}'` output. Pure —
+// entries look like `0.0.0.0:5503->5432/tcp, [::]:5503->5432/tcp`; exposed-but-unpublished ports
+// (bare `5432/tcp`) are not published bindings and never appear in {{.Ports}}.
+export function publishedPortsFromPs(output) {
+  const ports = new Set();
+  // One mapping per token. Tokens are separated by ',' within a container's line AND by the newline
+  // between containers (`docker ps --format '{{.Ports}}'` prints one line per container), so split
+  // on either. Each mapping looks like `0.0.0.0:5509->5432/tcp` or `[::]:5508->5432/tcp`; the host
+  // port is the digit run before `->`.
+  for (const token of String(output || '').split(/[,\s]+/)) {
+    const m = token.match(/:(\d+)->/);
+    if (m) ports.add(Number(m[1]));
+  }
+  return ports;
+}
+
+// Every host port on `ctx` that something already owns, for the given container ROLES: the union of
+// (meta-DB recorded host ports) ∪ (the daemon's published ports) ∪ (ports this caller already lost
+// at bind). Shared by both allocators so the db tier and the app tier read ownership the SAME way.
+// Never throws — a read that cannot complete must not fail a provision.
+//
+// PROCESS-runner rows carry docker_ctx NULL (a bare process in a worktree, no daemon), yet they
+// publish on the QUEENZEE HOST's ports. So when the target context IS the queenzee host, those
+// row-less-of-context rows are counted too — otherwise a process xell's :3147 is invisible to the
+// container xell that is about to ask the same host for :3147.
+// `own` is the inverse of `skip`: host ports the CALLER already holds and is about to re-stamp (a
+// rename re-ports the very rows it is reading). They are not an obstacle to themselves, so they are
+// removed from the union last — but never a port the caller explicitly listed in `skip`, which is
+// how a caller says "I am fleeing this one".
+async function takenHostPorts(ctx, { roles, skip = [], own = [], docker = dockerAdapter, who = 'alloc' }) {
+  const taken = new Set();
+  for (const p of skip) taken.add(Number(p));
+  const onHost = ctx === queenzeeHostCtx();
+  const recorded = await q(
+    `SELECT host_port FROM container
+      WHERE role = ANY($1) AND host_port IS NOT NULL
+        AND (docker_ctx = $2 OR (docker_ctx IS NULL AND $3))`, [roles, ctx, onHost])
+    .catch(() => []);
+  for (const r of recorded) taken.add(Number(r.host_port));
+  // the daemon's published ports — the source of truth for what is actually bound. Bounded, async,
+  // and failure-tolerant: an unreachable daemon degrades to meta-DB-only (logged, never a hang).
+  const ps = await docker(ctx, ['ps', '--format', '{{.Ports}}'], { timeout: 4000 });
+  if (ps?.unknown) {
+    console.warn(`[provision] ${who} (${ctx}): ${ps.reason} — allocating from the meta-DB `
+      + `recorded ports only; a daemon-side collision will surface as a bind refusal and retry`);
+  } else {
+    for (const p of publishedPortsFromPs(ps?.stdout)) taken.add(p);
+  }
+  const skipped = new Set(skip.map(Number));
+  for (const p of own) if (!skipped.has(Number(p))) taken.delete(Number(p));
+  return taken;
+}
+
+// The bounded walk window — how far up from the formula slot an allocation may look.
+const allocWindow = () => Number(process.env.PORT_ALLOC_WINDOW) || 64;
+
+// The first free db host port for `slot` on `ctx`. Never throws: a read that cannot complete must
+// not fail a provision — the caller (docker run) remains the arbiter of a genuinely taken port.
+export async function freeDbHostPort(ctx, { base = 5500, slot = 0, projectId = null, skip = [], docker = dockerAdapter } = {}) {
+  const formula = Number(base) + slot;
+  const taken = await takenHostPorts(ctx, { roles: ['db'], skip, docker, who: 'freeDbHostPort' });
+  // Walk up a bounded window from the formula slot. If every port in the window is claimed (a very
+  // full hive), fall back to the FORMULA port and let the bind refusal/retry below be the arbiter —
+  // a provision never fails on a crowded host by guessing a port the caller cannot use.
+  const window = allocWindow();
+  for (let s = slot; s < slot + window; s++) {
+    const port = Number(base) + s;
+    if (!taken.has(port)) return port;
+  }
+  return formula;
+}
+
+// The app tier's host ports (server + webapp) for `slot` on `ctx` — the SAME allocation the db tier
+// already got, for the two ports that were still a pure formula.
+//
+// Why this exists: computePorts() hands out base+slot with nobody checking, so two xells whose slugs
+// hash to the same slot are handed the SAME server/web ports. The meta-DB shows that happening in
+// the live hive (two xells on ctx 'default' both recorded :4824/:5324), and the loser's spin stack
+// dies at `Bind for 0.0.0.0:5324 failed: port is already allocated`. That failure is classed INFRA,
+// which writes build_readiness_record='missing', which makes fillStopReasonFor STOP the pool fill
+// for the whole project on that machine — one slot collision silently halts a project's pooling.
+//
+// The two ports move TOGETHER (one slot, both bases) so the pairing every other reader assumes —
+// spin-env.sh's slot, the compose file, a human reading :31xx/:52xx as "the same xell" — survives.
+// A slot is only free when BOTH its ports are free. Same contracts as freeDbHostPort: bounded walk,
+// failure-tolerant reads, and a fully-claimed window falls back to the FORMULA slot so a provision
+// never fails on a crowded host by guessing (the bind stays the arbiter).
+export async function freeAppSlot(ctx, { serverBase = 3100, webBase = 5200, slot = 0, skip = [], own = [], docker = dockerAdapter } = {}) {
+  const sb = Number(serverBase);
+  const wb = Number(webBase);
+  const formula = { slot, serverPort: sb + slot, webPort: wb + slot };
+  const taken = await takenHostPorts(ctx, { roles: ['server', 'webapp'], skip, own, docker, who: 'freeAppSlot' });
+  const window = allocWindow();
+  for (let s = slot; s < slot + window; s++) {
+    if (!taken.has(sb + s) && !taken.has(wb + s)) return { slot: s, serverPort: sb + s, webPort: wb + s };
+  }
+  return formula;
+}
+
+// REPAIR a xell whose recorded app-tier pair is ALREADY OWNED by another xell's rows.
+//
+// freeAppSlot stops NEW collisions; it cannot undo the ones the formula era already wrote into the
+// meta-DB. Those rows are not a race — they are a duplicate that is true every time it is read, so
+// the losing xell can never build: `docker compose up` asks for a port its neighbour holds, dies
+// with "port is already allocated", the failure is classed INFRA, and the project's pool fill stops
+// on that machine. A human re-porting rows by hand is the only cure today (it is what "not
+// provisioning xells" has been costing), and there is nothing to decide: the duplicate is visible
+// in the meta-DB and the fix is the allocation this module already performs.
+//
+// So the build path repairs it, ONCE, deterministically:
+//   • only a DUPLICATE recorded row counts (another owner's row on the same context and port) —
+//     never the daemon, which quite correctly shows THIS xell's own containers holding its ports;
+//   • FIRST COME KEEPS THE PORT: the older xell (by ready_at/created_at, then id) never moves, so
+//     two xells building at once cannot swap places or chase each other up the ladder;
+//   • the rows and the URL are re-stamped together, and .zeehive.env is re-projected, so the cage
+//     and the compose stack agree with the meta-DB.
+// Never throws — a repair that cannot complete leaves the xell exactly as it found it and lets the
+// build fail the way it already would.
+export async function repairCollidedAppPorts(xellId, { docker = dockerAdapter } = {}) {
+  try {
+    const xell = await one(`SELECT id, slug, project_id, ready_at, created_at FROM xell WHERE id=$1`, [xellId]);
+    if (!xell) return { repaired: false, reason: 'no such xell' };
+    const mine = await q(
+      `SELECT id, role, host_port, docker_ctx, url FROM container
+        WHERE owner_xell_id=$1 AND tier='spinoff' AND role IN ('server','webapp') AND host_port IS NOT NULL`,
+      [xellId]);
+    const server = mine.find((c) => c.role === 'server');
+    const webapp = mine.find((c) => c.role === 'webapp');
+    if (!server || !webapp) return { repaired: false, reason: 'no app-tier pair recorded' };
+    const ctx = server.docker_ctx || queenzeeHostCtx();
+
+    // Who else claims either of my two ports on this context? (docker_ctx NULL = a process role on
+    // the queenzee host, which is a real claim when that is where I run — the same rule the
+    // allocator uses.)
+    const onHost = ctx === queenzeeHostCtx();
+    const clashes = await q(
+      `SELECT c.id, c.host_port, c.owner_xell_id, x.slug, COALESCE(x.ready_at, x.created_at) AS since
+         FROM container c LEFT JOIN xell x ON x.id = c.owner_xell_id
+        WHERE c.role IN ('server','webapp') AND c.host_port = ANY($1)
+          AND (c.docker_ctx = $2 OR (c.docker_ctx IS NULL AND $3))
+          AND (c.owner_xell_id IS DISTINCT FROM $4)`,
+      [[Number(server.host_port), Number(webapp.host_port)], ctx, onHost, xellId]);
+    if (!clashes.length) return { repaired: false, reason: 'no duplicate' };
+
+    // FIRST COME KEEPS THE PORT. An unowned row (a shared container holding the port) always wins:
+    // it is not a xell and cannot be asked to move.
+    const since = xell.ready_at || xell.created_at;
+    const iAmOlder = clashes.every((c) => c.owner_xell_id && c.since && since && new Date(c.since) > new Date(since));
+    if (iAmOlder) {
+      return { repaired: false, reason: 'this xell holds the ports first — the newer one moves' };
+    }
+
+    const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+    const formula = computePorts(xell.slug, project || {});
+    const next = await freeAppSlot(ctx, {
+      serverBase: formula.serverPort - formula.slot,
+      webBase: formula.webPort - formula.slot,
+      slot: formula.slot,
+      // my OWN current pair is what I am fleeing — never re-allocate onto it
+      skip: [Number(server.host_port), Number(webapp.host_port)],
+      docker,
+    });
+    if (next.serverPort === Number(server.host_port) || next.webPort === Number(webapp.host_port)) {
+      return { repaired: false, reason: 'no free slot to move to' };
+    }
+
+    const restamp = async (row, port) => {
+      const url = row.url ? String(row.url).replace(/:\d+$/, `:${port}`) : row.url;
+      const updated = await one(
+        `UPDATE container SET host_port=$2, url=$3 WHERE id=$1 RETURNING *`, [row.id, port, url]);
+      if (updated) broadcast('container', updated);
+    };
+    await restamp(server, next.serverPort);
+    await restamp(webapp, next.webPort);
+    // the cage reads its ports from .zeehive.env — re-project so it agrees with the rows
+    await emitXellEnv(xellId).catch(() => { /* best effort: the rows are the source of truth */ });
+    const held = clashes.map((c) => `${c.slug || 'unowned'}:${c.host_port}`).join(', ');
+    logline('build', `${xell.slug}: recorded app ports :${server.host_port}/:${webapp.host_port} are `
+      + `already held on ${ctx} (${held}) — re-stamped to :${next.serverPort}/:${next.webPort} before building`);
+    return { repaired: true, from: { serverPort: Number(server.host_port), webPort: Number(webapp.host_port) },
+             to: { serverPort: next.serverPort, webPort: next.webPort }, held };
+  } catch (e) {
+    console.error(`[provision] app-port collision repair skipped for xell ${xellId}: ${e.message}`);
+    return { repaired: false, reason: e.message };
+  }
+}
+
+// The host port for a xell's spin compose db service, as lib/build.js projects it into the build
+// env (SPINOFF_DB_PORT). A recorded per-xell db row (db-isolated coupling — provision stamped the
+// port) is authoritative, exactly like the server/web rows. With NO db row (db-shared-dev coupling)
+// the generated compose falls back to its DEFAULT 5500 — and 5500 is the one host port every other
+// row-less spin db also wants, so row-less xells collided cross-xell ("Bind for 0.0.0.0:5500 failed"
+// took a build down twice). So a row-less xell ALLOCATES like provision's per-xell db instead of
+// inheriting the default. Failure-tolerant: an allocation that blows up (daemon AND meta-DB both
+// gone) degrades to null = the compose default — the bind stays the arbiter, never a build blocker.
+export async function spinComposeDbPort({ recordedPort, ctx, slug, project = {}, docker = dockerAdapter }) {
+  if (recordedPort != null) return recordedPort;
+  const { slot } = computePorts(slug, project);
+  return freeDbHostPort(ctx, { slot, projectId: project?.id ?? null, docker }).catch(() => null);
 }
 
 // The harness-free projection (spec §3.4): a generated, gitignored env file in the worktree so
@@ -186,6 +408,42 @@ export async function sameDatabase(a, b) {
   return sameDatabaseByHostPort(a, b);
 }
 
+// Inject the ACTUAL password into a passwordless TCP DSN — the heart of TKT-181-9EDA.
+//
+// conn_refs are stored passwordless by design ("parameters, not secrets"): a docker-exec psql
+// authenticates through the container's socket, so the inventory never needed the role password.
+// A CXELL zee has no docker and reaches postgres over TCP, where postgres demands SCRAM — so the
+// projection carries the password of the database it names, recorded per container at provision
+// (container.conn_pw). Pure and exported for tests. Never overwrites a password already in the
+// DSN (a minted reader DSN, a prod-RO DSN — those are their own credentials).
+export function dsnWithPassword(dsn, password, { user = null } = {}) {
+  if (!dsn || !password) return dsn;
+  try {
+    const u = new URL(String(dsn).replace(/^postgres(ql)?:/, 'http:'));
+    if (u.password) return dsn;                     // already carries a credential — never overwrite it
+    if (!u.username && user) u.username = user;
+    u.password = password;
+    return String(u).replace(/^http:/, 'postgresql:');
+  } catch { return dsn; }                            // unparseable — leave as-is for the consumer
+}
+
+// WHICH password a resolved DSN should carry. The per-container conn_pw is authoritative: it is
+// whatever actually provisioned that postgres. Only an OWNED per-xell db — created by this code
+// (or its compose) with the manifest credential — may fall back to manifest.db.password, and for
+// EVERY runner (a compose-runner xell's own db is composed with the same manifest value). Rows
+// created after this migration carry conn_pw (provision.js records it on both runner paths), so
+// this fallback only serves rows that predate the column — exactly the ones whose container was
+// created with the manifest credential, which is why the manifest is safe HERE and nowhere else.
+// Shared dev / prod / clone rows are NEVER guessed: their real POSTGRES_PASSWORD is whatever
+// provisioned the container (measured 2026-09-02: ugreen-nas's shared dev db was created by
+// provision-xell-db.sh's default 'omnibiz' while the manifest says 'zeehive'), and a guessed
+// password fails auth exactly as hard as none at all.
+export function passwordForDsn(rowConnPw, { owned = false, manifestDb = {} } = {}) {
+  if (rowConnPw) return rowConnPw;
+  if (owned && manifestDb.password) return manifestDb.password;
+  return null;
+}
+
 // WHICH DATABASE THIS XELL IS MEANT TO TALK TO — the one rule, in one place.
 //
 // Extracted out of writeXellEnv unchanged, because a second reader needs the SAME answer: the
@@ -223,11 +481,13 @@ export async function sameDatabase(a, b) {
 export async function resolveXellDsn(xell, project, containers = []) {
   const xellId = xell.id;
   let dbUrl = null;
+  let dbPw = null;                             // the ACTUAL password of the database dbUrl names (container.conn_pw)
+  let dbOwned = false;                          // dbUrl came from THIS xell's OWN per-xell db container
   let source = null;
   let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
   if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
     const linkedProd = await one(
-      `SELECT c.conn_ref, c.host AS host, c.host_port
+      `SELECT c.conn_ref, c.conn_pw, c.host AS host, c.host_port
          FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
         WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
     bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
@@ -243,6 +503,9 @@ export async function resolveXellDsn(xell, project, containers = []) {
       : (linkedProd?.conn_ref
         || derivedTcpDsn(linkedProd, await dbIdentity(xell.project_id))
         || xell.prod_ro_dsn || null);
+    // A db-shared-prod bind's OWN password (if recorded) rides in the DSN; the prod-readonly
+    // minted DSN already carries its own credential and must never be overwritten below.
+    if (xell.db_coupling === 'db-shared-prod' && dbUrl) dbPw = linkedProd?.conn_pw || null;
     if (dbUrl) source = xell.db_coupling === 'db-prod-readonly' ? 'prod-readonly-dsn' : 'prod-linked';
     if (bindingIsProd && !dbUrl) {
       logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
@@ -253,7 +516,10 @@ export async function resolveXellDsn(xell, project, containers = []) {
   }
   // …else the xell's OWN db container, when it has one.
   if (!dbUrl && !bindingIsProd) {
-    dbUrl = containers.find((c) => c.role === 'db')?.conn_ref || null;
+    const own = containers.find((c) => c.role === 'db') || null;
+    dbUrl = own?.conn_ref || null;
+    dbPw = own?.conn_pw || null;
+    dbOwned = !!dbUrl;
     if (dbUrl) source = 'own-db-container';
   }
   // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
@@ -261,13 +527,14 @@ export async function resolveXellDsn(xell, project, containers = []) {
   // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
   if (!dbUrl && xell.db_coupling === 'db-clone') {
     const inst = await one(
-      `SELECT di.name, c.conn_ref FROM db_instance di JOIN container c ON c.id = di.container_id
+      `SELECT di.name, c.conn_ref, c.conn_pw FROM db_instance di JOIN container c ON c.id = di.container_id
         WHERE di.owner_xell_id=$1 AND di.kind='clone' AND c.conn_ref IS NOT NULL LIMIT 1`, [xellId]);
     if (inst?.conn_ref) {
       try {
         const u = new URL(String(inst.conn_ref).replace(/^postgres(ql)?:/, 'http:'));
         u.pathname = `/${inst.name}`;
         dbUrl = String(u).replace(/^http:/, 'postgresql:');
+        dbPw = inst.conn_pw || null;
         source = 'clone-instance';
       } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
     }
@@ -281,53 +548,111 @@ export async function resolveXellDsn(xell, project, containers = []) {
   // pins DATABASE_URL to its db alias for the containers, so the extra line only hands the zee a
   // working address and never changes what the stack resolves. The §6.2 guard still applies
   // unchanged (the reader-binding exemption in writeXellEnv is about the COUPLING, not the runner).
-  const spin = project?.manifest?.tiers?.spinoff || {};
-  const spinRunner = spin.runner || null;
   if (!dbUrl && xell.db_coupling === 'db-shared-dev') {
     const used = await one(
-      `SELECT c.conn_ref, c.host, c.host_port, c.docker_ctx
+      `SELECT c.conn_ref, c.conn_pw, c.host, c.host_port, c.docker_ctx
          FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
         WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' LIMIT 1`, [xellId]);
-    if (used?.conn_ref) { dbUrl = used.conn_ref; source = 'shared-dev-container'; }
+    if (used?.conn_ref) { dbUrl = used.conn_ref; dbPw = used.conn_pw || null; source = 'shared-dev-container'; }
     else if (used?.host && used?.host_port) {
       // A shared dev db that records no conn_ref but IS published: derive the TCP DSN the same
       // way the prod path does (derivedTcpDsn), so a caged zee still gets a door rather than
-      // falling through to a docker-exec psql a cxell cannot run.
+      // falling through to a docker-exec psql a cxell cannot run. The derived DSN names the same
+      // container, so its recorded password rides with it.
       const dsn = derivedTcpDsn(used, await dbIdentity(xell.project_id));
-      if (dsn) { dbUrl = dsn; source = 'shared-dev-derived'; }
+      if (dsn) { dbUrl = dsn; dbPw = used.conn_pw || null; source = 'shared-dev-derived'; }
     }
   }
-  // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
-  // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may
-  // carry the committed dev credential (the same one the compose files already commit); inject
-  // it for process xells when the ref has none. Anything genuinely secret stays out of manifests.
+  // The password the projected DSN carries: per-container conn_pw when recorded (authoritative),
+  // else the manifest credential ONLY for an owned per-xell db — the database this code created
+  // with that exact value, compose runner included. Shared dev / prod / clone rows are NEVER
+  // guessed from the manifest (their real password is whatever provisioned the container, which
+  // the manifest does not know: TKT-181-9EDA); a row with no conn_pw there stays passwordless so
+  // the readiness preflight names the fault instead of the zee discovering it mid-task.
   const manifestDb = project?.manifest?.db || {};
-  if (dbUrl && spinRunner === 'process' && manifestDb.password) {
-    try {
-      const u = new URL(String(dbUrl).replace(/^postgres(ql)?:/, 'http:'));
-      if (!u.password) {
-        if (!u.username && manifestDb.user) u.username = manifestDb.user;
-        u.password = manifestDb.password;
-        dbUrl = String(u).replace(/^http:/, 'postgresql:');
-      }
-    } catch { /* unparseable ref — emit as-is and let the guard/consumer complain */ }
+  if (dbUrl) {
+    const pw = passwordForDsn(dbPw, { owned: dbOwned, manifestDb });
+    const withPw = dsnWithPassword(dbUrl, pw, { user: manifestDb.user });
+    if (withPw) dbUrl = withPw;
   }
   return { dsn: dbUrl, source, binding_is_prod: bindingIsProd };
+}
+
+// ── the MESH env block (docs/netbird-mesh-plan.md §3.3 / §6 phase 3) ─────────────────────────────
+// A project whose manifest opts tiers.spinoff.mesh.enabled AND whose queenzee has the mesh
+// configured (meshEnabled) gets a per-xell mesh block in .zeehive.env: SPINOFF_MESH_MGMT_URL
+// always (it is queenzee config), and SPINOFF_MESH_SETUP_KEY ONLY while the intent row is still
+// 'minted'. The sidecar CONSUMES the key at join, so a stale consumed key is worse than none — a
+// recreated sidecar would try to re-join with an already-used one-off key instead of idling. The
+// key value lives ONLY in this file (never the meta-DB — migration 249 records its id for audit),
+// so a re-emit before the sidecar has joined must read the current file and preserve the key, or a
+// rename/reconcile would strip the one carrier the joining agent has not yet consumed.
+function meshOptIn(project) {
+  return project?.manifest?.tiers?.spinoff?.mesh?.enabled === true;
+}
+
+function envValueInText(text, name) {
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (line.startsWith(`${name}=`)) return line.slice(name.length + 1).trim();
+  }
+  return null;
+}
+
+async function meshEnvLines({ xell, project, meshSetupKey = null, previousText = null }) {
+  if (!meshOptIn(project) || !meshEnabled()) return [];
+  const peer = await one(
+    `SELECT status FROM mesh_peer
+      WHERE xell_id=$1 AND kind='xell' AND removed_at IS NULL
+      ORDER BY created_at DESC LIMIT 1`, [xell.id]);
+  if (!peer) return [];   // no live intent → the sidecar stays idle; nothing mesh in the file
+  const lines = ['# —— mesh sidecar (docs/netbird-mesh-plan.md §3.3): the generated compose\'s mesh '
+    + 'service joins the control plane with these; the setup key is ONE-TIME and never stored, so '
+    + 'this file is its only carrier until the sidecar consumes it ——'];
+  lines.push(`SPINOFF_MESH_MGMT_URL=${config.netbirdApiUrl}`);
+  if (peer.status === 'minted') {
+    const key = meshSetupKey || envValueInText(previousText, 'SPINOFF_MESH_SETUP_KEY');
+    if (key) lines.push(`SPINOFF_MESH_SETUP_KEY=${key}`);
+  }
+  return lines;
+}
+
+// The BUILD-path relay (the build-container.sh env contract the generated compose interpolates):
+// build.js puts the mesh service's two interpolation names (NB_SETUP_KEY/NB_MANAGEMENT_URL ←
+// SPINOFF_MESH_SETUP_KEY/SPINOFF_MESH_MGMT_URL) into `recorded` env, and THIS is where they come
+// from. The management URL is queenzee config; the one-time setup key is read from the worktree's
+// .zeehive.env — the ONE carrier the key ever rides (never the meta-DB), written by writeXellEnv
+// at provision. Returns {} for a mesh-less xell/queenzee, so a legacy build env is byte-identical.
+export function meshBuildEnv(worktreePath, project) {
+  if (!meshOptIn(project) || !meshEnabled()) return {};
+  const out = { SPINOFF_MESH_MGMT_URL: config.netbirdApiUrl };
+  try {
+    const key = envValueInText(
+      readFileSync(`${String(worktreePath).replace(/\\/g, '/')}/.zeehive.env`, 'utf8'),
+      'SPINOFF_MESH_SETUP_KEY');
+    if (key) out.SPINOFF_MESH_SETUP_KEY = key;
+  } catch { /* no file yet → URL-only; the sidecar idles without a key (compose default) */ }
+  return out;
 }
 
 // Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
 // The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
 // ordinary state of a pooled xell, not a projection failure worth flagging to a human.
-async function writeXellEnv(xellId, { dryRun = false } = {}) {
+async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell?.worktree_path) throw Object.assign(new Error('xell has no worktree'), { no_worktree: true });
   if (!existsSync(xell.worktree_path)) {
     throw Object.assign(new Error(`worktree does not exist: ${xell.worktree_path}`), { no_worktree: true });
   }
+  // The file as it is on disk NOW — read ONCE, for two jobs: the mesh block below preserves the
+  // one-time setup key across a re-emit before the sidecar has consumed it, and the final
+  // no-op-if-identical write comparison reuses it instead of reading the file a second time.
+  const projectedPath = `${xell.worktree_path.replace(/\\/g, '/')}/.zeehive.env`;
+  let previousText = null;
+  try { previousText = readFileSync(projectedPath, 'utf8'); } catch { /* absent → first projection */ }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   const site = await resolveSite(xell.project_id, 'dev');
   const cs = await q(
-    `SELECT role, host_port, conn_ref, docker_ctx FROM container
+    `SELECT role, host_port, conn_ref, conn_pw, docker_ctx FROM container
       WHERE owner_xell_id=$1 AND role IN ('server','webapp','db')`, [xellId]);
   const portOf = (role) => cs.find((c) => c.role === role)?.host_port ?? '';
   // The context the xell's stack ACTUALLY runs on — machines made this per-xell, so the site's
@@ -386,6 +711,20 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
     lines.push(`DATABASE_URL=${dbUrl}`);
   }
 
+  // ZEEHIVE_META_RO_DSN — the infra-medic's READ-ONLY bind to the orchestrator's OWN meta-DB
+  // (provision-proof stage 3). Distinct from DATABASE_URL on purpose: a medic still does its own
+  // work on its own database; this line is the SEPARATE SELECT-only credential for the meta-DB, the
+  // one that lets it read the provisioning evidence (machines, containers, pool, readiness, proof).
+  // The DSN is minted at dispatch (lib/prod-readonly.js mintMetaReader) and lives in
+  // xell.meta_ro_dsn; a live value here is the ONLY reason the line is emitted, and the reaper
+  // clears the column when it drops the role with the xell. The same §6.2 refusal above does NOT
+  // apply: this is a minted SELECT-only reader (default_transaction_read_only=on), the exact class
+  // the exemption is about — a medic could no more reap a live xell than a manager could.
+  if (xell.meta_ro_dsn) {
+    lines.push(`# ZEEHIVE_META_RO_DSN — the meta-DB, READ-ONLY (SELECT-only zee_ro_ role minted for this xell)`);
+    lines.push(`ZEEHIVE_META_RO_DSN=${xell.meta_ro_dsn}`);
+  }
+
   // QUEENZEE_INPROC=false — API-only when this xell shares THE queenzee's meta-DB (TKT-136-FE32).
   //
   // index.js takes advisory lock 715533001 on whatever DATABASE_URL it opens. A spinoff whose
@@ -428,6 +767,10 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
     lines.push('QUEENZEE_INPROC=false');
   }
 
+  // The mesh sidecar env block (meshEnvLines above): a no-op [] for a mesh-less xell/queenzee, so
+  // today's file is byte-identical on every mesh-less path.
+  for (const line of await meshEnvLines({ xell, project, meshSetupKey, previousText })) lines.push(line);
+
   // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
   // Resolved by tier: a xell ON PRODUCTION (environments.isOnProduction — writing it, reading it
   // read-only, or being it) gets the project's default PROD environment, else the default DEV one;
@@ -459,6 +802,10 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
       // never an environment's to set, present in the file or not.
       const reserved = new Set([
         'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', 'QUEENZEE_INPROC',
+        'ZEEHIVE_META_RO_DSN',
+        // The mesh block's two names are never an environment's to set either — reserve them even on
+        // a mesh-less xell, so a later mesh opt-in can't be pre-poisoned by a stale env var.
+        'SPINOFF_MESH_MGMT_URL', 'SPINOFF_MESH_SETUP_KEY',
         serverEnv, webEnv,
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);
@@ -484,9 +831,9 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // A projection identical to what is already on disk is a NO-OP, not a write. The reconcile below
   // runs over the whole fleet, and a queenzee that rewrites an unchanged file under every working
   // zee is indistinguishable (mtime, watchers, "did I do that?") from the zee having edited it —
-  // the same rule reinjectHarnessIntoLiveXells holds for harness files.
-  let changed = true;
-  try { changed = readFileSync(path, 'utf8') !== text; } catch { changed = true; }   // unreadable/absent → write
+  // the same rule reinjectHarnessIntoLiveXells holds for harness files. previousText was read once
+  // at the top (the mesh block needed it); an absent/unreadable file reads null → write.
+  const changed = previousText !== text;
   // The zee in the cage reads a COPY of this file, not this file (refreshLiveCxellEnv below). That
   // copy does its OWN comparison, so it runs whether or not the HOST file moved — see the comment
   // there for why keying it off `changed` would leave the affected zees unreachable forever.
@@ -608,9 +955,9 @@ export async function prewarmCage({ slug, worktree, project, prep }) {
   }
 }
 
-export async function emitXellEnv(xellId, { dryRun = false } = {}) {
+export async function emitXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}) {
   try {
-    const r = await writeXellEnv(xellId, { dryRun });
+    const r = await writeXellEnv(xellId, { dryRun, meshSetupKey });
     if (!dryRun) await noteEnvProjection(xellId, null, r.cxell);
     return r;
   } catch (e) {
@@ -935,14 +1282,16 @@ export async function makeSlug(projectId) {
 // Provision one pooled (empty, ready) xell for a project. machineCtx (optional) pins the target
 // machine — the pool maintainer passes it when filling per-machine targets; omitted, the
 // highest-priority machine with room is chosen (or legacy site placement when no machines exist).
-export async function provisionXell({ projectId, mode = 'simulate', sourceCoupling, dbCoupling, machineCtx }) {
+export async function provisionXell({ projectId, mode = 'simulate', sourceCoupling, dbCoupling, machineCtx, mesh }) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
   const xource = await one(`SELECT * FROM xource WHERE project_id=$1 AND ref=$2`, [projectId, project.main_branch]);
   const cfg = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);
   const slug = await makeSlug(projectId);
   const branch = `spinoff/${slug}`;
   const worktree = `${project.repo_root.replace(/\\/g, '/')}/.claude/worktrees/${slug}`;
-  const ports = computePorts(slug, project);
+  // The formula slot — the STARTING guess. Once the target context is known (below) it is checked
+  // against what actually owns host ports there, exactly like the db port already is.
+  let ports = computePorts(slug, project);
 
   // WHERE this xell's app tier runs. Machine-aware when machine rows exist (highest dev_priority
   // with room under max_xells — spec: "if local priority is higher, dev xells get spawned there
@@ -974,7 +1323,15 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   }
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
-  const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
+  // deploy_site is the source of truth for WHERE a tier runs (docs/deploy-topology-spec.md §5):
+  // the dev site whose docker_ctx matches the machine's own context WINS over the machine row's
+  // host_ip (TKT-180 — before this, ugreen-nas carried host_ip=10.0.1.18 while the daemon and
+  // every other source said 10.1.0.18, and every spin container stamped from that row inherited
+  // an address that never answered). No machine → the project's default dev site → deprecated
+  // project column → global env default, unchanged.
+  const machineSiteHost = machine ? await siteHostForMachine(project.id, machine.docker_ctx) : null;
+  const devHost = machineSiteHost || machine?.host_ip
+    || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
   // A machine row with no host_ip used to produce literal "http://null:PORT" URLs — a URL the
   // health prober can never answer. For a CONTAINERIZED queenzee whose host-machine row carries
@@ -983,7 +1340,35 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // what both actually reach the host on. The host era keeps 'localhost' (true there).
   const urlHost = devHost
     || (devCtx === queenzeeHostCtx() && existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost');
-  const url = `http://${urlHost}:${ports.webPort}`;
+
+  // ALLOCATE THE APP TIER'S HOST PORTS AGAINST REAL OWNERSHIP (TKT-85 family, plan §4.5) — the
+  // same fix the per-xell db port got, for the two ports that were still a pure formula. With
+  // port_slot_mod=90 and a dozen live xells per project, two slugs hashing to one slot is routine:
+  // the loser's spin stack dies at "Bind for 0.0.0.0:5324 failed: port is already allocated", that
+  // failure is classed INFRA, and an INFRA failure writes build_readiness_record='missing' — which
+  // STOPS the pool fill for the whole project on that machine. One collision, no more xells.
+  // Both ports move together on one slot; the rows stamped below are what lib/build.js projects
+  // into SPINOFF_SERVER_PORT/SPINOFF_WEB_PORT, so the recorded port is what actually gets bound.
+  // The bases are computePorts' OWN (port - slot), never a second reading of the project row: the
+  // allocation must walk the same ladder the formula sits on, or the two would drift.
+  const appBases = { serverBase: ports.serverPort - ports.slot, webBase: ports.webPort - ports.slot };
+  const formulaSlot = ports.slot;
+  const allocated = await freeAppSlot(devCtx, { ...appBases, slot: ports.slot }).catch((e) => {
+    // Never a new way to fail a provision: an allocator that blows up degrades to the formula —
+    // the bind refusal stays the arbiter, exactly as it was before this fix existed.
+    console.warn(`[provision] ${slug}: app-tier port allocation failed (${e.message}) — using the `
+      + `formula ports :${ports.serverPort}/:${ports.webPort}`);
+    return ports;
+  });
+  if (allocated.slot !== ports.slot) {
+    console.warn(`[provision] ${slug}: slot ${ports.slot} (:${ports.serverPort}/:${ports.webPort}) is `
+      + `already owned on ${devCtx} — allocating slot ${allocated.slot} `
+      + `(:${allocated.serverPort}/:${allocated.webPort})`);
+  }
+  ports = allocated;
+  // Derived on READ, never captured: a bind-refusal retry below can move the pair again, and a URL
+  // frozen at the first allocation would point the health prober at a port nothing listens on.
+  const webUrl = () => `http://${urlHost}:${ports.webPort}`;
 
   // A xell's app tier must never reach across docker contexts for its database, so a machine
   // without this project's own shared dev db cannot host xells that need one. Refused HERE, by
@@ -1014,17 +1399,43 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     const script = resolve(config.repoRoot, 'scripts', 'provision-xell.sh');
     // Pass the project's source branch — the script used to hardcode 'main', which silently
     // ignored main_branch and broke every project that isn't on main.
-    const r = spawnSync(resolveBash(), [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
-      encoding: 'utf8', timeout: 600000,
-      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devCtx, DEV_HOST_IP: devHost,
-             PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
-    });
+    const runProvisionScript = () => spawnSync(
+      resolveBash(), [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
+        encoding: 'utf8', timeout: 600000,
+        // The ALLOCATED ports, not the script's own formula: the script (and spin-env.sh under it)
+        // already honour an inherited SPINOFF_SERVER_PORT/SPINOFF_WEB_PORT, so the stack binds
+        // exactly what the container rows below record — and what lib/build.js later rebuilds with.
+        env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devCtx, DEV_HOST_IP: devHost,
+               SPINOFF_SERVER_PORT: String(ports.serverPort), SPINOFF_WEB_PORT: String(ports.webPort),
+               PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
+      });
+    // A BIND REFUSAL is the collision the allocation raced: something bound one of the pair between
+    // the ps read and `spin-env.sh up` — or the daemon read degraded to meta-DB-only (docker
+    // unreachable) and never saw the binder at all. Retry on the next free slot, skipping the pair
+    // we just lost so the walk makes forward progress; the script re-uses the worktree it already
+    // has. Same contract as the per-xell db container's retry below. Anything else (a failed
+    // install, a dead context) is a real failure and stays one, on the FIRST attempt.
+    const bindRefused = (r) => /port is already allocated|address already in use|bind[^\n]*already in use/i
+      .test(`${r?.stderr || ''}\n${r?.stdout || ''}`);
+    const skipPorts = [];
+    let r = runProvisionScript();
+    for (let attempt = 1; attempt < 3 && r.status !== 0 && bindRefused(r); attempt++) {
+      skipPorts.push(ports.serverPort, ports.webPort);
+      const next = await freeAppSlot(devCtx, { ...appBases, slot: formulaSlot, skip: skipPorts })
+        .catch(() => null);
+      if (!next || skipPorts.includes(next.serverPort) || skipPorts.includes(next.webPort)) break;
+      console.warn(`[provision] ${slug}: :${ports.serverPort}/:${ports.webPort} refused at bind — `
+        + `retrying on slot ${next.slot} (:${next.serverPort}/:${next.webPort})`);
+      ports = next;
+      r = runProvisionScript();
+    }
     if (r.status !== 0) throw new Error(`provision-xell.sh failed: ${provisionFailureReason(r)}`);
     health = appTier ? 'up' : 'down'; // worktree exists; containers only up if the app tier ran
   }
 
   const client = await pool.connect();
   let createdDbContainer = null;   // a docker-run per-xell db to tear down if the tx fails
+  let sharedDevContainerId = null; // the shared dev db linked below — for a real-mode conn_pw backfill
   try {
     await client.query('BEGIN');
     const { rows: [xell] } = await client.query(
@@ -1076,7 +1487,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, c.id]);
     };
     await mk('server', ports.serverPort, 3000, `http://${urlHost}:${ports.serverPort}`);
-    await mk('webapp', ports.webPort, 5173, url);
+    await mk('webapp', ports.webPort, 5173, webUrl());
 
     // Per-xell OWN database container (spec §6.1: a Zeehive xell gets its own meta-DB container,
     // slot-ported, provisioned BY ZEEHIVE). Scoped to db-isolated coupling on a PROCESS-runner
@@ -1090,19 +1501,46 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       const dbName = mdb.name || project.db_name || 'app';
       const dbUser = mdb.user || project.db_user || 'postgres';
       const dbPass = mdb.password || 'dev';
-      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      // ALLOCATE THE HOST PORT AGAINST REAL OWNERSHIP (TKT-85 family, plan §4.5): the slot formula
+      // is the STARTING guess; the actual port is the first free one walking up from it, checked
+      // against the union of the meta-DB's recorded db host ports on this context and one bounded
+      // `docker ps --format '{{.Ports}}'` read of the daemon (async — never spawnSync on the event
+      // loop). docker run below remains the arbiter of a genuinely taken port (a TOCTOU between the
+      // read and the run), which is why the bind is RETRIED on the next free slot instead of failing
+      // the attach. The stage-2 re-preflight is the safety net; this is the fix.
+      const dbBase = Number(spinTier.ports?.db?.base) || 5500;
+      let dbPort = await freeDbHostPort(devCtx, { base: dbBase, slot: ports.slot, projectId });
       const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
       if (mode === 'real') {
-        const run = spawnSync('docker',
-          ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
-           // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
-           // the published host port below is the HUMAN's door (psql from the host)
-           '--network', 'zee-hive-net',
-           '-p', `${dbPort}:5432`,
-           '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
-           '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
-           '--label', `zeehive.slug=${slug}`, dbImage],
-          { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+        const skipPorts = [];     // host ports this provision already failed to bind — walk past them
+        let run = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          run = spawnSync('docker',
+            ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
+             // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
+             // the published host port below is the HUMAN's door (psql from the host)
+             '--network', 'zee-hive-net',
+             '-p', `${dbPort}:5432`,
+             '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
+             '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
+             '--label', `zeehive.slug=${slug}`, dbImage],
+            { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+          if (run.status === 0) break;
+          const err = (run.stderr || '').slice(-300);
+          // A BIND REFUSAL is the collision the allocation raced: something bound the port between
+          // the ps read and this docker run. Retry on the next free slot — a fresh freeDbHostPort
+          // re-reads the daemon (now seeing the new binder) AND skips the port we just lost, so the
+          // walk makes forward progress. Anything else (image pull, daemon down) is a real failure
+          // and stays one.
+          if (/port is already allocated|address already in use|bind.*already/i.test(err)) {
+            console.warn(`[provision] ${slug}: db host port :${dbPort} refused at bind — retrying the `
+              + `next free slot (${err.trim().slice(0, 90)})`);
+            skipPorts.push(dbPort);
+            dbPort = await freeDbHostPort(devCtx, { base: dbBase, slot: ports.slot, projectId, skip: skipPorts });
+            continue;
+          }
+          break;
+        }
         if (run.status !== 0) {
           throw new Error(`per-xell db container ${nmDb.container} failed: ${(run.stderr || '').slice(-300)}`);
         }
@@ -1139,20 +1577,23 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
           }
         }
       }
-      // conn_ref stays passwordless (parameters, not secrets) — emitXellEnv injects the
-      // manifest's committed dev credential for process xells. The HOST in it depends on where
-      // the consumers run: a containerized queenzee's process xells and its cxells resolve the
-      // db by CONTAINER NAME over zee-hive-net (localhost:<published port> is the container's
-      // own empty loopback — seen live: the first in-container process start died on connect
-      // and its port never answered); the host era keeps the published-port form.
+      // conn_ref stays passwordless (parameters, not secrets) — conn_pw carries the credential
+      // resolveXellDsn injects into the projected DATABASE_URL (TKT-181-9EDA). The HOST in
+      // conn_ref depends on where the consumers run: a containerized queenzee's process xells
+      // and its cxells resolve the db by CONTAINER NAME over zee-hive-net (localhost:<published
+      // port> is the container's own empty loopback — seen live: the first in-container process
+      // start died on connect and its port never answered); the host era keeps the published-port
+      // form.
       const inContainer = existsSync('/.dockerenv');
       const connRef = inContainer
         ? `postgresql://${dbUser}@${nmDb.container}:5432/${dbName}`
         : `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`;
+      // conn_pw IS recorded here (TKT-181-9EDA): this code just docker-ran the container with
+      // POSTGRES_PASSWORD=dbPass, so dbPass is the ONE password the projected DSN must carry.
       const { rows: [dbc] } = await client.query(
-        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,owner_xell_id,site_id,health)
-         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10) RETURNING id`,
-        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef,
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,conn_pw,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11) RETURNING id`,
+        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef, dbPass,
          xell.id, devSiteId, mode === 'real' ? 'up' : 'unknown']);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
     } else if (coupling === 'db-isolated' && project.manifest?.roles?.db?.service) {
@@ -1167,13 +1608,21 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       const mdb = project.manifest?.db || {};
       const dbName = mdb.name || project.db_name || 'app';
       const dbUser = mdb.user || project.db_user || 'postgres';
-      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      const dbPass = mdb.password || 'dev';
+      // ALLOCATE AGAINST REAL OWNERSHIP, same as the process twin (TKT-85, plan §4.5): there is no
+      // docker run here to catch a collision (compose binds at first build), so the ROW must record
+      // a port the daemon does not already own — otherwise the recorded conn_ref is a lie from the
+      // moment it is written and the compose stack fails to bind. The union check is the fix.
+      const dbPort = await freeDbHostPort(devCtx, { base: Number(spinTier.ports?.db?.base) || 5500,
+                                                    slot: ports.slot, projectId });
       const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
+      // conn_pw IS recorded (TKT-181-9EDA): the compose stack this row models is generated with
+      // POSTGRES_PASSWORD=dbPass (lib/compose-gen.js), so dbPass is what a TCP DSN must carry.
       const { rows: [dbc] } = await client.query(
-        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,compose_project,compose_file,owner_xell_id,site_id,health)
-         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11,'down') RETURNING id`,
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,conn_pw,compose_project,compose_file,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11,$12,'down') RETURNING id`,
         [projectId, nmDb.container, dbImage, devCtx, urlHost, dbPort,
-         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`,
+         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`, dbPass,
          namingFor(project, 'db', slug).composeProject, project.compose_spinoff,
          xell.id, devSiteId]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
@@ -1191,17 +1640,53 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
             AND (docker_ctx = $2 OR docker_ctx IS NULL)
           ORDER BY (docker_ctx = $2) DESC NULLS LAST LIMIT 1`, [projectId, devCtx]);
       if (shared.rows[0]) {
-        await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'uses') ON CONFLICT DO NOTHING`, [xell.id, shared.rows[0].id]);
+        sharedDevContainerId = shared.rows[0].id;
+        await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'uses') ON CONFLICT DO NOTHING`, [xell.id, sharedDevContainerId]);
       }
     }
     await client.query('COMMIT');
     broadcast('xell', xell);
     // the honeycomb's queenzee→xell line: the queenzee just provisioned this xell
     activity('q2x', xell.id, 'provision', projectId);
+    // ── MESH SIDECAR INTENT (docs/netbird-mesh-plan.md §3.3 / §6 phase 3) ─────────────────────────
+    // A project whose manifest opts tiers.spinoff.mesh.enabled AND whose queenzee has the mesh
+    // configured mints the per-xell peer at provision. The one-time setup key is passed straight
+    // into the .zeehive.env projection below (real mode) and is NEVER stored — only its id rides
+    // the row. A mint failure must degrade this provision to LEGACY-ONLY, logged, never block: a
+    // control-plane outage is not a reason a pooled xell does not exist. A SIMULATE provision mints
+    // only when a caller injects a request adapter (a test double) — a bare simulate (a nested
+    // queenzee) must not mint a REAL control-plane peer it will never hand a key to.
+    let meshSetupKey = null;
+    if (meshOptIn(project) && meshEnabled() && (mode === 'real' || mesh?.request)) {
+      try {
+        const mint = await mintPeer({ projectId, kind: 'xell', hostname: slug, xellId: xell.id },
+                                    { request: mesh?.request || netbirdRequest });
+        if (mint.ok) {
+          meshSetupKey = mint.setupKey;
+        } else {
+          logline('mesh', `${slug}: mesh peer mint ${mint.disabled ? 'disabled' : 'failed'} `
+            + `(${mint.reason}) — provisioning continues LEGACY-ONLY`);
+        }
+      } catch (e) {
+        logline('mesh', `${slug}: mesh peer mint errored (${e.message}) — provisioning continues LEGACY-ONLY`);
+      }
+    }
     // the harness-free projection rides every REAL provision; failure is logged, never fatal
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {
-      await emitXellEnv(xell.id).catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
+      // The shared dev db this xell USES may predate container.conn_pw (the column is new: TKT-181-
+      // 9EDA). Its row has no password to project, so before writing this xell's .zeehive.env, ask
+      // the LIVE container what POSTGRES_PASSWORD it was created with and record it — the only
+      // honest source (the meta-DB never knew, and the manifest can be a different password, as the
+      // ugreen-nas shared dev db proved). A row we still cannot read stays passwordless and the
+      // preflight below names the fault; this is a best-effort repair, never a reason to fail the
+      // provision.
+      if (sharedDevContainerId) {
+        await ensureDbContainerConnPw(sharedDevContainerId, { mode })
+          .catch((e) => logline('provision', `${slug}: shared dev db conn_pw backfill failed (ignored): ${e.message}`));
+      }
+      await emitXellEnv(xell.id, { meshSetupKey })
+        .catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
       // …and OPEN what was just written, before anyone treats this xell as ready (#53). Writing a
       // DATABASE_URL and that DATABASE_URL answering are two different facts, and the gap is what
       // let seven zees in one night be handed a credential the shared dev db rejects (#47).
@@ -1235,7 +1720,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
           .catch((e) => logline('pool', `${slug}: cage prewarm errored (ignored): ${e.message}`));
       }
     }
-    return { ...xell, ports, url, mode };
+    return { ...xell, ports, url: webUrl(), mode };
   } catch (err) {
     await client.query('ROLLBACK');
     // the rollback erased the row that owned it — remove the physical container too

@@ -138,6 +138,27 @@ ok(/text: `zee \$\{verb\}`/.test(app),
 ok(/r\?\.sent/.test(app), 'and reports the delivery result (sent / not delivered)');
 ok(!/sendXellMessage/.test(src), 'HiveCanvas itself never calls the door — the menu only names the verb');
 
+// ── 4.6 RESCUE — a quarantined xell gets the rescue arm (ticket #81) ──────────
+console.log('\nthe quarantine decision: rescue vs reap, on the flower and the menu');
+const qx = { ...worker, id: 'q', slug: 'q', quarantined_at: '2026-08-01T00:00:00Z', hive_status: 'occ-quarantined' };
+const qv = petalVerbs(qx, clean);
+const qm = xellContextMenuItems(qx, clean);
+const qKinds = Object.values(qv).flat();
+ok(qKinds.includes('rescue'), 'a quarantined xell is offered RESCUE on the flower');
+ok(kinds(qm).includes('rescue'),
+   '…and in the context menu (the menu inherits the flower\'s verb list)');
+ok(!qKinds.includes('swap') && !kinds(qm).includes('swap'),
+   'SWAP is NOT offered on a quarantined xell — the quarantine guard refuses to dispatch ANY new agent into the cage');
+ok(qKinds.includes('done') && kinds(qm).includes('done'),
+   'DONE stays — it is the reap arm of the same rescue-or-reap decision');
+ok(qm.find((it) => it.kind === 'rescue')?.label === '🛟 Rescue',
+   'the rescue row reads as a word (the flower draws just 🛟)');
+ok(!kinds(xellContextMenuItems(worker, clean)).includes('rescue')
+   && !kinds(xellContextMenuItems({ ...worker, quarantined_at: null }, clean)).includes('rescue'),
+   'a clean xell is NOT offered rescue — there is nothing to clear');
+ok(/kind === 'rescue'/.test(app) && /rescueXell\(x\.id\)/.test(app),
+   'App dispatches kind rescue → rescueXell (the /xells/:id/unquarantine POST)');
+
 // ── 5. closing: one menu at a time, close on outside interaction ──────────────
 console.log('\nthe menu closes like the container menu');
 ok(/setCtxXell\(null\); +\/\/ one menu at a time/.test(src),

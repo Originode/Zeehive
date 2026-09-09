@@ -26,4 +26,16 @@ for hp in $BLOCK_TCP; do
   done
 done
 
+# The MESH route (docs/netbird-mesh-plan.md §3.5): a cxell reaches mesh addresses through the
+# queenzee's mesh-gateway container on zee-hive-net, not through a per-cage agent. MESH_GATEWAY_IP
+# (the gateway's zee-hive-net address) unset = no mesh on this install — the legacy published ports
+# stay the whole story and nothing here changes. The route replaces (idempotent) so a re-seal with a
+# new gateway address converges instead of stacking.
+MESH_GATEWAY_IP=${MESH_GATEWAY_IP:-}
+MESH_CIDR=${MESH_CIDR:-100.64.0.0/10}
+if [ -n "$MESH_GATEWAY_IP" ]; then
+  ip route replace "$MESH_CIDR" via "$MESH_GATEWAY_IP"
+  echo "mesh route: $MESH_CIDR via $MESH_GATEWAY_IP"
+fi
+
 echo "cxell egress: default ALLOW; blocked prod db(s): ${BLOCK_TCP:-none}"

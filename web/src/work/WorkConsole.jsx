@@ -1,5 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { subscribe } from '../api.js';
 import { showPrompt } from '../Dialog.jsx';
 import { createWorkItem, getWorkStatuses, listWorkItems, patchWorkItem, vocabOf } from './workApi.js';
@@ -14,12 +13,18 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 // REFLECTIONS ledger — what the fleet's own zees reported after their work shipped), the plan
 // (board), and time (timeline), over a single hierarchy of work items.
 //
-// WHY A FULL-SCREEN OVERLAY: this console has no router — every heavyweight surface (the terminal,
-// the diff viewer, the dispatch composer) is a portalled overlay, and adding a router for one
-// feature would mean every existing deep link changes meaning. So the tracker opens like they do,
-// portalled onto <body>. That portal is not decoration: `.hive-split` sets `position: fixed` and the
-// panes create stacking contexts, so an overlay rendered inside the tree ranks at z-index 1 no
-// matter what number it carries (Dispatch.jsx's header documents the same trap).
+// WHY IT IS NO LONGER AN OVERLAY: it used to open as a full-screen portalled modal over the
+// honeycomb, which made the plan a place you LEAVE the fleet view to visit — and the two are the
+// same subject seen two ways (the honeycomb is the plan with a zee on it). So the tracker is now a
+// VIEW OF THE HONEYCOMB PANE: App.jsx draws a view selector on that pane (honeycomb · tickets ·
+// reflections · board · timeline) and renders this component in the pane's place when a work view
+// is picked. Nothing is portalled and nothing floats: `.work-embed` fills the pane the canvas
+// would have filled.
+//
+// WHICH VIEW IS SHOWING IS THEREFORE THE PANE'S STATE, NOT THIS COMPONENT'S: `tab` comes in as a
+// prop and `onTabChange` reports a change back (the Reflections screen's "go to tickets" link).
+// Two copies of "which view" — one here, one on the selector — is how a selector and a screen end
+// up disagreeing about what is on screen.
 //
 // WHY THE TREE RAIL IS PERMANENT, LEFT OF THE TABS: the hierarchy is the spine of this model — there
 // is exactly ONE `kind='project'` item per ZEEHIVE project and every activity and task is its
@@ -45,19 +50,17 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 // a UI that also wrote status periodically would fight it, each overwriting the other's idea of the
 // plan. The console reads, and writes only what a human asked for.
 
-const TAB_KEY = 'zeehive.work.tab';
-const TABS = [
-  { id: 'tickets', label: 'Tickets' },
-  { id: 'reflections', label: 'Reflections' },
-  { id: 'board', label: 'Board' },
-  { id: 'timeline', label: 'Timeline' },
+// THE VIEWS this console can draw, in the order the selector offers them. Exported because the
+// selector that switches between them lives on the honeycomb pane (App.jsx) — one list, read by
+// both, so a view added here appears in the selector without a second edit.
+export const WORK_VIEWS = [
+  { id: 'tickets', label: '⛁ tickets', title: 'intake — tickets and their breakdown' },
+  { id: 'reflections', label: '✎ reflections', title: 'what zees reported after their work shipped' },
+  { id: 'board', label: '▦ board', title: 'the plan as a kanban board' },
+  { id: 'timeline', label: '▤ timeline', title: 'the plan as a gantt timeline' },
 ];
 
-export default function WorkConsole({ projectId, projectName, onClose }) {
-  const [tab, setTab] = useState(() => {
-    try { const t = localStorage.getItem(TAB_KEY); return TABS.some((x) => x.id === t) ? t : 'board'; }
-    catch { return 'board'; }
-  });
+export default function WorkConsole({ projectId, projectName, tab, onTabChange, onClose }) {
   const [vocab, setVocab] = useState({ statuses: [], itemKinds: [], ticketKinds: [] });
   const [tree, setTree] = useState(null);
   const [selected, setSelected] = useState(null);      // the work item scoping board + timeline
@@ -67,8 +70,6 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
   const [rev, setRev] = useState(0);                   // bumped to make children refetch
   const dragRef = useRef(null);
   const [dropOn, setDropOn] = useState(null);
-
-  useEffect(() => { try { localStorage.setItem(TAB_KEY, tab); } catch { /* private mode */ } }, [tab]);
 
   // The status vocabulary is fetched ONCE here and handed to every child: the board, the drawer's
   // picker and the ticket filters must all be talking about the same list, and three fetches of one
@@ -115,8 +116,9 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
     return () => { clearTimeout(slow); clearTimeout(fast); stop(); };
   }, [projectId, refresh]);
 
-  // Escape closes the drawer first, then the console — the innermost thing goes first, which is what
-  // every other overlay in the console does and what a human expects from a stack.
+  // Escape closes the drawer first, then hands the pane back to the honeycomb (onClose) — the
+  // innermost thing goes first, which is what every other surface in the console does and what a
+  // human expects from a stack.
   useEffect(() => {
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
@@ -158,22 +160,15 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
     catch (e) { setErr(e); }        // e.g. "a task cannot contain an activity" — shown, not swallowed
   };
 
-  const overlay = (
-    <div className="work-overlay" data-testid="work-console">
+  return (
+    <div className="work-embed" data-testid="work-console">
       <div className="work-shell">
         <header className="work-head">
           <span className="work-h-title">▦ Work — <b>{projectName || 'project'}</b></span>
-          <nav className="work-tabs">
-            {TABS.map((t) => (
-              <button key={t.id} className={`work-tab${tab === t.id ? ' on' : ''}`}
-                      data-testid={`work-tab-${t.id}`} onClick={() => setTab(t.id)}>{t.label}</button>
-            ))}
-          </nav>
           <span className="work-scope" title="the board and the timeline are scoped to this node">
             scope: <b>{scopeLabel}</b>
             {selected && <button className="work-mini" onClick={() => setSelected(null)}>clear</button>}
           </span>
-          <button className="work-x" data-testid="work-close" onClick={onClose} title="close (Esc)">✕</button>
         </header>
 
         <ErrLine err={err} onDismiss={() => setErr(null)} />
@@ -205,7 +200,7 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
             )}
             {tab === 'reflections' && (
               <Reflections projectId={projectId} kinds={vocab.ticketKinds} reloadKey={rev}
-                           onOpenTickets={() => setTab('tickets')} />
+                           onOpenTickets={() => onTabChange?.('tickets')} />
             )}
             {tab === 'board' && (
               <Board projectId={projectId} rootId={rootId} statuses={statuses} reloadKey={rev}
@@ -222,8 +217,6 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
       </div>
     </div>
   );
-
-  return createPortal(overlay, document.body);
 }
 
 // ── the rail ────────────────────────────────────────────────────────────────

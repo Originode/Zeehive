@@ -7,11 +7,12 @@ import {
 } from './api.js';
 import { hiveColor, hiveStatusLabel } from './hive/status.js';
 import { xellContextMenuItems } from './hive/HiveCanvas.jsx';
+import { findProject, formatPath, legacyProjectParam, parsePath } from './route.js';
 // Re-exported so a render test can assert the menu is exactly the hexagon's list.
 export { xellContextMenuItems } from './hive/HiveCanvas.jsx';
 
 // ────────────────────────────────────────────────────────────────────────────────
-// MOBILE CHAT UI — /m?project=<name>
+// MOBILE CHAT UI — /m/<project>[/<child>/<child>…]
 //
 // A phone-first, read-heavy surface over the same API the console uses. No gates, no
 // admin panels: one box per xell, a prompt button to deploy a zee, and tapping a box
@@ -24,31 +25,34 @@ export { xellContextMenuItems } from './hive/HiveCanvas.jsx';
 // page is meant to be small and self-contained, and the fleet read model is cheap.
 // ────────────────────────────────────────────────────────────────────────────────
 
-const PROJECT_PARAM = 'project';
 const XELL_PARAM = 'xell';
 const PROJECT_KEY = 'zeehive.project';
 const POLL_MS = 5000;
-
-// Resolve a project from a URL token (?project=…), matched against either the id or the
-// name (case-insensitive) — the same rule the console uses.
-const findByToken = (ps, token) =>
-  token
-    ? ps.find((p) => p.id === token || p.name?.toLowerCase() === String(token).toLowerCase())
-    : null;
 
 const readParam = (key) => {
   try { return new URLSearchParams(window.location.search).get(key); } catch { return null; }
 };
 
+// The project comes from the PATH now — /m/<project>/… — with the legacy `?project=` still read for
+// an old link. The node segments after it are the console's work-node path (route.js): this screen
+// has no node hierarchy to drill, so it CARRIES them untouched rather than dropping them, and a
+// /m/a/b/c link stays a /a/b/c link when a human hops back to the console.
+const readProjectToken = () =>
+  parsePath(window.location.pathname).project || legacyProjectParam(window.location.search);
+const carriedNodes = () => parsePath(window.location.pathname).nodes;
+
 // Keep the URL in step WITHOUT adding history entries, so Back does not walk through
-// every xell box you tapped.
-const writeParams = (params) => {
+// every xell box you tapped. `path` (when given) replaces the pathname; params still ride the query
+// — a selected XELL is not a work node, so it stays a param rather than inventing a segment for it.
+const writeParams = (params, path) => {
   try {
     const url = new URL(window.location.href);
+    if (path) url.pathname = path;
     for (const [k, v] of Object.entries(params)) {
       if (v == null || v === '') url.searchParams.delete(k);
       else url.searchParams.set(k, v);
     }
+    url.searchParams.delete('project');   // the legacy param — the path says it now
     window.history.replaceState(null, '', url);
   } catch { /* history unavailable — non-fatal */ }
 };
@@ -139,10 +143,15 @@ export default function MobileChat() {
       .then((ps) => {
         if (dead) return;
         setProjects(ps);
-        const fromUrl = findByToken(ps, readParam(PROJECT_PARAM));
+        const fromUrl = findProject(ps, readProjectToken());
         const stored = localStorage.getItem(PROJECT_KEY);
         const picked = fromUrl || ps.find((p) => p.id === stored) || ps[0] || null;
         setProjectId(picked?.id || null);
+        // Normalise the address: fill in a bare /m, and rewrite a legacy /m?project=x as a path.
+        if (picked) {
+          writeParams({}, formatPath({ mobile: true, project: picked.name,
+                                       nodes: fromUrl ? carriedNodes() : [] }));
+        }
       })
       .catch((e) => { if (!dead) setErr(e.message); });
     return () => { dead = true; };
@@ -193,7 +202,9 @@ export default function MobileChat() {
     setProjectId(id || null);
     if (id) localStorage.setItem(PROJECT_KEY, id);
     else localStorage.removeItem(PROJECT_KEY);
-    writeParams({ [PROJECT_PARAM]: projects.find((p) => p.id === id)?.name || null, [XELL_PARAM]: null });
+    // a project switch drops the previous project's node segments — they mean nothing here
+    writeParams({ [XELL_PARAM]: null },
+                formatPath({ mobile: true, project: projects.find((p) => p.id === id)?.name || null }));
   };
 
   const deploy = async () => {

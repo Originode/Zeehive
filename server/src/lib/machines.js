@@ -19,7 +19,7 @@ import { logline } from './logbus.js';
 import { resolveContext, contextEndpoint, dockerPs } from './docker.js';
 import { resolveBash } from './bash.js';
 import { namingFor, sanitizeName } from './manifest.js';
-import { derivedTcpDsn } from './xell-db.js';
+import { derivedTcpDsn, resolveRealDbContainer } from './xell-db.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -39,14 +39,39 @@ export function queenzeeHostCtx() { return 'default'; }
 // context strings itself.
 const withHostFlag = (rows) => rows.map((m) => ({ ...m, is_queenzee_host: m.docker_ctx === queenzeeHostCtx() }));
 
-// The host a machine's shared dev db is RECORDED at. The three explicit places first (the machine
-// row, the project, the config), then the QUEENZEE-HOST fallback: a local machine's published
-// ports ARE the host's own, so a db provisioned there is reachable at host.docker.internal from a
-// containerized queenzee/cxell, else localhost from the host. A REMOTE machine with none of the
-// three stays null — fail closed (db-dsn-needs-a-host): its address is genuinely unknown, and
-// guessing 'localhost' would point every consumer at a silent wrong database. This is what keeps a
-// freshly provisioned local dev db from wearing the chip's "no URL recorded" tooltip.
-export function machineDbHost(m, project, cfg) {
+// The dev deploy_site whose docker_ctx matches a machine's context — the site that says WHERE
+// that machine's dev tier actually runs (docs/deploy-topology-spec.md §5). deploy_site is the
+// single source of truth for a machine-placed container's host: a matching site's host WINS over
+// the machine row's host_ip (TKT-180 — before this, ugreen-nas carried host_ip=10.0.1.18 while
+// every other source said 10.1.0.18, and every spin container stamped from that row inherited an
+// address that never answered). NULL when there is no dev site for the context: the fallback
+// chain then owns the answer.
+export async function siteHostForMachine(projectId, dockerCtx) {
+  if (!projectId || !dockerCtx) return null;
+  const site = await one(
+    `SELECT host FROM deploy_site WHERE project_id=$1 AND tier='dev' AND docker_ctx=$2 LIMIT 1`,
+    [projectId, dockerCtx]).catch(() => null);
+  return site?.host || null;
+}
+
+// The host a machine's shared dev db is RECORDED at. deploy_site wins first (the dev site whose
+// docker_ctx matches the machine's context — see siteHostForMachine), then the three explicit
+// legacy places (the machine row, the project, the config), then the QUEENZEE-HOST fallback: a
+// local machine's published ports ARE the host's own, so a db provisioned there is reachable at
+// host.docker.internal from a containerized queenzee/cxell, else localhost from the host. A
+// REMOTE machine with none of the above stays null — fail closed (db-dsn-needs-a-host): its
+// address is genuinely unknown, and guessing 'localhost' would point every consumer at a silent
+// wrong database. This is what keeps a freshly provisioned local dev db from wearing the chip's
+// "no URL recorded" tooltip.
+export async function machineDbHost(m, project, cfg) {
+  const siteHost = await siteHostForMachine(project?.id, m?.docker_ctx);
+  if (siteHost) return siteHost;
+  return machineDbHostFallback(m, project, cfg);
+}
+
+// The pure legacy fallback chain, kept separate so callers with no site (or no DB) can still
+// resolve the explicit places. machineDbHost consults deploy_site first and falls back to this.
+export function machineDbHostFallback(m, project, cfg) {
   return m.host_ip || project.dev_host_ip || cfg.devHostIp
     || (m.docker_ctx === queenzeeHostCtx()
         ? (existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost')
@@ -330,6 +355,44 @@ export async function sharedDevDb(projectId, ctx) {
       LIMIT 1`, [projectId, ctx]);
 }
 
+// ── container.conn_pw (TKT-181-9EDA) ─────────────────────────────────────────
+// conn_refs are passwordless BY DESIGN, so the inventory historically never held the role
+// password. A worker xell's projected DATABASE_URL needs it over TCP, and the source of truth for
+// "what password actually authenticates" is per-container: the POSTGRES_PASSWORD the live
+// container was created with. These helpers read that truth (for rows that predate the conn_pw
+// column) and record it where resolveXellDsn can inject it.
+
+// Parse POSTGRES_PASSWORD out of a `docker inspect` env listing. PURE — a line is either the
+// variable we hunt or noise, so one expression carries the whole rule (exported for tests).
+export function postgresPasswordFromEnv(envLines) {
+  for (const line of envLines || []) {
+    const m = /^POSTGRES_PASSWORD=(.*)$/.exec(String(line || '').trim());
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Backfill a db container row's conn_pw from the LIVE container's own POSTGRES_PASSWORD — the
+// only honest source for a row that predates the column (the meta-DB never knew the password;
+// guessing it from the manifest is the bug class TKT-181-9EDA exists to close). Real mode only:
+// there is no daemon to ask in simulate mode, and the caller is expected to have set conn_pw by
+// hand in fixtures. Returns the (possibly unchanged) row; never throws — a row we cannot read
+// stays passwordless, and the readiness preflight names the fault instead of this helper.
+export async function ensureDbContainerConnPw(containerId, { mode = MODE } = {}) {
+  const db = await one(`SELECT * FROM container WHERE id=$1`, [containerId]);
+  if (!db || db.role !== 'db' || db.conn_pw) return db;
+  if (mode !== 'real') return db;
+  const r = spawnSync('docker',
+    ['--context', db.docker_ctx || 'default', 'inspect', '-f', '{{range .Config.Env}}{{println .}}{{end}}', db.name],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  const pw = postgresPasswordFromEnv((r.stdout || '').split('\n'));
+  if (!pw) return db;   // unreadable (container gone / not a postgres image) — leave for the preflight
+  const updated = await one(`UPDATE container SET conn_pw=$2 WHERE id=$1 RETURNING *`, [db.id, pw]);
+  broadcast('container', updated);
+  logline('machine', `backfilled conn_pw for ${db.name} (${db.docker_ctx || 'default'}) from the live container`);
+  return updated;
+}
+
 // WHERE do a xell's images compile when it runs on `machine`? On the machine itself when it can
 // build; otherwise on the oldest build-capable machine (registry handoff) — build capability is a
 // machine-wide fact, so its choice no longer rides on the (now per-project) dev_priority. null ⇒
@@ -376,16 +439,46 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     `SELECT name, image_tag FROM container
       WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared'
       ORDER BY (image_tag IS NOT NULL) DESC LIMIT 1`, [projectId]);
-  const prodDb = source ? null : await one(
-    `SELECT name, image_tag, docker_ctx FROM container
+  const prodDb = await one(
+    `SELECT name, image_tag, docker_ctx, host_port FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [projectId]);
-  // A modeled prod db row often has no image_tag — the LIVE container knows what it runs.
-  let prodImage = prodDb?.image_tag || null;
-  if (prodDb && !prodImage && MODE === 'real') {
-    prodImage = (spawnSync('docker', ['--context', prodDb.docker_ctx || 'default', 'inspect', '-f', '{{.Config.Image}}', prodDb.name],
-      { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim() || null;
+  // The IMAGE comes from PROD FIRST, dev siblings LAST. A dev db exists to restore prod's dumps,
+  // so "which image can load them" is a fact about prod — a sibling's recorded image_tag is
+  // hearsay, and on omnibiz EVERY sibling lied: the first dev db was cut from the exited
+  // postgres:18beta1 husk (the logical-name-inspect defect, fixed below), all three machines'
+  // rows recorded that stock tag, and sibling-first meant each re-provision re-created the fault
+  // no matter what prod actually ran — the 2026-09-07 recurrence of `extension "postgis" is not
+  // available`. Order: the LIVE prod container's image (resolved by registry identity, trusted
+  // only while RUNNING), else the prod row's recorded tag, else the dev sibling's tag (prod
+  // unreachable — degraded, and it may re-propagate a stale sibling, so the log says which
+  // source won), else the hardcoded default.
+  //
+  // A modeled prod db row often has no image_tag — the LIVE container knows what it runs. But the
+  // row's LOGICAL name (omnibiz_db_prod) is NOT the live container: the daemon runs a VERSIONED
+  // one (omnibiz_db_prod_v184), and `docker inspect` on the logical name reads whatever container
+  // still wears it — on omnibiz that is the EXITED stock postgres:18beta1 husk. Resolve by
+  // registry identity first — the same rule every other prod-db reader follows — and only trust a
+  // RUNNING container's image: with prod down the resolver falls back to the logical name, and
+  // inspecting that reads the husk again.
+  let liveProdImage = null;
+  if (prodDb && MODE === 'real') {
+    const prodCtx = prodDb.docker_ctx || 'default';
+    try {
+      const real = await resolveRealDbContainer(prodCtx, prodDb.name, { row: prodDb });
+      const [running, img] = (spawnSync('docker',
+        ['--context', prodCtx, 'inspect', '-f', '{{.State.Running}}\t{{.Config.Image}}', real],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim().split('\t');
+      liveProdImage = running === 'true' ? (img || '').trim() || null : null;
+    } catch (e) {
+      logline('machine', `could not resolve the live prod db for ${project.name} to read its image `
+        + `(${e.message}) — falling back to recorded tags / the default`);
+    }
   }
-  const image = source?.image_tag || prodImage || 'omnibiz-postgis:18-3.6-h3';
+  const [image, imageVia] =
+      liveProdImage ? [liveProdImage, 'live prod container']
+    : prodDb?.image_tag ? [prodDb.image_tag, 'prod row']
+    : source?.image_tag ? [source.image_tag, `dev sibling ${source.name} — prod unreachable/unmodeled, may be stale`]
+    : ['omnibiz-postgis:18-3.6-h3', 'default'];
 
   // Data: the requested snapshot, else the latest completed prod backup. No dump is allowed but
   // loudly so — an empty dev db is only schema-less postgres, useless until something fills it.
@@ -410,16 +503,36 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   // project's OWN db identity instead (omnibiz_db_dev_<machine>), which can never be read as an
   // extension of prod. Bootstrapping from the prod row still borrows its IMAGE (above), never its
   // name.
+  //
+  // NOR by extending the previous DEV sibling's whole name. `${source.name}_${mkey}` re-seeds a
+  // new machine's db from the last sibling's ENTIRE name, so every extra machine appends one more
+  // key onto the one before it (2026-09-07): zeehive_db_dev_mardale_prod →
+  // zeehive_db_dev_mardale_prod_ugreen_nas → …_mardale_prod_ugreen_nas_local, and on a lineage that
+  // had once been bootstrapped from the prod name the polluted root was re-seeded every time too
+  // (omnibiz_db_prod_dev_local_mardale_prod_ugreen_nas_local_mardale_prod). A sibling is
+  // <family root> + THIS machine, and the family root is always the project's own dev identity: a
+  // second machine's db is omnibiz_db_dev_<other machine>, never an extension of the first's.
+  // `source` still hands over its IMAGE (a prod dump needs the custom postgis build); it never
+  // lends its NAME. That also settles what main's shape check existed for: a sibling that extends
+  // the PROD name (omnibiz_db_prod_dev_local_…) is excluded as a matter of course, since no
+  // sibling name is ever inherited.
   const devLogical = `${sanitizeName(project.name)}_db_dev`;
-  const name = source?.name ? `${source.name}_${mkey}`
-    : prodDb ? `${devLogical}_${mkey}`
+  const name = (source || prodDb) ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
-  const host = machineDbHost(m, project, config);
+  const host = await machineDbHost(m, project, config);
   const dbUser = project.db_user || config.prodDbUser || 'postgres';
   const dbName = project.db_name || config.prodDbName || 'omnibiz';
+  // The password THIS dev db is created with, recorded as conn_pw so a worker xell's projected
+  // DATABASE_URL carries a credential that actually authenticates (TKT-181-9EDA). Direction of
+  // travel: the manifest's committed dev credential when the project declares one (mardale-prod's
+  // shared dev db runs it); else the provision-xell-db.sh default the existing fleet already runs
+  // (ugreen-nas's runs 'omnibiz'). ALWAYS passed to the script explicitly, so the recorded value
+  // can never drift from the live container's POSTGRES_PASSWORD into a second manifest-vs-reality
+  // split like the ugreen-nas one.
+  const dbPw = project.manifest?.db?.password || 'omnibiz';
 
   provisioning.add(lockKey);
-  logline('machine', `provisioning dev db for ${project.name} on ${m.key} (${image}${snap ? `, restore ${String(snap.dump_path).split(/[\\/]/).pop()}` : ', NO DUMP — empty db'}${network ? `, network ${network} alias ${alias}` : ''})…`);
+  logline('machine', `provisioning dev db for ${project.name} on ${m.key} (${image} via ${imageVia}${snap ? `, restore ${String(snap.dump_path).split(/[\\/]/).pop()}` : ', NO DUMP — empty db'}${network ? `, network ${network} alias ${alias}` : ''})…`);
 
   (async () => {
     let port = 0;
@@ -428,7 +541,9 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
       const dumpPath = snap?.dump_path ? String(snap.dump_path).replace(/\\/g, '/') : '';
       const r = spawnSync(resolveBash(), [script, name, m.docker_ctx, image, dumpPath, dbUser, dbName], {
         encoding: 'utf8', timeout: 3600000, windowsHide: true,
-        env: { ...process.env, ...(network ? { DB_NETWORK: network, DB_NETWORK_ALIAS: alias } : {}) },
+        env: { ...process.env,
+               ...(network ? { DB_NETWORK: network, DB_NETWORK_ALIAS: alias } : {}),
+               ZEEHIVE_SPIN_DB_PASSWORD: dbPw },   // conn_pw below records exactly this
       });
       const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
       let res = null; try { res = JSON.parse(line); } catch { /* no JSON */ }
@@ -444,10 +559,11 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     // from. (Found from inside a cxell on 2026-08-03: a dev xell whose server container could not
     // boot, on a db that was listening the whole time.)
     //
-    // host now resolves through machineDbHost: the QUEENZEE-HOST (local) machine falls back to
-    // host.docker.internal / localhost so a local dev db gets a real conn_ref instead of the chip's
-    // "no URL recorded". A REMOTE machine with none of the three explicit places still leaves host
-    // null, and derivedTcpDsn is the function that owns the fail-closed rule ("no address is a
+    // host now resolves through machineDbHost: deploy_site is consulted FIRST (the dev site whose
+    // docker_ctx matches this machine — TKT-180), then the QUEENZEE-HOST (local) machine falls
+    // back to host.docker.internal / localhost so a local dev db gets a real conn_ref instead of
+    // the chip's "no URL recorded". A REMOTE machine with none of the explicit places still leaves
+    // host null, and derivedTcpDsn is the function that owns the fail-closed rule ("no address is a
     // fixable state, a guessed one is a silent wrong database") — it returns null rather than
     // compose one, and a line says exactly which of the three places to fill in.
     const conn = derivedTcpDsn({ host, host_port: port || 5432 }, { user: dbUser, name: dbName });
@@ -459,13 +575,14 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     }
     const row = await one(
       `INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx, host,
-                              host_port, internal_port, conn_ref, health)
-       VALUES ($1,'db','dev','shared',$2,$3,$4,$5,$6,5432,$7,$8)
+                              host_port, internal_port, conn_ref, conn_pw, health)
+       VALUES ($1,'db','dev','shared',$2,$3,$4,$5,$6,5432,$7,$8,$9)
        ON CONFLICT (project_id, name) DO UPDATE
          SET image_tag=EXCLUDED.image_tag, docker_ctx=EXCLUDED.docker_ctx, host=EXCLUDED.host,
-             host_port=EXCLUDED.host_port, conn_ref=EXCLUDED.conn_ref, health=EXCLUDED.health
+             host_port=EXCLUDED.host_port, conn_ref=EXCLUDED.conn_ref,
+             conn_pw=EXCLUDED.conn_pw, health=EXCLUDED.health
        RETURNING *`,
-      [projectId, name, image, m.docker_ctx, host, port || null, conn, MODE === 'real' ? 'up' : 'down']);
+      [projectId, name, image, m.docker_ctx, host, port || null, conn, dbPw, MODE === 'real' ? 'up' : 'down']);
     broadcast('container', row);
     logline('machine', `dev db READY on ${m.key}: ${name} :${port}${snap ? ' (dump restored)' : ' (empty)'} — ${m.key} can now host ${project.name} xells`);
   })().catch((e) => {

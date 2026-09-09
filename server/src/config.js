@@ -80,6 +80,19 @@ export const config = {
   // the stable one and the compose-network name is the fallback, not the other way round.
   cxellApiBase: process.env.CXELL_API_BASE || 'http://host.docker.internal:4700',
   cxellApiFallback: process.env.CXELL_API_FALLBACK || 'http://host.docker.internal:4700',
+  // The EXTERNALLY-REACHABLE base URL for /api/ext/v1 — the address a DEPLOYED project on another
+  // host uses to file tickets. DELIBERATELY NOT the cxell address above: cxellApiBase defaults to
+  // host.docker.internal:4700, which means "the docker host I am running on" — right for a cxell
+  // container sitting beside the queenzee, WRONG for a deployed project on its own host (the
+  // omnibiz helpdesk bridge sat silently broken for two weeks on exactly that default). An
+  // operator sets EXT_API_BASE to the real address (a LAN host:port, a tunnel URL, a reverse-proxy
+  // origin). When unset it falls back to DEV_HOST_IP (the queenzee host's LAN address) on the API
+  // port so the default is honest wherever a LAN address is known; when neither is set it is null —
+  // meaning "no externally-reachable address configured", which /api/ext/v1/whoami, /api/ext/v1/
+  // limits and the console report plainly instead of handing an integrator an address that points
+  // at its own docker host.
+  extApiBase: process.env.EXT_API_BASE
+    || (process.env.DEV_HOST_IP ? `http://${process.env.DEV_HOST_IP}:${int(process.env.PORT, 4700)}` : null),
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),
@@ -92,4 +105,12 @@ export const config = {
   // container from the inventory, so only user/name need overriding for an off-convention prod.
   prodDbName: process.env.PROD_DB_NAME || null,
   prodDbUser: process.env.PROD_DB_USER || 'postgres',
+  // The NetBird control plane (docs/netbird-mesh-plan.md) — the self-hosted management API the
+  // queenzee drives peer lifecycle through. BOTH unset = the mesh is disabled and every mesh
+  // consumer degrades to legacy host:port answers; the token is a real secret and lives only in
+  // the queenzee's env (surfaced as PRESENCE ONLY by `zee infra settings`, never the value).
+  netbirdApiUrl: process.env.NETBIRD_API_URL || null,
+  netbirdApiToken: process.env.NETBIRD_API_TOKEN || null,
+  // The mesh DNS domain peers resolve under (<hostname>.<domain>). NetBird's self-hosted default.
+  meshDomain: process.env.MESH_DOMAIN || 'netbird.selfhosted',
 };

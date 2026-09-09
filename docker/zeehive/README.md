@@ -80,3 +80,81 @@ New Project → Clone from GitHub. Staged, each step reversible:
    containers are decommissioned at Mark's pace. Host-zee code paths (local SDK spawn, `claude
    remote`, their monitor passes, hooks/skill host surface) are disabled via `agent_runtime`
    first, deleted in a later cleanup ship.
+
+## The NetBird mesh control plane (docs/netbird-mesh-plan.md §3.1)
+
+`docker-compose.bootstrap.yml` and `docker-compose.prod.yml` both define the self-hosted NetBird
+control plane — `netbird-management`, `netbird-signal`, `netbird-relay`, `netbird-dashboard` —
+gated behind the **`mesh` compose profile**. That is a deliberate choice: an unscoped `up -d`
+boots the pre-mesh stack, and the mesh stays off until a human stands it up **and** points the
+queenzee at it. The compose files are only the definition; **live stand-up is a human's deploy,
+not something the queenzee does for you**, and it has not been verified in a cage — this section
+is the record of how to do it, and it will need adjusting to the NetBird tag you pin (see below).
+
+### What it is, and why the datastore is a one-way door
+
+- The four services are NetBird's own published images (`netbirdio/management`, `netbirdio/signal`,
+  `netbirdio/relay`, `netbirdio/dashboard`) — the exact set docs/netbird-mesh-plan.md §3.1 names.
+  Coturn/TURN is deliberately **not** included: the fleet is a private LAN, and relay is the
+  NAT-traversal fallback NetBird needs here.
+- The meta-DB (`mesh_peer`, migration 249) records **intent** — which peers should exist, and the
+  setup-key id minted for each. The NetBird management datastore (`netbird_management_data`) is the
+  **live** truth — assigned IPs, connectedness, every peer's key material.
+- **The management datastore is a one-way door.** Losing it orphans every joined peer at once: the
+  queenzee can re-mint intent rows, but every machine/xell/gateway peer must re-join the mesh with
+  a fresh setup key, and the old mesh IP space is gone. There is no supported migration path from a
+  wiped NetBird store into a fresh one. **Back up the `netbird_management_data` volume before any
+  teardown** (`docker run --rm -v zeehive_netbird_management_data:/data -v $(pwd):/backup alpine tar czf
+  /backup/netbird-management-$(date +%F).tgz /data`), and treat a restore as the fleet-wide re-join
+  it will be.
+
+### Standing it up (one-time bootstrap)
+
+Both compose files already carry the services; the steps below are for a repo checkout driving
+`docker/zeehive/docker-compose.prod.yml`. A standalone bootstrap install works the same but the
+`netbird/management.json` path is relative to wherever you keep `docker-compose.bootstrap.yml`.
+
+1. **Pin the NetBird tags.** NetBird moves fast and its images' flag surface changes between
+   releases (the consolidated port architecture landed around v0.29). Edit the four
+   `NETBIRD_*_TAG` vars in your `docker/zeehive/.env` to one release and check that release's
+   self-hosted docs before going further. The compose defaults (`:latest`) are for evaluation only.
+2. **Write the management config.** Copy the example and edit the endpoints:
+   ```sh
+   cp netbird/management.json.example netbird/management.json   # from docker/zeehive/
+   ```
+   `management.json` is read by `netbird-management` from the bind mount `./netbird/management.json`
+   (relative to the compose file, so `docker/zeehive/netbird/management.json` in a checkout). The
+   example is valid JSON with placeholder `Signal` / `Relay` / datastore-encryption values; fill in
+   the LAN addresses/ports you publish below and a real `DataStoreEncryptionKey`/relay secret.
+3. **Bring the control plane up.**
+   ```sh
+   docker compose -f docker/zeehive/docker-compose.prod.yml --profile mesh up -d
+   ```
+   The services land on the compose network as `netbird-management` / `netbird-signal` /
+   `netbird-relay` / `netbird-dashboard`, publishing (defaults, all overridable in your `.env`):
+
+   | service | host port → container | env override |
+   |---|---|---|
+   | management HTTP API (REST — what `lib/netbird.js` speaks) | `33074 → 443` | `NETBIRD_MGMT_API_PORT` |
+   | management gRPC API (agents) | `33073 → 33073` | `NETBIRD_MGMT_GRPC_PORT` |
+   | signal | `10000 → 80` | `NETBIRD_SIGNAL_PORT` |
+   | relay | `33080 → 33080` | `NETBIRD_RELAY_PORT` |
+   | dashboard (optional human UI) | `33081 → 80` | `NETBIRD_DASH_HTTP_PORT` |
+
+   The dashboard needs an OIDC provider (`AUTH_AUTHORITY`/`AUTH_CLIENT_ID`/…) before it can sign
+   anyone in; the mesh works without it — the queenzee drives the management REST API, never the
+   dashboard.
+4. **Point the queenzee at it.** Set these in `docker/zeehive/.env` (never committed) and recreate
+   the server so the env reaches it:
+   ```sh
+   NETBIRD_API_URL=https://netbird-management:443   # or http(s)://<host LAN ip>:33074 for a host-routed install
+   NETBIRD_API_TOKEN=<a management API token minted on the control plane>
+   ```
+   **Both unset = the mesh is disabled** and every mesh path in the queenzee is a legible no-op —
+   that is the standing default and the pre-mesh behaviour is unchanged. Only once both are set does
+   provisioning mint per-xell peers (mesh-plan §6 phase_3) and the router answer owned roles over the
+   mesh (mesh-plan §3.4).
+5. **Back up the datastore** (see above) — and schedule it beside the meta-db backups once the mesh
+   has live peers. `netbird_management_data` and `netbird_signal_data` are named volumes with
+   explicit names, exactly like the `zeehive_*` volumes, so a backup/restore script can mount them
+   by bare name.

@@ -186,6 +186,14 @@ async function pollBuild(role, secs, { watch = false } = {}) {
         // published-port branch — a failed finalize sets health=down AND the port probe also reads
         // down, and without this order the zee only ever saw "port refused" with no stderr.
         console.error(`  ✗ ${c.role} (${c.name}) is ${String(c.health).toUpperCase()} — the build FAILED.`);
+        // The classified next step (INFRA — not your code / CODE — your worktree / UNKNOWN —
+        // could not tell) is computed server-side and rides the status payload, so --wait and
+        // --watch print the same sentence.
+        if (c.last_build_error_next_step) {
+          console.error('');
+          for (const line of String(c.last_build_error_next_step).split('\n')) console.error(`  ${line}`);
+          console.error('');
+        }
         console.error('  ── last build error ──');
         for (const line of String(c.last_build_error).split('\n')) console.error(`  ${line}`);
         console.error('  ─────────────────────');
@@ -561,6 +569,7 @@ function usage() {
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee env [--export]                  which ENVIRONMENT your xell is loaded with (its key + var names; values live in .zeehive.env, never echoed). --export dumps the FULL current env text. Read-only. A live-prod/production xell gets the prod env, else the dev env
   zee creds [--provider <key>] [--export] [--json]   what PROVIDER CREDENTIALS this cage holds — every connected provider's key, each under its own ZEE_PROVIDER_<KEY>_TOKEN (not just the one this dispatch runs on). Read straight from the cage's own env, no API. --provider prints the source-able env for one; --provider <key> --export prints the RUNNABLE vendor env for that provider (server-computed through the runtime adapter — the exact KIMI_MODEL_*/OPENAI_API_KEY/ANTHROPIC_* vars the vendor CLI needs; codex's in-cage install is PRINTED, never run); --json prints the list. Read-only, opens no gate
+  zee routes                          HOW TO REACH YOUR STUFF, resolved LIVE from the meta-DB (never baked): your db/server/webapp, each with a source — 'mesh' (your xell's joined mesh peer: hostname + canonical port) or 'legacy-port' (the recorded host:port) — the legacy pair kept as fallback while both are true, and a bounded liveness probe on the db answer. Read-only, opens no gate. Your .zeehive.env is a SNAPSHOT stamped at provision; when the two disagree, THIS answer is the current one — reach for it the moment a recorded address refuses
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
   zee turn --start | --end           report an INTERACTIVE turn boundary (a human or a manager typing into this cage's pane) — the ONE kind of turn the queenzee does not start and cannot see. The vendor CLI's own turn hooks call this for you; NOT gated, and it records NO cost (a hook knows a turn happened, not what it cost)
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
@@ -568,6 +577,12 @@ function usage() {
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee db-sandbox [--migrate] [--status] [--stop]   start a REAL throwaway postgres INSIDE this cage (127.0.0.1 only) and print its DSN — how you verify database work when your assigned db is unusable. NOT gated, nothing to ask for: it dies with the container. --migrate applies db/migrations to it; --stop stops it; a second start returns the SAME DSN. It NEVER replaces your assigned DATABASE_URL — pass the DSN yourself, and report a broken assigned db rather than working around it
   zee migration-number [--name "..."] [--again]   ASK for the next free db/migrations number: the queenzee counts what is LANDED plus what every other LIVE xell's worktree and claims already hold — the sibling branches you cannot see (ticket #9). NOT gated. Advisory: it hands out a number, it does not gate your landing. Asking twice returns the SAME number; --again gets a second one
+  zee infra readiness [--machine <key>] [--refresh] [--project <name|id>]   run/read machine×project readiness for a TARGET project (yours by default; the medic names ANY project by name or id — reads are open across the meta-DB) — the probe's checks, each pass/fail/unknown/skipped (NOT gated, read-only); --machine narrows to one host, --refresh probes NOW instead of reading the recorded verdict
+  zee infra proof --xell <slug> [--project <name|id>]   BURN-IN a pooled xell of a TARGET project — throwaway containers, same class as \`zee build\` (NOT gated). The proof verdict names the first failing check when the burn fails
+  zee infra bootstrap --plan --machine <id> [--project <name|id>]   the DRY-RUN plan performBuildBootstrap already computes for the target (NOT gated, performs nothing)
+  zee infra bootstrap --perform --machine <id> [--project <name|id>] [--reason "..."]   HUMAN-GATED CARD on the TARGET → the queenzee performs on approval (the console 🔧 as a verb: creates only manifest-declared DEV infra, never invents/removes, dev-only guard intact)
+  zee infra settings [--project <name|id>]   NON-SECRET projection of a TARGET project's settings (manifest cache, pool_config, machines + machine_pool, containers, deploy sites) — never a token or password
+  zee infra propose --change '<json>' --reason "..." [--project <name|id>]   HUMAN-GATED settings card on the TARGET (pool knobs, registry, machine priority, manifest-cache refresh) → the queenzee applies on approval; who asked, what changed, recorded
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
@@ -581,8 +596,9 @@ function usage() {
   zee upload-conversation [--reason "…"]   UPLOAD this xell's conversation to the queenzee (archived; a manager can review it). NOT gated. Reads your own session transcript and stores it — the "upload conversations on done" harness setting does this automatically at \`zee done\`
   zee a2a <card-url> --message "..."   send an A2A SendMessage to an EXTERNAL agent's card URL — QUEENZEE-mediated (you never dial the external server) and RECORDED at the transport layer like the LLM gateway. NOT gated. The queenzee fetches the card, reads the JSON-RPC endpoint it declares, and POSTs the message; the answer is the external server's JSON-RPC result (or a clear refusal)
   zee meet create --title "..."        start a GROUP CHAT (a "meet") and print its code — the conversation link you hand to other zees. You are the founder and only member. NOT gated, recorded: the room is a first-class a2a_meet row, membership is the audit (docs/zee-meet-plan.md)
-  zee meet attend <code>               JOIN a room by the code a founder printed — idempotent (re-attending is a no-op). Any zee of your project may attend; the member row is the audit. Read what you missed with \`zee meet --transcript <code>\`
+  zee meet attend <code>               JOIN a room by the code a founder printed — idempotent (re-attending is a no-op). Any zee of your project may attend; a zee of an INVITED project may too (DR-5). The member row is the audit. Read what you missed with \`zee meet --transcript <code>\`
   zee meet say <code> --message "..."  POST to a room you are a member of; the transcript is the record and every live member is notified. Attend before you say — membership is the visibility boundary
+  zee meet invite <code> --project <name-or-id>   FOUNDER only to INVITE another whole PROJECT so its zees can attend by code. \`--remove\` withdraws (founder OR a live manager of the room's own project — so a founder reap cannot leave a permanent grant). Members + transcript stay; future attends/says stop. Inviting your own project is a no-op
   zee meet --list | zee meet --status  the rooms you are a member of, newest first, with per-room unread counts
   zee meet --transcript <code>         read one room's full transcript (marks it read); how a newly attended zee catches up
   zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
@@ -758,11 +774,80 @@ switch (cmd) {
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
     break;
   }
+  case 'infra': {
+    // THE INFRA-MEDIC SURFACE (provision-proof plan §7, stage 3, meta-plane model). The calling
+    // xell's EFFECTIVE harness chain must carry the 'infra-troubleshoot' capability — the server
+    // refuses a plain worker with a clear 403, so wearing the medic harness IS the grant. The TARGET
+    // project is EXPLICIT: --project <name|id> names ANY project (the medic on Zeehive fixes another
+    // project's meta-DB config); without it the server resolves the CALLING xell's own project. Read
+    // wide, write through gates: readiness / proof / bootstrap --plan / settings are NOT gated
+    // (read-only or throwaway containers); bootstrap --perform and propose are HUMAN-GATED CARDS on
+    // the target that perform NOTHING until a human approves, then the queenzee performs and the
+    // card becomes the receipt.
+    const sub = positional();
+    const proj = flag('project');
+    const qp = (parts) => { if (proj) parts.push(`project=${encodeURIComponent(proj)}`); return parts.length ? `?${parts.join('&')}` : ''; };
+    if (sub === 'readiness') {
+      const qs = [];
+      if (rest.includes('--refresh')) qs.push('refresh=1');
+      const r = await req('GET', `/api/xell/self/infra/readiness${qp(qs)}`);
+      const rows = r.json?.probe || r.json?.recorded || [];
+      const key = flag('machine');
+      const filtered = key ? rows.filter((x) => x.machine_key === key) : rows;
+      if (key && !filtered.length) console.error(`  no readiness row for machine '${key}' (rows: ${rows.map((x) => x.machine_key).join(', ') || 'none'})`);
+      console.log(JSON.stringify(filtered, null, 2));
+      process.exit(r.code >= 400 ? 1 : 0);
+      break;
+    }
+    if (sub === 'proof') {
+      const xell = flag('xell');
+      if (!xell) { console.error('infra proof needs --xell <slug> — which pooled xell of the target project to burn in'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/infra/proof', { xell, project: proj }));
+      break;
+    }
+    if (sub === 'bootstrap') {
+      const machineId = flag('machine') || flag('machine_id');
+      if (!machineId) {
+        console.error('infra bootstrap needs --machine <id> — the machine id you saw in `zee infra settings` (or readiness)');
+        process.exit(1);
+      }
+      if (rest.includes('--plan')) {
+        out(await req('POST', '/api/xell/self/infra/bootstrap-plan', { machine_id: machineId, project: proj }));
+      } else if (rest.includes('--perform')) {
+        out(await req('POST', '/api/xell/self/infra/bootstrap', { machine_id: machineId, reason: flag('reason'), project: proj }));
+      } else {
+        console.error('infra bootstrap needs --plan (dry-run, NOT gated) or --perform (HUMAN-GATED card)'); process.exit(1);
+      }
+      break;
+    }
+    if (sub === 'settings') {
+      out(await req('GET', `/api/xell/self/infra/settings${qp([])}`));
+      break;
+    }
+    if (sub === 'propose') {
+      const change = flag('change');
+      const reason = flag('reason');
+      if (!change) { console.error('infra propose needs --change "<json>" — the settings patch (pool knobs, registry, machine priority, manifest refresh)'); process.exit(1); }
+      if (!reason) { console.error('infra propose needs --reason "…" — it is what the human reads on the card'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/infra/propose', { change, reason, project: proj }));
+      break;
+    }
+    console.error('infra subcommands: readiness [--machine <key>] [--refresh] [--project <name|id>] | proof --xell <slug> [--project <name|id>] | bootstrap --plan|--perform --machine <id> [--project <name|id>] | settings [--project <name|id>] | propose [--project <name|id>]');
+    process.exit(1);
+  }
   case 'env': {
     // Which environment this xell resolves to (the meta-DB set merged into .zeehive.env). Masked —
     // var NAMES only. `--export` extracts the FULL current env (.zeehive.env values), for piping to
     // a file. Read-only, opens no gate.
     out(await req('GET', rest.includes('--export') ? '/api/xell/self/env/export' : '/api/xell/self/env'));
+    break;
+  }
+  case 'routes': {
+    // The router's directory half (docs/netbird-mesh-plan.md §3.4): the LIVE "how do I reach my
+    // db/server/webapp". The .zeehive.env DSN is a snapshot stamped at provision and never
+    // re-minted (the cage-age reality) — this answer is derived at call time, so a dead snapshot
+    // address stops being a dead end. Read-only, opens no gate.
+    out(await req('GET', '/api/xell/self/routes'));
     break;
   }
   case 'creds': {
@@ -1020,11 +1105,10 @@ switch (cmd) {
   case 'meet': {
     // A2A MEET — peer-to-peer GROUP CHAT rooms (docs/zee-meet-plan.md). The human directive:
     // "initiate a zee meet → it shows a code → tell another zee to attend with the code → zees
-    // join and talk." Four subcommands, one verb: create (prints the code), attend <code>,
-    // say <code> --message, and the two read forms --list/--status and --transcript <code>.
-    // NOT gated: any live zee of your project may create/attend/post (DR-2), and the room's
-    // membership set is the visibility boundary. The transcript is the record; live members are
-    // notified (DR-3).
+    // join and talk." Subcommands: create (prints the code), attend <code>, say <code> --message,
+    // invite <code> --project (founder, DR-5), and the two read forms --list/--status and
+    // --transcript <code>. NOT gated; every act is recorded. Default is project-scoped (DR-2);
+    // a founder may invite another whole project (DR-5). Membership is the visibility boundary.
     const sub = positional();
     // The code is the positional AFTER the subcommand — NOT the first non-flag, which is the
     // subcommand itself (`meet say <code>` would otherwise take "say" as the code). --code /
@@ -1050,6 +1134,15 @@ switch (cmd) {
       if (!c) { console.error('meet say needs <code> — the room you are posting to (`zee meet --list` shows yours)'); process.exit(1); }
       if (!msg) { console.error('meet say needs --message "…" — what you want the room to hear'); process.exit(1); }
       out(await req('POST', '/api/xell/self/meet/say', { code: c, message: msg }));
+      break;
+    }
+    if (sub === 'invite') {
+      const c = code || flag('code');
+      const project = flag('project');
+      const remove = rest.includes('--remove');
+      if (!c) { console.error('meet invite needs <code> — the room you founded'); process.exit(1); }
+      if (!project) { console.error('meet invite needs --project <name-or-id> — the whole project to let into this room'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/meet/invite', { code: c, project, remove }));
       break;
     }
     if (rest.includes('--transcript') || flag('transcript')) {

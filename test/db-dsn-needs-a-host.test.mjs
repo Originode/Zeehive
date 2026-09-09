@@ -47,7 +47,7 @@ for (const [what, row] of [
 
 section('the dev-db provisioner composes through it, so it cannot mint a hostless conn_ref');
 const machines = readFileSync(join(ROOT, 'server', 'src', 'lib', 'machines.js'), 'utf8');
-ok(/import \{ derivedTcpDsn \} from '\.\/xell-db\.js'/.test(machines),
+ok(/import \{[^}]*\bderivedTcpDsn\b[^}]*\} from '\.\/xell-db\.js'/.test(machines),
    'lib/machines.js uses the shared composer');
 ok(/const conn = derivedTcpDsn\(/.test(machines),
    'the dev db conn_ref is composed by it, not by a template literal');
@@ -57,7 +57,7 @@ ok(/if \(!conn\)[\s\S]{0,400}host_ip/.test(machines),
    'a missing address is SAID, naming where the host should come from (machine.host_ip / dev_host_ip / DEV_HOST_IP)');
 // the row is still recorded — a db that exists but has no published address is a fixable state,
 // and losing the row would lose the container itself
-ok(/conn_ref, health\)[\s\S]{0,600}\$7/.test(machines),
+ok(/conn_ref(?:, conn_pw)?, health\)[\s\S]{0,600}\$7/.test(machines),
    'the container row is still written (with a NULL conn_ref), so the db is not lost — only its address is missing');
 
 section('every other DSN composition in the tree is a GUARDED one');

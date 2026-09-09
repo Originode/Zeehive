@@ -57,6 +57,7 @@ import { recordEvent, setTend } from '../lib/status.js';
 import { cxellName, cxellState, startCxell, stopCxell, restartCxellSshd, sealCxell,
          refreshZeeLiveInLiveCxells } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
+import { metaDbHostPort } from '../lib/prod-readonly.js';
 import { markZeeTurn } from '../lib/turn-record.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
 import { endTurn } from '../lib/turn-ledger.js';
@@ -108,7 +109,7 @@ let sweeping = false;
 // button cannot drift into disagreeing about it — a manual restart that accepted a decommissioned
 // zee or a tearing-down xell would be a hole in exactly the rules the sweep spells out above.
 const CXELL_COLS = `x.id AS xell_id, x.slug, x.project_id, x.db_coupling, x.status AS xell_status,
-                    z.id AS zee_id, z.status AS zee_status, z.claude_session_id`;
+                    x.meta_ro_dsn, z.id AS zee_id, z.status AS zee_status, z.claude_session_id`;
 const CXELL_WHERE = `z.viewer_kind = 'ssh-terminal'
                      AND z.decommissioned_at IS NULL
                      AND z.entrypoint = 'cxell-cli'
@@ -211,9 +212,12 @@ async function recoverOne(row, { reason, mode, force = false, by = 'the queenzee
   try { await restartCxellSshd({ ctx: 'default', slug }); }
   catch (e) { door = false; logline('cxell-recover', `${slug}: cxell is back but its ssh door did not re-open (${String(e.message).slice(0, 140)}) — the terminal will not attach`); }
   // 3. THE SEAL — the one step whose failure stops everything after it.
+  // A medic's meta-RO DSN (live → the bind was minted for this xell) must stay reachable across the
+  // re-seal, exactly as the spawn seal opens it — a restarted medic must not lose its one door.
+  const allowList = row.meta_ro_dsn ? [metaDbHostPort()] : [];
   let blockTcp = [];
   try {
-    blockTcp = await prodDbBlockList({ projectId: row.project_id, dbCoupling: row.db_coupling });
+    blockTcp = await prodDbBlockList({ projectId: row.project_id, dbCoupling: row.db_coupling, allowList });
     await sealCxell({ ctx: 'default', name: cxellName(slug), blockTcp });
   } catch (e) {
     // A RUNNING CAGE WITH NO SEAL IS WORSE THAN A STOPPED ONE, so the restart is UNDONE: default-allow

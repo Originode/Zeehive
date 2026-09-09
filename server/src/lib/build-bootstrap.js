@@ -26,6 +26,7 @@
 import { one } from '../db/pool.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
 import { sharedDevDb, provisionDevDb } from './machines.js';
+import { meshEnabled, mintPeer, netbirdRequest } from './netbird.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 
@@ -80,7 +81,8 @@ export async function hostProdDisclosure(machine, project, createNames = []) {
 // ── the planner ───────────────────────────────────────────────────────────────
 // Run the probe and turn its failing checks into an ORDERED list of steps the performer can run.
 // Each step: { kind, target, why, action, status, detail, stderr }.
-//   kind   'network' | 'shared-dev-db' (performable) | 'cannot' (a human action, not a queenzee one)
+//   kind   'network' | 'shared-dev-db' | 'mesh-machine-peer' (performable) | 'cannot'
+//          (a human action, not a queenzee one)
 //   status 'planned' (not yet performed) | 'cannot' (never performable)
 // A step is 'cannot' when the bootstrap is NOT the right tool: a missing volume (DATA), a missing
 // registry / build machine (configuration + credentials, a human's decision), a compose file that
@@ -97,7 +99,6 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
   // tier also declares. Host-level prod is a DISCLOSURE (below), not a refusal.
   guardDevOnly(machine, project);
   const probe = await probeBuildReadiness(machine, project, { docker });
-  if (probe.status === 'ok') return { probe, steps: [], refused: null, disclosure: null };
 
   const check = (name) => probe.checks.find((c) => c.check === name);
   const ctxCheck = check('context-reachable');
@@ -182,10 +183,37 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
     cannot(comp, 'spinoff compose', null, comp.detail);
   }
 
+  // MESH MACHINE PEER (docs/netbird-mesh-plan.md §3.2 phase 2): the bootstrap CARD is the
+  // human-gated seam that installs the mesh agent on a build/db host. When the queenzee has the
+  // mesh configured (meshEnabled) and this machine has no ACTIVE kind='machine' peer yet, the plan
+  // names the peer the perform step mints. A dry-run only SHOWS it — perform creates the intent
+  // row + the one-time setup key. Mesh unset → no step, ever (the standing invariant). A machine
+  // with a peer already (from another project's bootstrap — one active peer per machine, hostname
+  // = machine key) needs no second step.
+  if (meshEnabled()) {
+    const existing = await one(
+      `SELECT id FROM mesh_peer WHERE machine_id=$1 AND kind='machine' AND removed_at IS NULL LIMIT 1`,
+      [machine.id]);
+    if (!existing) {
+      steps.push({
+        kind: 'mesh-machine-peer', target: machine.key,
+        why: `machine '${machine.key}' has no NetBird mesh peer yet (docs/netbird-mesh-plan.md §3.2)`,
+        action: `mint the machine's mesh peer + one-time setup key (control-plane API)`,
+        status: 'planned', detail: null, stderr: null,
+      });
+    }
+  }
+
+  // A fully-ready machine with nothing to create and no mesh peer to mint → the plan is empty.
+  if (probe.status === 'ok' && !steps.length) return { probe, steps: [], refused: null, disclosure: null };
+
   // Host-level prod is a DISCLOSURE the human confirms, not a refusal: in the single-host topology
   // dev and prod share the docker host, so refusing there would switch the bootstrap off by default.
-  // Only attach it when there is something the bootstrap will actually create.
-  const createNames = steps.filter((s) => s.status === 'planned').map((s) => s.target);
+  // Only attach it when there is something the bootstrap will actually create — a mesh peer is a
+  // control-plane object, not a docker one, so it never triggers the docker disclosure.
+  const createNames = steps
+    .filter((s) => s.status === 'planned' && s.kind !== 'mesh-machine-peer')
+    .map((s) => s.target);
   let disclosure = null;
   if (createNames.length) {
     disclosure = await hostProdDisclosure(machine, project, createNames);
@@ -204,7 +232,7 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
 // ── the performer ─────────────────────────────────────────────────────────────
 // Run ONE planned step idempotently and return its result:
 //   { status: 'created'|'already-present'|'cannot'|'failed'|'started', detail, stderr }
-async function performStep(step, machine, project, { docker, provisionDb }) {
+async function performStep(step, machine, project, { docker, provisionDb, mesh = {} }) {
   if (step.kind === 'network') {
     // Idempotent: re-check before creating (a previous run, or a human, may have got there first).
     const exists = await docker(machine.docker_ctx, ['network', 'inspect', step.target, '--format', '{{.Name}}']);
@@ -258,6 +286,38 @@ async function performStep(step, machine, project, { docker, provisionDb }) {
     }
   }
 
+  if (step.kind === 'mesh-machine-peer') {
+    // The bootstrap CARD's mesh half (§3.2): mint the machine's peer + one-time setup key. The key
+    // is returned ONCE — it rides the step result (the human-approved action's receipt) and is
+    // never stored on the row; the agent install on the host consumes it at first join.
+    if (!meshEnabled()) {
+      return { status: 'cannot', detail: 'mesh disabled — nothing to mint', stderr: null };
+    }
+    const existing = await one(
+      `SELECT id FROM mesh_peer WHERE machine_id=$1 AND kind='machine' AND removed_at IS NULL LIMIT 1`,
+      [machine.id]);
+    if (existing) {
+      return { status: 'already-present',
+               detail: `machine '${machine.key}' already has an active mesh peer`, stderr: null };
+    }
+    try {
+      const mint = await mintPeer({ projectId: project.id, kind: 'machine', hostname: machine.key,
+                                    machineId: machine.id },
+                                  { request: mesh.request || netbirdRequest });
+      if (!mint.ok) {
+        return { status: 'failed',
+                 detail: `machine peer mint ${mint.disabled ? 'disabled' : 'failed'} (${mint.reason})`,
+                 stderr: null };
+      }
+      return { status: 'created',
+               detail: `machine peer '${machine.key}' minted — one-time setup key ${mint.setupKey} `
+                 + `(hand it to the host's agent install; it is shown ONLY here and never stored)`,
+               stderr: null };
+    } catch (e) {
+      return { status: 'failed', detail: e.message, stderr: null };
+    }
+  }
+
   return { status: 'cannot', detail: `no performer for step kind '${step.kind}'`, stderr: null };
 }
 
@@ -290,7 +350,8 @@ async function loadProjectWithCoupling(projectId) {
 // the probe, and records the whole action. Never throws for a verdict outcome (a missing
 // machine/project row still throws — the row is gone).
 export async function performBuildBootstrap(projectId, machineId,
-  { dryRun = false, docker = dockerAdapter, provisionDb = provisionDevDb, actor = 'human@console' } = {}) {
+  { dryRun = false, docker = dockerAdapter, provisionDb = provisionDevDb,
+    actor = 'human@console', mesh = {} } = {}) {
   const project = await loadProjectWithCoupling(projectId);
   const machine = await one(`SELECT * FROM machine WHERE id=$1`, [machineId]);
   if (!machine) throw new Error('machine not found');
@@ -322,7 +383,7 @@ export async function performBuildBootstrap(projectId, machineId,
     // A disclosure is information for the human, not a step to perform — keep it in the results
     // so the audit records it, but never hand it to the performer.
     if (step.kind === 'disclosure' || step.status === 'cannot') { results.push(step); continue; }
-    results.push({ ...step, ...(await performStep(step, machine, project, { docker, provisionDb })) });
+    results.push({ ...step, ...(await performStep(step, machine, project, { docker, provisionDb, mesh })) });
   }
 
   // Re-run the probe so the returned verdict is what is now TRUE, not what the action hoped.

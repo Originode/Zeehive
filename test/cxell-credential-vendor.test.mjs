@@ -152,8 +152,8 @@ try {
   clearLog();
   let threw = null;
   try {
-    runZee({ ctx: 'default', name: 'cxell_test', prompt: 'go', model: 'opus',
-             adapter: deepseek, token: CLAUDE_TOK, onEvent: () => {} });
+    await runZee({ ctx: 'default', name: 'cxell_test', prompt: 'go', model: 'opus',
+                   adapter: deepseek, token: CLAUDE_TOK, onEvent: () => {} });
   } catch (e) { threw = e; }
   ok(!!threw, 'a claude token on the DeepSeek adapter THROWS out of runZee');
   ok(threw && /claude/i.test(threw.message) && /deepseek/i.test(threw.message),
@@ -162,9 +162,11 @@ try {
   ok(readLog() === '', '…and no docker exec happened at all — nothing is spent finding this out');
 
   clearLog();
-  const run = runZee({ ctx: 'default', name: 'cxell_test', prompt: 'go', model: 'deepseek-chat',
-                       adapter: deepseek, token: DEEPSEEK_TOK, extraEnv: { ZEEHIVE_EXTRA_TEST: 'http://example' },
-                       onEvent: () => {} });
+  // runZee is ASYNC (it proves the gateway address before minting the env), so the handle —
+  // { proc, done } — comes off the RESOLVED promise, not off the call.
+  const run = await runZee({ ctx: 'default', name: 'cxell_test', prompt: 'go', model: 'deepseek-chat',
+                             adapter: deepseek, token: DEEPSEEK_TOK, extraEnv: { ZEEHIVE_EXTRA_TEST: 'http://example' },
+                             onEvent: () => {} });
   await run.done.catch(() => {});   // the fake docker prints no result event; the exec is the point
   const runLog = readLog();
   ok(/-e ANTHROPIC_AUTH_TOKEN=/.test(runLog) && runLog.includes(DEEPSEEK_TOK),

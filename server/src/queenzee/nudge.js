@@ -13,7 +13,9 @@
 // cxell is unreachable.
 import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
-import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
+import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell,
+         refreshCxellOriginMain } from '../lib/cxell.js';
+import { invalidateCrewDiff } from '../lib/managers.js';
 import { adapterFor, usageFrom, resultFrom } from '../lib/cxell-runtimes.js';
 import { decideMessageDelivery } from '../lib/zee-turn.js';
 import { resumeTurnDeath } from '../lib/turn-death.js';
@@ -24,7 +26,7 @@ import { predecessorActionDigest } from '../lib/predecessor-digest.js';
 // is already in flight) instead of blindly marking 'working' over a live session (TKT-114-B).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText, turnBudgetWarningMessage } from '../lib/turn-ledger.js';
-import { tokenForSpawn } from '../lib/provider-tokens.js';
+import { tokenForSpawn, scrubSecrets } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
 import { broadcast } from '../lib/events.js';
 import { fleetPaused, PAUSED_REASON, noteHeldNudge } from '../lib/fleet-pause.js';
@@ -499,6 +501,27 @@ export async function nudgeXellForStatus(xellId, { by = 'human' } = {}) {
 
 // Re-invoke the cxell zee that owns this xell, if one is live. NEVER throws.
 export async function nudgeXellAfterLand(xellId, { by = 'human', mode = PROVISION_MODE } = {}) {
+  // TKT-185: BEFORE resuming the worker, refresh the cage's origin/main to the xource tip that
+  // just received the land. Otherwise `zee zees` / cxellDiff still measure against the pre-land
+  // tip and every successful landing reads as phantom UNLANDED — the done-guard crying wolf.
+  // Best-effort and never throws: a dead cage must not block the resume that tells the zee it landed.
+  try {
+    const row = await one(
+      `SELECT x.slug, x.worktree_path, xo.ref AS xource_ref
+         FROM xell x LEFT JOIN xource xo ON xo.id = x.xource_id
+        WHERE x.id=$1`, [xellId]);
+    if (row?.slug && row?.xource_ref && row?.worktree_path) {
+      const r = await refreshCxellOriginMain({
+        ctx: 'default', slug: row.slug, worktree: row.worktree_path, ref: row.xource_ref,
+      });
+      if (r?.refreshed) invalidateCrewDiff(xellId);
+      else if (r && r.refreshed === false) {
+        logline('nudge', `${row.slug}: post-land origin/main refresh skipped — ${r.reason || 'unknown'}`);
+      }
+    }
+  } catch (e) {
+    logline('nudge', `post-land origin/main refresh failed closed: ${String(e.message || e).slice(0, 200)}`);
+  }
   return nudgeCxell(xellId, { by, mode, prompt: CONTINUE_PROMPT,
     why: 'landing approved', log: (slug, sid) => `${slug}: landing approved by ${by} — resuming cxell session ${sid} to continue` });
 }
@@ -961,22 +984,29 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
       // firing onFail (a stale landing raises a TEND from there) and filing a turn death that never
       // happened. It answers for the EXEC only.
       }, async (e) => {
-        logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`);
         // The exec that REJECTED may still have said what it did: dk() attaches both streams to
         // `err.dk`, so the same one parser reads the same final result event off it (resultFrom).
         // Two things then follow, and neither used to happen on this path:
         //   • a turn that SPOKE before the exec died spent tokens, and they are charged — "the exec
         //     exited non-zero" is not "nothing ran". Nothing at all on the streams still books zero.
-        //   • a resume that died on a 429 is a turn DEATH, not an unreachable cage, and belongs on
-        //     the revive ladder rather than in a log line.
+        //   • a resume that died on a 429 (or on a GATEWAY refusal) is a turn DEATH, not an
+        //     unreachable cage, and belongs on the revive ladder rather than in a log line.
         const dk = e?.dk || { code: 1, err: e?.message || '' };
         const result = resultFrom(adapter, dk);
+        const death = resumeTurnDeath({ ...dk, result });
+        // The log line must tell the SAME truth the row does: a dead turn is filed as a death (the
+        // revive ladder decides the retry), never as "cxell may be down; no retry" — a GATEWAY
+        // refusal is our door, not the cage, and the ladder retries even that.
+        // The vendor's stderr tail can ECHO A TOKEN back ("your api key: sk-ant-… is invalid") or a
+        // token-bearing base-url (/x/<xellToken>/…), so both interpolations go through the same
+        // scrubSecrets revive.js uses before the reason reaches the row (finding [10]).
+        logline('nudge', `${zee.slug}: nudge exec could not run (${scrubSecrets(String(e.message).slice(0, 160))}) — `
+          + (death ? `filing the death (${scrubSecrets(death.message.slice(0, 140))})` : 'no death signal; ending the turn'));
         // Put the row back where it was rather than leaving a zee 'working' on a turn that never
         // started — a stuck 'working' is the same lie as a stuck 'idle', and it also blocks a reap.
         markZeeTurn(zee.id, zee.status === 'working' ? 'working' : 'idle',
                     `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
                     usageFrom(result)).catch(() => {});
-        const death = resumeTurnDeath({ ...dk, result });
         // PER-TURN LEDGER: close the failed resume — errored if it died on a provider/infra error,
         // else just 'ended' (the exec never started, but the row must not sit 'started' forever).
         await endTurn(turn?.id, {

@@ -404,6 +404,77 @@ export async function deliverXourceIntoCxell({ ctx = 'default', slug, worktree, 
   }
 }
 
+// ── REFRESH a live cage's origin/main — NO merge, ONLY the tracking ref (TKT-185) ────────────────
+// After a successful land, the cage's refs/remotes/origin/main stays at the tip it was handed at
+// spawn (or the last sync). `zee zees` / cxellDiff measure "unlanded" as
+// `rev-list origin/main..HEAD` and the source shortstat against merge-base(origin/main, HEAD), so a
+// stale origin/main makes every successfully-landed commit read as still unlanded — the load-bearing
+// done-guard crying wolf. deliverXourceIntoCxell already knows how to push a tip in, but it is the
+// sync door (thin-then-full, may throw). This is the POST-LAND door: always a FULL self-contained
+// bundle via a temp ref (so a cage missing the base still fetches), fetches ONLY into
+// refs/remotes/origin/main, touches no worktree / index / merge state, and NEVER throws — a dead
+// cage or a missing ref returns { refreshed:false } so a landing / nudge can keep going.
+//
+//   git update-ref refs/zeehive/refresh <tip>                # queenzee side, on the worktree
+//   git bundle create <tmp>/main.bundle refs/zeehive/refresh # FULL — no --not boundary
+//   docker cp <bundle> <cxell>:/tmp/main.bundle
+//   git fetch -f /tmp/main.bundle refs/zeehive/refresh:refs/remotes/origin/main
+export async function refreshCxellOriginMain({ ctx = 'default', slug, worktree, ref }) {
+  try {
+    if (!slug) return { refreshed: false, reason: 'no slug' };
+    if (!ref) return { refreshed: false, reason: 'no xource ref' };
+    if (!worktree || !existsSync(worktree)) {
+      return { refreshed: false, reason: `no host worktree on disk (${worktree || 'null'})` };
+    }
+    const name = cxellName(slug);
+    const tmp = mkdtempSync(join(tmpdir(), 'zee-refresh-'));
+    const git = (args) => new Promise((resolve, reject) => {
+      const g = spawn('git', ['-C', worktree, ...args], { windowsHide: true });
+      let out = '', err = '';
+      g.stdout.on('data', (d) => (out += d.toString()));
+      g.stderr.on('data', (d) => (err += d.toString()));
+      g.on('error', reject);
+      g.on('close', (c) => (c === 0 ? resolve(out.trim())
+        : reject(new Error(`git ${args.join(' ')} exited ${c}: ${err.slice(0, 300)}`))));
+    });
+    try {
+      let tip;
+      try { tip = await git(['rev-parse', '--verify', ref]); }
+      catch (e) {
+        return { refreshed: false, reason: `xource ref unreadable (${ref}): ${String(e.message).slice(0, 200)}` };
+      }
+      // Stage the tip under a stable temp ref so the fetch mapping never depends on the xource's
+      // branch name (master vs main) and the bundle always carries an unambiguous tip.
+      await git(['update-ref', 'refs/zeehive/refresh', tip]);
+      const bundle = join(tmp, 'main.bundle');
+      // FULL bundle — self-contained, no --not boundary. A cage that never synced (or whose objects
+      // drifted) must still be able to fetch; a thin bundle would refuse on a missing prerequisite.
+      await git(['bundle', 'create', bundle, 'refs/zeehive/refresh']);
+      try {
+        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+        await dk(ctx, ['exec', name, 'bash', '-lc',
+          "cd /work/repo && git fetch -f /tmp/main.bundle 'refs/zeehive/refresh:refs/remotes/origin/main'"],
+          { timeoutMs: 60000 });
+      } catch (e) {
+        return { refreshed: false, reason: `cxell unreachable or fetch refused: ${String(e.message).slice(0, 300)}` };
+      } finally {
+        await dk(ctx, ['exec', '-u', '0', name, 'rm', '-f', '/tmp/main.bundle']).catch(() => {});
+      }
+      logline('cxell', `${slug}: refreshed origin/main → ${String(tip).slice(0, 8)} (post-land; no merge)`);
+      return { refreshed: true, ref, tip };
+    } finally {
+      // Drop the staging ref so it does not linger on the worktree between refreshes.
+      await git(['update-ref', '-d', 'refs/zeehive/refresh']).catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  } catch (e) {
+    // Absolute last resort — callers (land nudge, selfLand, selfHealSync) must never be failed by
+    // a refresh. Anything that escaped the inner returns lands here as refreshed:false.
+    logline('cxell', `${slug || '?'}: refreshCxellOriginMain failed closed: ${String(e.message || e).slice(0, 200)}`);
+    return { refreshed: false, reason: String(e.message || e).slice(0, 300) };
+  }
+}
+
 // ── SYNC a live cxell with its xource — PURE SCRIPT, no model in the loop ─────────────────────────
 // Deliver the xource in (above), then MERGE origin/main into the cxell's branch, inside the cxell,
 // with the queenzee identity so it never depends on the container's git config. This is the whole
@@ -1582,7 +1653,7 @@ function credentialEnvFor(adapter, { token, baseUrl = null, model = null } = {})
 // transport failure). onEvent(obj) fires per normalized event — init (session id), assistant
 // turns, result. Bypass/auto mode inside is safe HERE and only here — the cxell is the
 // permission system, and every adapter runs its CLI's equivalent of skip-permissions.
-export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
+export async function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
   // The credential goes through the ONE guarded door (credentialEnvFor): a token that is plainly
   // another vendor's throws HERE, before docker is spawned, so the dispatch fails with a sentence
   // naming both vendors instead of the cage burning a turn on the vendor's own "invalid api key".
@@ -1597,7 +1668,7 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
     // off (GATEWAY_PORT === PORT), gatewayEnv returns {} and the adapter's real URLs are kept.
     // Without the xell identity token the gateway would 401 every call, so the env is only added
     // when one is present — a caller with no token keeps the adapter's direct URLs.
-    ...(xellToken ? Object.entries(gatewayEnv({ xellToken, provider: adapter.provider }))
+    ...(xellToken ? Object.entries(await gatewayEnv({ xellToken, provider: adapter.provider }))
       .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ];
   const cmd = ['exec', '-i',
@@ -1834,7 +1905,7 @@ export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, 
   // URLs are kept).
   const env = [
     ...credentialEnvFor(adapter, { token: vendorTok, model }),
-    ...(identTok ? Object.entries(gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
+    ...(identTok ? Object.entries(await gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
       .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ].flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);

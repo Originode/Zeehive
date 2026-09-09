@@ -13,7 +13,8 @@ import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
 import { removeCxell, cxellName } from '../lib/cxell.js';
-import { stopAndRemoveContainer } from '../lib/docker.js';
+import { stopAndRemoveContainer, removeNetwork } from '../lib/docker.js';
+import { deregisterXellPeers } from '../lib/netbird.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
 import { releaseXellShips } from './shipgate.js';
 import { collectDispatchLoss, reportDispatchLoss } from '../lib/dispatch-loss.js';
@@ -129,6 +130,21 @@ export function midTurnVerdict(live) {
          : `; the monitor (${live.monitor_source || 'probe'}) sees no live agent session either`) };
 }
 
+// The docker NETWORKS a xell's stack created, derived from its OWN container rows (`network` and
+// `compose_project` columns — compose names the default network `<project>_default`). PURE, so the
+// derivation is table-testable without a database or a daemon. The guard that makes it safe to
+// remove what it returns: only a name that carries the xell's SLUG is a candidate — a shared
+// network a row happens to name (zee-hive-net, a manifest-required external) can never match,
+// because shared names do not embed a slug.
+export function xellNetworkCandidates(slug, rows) {
+  const names = new Set();
+  for (const r of rows || []) {
+    if (r?.network) names.add(String(r.network));
+    if (r?.compose_project) names.add(`${r.compose_project}_default`);
+  }
+  return [...names].filter((n) => slug && n.includes(slug));
+}
+
 export async function reapXell(xellId, reason = 'task-done', { force = false, mode = PROVISION_MODE } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
   if (!xell) return { ok: false, error: 'xell not found' };
@@ -208,6 +224,16 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     logline('reaper',
       `${xell.slug} was bound to PRODUCTION — DISCONNECTED ${prodLinks.map((c) => c.name).join(', ')} `
       + '(released, NOT deleted) before teardown. Production is untouched.');
+  }
+
+  // An INFRA-MEDIC held the ORCHESTRATOR'S OWN meta-DB through its own read-only postgres role
+  // (mintMetaReader, provision-proof stage 3). Same rule as the manager's prod reader just above: a
+  // role that outlives the agent it was minted for is a credential nobody owns. Best-effort —
+  // dropMetaReader never throws, and the role is inert once its DSN is gone with the cxell.
+  if (xell.meta_ro_dsn) {
+    const { dropMetaReader } = await import('../lib/prod-readonly.js');
+    const mr = await dropMetaReader(xell);
+    logline('reaper', `${xell.slug}: meta-RO role ${mr.role || ''} ${mr.dropped ? 'DROPPED' : `not dropped (${mr.reason || mr.error || '—'})`}`);
   }
 
   logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`
@@ -346,7 +372,41 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
       await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: true })
         .catch((e) => logline('reaper', `container cleanup failed for ${c.name}: ${e.message}`));
     }
+
+    // THE NETWORK — the leak reap always had (docs/netbird-mesh-plan.md §1.1, TKT-178). The
+    // despawn script's `spin-env.sh purge` removes the stack's network only when it runs from an
+    // intact worktree, so every degraded teardown left `<compose_project>_default` behind holding
+    // a subnet — until the daemon had none left ('all predefined address pools have been fully
+    // subnetted', both build hosts, 2026-09-02). The queenzee knows the names from the rows it is
+    // about to delete, so it does not need the worktree — same reasoning as removeXellImages.
+    // Runs AFTER the containers are gone (a network with attachments cannot be removed anyway);
+    // docker's own in-use refusal is logged, never fought, and the janitor sweeps what
+    // best-effort misses (lib/docker-repair.js sweepDockerLeftovers).
+    const netRows = await q(
+      `SELECT DISTINCT network, compose_project, docker_ctx FROM container
+        WHERE owner_xell_id=$1 AND docker_ctx IS NOT NULL`, [xellId]);
+    const netsByCtx = new Map();
+    for (const r of netRows) {
+      if (!netsByCtx.has(r.docker_ctx)) netsByCtx.set(r.docker_ctx, []);
+      netsByCtx.get(r.docker_ctx).push(r);
+    }
+    for (const [ctx, rows] of netsByCtx) {
+      for (const name of xellNetworkCandidates(xell.slug, rows)) {
+        const v = await removeNetwork(ctx, name).catch((e) => ({ removed: false, reason: e.message }));
+        if (v.removed) logline('reaper', `${xell.slug}: removed spin network '${name}' on '${ctx}'`);
+        else if (!v.alreadyGone) {
+          logline('reaper', `network cleanup left '${name}' on '${ctx}': ${v.reason || 'unknown'}`);
+        }
+      }
+    }
   }
+
+  // A mesh peer must never outlive its xell (docs/netbird-mesh-plan.md §3.6). Row stamping is
+  // bookkeeping and always happens (like the container-row delete below); the control-plane
+  // DELETE rides the same destructive verdict as every other machine touch. Best-effort: a
+  // failure leaves the row active so the janitor's mesh pass retries, and never sinks the reap.
+  await deregisterXellPeers(xellId, { controlPlane: destructive })
+    .catch((e) => logline('reaper', `mesh peer cleanup failed for ${xell.slug}: ${e.message}`));
 
   // drop this xell's per-xell containers from the meta DB
   await q(`DELETE FROM container WHERE owner_xell_id = $1`, [xellId]);

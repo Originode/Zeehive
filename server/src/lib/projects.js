@@ -41,6 +41,14 @@ const outboundRefusal = (what, p) =>
 // Live statuses that mean a zee is actively bound — deleting such a project is refused.
 const LIVE_ZEE = ['spawning', 'online', 'working', 'idle'];
 
+// How a NESTED project's repo joins its parent's git. A project onboarded inside another project's
+// tree must pick one: 'submodule' (a git submodule entry in the parent), 'subtree' (the parent
+// grafts the nested repo's history as a subtree), or 'main_repo' ("just use the main repo" — no
+// nested git at all). Top-level projects carry NULL. The console surfaces the same vocabulary via
+// web/src/hive/plusMenu.js; keep the two in step.
+export const GIT_BEHAVIORS = ['submodule', 'subtree', 'main_repo'];
+export const isValidGitBehavior = (b) => b === null || b === undefined || GIT_BEHAVIORS.includes(b);
+
 // The application database's identity — a PROJECT fact (spec Appendix A). The global
 // PROD_DB_NAME/PROD_DB_USER env vars are last-resort fallback only: they cannot be right
 // for two projects at once.
@@ -78,6 +86,14 @@ export async function createProject(body) {
   const repoRoot = (body.repo_root || '').trim();
   if (!name) throw new Error('project name is required');
   if (!repoRoot) throw new Error('repo_root (project folder) is required');
+  // The git-behavior choice is only meaningful for a NESTED project (its repo joins a parent's);
+  // the console forces it there. A top-level project carries NULL. Validate the enum here rather
+  // than trusting the DB constraint to be the first line of defence — a clear sentence beats a
+  // postgres check violation.
+  const gitBehavior = (body.git_behavior || '').trim() || null;
+  if (gitBehavior && !GIT_BEHAVIORS.includes(gitBehavior)) {
+    throw new Error('git_behavior must be submodule, subtree or main_repo');
+  }
 
   const mainBranch = (body.main_branch || 'main').trim();
   const clash = await one(`SELECT id FROM project WHERE name = $1`, [name]);
@@ -104,10 +120,10 @@ export async function createProject(body) {
       `INSERT INTO project (name, repo_root, main_branch, docker_ctx_dev, docker_ctx_prod,
           dev_host_ip, prod_host_ip, compose_dev, compose_spinoff, compose_prod, env_file,
           port_server_base, port_web_base, port_slot_mod,
-          db_name, db_user, manifest, manifest_hash, manifest_at, remote_url)
+          db_name, db_user, manifest, manifest_hash, manifest_at, remote_url, git_behavior)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
           COALESCE($12,3100), COALESCE($13,5200), COALESCE($14,90),
-          $15,$16,$17,$18, CASE WHEN $17::jsonb IS NULL THEN NULL ELSE now() END, $19)
+          $15,$16,$17,$18, CASE WHEN $17::jsonb IS NULL THEN NULL ELSE now() END, $19,$20)
        RETURNING *`,
       [name, repoRoot, mainBranch,
        body.docker_ctx_dev || null, body.docker_ctx_prod || null,
@@ -123,7 +139,8 @@ export async function createProject(body) {
        body.db_user || md.db_user || 'postgres',
        mf.found ? JSON.stringify(mf.manifest) : null,
        mf.found ? mf.hash : null,
-       (body.remote_url || '').trim() || null]);
+       (body.remote_url || '').trim() || null,
+       gitBehavior]);
 
     // Record the xource's head AT ONBOARDING. This is the baseline the rollback tripwire
     // reads: a remote that later moves BACKWARD (force-push, restored-from-stale-backup)
@@ -911,6 +928,7 @@ const PATCHABLE = [
   'auto_approve_land', 'auto_approve_ship',   // operator policy: skip the human gate (default off)
   'auto_approve_seed', 'auto_done',           // …and the seed/done policies (122): auto-run seeds, auto-confirm manager-suggested done
   'remote_url', // inbound-only fetch source (migration 032) — re-pointing it is safe, unlike repo_root
+  'git_behavior', // how a NESTED project's repo joins its parent's git (submodule/subtree/main_repo)
 ];
 
 export async function updateProject(id, body = {}) {
@@ -925,6 +943,9 @@ export async function updateProject(id, body = {}) {
       const v = typeof body[f] === 'string' ? (body[f].trim() || null) : body[f];
       if (f === 'name' && !v) throw new Error('project name cannot be empty');
       if (f === 'main_branch' && !v) throw new Error('main_branch cannot be empty');
+      if (f === 'git_behavior' && v && !GIT_BEHAVIORS.includes(v)) {
+        throw new Error('git_behavior must be submodule, subtree or main_repo');
+      }
       vals.push(v);
       sets.push(`${f} = $${vals.length}`);
     }

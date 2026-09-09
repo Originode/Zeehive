@@ -128,6 +128,19 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .setup-grid label.setup-check { flex-direction: row; align-items: center; gap: 6px; }
 .setup-grid label.setup-check .pc { flex-basis: 100%; }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+/* the '+ hexagon' NESTED-project create: a forced git-behavior picker. Options are cards — radio,
+   but big enough to hold the label AND its one-line consequence, so a human can decide on sight
+   what "submodule" vs "just use the main repo" actually means for their monorepo. */
+.nested-proj { border: 1px dashed var(--line); border-radius: 8px; padding: 10px; background: var(--panel); }
+.nested-git-label { display: block; font-size: 12px; color: var(--text); margin: 6px 0 4px; }
+.nested-git-opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px; }
+.nested-git-opt { display: flex; flex-direction: column; gap: 2px; padding: 8px; border: 1px solid var(--line);
+  border-radius: 7px; cursor: pointer; background: var(--bg); }
+.nested-git-opt.sel { border-color: var(--accent); background: rgba(91,140,255,.08); }
+.nested-git-opt input { accent-color: var(--accent); }
+.nested-git-opt-label { font-size: 13px; font-weight: 600; color: var(--text); }
+.fsb-confine { display: block; margin: 2px 0 4px; font-size: 11px; }
+.fsb-confine b { font-family: ui-monospace, monospace; }
 
 /* Docs tab: one editor per SOURCE text, with the provider files it generates ticked below it. A
    DISABLED doc is dimmed but still readable — it is text somebody wrote, not a deleted thing. */
@@ -384,6 +397,91 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 /* the decision card(s) for the clicked chip, inline right under the bar */
 .ny-decision { display: flex; flex-direction: column; gap: 8px; }
+/* The PROJECT blocker chip (a machine×project that cannot build/provision, surfaced on the bar even
+   when no xell is waiting — the pool just stopped filling). Amber like every other need, but edged
+   with the fault colour: this one is a build being stopped, not a decision a zee is waiting on. */
+.needsyou .ny-chip.proj { border-color: rgba(229,85,78,.55); }
+.needsyou .ny-chip.proj.active { border-color: var(--down); background: rgba(229,85,78,.16);
+  box-shadow: 0 0 0 1px var(--down) inset; }
+/* One opened blocker: the dated condition line + its ⛑ Dispatch-medic button. The body is a
+   first-class sentence (a PROVISION-INFRA card quotes the check detail), so it is readable in full,
+   wrapped, never clipped to a head the way a chip's title has to be. */
+.ny-blocker { display: flex; flex-direction: column; gap: 5px; background: var(--panel2);
+  border: 1px solid var(--line); border-left: 2px solid rgba(229,85,78,.7); border-radius: 6px;
+  padding: 8px 10px; }
+.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ny-blocker-date { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+.ny-blocker-body { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
+  line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.needsyou .pill { background: rgba(229,85,78,.16); color: var(--text);
+  border: 1px solid rgba(229,85,78,.6); border-radius: 5px; font-size: 12px; padding: 3px 9px;
+  cursor: pointer; white-space: nowrap; }
+.needsyou .pill:hover { border-color: var(--down); background: rgba(229,85,78,.28); }
+.needsyou .pill:disabled { opacity: .55; cursor: default; }
+
+/* ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) ──────────────────────────────────────────
+   Medics have no xell, so they are in no honeycomb; this strip is their whole surface. Styled as a
+   SIBLING of .needsyou (same width, same card language, directly beneath it) because the two
+   answer the same question — what is waiting on a human — and a medic that asked must read as
+   loudly as a tend does. Its own palette lives in MedicBay.jsx (MEDIC_COLORS): the hexes are
+   painted from data, so only the chrome is here. */
+.medic-bay { display: flex; flex-direction: column; gap: 8px; background: var(--panel);
+  border: 1px solid var(--line); border-left: 3px solid #4aa3df; border-radius: 10px;
+  padding: 10px 12px; }
+.medic-bay-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.medic-bay-t { font-weight: 600; color: var(--text); }
+.medic-bay-n { color: var(--muted); font-size: 12px; }
+.medic-bay-ask { color: var(--building); }
+.medic-bay-note { color: var(--muted); font-size: 11px; margin-left: auto; }
+.medic-hexes { display: block; max-width: 100%; }
+.medic-hex polygon { transition: fill-opacity .15s ease; }
+.medic-hex:hover polygon { fill-opacity: 1; }
+.medic-hex-t { font-size: 13px; fill: #0e1116; }
+.medic-hex-s { font-size: 9px; fill: var(--muted); font-family: 'Segoe UI', sans-serif; }
+
+.medic-panel { display: flex; flex-direction: column; gap: 8px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.medic-panel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.medic-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.medic-target, .medic-when { color: var(--muted); font-size: 12px; }
+.medic-state { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--building); }
+.medic-panel .pill { background: rgba(74,163,223,.14); color: var(--text);
+  border: 1px solid rgba(74,163,223,.55); border-radius: 5px; font-size: 12px; padding: 3px 9px;
+  cursor: pointer; white-space: nowrap; margin-left: auto; }
+.medic-panel .pill.on { background: rgba(74,163,223,.3); }
+.medic-panel .pill.ghost { background: transparent; }
+.medic-panel .pill:disabled { opacity: .55; cursor: default; }
+/* The one sentence that stops a human hunting for a medic's hexagon in the honeycomb. */
+.medic-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.medic-brief pre, .medic-act-sql { font-family: 'Cascadia Code', monospace; font-size: 11.5px;
+  white-space: pre-wrap; word-break: break-word; color: var(--text); margin: 4px 0 0; }
+/* The ask. Nothing about a medic that is waiting may be quiet. */
+.medic-asking { display: flex; flex-direction: column; gap: 6px; background: rgba(224,161,58,.12);
+  border: 1px solid rgba(224,161,58,.5); border-radius: 8px; padding: 8px 10px; }
+.medic-asking-why { font-size: 13px; color: var(--text); }
+.medic-reply { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-family: inherit; font-size: 12px; resize: vertical; }
+/* THE LEDGER — the only receipt a config write leaves, so it is rendered verbatim and monospaced. */
+.medic-ledger { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px;
+  max-height: 40vh; overflow-y: auto; }
+.medic-act { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.medic-act.refused { border-color: rgba(229,85,78,.6); }
+.medic-act-head { font-size: 12px; color: var(--text); }
+.medic-act-tables, .medic-act-rows, .medic-act-when { color: var(--muted); font-size: 11px; }
+.medic-act-refused { color: var(--down); font-size: 11.5px; margin-top: 4px; }
+.medic-transcript { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.medic-msg { display: flex; gap: 6px; font-size: 12px; line-height: 1.5; }
+.medic-msg-role { color: var(--muted); }
+.medic-msg-text { white-space: pre-wrap; word-break: break-word; }
+.medic-msg.user .medic-msg-text { color: var(--muted); }
+.medic-cards, .medic-workers { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.medic-card { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.medic-card.pending { border-color: rgba(224,161,58,.55); }
+.medic-gate { color: var(--muted); }
+.medic-tabs { display: flex; gap: 6px; }
+.medic-tabs .pill { margin-left: 0; }
+.medic-empty { color: var(--muted); font-size: 12px; }
+.medic-err { color: var(--down); font-size: 12px; }
 /* WHY a tend was raised. A tend has no Approve/Reject — the only thing it carries is the zee's
    reason, so that reason is the loudest word in the note rather than a footnote to it. */
 .ny-why { color: var(--building); }
@@ -602,6 +700,12 @@ a.cbox:hover { border-color: var(--accent); }
 }
 .statusline .providerlimits-prov.is-warn b { color: var(--amber, #d4a017); }
 .statusline .providerlimits-prov.is-tight b { color: var(--danger, #c44); }
+/* GATEWAY HEALTH — is the LLM gateway reachable at the address cages are actually given? The WORD is
+   the signal (gatewayHealthWord), colour is reinforcement: ok is muted, unknown is muted/amber, down
+   is DANGER (every dispatch dies while the gateway port is closed). The address is named when down. */
+.statusline .gateway-health { color: var(--muted); font-size: 14px; }
+.statusline .gateway-health.gateway_down { color: var(--danger, #c44); font-weight: 600; }
+.statusline .gateway-health.gateway_unknown { color: var(--amber, #d4a017); }
 .statusline .providerlimits-name { color: var(--muted); font-size: 12px; }
 /* Project setup: remaining limit next to each provider account. */
 .token-usage-limit {
@@ -750,6 +854,16 @@ a.cbox:hover { border-color: var(--accent); }
 .ctxmenu button.ctxitem-danger:hover { background: #b3261e; color: #fff; }
 .ctxmenu button.ctxitem-danger:hover .ctxsub { color: rgba(255,255,255,.85); }
 .ctxmenu.confirming { min-width: 250px; }
+/* the '+ hexagon' create menu: a label can carry a sub-line AND a ▸ affordance; the back button on
+   the work-node SUB level is muted and separated so it reads as navigation, not a choice */
+.ctxmenu .ctx-sub-arrow { float: right; color: var(--muted); font-size: 10px; padding-left: 8px; }
+.ctxmenu button:hover .ctx-sub-arrow { color: rgba(255,255,255,.75); }
+.ctxmenu button.ctx-back { color: var(--muted); border-bottom: 1px solid var(--line);
+  border-radius: 0; margin-bottom: 2px; font-size: 11px; }
+.ctxmenu button.ctx-back:hover { color: var(--text); background: var(--panel); }
+/* the '+ hexagon' create menu — a touch wider than the xell/queenzee menus so an option's sub-line
+   has room to read whole */
+.ctxmenu.hive-plus-ctx { min-width: 230px; }
 /* the second-stage confirmation panel */
 .ctxconfirm { padding: 4px 8px 8px; }
 .ctxconfirm .ctxwarn-id { padding: 2px 0 8px; }
@@ -1927,6 +2041,23 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-crumbs .hive-crumb:hover { color: #e6ebf2; border-color: #7f95c2; }
 .hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
+/* ── the pane's VIEW SELECTOR (honeycomb · tickets · reflections · board · timeline) ───────────
+   Top-RIGHT, opposite the breadcrumb and in the same chip language, floating over the pane so the
+   honeycomb canvas (absolute, inset 0) keeps every pixel it had. A work view fills the same pane
+   and keeps the RIGHT half of its head row empty, so these chips land in that strip rather than on
+   top of anything (see the WORK TRACKER section below). */
+.hive-views {
+  position: absolute; top: 8px; right: 10px; z-index: 6;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end;
+  max-width: calc(100% - 20px);
+}
+.hive-views .hive-view {
+  background: rgba(22, 27, 36, 0.88); color: #8b97a8;
+  border: 1px solid #2a3242; border-radius: 12px;
+  font: 600 11px 'Segoe UI', sans-serif; padding: 3px 10px; cursor: pointer; white-space: nowrap;
+}
+.hive-views .hive-view:hover { color: #e6ebf2; border-color: #7f95c2; }
+.hive-views .hive-view.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-pane.panels { flex: 2 1 0; overflow: auto; }
 
 /* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
@@ -2166,6 +2297,8 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-xt-dir { margin-top: 4px; font-size: 12px; color: #e6ebf2; word-break: break-word; }
 .hive-xt-dir.none { color: #8a93a6; font-style: italic; }
 .hive-xt-status { margin-top: 3px; font-size: 11px; color: #8a93a6; }
+.hive-xt-fault { margin-top: 4px; font-size: 11px; color: #ffb4a2; background: rgba(217,85,59,.12);
+  padding: 3px 6px; border-radius: 6px; word-break: break-word; }
 
 /* the panels half scrolls independently; drop the old flex/rail padding assumptions */
 .hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }
@@ -2596,27 +2729,23 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
    orange/red = touching something irreversible, grey = closed).
    ═══════════════════════════════════════════════════════════════════════════════════════════ */
 
-/* the button in the status line that opens it */
-.work-btn-open { margin-left: 12px; background: var(--panel2); border: 1px solid var(--line);
-  color: var(--text); font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
-.work-btn-open:hover { border-color: var(--accent); color: var(--accent); }
-
-/* ── the overlay shell ─────────────────────────────────────────────────────── */
-.work-overlay { position: fixed; inset: 0; z-index: 70; background: rgba(6,8,12,.72);
-  display: flex; padding: 26px; }
+/* ── the shell, INSIDE the honeycomb pane ──────────────────────────────────────
+   Not an overlay: the tracker is a VIEW of that pane now (App.jsx's view selector), so it fills the
+   pane the way the canvas does — absolute, inset 0. Its head row is the strip the pane's view
+   selector floats in (top-right), which is why everything in the head stays LEFT: the right half of
+   that row belongs to the chips. */
+.work-embed { position: absolute; inset: 0; display: flex; overflow: hidden; }
 .work-shell { flex: 1; min-width: 0; display: flex; flex-direction: column;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
-  box-shadow: 0 24px 70px rgba(0,0,0,.6); overflow: hidden; }
-.work-head { display: flex; align-items: center; gap: 14px; padding: 10px 14px;
-  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto; }
-.work-h-title { font-size: 15px; letter-spacing: .02em; }
-.work-tabs { display: flex; gap: 4px; }
-.work-tab { background: none; border: 1px solid transparent; color: var(--muted); font-size: 13px;
-  padding: 4px 14px; border-radius: 7px; cursor: pointer; }
-.work-tab:hover { color: var(--text); }
-.work-tab.on { color: var(--accent); border-color: var(--accent); background: rgba(91,140,255,.10); }
-.work-scope { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  background: var(--bg); overflow: hidden; }
+/* The head keeps its RIGHT half empty on purpose: that is where the pane's view selector floats,
+   and the head is exactly tall enough to read as the strip those chips sit in. */
+.work-head { display: flex; align-items: center; gap: 14px; padding: 7px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto; min-height: 34px; }
+.work-h-title { font-size: 13.5px; letter-spacing: .02em; }
+.work-scope { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px;
+  min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; max-width: 45%; }
 .work-scope b { color: var(--text); }
+/* the ✕ on the tracker's own inner panels (the drawer, a ticket, a gantt bar's detail) */
 .work-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer; padding: 2px 6px; }
 .work-x:hover { color: var(--text); }
 .work-main { flex: 1 1 auto; min-height: 0; display: flex; }
@@ -3521,7 +3650,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }
 
 /* ════════════════════════════════════════════════════════════════════════════════
-   MOBILE CHAT UI (/m?project=…) — web/src/MobileChat.jsx
+   MOBILE CHAT UI (/m/<project>/…) — web/src/MobileChat.jsx
    A phone-first sibling of the console. Every class is prefixed .mob- so it can never
    collide with the console's classes. It owns the FULL screen: no width cap, no centering —
    a phone (and any other device) gets edge-to-edge content. min-height is 100vh first with

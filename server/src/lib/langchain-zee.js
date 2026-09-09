@@ -41,9 +41,11 @@ export function isOpenAIDialect(provider) {
 
 // The gateway base URL + dialect for a provider — the same path shape gatewayEnv mints for the
 // vendor CLIs. The xell token travels in the PATH, so the gateway attributes the call to the xell
-// without parsing the bearer (which stays the provider key).
-export function chatModelConfig({ provider = 'claude', xellToken = null } = {}) {
-  const gw = gatewayEnv({ xellToken, provider });
+// without parsing the bearer (which stays the provider key). ASYNC because gatewayEnv PROVES the
+// gateway address before minting it (chooseGatewayBaseUrl — cached), so a langchain turn never
+// starts against a base-url the queenzee itself cannot reach.
+export async function chatModelConfig({ provider = 'claude', xellToken = null } = {}) {
+  const gw = await gatewayEnv({ xellToken, provider });
   return {
     dialect: isOpenAIDialect(provider) ? 'chat-completions' : 'messages',
     baseUrl: isOpenAIDialect(provider) ? gw.OPENAI_BASE_URL : gw.ANTHROPIC_BASE_URL,
@@ -130,47 +132,68 @@ export function usageFromLc(resp) {
 // Best-effort by contract (like every ledger write in this system): a load that fails returns an
 // empty history (the zee still runs, just cold), and an append that fails logs and never fails the
 // turn. The queueenzee's scheduling never depends on these.
+//
+// KEYED BY PLANE (245): the durable work unit is the XELL for a caged/langchain zee and the MEDIC
+// for a meta-plane medic — pass a bare uuid (legacy: a xell id) or { xellId } / { medicId }. The
+// column split keeps every existing caller byte-identical while a medic's history rides the same
+// table, same replay order, same one-user-one-assistant-per-turn shape.
+const convKeyOf = (key) => {
+  if (key && typeof key === 'object') {
+    if (key.medicId) return { col: 'medic_id', id: key.medicId, conflict: 'zee_conversation_medic_seq_uq' };
+    return { col: 'xell_id', id: key.xellId, conflict: null };
+  }
+  return { col: 'xell_id', id: key, conflict: null };
+};
 
-export async function loadConversation(xellId, { limit = 100 } = {}) {
-  if (!xellId) return [];
+export async function loadConversation(key, { limit = 100 } = {}) {
+  const k = convKeyOf(key);
+  if (!k.id) return [];
   try {
     const cap = Math.min(Math.max(Number(limit) || 100, 1), 1000);
     const rows = await q(
       `SELECT role, content, name FROM zee_conversation
-        WHERE xell_id=$1 ORDER BY seq DESC LIMIT $2`, [xellId, cap]);
+        WHERE ${k.col}=$1 ORDER BY seq DESC LIMIT $2`, [k.id, cap]);
     return rows.reverse().map(rowToMessage);
   } catch (e) {
-    logline('langchain', `loadConversation(${String(xellId).slice(0, 8)}) failed (${e.message})`);
+    logline('langchain', `loadConversation(${String(k.id).slice(0, 8)}) failed (${e.message})`);
     return [];
   }
 }
 
-export async function appendConversation(xellId, messages, { zeeId = null, turnId = null } = {}) {
-  if (!xellId || !messages?.length) return;
+export async function appendConversation(key, messages, { zeeId = null, turnId = null } = {}) {
+  const k = convKeyOf(key);
+  if (!k.id || !messages?.length) return;
   try {
     const max = await one(
-      `SELECT COALESCE(MAX(seq),0) AS m FROM zee_conversation WHERE xell_id=$1`, [xellId]);
+      `SELECT COALESCE(MAX(seq),0) AS m FROM zee_conversation WHERE ${k.col}=$1`, [k.id]);
     let seq = Number(max?.m || 0);
     for (const msg of messages) {
       const row = messageToRow(msg);
       if (!row) continue;
       seq += 1;
+      // The conflict target differs by plane: (xell_id, seq) is the 192 table UNIQUE; the medic
+      // side is the 245 partial unique index, which postgres addresses by the same column pair
+      // with its predicate restated.
+      const conflict = k.col === 'medic_id'
+        ? `ON CONFLICT (medic_id, seq) WHERE medic_id IS NOT NULL`
+        : `ON CONFLICT (xell_id, seq)`;
       await q(
-        `INSERT INTO zee_conversation (xell_id, zee_id, turn_id, seq, role, content, name)
+        `INSERT INTO zee_conversation (${k.col}, zee_id, turn_id, seq, role, content, name)
          VALUES ($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT (xell_id, seq) DO UPDATE
+         ${conflict} DO UPDATE
            SET content=EXCLUDED.content, role=EXCLUDED.role, name=EXCLUDED.name`,
-        [xellId, zeeId || null, turnId || null, seq, row.role, row.content, row.name]);
+        [k.id, zeeId || null, turnId || null, seq, row.role, row.content, row.name]);
     }
   } catch (e) {
-    logline('langchain', `appendConversation(${String(xellId).slice(0, 8)}) failed (${e.message})`);
+    logline('langchain', `appendConversation(${String(k.id).slice(0, 8)}) failed (${e.message})`);
   }
 }
 
-export async function resetConversation(xellId) {
-  if (!xellId) return;
-  try { await q(`DELETE FROM zee_conversation WHERE xell_id=$1`, [xellId]); }
-  catch (e) { logline('langchain', `resetConversation(${String(xellId).slice(0, 8)}) failed (${e.message})`); }
+export async function resetConversation(key) {
+  const k = convKeyOf(key);
+  if (!k.id) return;
+  try { await q(`DELETE FROM zee_conversation WHERE ${k.col}=$1`, [k.id]); }
+  catch (e) { logline('langchain', `resetConversation(${String(k.id).slice(0, 8)}) failed (${e.message})`); }
 }
 
 // ── the turn ──────────────────────────────────────────────────────────────────────────────────
@@ -183,7 +206,7 @@ export async function resetConversation(xellId) {
 // inherit the previous persona's system context.
 export async function runLangchainTurn({ xell, task = null, provider = 'claude', model = null,
                                           apiKey = null, xellToken = null, system = null } = {}) {
-  const { baseUrl } = chatModelConfig({ provider, xellToken });
+  const { baseUrl } = await chatModelConfig({ provider, xellToken });
   const chat = buildChatModel({ provider, model, apiKey, baseUrl });
   const history = await loadConversation(xell.id);
   const messages = [];
@@ -248,13 +271,23 @@ export function buildTool(desc, ctx) {
 // `tools` defaults to the WAVE-1 registry (status/work/working/item). `onAssistant` / `onTool`
 // let the caller (spawnLangchainZee) feed the play-by-play. Returns the final model response, the
 // accumulated messages, how many model calls ran, whether the cap was hit, and which tools ran.
+// PLANE GENERALITY (stage 4): the loop also drives the meta-plane MEDIC (queenzee/medic-spawn.js).
+// `registry` is the ALLOWLIST the loop resolves against — the zee registry by default, MEDIC_TOOLS
+// for a medic — and `runToolFn` its single dispatch path; the two registries are disjoint by test,
+// so neither plane can name the other's verbs. `convKey` keys the durable conversation ({ medicId }
+// for a medic; defaults to the xell id). `xell` stays the SUBJECT the tools receive (for a medic it
+// is the medic row) — the identity still comes from the turn, never from the model.
 export async function runLangchainAgentTurn({ xell, task = null, provider = 'claude', model = null,
                                                apiKey = null, xellToken = null, system = null,
-                                               tools = toolList(), maxIterations = MAX_TOOL_ITERATIONS,
+                                               tools = null, registry = LANGCHAIN_TOOLS,
+                                               runToolFn = runTool, convKey = null,
+                                               maxIterations = MAX_TOOL_ITERATIONS,
                                                onAssistant = null, onTool = null } = {}) {
-  const { baseUrl } = chatModelConfig({ provider, xellToken });
+  const { baseUrl } = await chatModelConfig({ provider, xellToken });
   const chat = buildChatModel({ provider, model, apiKey, baseUrl });
-  const history = await loadConversation(xell.id);
+  if (!tools) tools = registry === LANGCHAIN_TOOLS ? toolList() : Object.values(registry);
+  const conv = convKey ?? xell.id;
+  const history = await loadConversation(conv);
   const messages = [];
   if (system) messages.push(new SystemMessage(system));
   messages.push(...history);
@@ -268,14 +301,14 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
   // Now the user's task is persisted BEFORE any model call, so an interrupted turn keeps its task;
   // the final assistant response is appended at the end (below). An interruption therefore loses at
   // most the in-flight call, never the whole turn.
-  await appendConversation(xell.id, [userMsg]);
+  await appendConversation(conv, [userMsg]);
 
   // THE ALLOWLIST IS THE CONFINEMENT, STRUCTURALLY. Only tools in LANGCHAIN_TOOLS may be bound, and
   // every execution resolves through the allowlist (runTool, which defaults to LANGCHAIN_TOOLS). A
   // caller passing an over-wide `tools` array cannot widen the loop: `bindable` filters it down to
   // the allowlist, so a verb outside it is never even offered to the model, and if the model asks
   // for it anyway runTool refuses it. The loop never binds or runs a verb the allowlist does not name.
-  const bindable = tools.filter((d) => LANGCHAIN_TOOLS[d.name]);
+  const bindable = tools.filter((d) => registry[d.name]);
   const bound = bindable.length ? chat.bindTools(bindable.map((d) => buildTool(d, { xell }))) : chat;
   let iterations = 0;
   let capHit = false;
@@ -307,7 +340,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
       // is the single place a tool is looked up and run — the allowlist refusal + the handler call.
       // `desc` is the ALLOWLIST lookup (LANGCHAIN_TOOLS[tc.name]), so `executed`/`onTool` only ever
       // record a verb the allowlist names; an over-wide caller array cannot leak a name in.
-      const desc = LANGCHAIN_TOOLS[tc.name];
+      const desc = registry[tc.name];
       // LOOP POLICY — THE LOOP DOES NOT RUN `working` WHILE A TEND IS OPEN. A human's question must
       // not be dissolved by loop filler. This is HARNESS POLICY, not verb semantics: `working` stays
       // the plain shared handler (same door as every cxell zee); the loop simply does not reach for
@@ -316,7 +349,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
       // for everybody (with a human), not a langchain-local patch. This policy only stops THIS loop
       // from exercising it. The model gets a visible refusal it can react to, not a silent skip.
       let policyRefused = null;
-      if (tc.name === 'working') {
+      if (tc.name === 'working' && xell?.id) {
         const st = await tendState(xell.id);
         if (st.open) {
           policyRefused = { ok: false, error: `working is REFUSED by loop policy: this xell has an `
@@ -327,7 +360,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
       }
       const content = policyRefused
         ? JSON.stringify(policyRefused)
-        : await runTool(xell, { name: tc.name, args: tc.args || {} });
+        : await runToolFn(xell, { name: tc.name, args: tc.args || {} });
       if (desc && !policyRefused) executed.push({ name: tc.name, args: tc.args || {} });
       messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
       if (onTool && desc && !policyRefused) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
@@ -341,11 +374,18 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
       // is answering, not asking. hint-land/hint-ship do NOT end the turn either — a hint blocks
       // nothing by construction (it lights a button) and the zee keeps working; ending on a hint
       // would invent a stop the fleet does not have.
-      if (tc.name === 'tend' && !tc.args?.clear) {
+      //
+      // The MEDIC plane has the same policy under its own verb name: `need_human` IS the medic's
+      // tend (the meta plane has no tend row — the medic row's `awaiting-human` status is the card
+      // a human answers), so it ends the turn identically. The registry entry declares it
+      // (`endsTurn: true`) so the policy has ONE source of truth per plane and this loop never
+      // hardcodes another registry's verb names.
+      const asksAHuman = (tc.name === 'tend' && !tc.args?.clear) || !!desc?.endsTurn;
+      if (asksAHuman) {
         try {
           const parsed = JSON.parse(content);
-          if (parsed.ok) endedForHuman = { reason: parsed.message || 'a human was asked' };
-        } catch { /* not JSON — fall through, the tend was refused (e.g. no reason) */ }
+          if (parsed.ok) endedForHuman = { reason: parsed.message || parsed.reason || 'a human was asked' };
+        } catch { /* not JSON — fall through, the ask was refused (e.g. no reason) */ }
         if (endedForHuman) break;
       }
     }
@@ -363,7 +403,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
   // that never resolved. So only a turn that actually ANSWERED appends its response; an interrupted
   // / tended / capped turn keeps just the task, and the next turn re-derives from there.
   if (!endedForHuman && !capHit) {
-    await appendConversation(xell.id, [finalResp]);
+    await appendConversation(conv, [finalResp]);
   }
 
   // A CAPPED loop is a VISIBLE result, not a silent stop: the model never reached a final answer,

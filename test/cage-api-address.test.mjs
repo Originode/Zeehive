@@ -65,6 +65,13 @@ try {
      `cxellApiFallback defaults to the stable address (got ${config.cxellApiFallback})`);
   ok(config.cxellApiBase === 'http://host.docker.internal:4700',
      `cxellApiBase is the stable address by default (got ${config.cxellApiBase})`);
+  // TKT-184: the EXTERNAL ticketing address must NEVER inherit the cxell address — that one means
+  // "the docker host I am running on", which for a deployed project is its OWN host. extApiBase is
+  // a separate, operator-settable value (EXT_API_BASE, else derived from DEV_HOST_IP, else null).
+  ok(config.extApiBase !== 'http://host.docker.internal:4700',
+     `extApiBase never defaults to the cxell address (got ${config.extApiBase}) — TKT-184`);
+  ok(config.extApiBase === null || /^https?:\/\//.test(config.extApiBase),
+     `extApiBase is null (no external ingress) or a real URL (got ${config.extApiBase})`);
 
   console.log('\n── 3. the CLI retries the fallback on a network error and says so ──');
   // Primary = 127.0.0.1:1 (connection refused, instant). Fallback = the mock. The CLI must succeed
