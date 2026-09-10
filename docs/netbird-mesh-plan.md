@@ -553,6 +553,42 @@ one more peer kind).
   `decideProdBind` flips the one narrow `xells→prod:<db>` policy a human-approved prod bind needs.
   Tests: `test/build-bootstrap.test.mjs`, `test/mesh-routes.test.mjs`, `test/netbird-policies.test.mjs`,
   `test/netbird-compose.test.mjs`. The committed `docker-compose.spinoff.yml` is untouched.
+- **The cage's route was dead; the seal now resolves it** (`b012a91f`): the `ip route replace` line
+  above landed with the gateway, but nothing ever set `MESH_GATEWAY_IP` — `sealCxell` shells
+  `docker exec -u 0 … cxell-firewall.sh` and `docker exec` inherits nothing, so the branch could
+  not fire on ANY install. The address cannot be configuration (docker reassigns it on every
+  recreate, and `zee-hive-net` is external and per docker host), so `lib/cxell.js
+  resolveMeshGatewayIp` inspects the running `zeehive_mesh_gateway` on the CAGE'S OWN context at
+  seal time and passes `-e MESH_GATEWAY_IP=…`. Mesh disabled → null with NO docker call and an argv
+  byte-identical to the pre-mesh seal; no gateway on this machine → logged as ordinary, seal
+  continues; `config.meshGatewayIp` (`MESH_GATEWAY_IP`) is the validated escape hatch for a gateway
+  this compose did not create. Only ever ADDS a route — the prod DROP list is untouched. Test:
+  `test/mesh-gateway-seal.test.mjs` (27 assertions, verified red before the fix). Documented for the
+  operator in `docker/zeehive/README.md`.
+
+### Verified live vs verified by test (2026-09-10, the inheriting xell)
+
+Live, in-cage: a migrated sandbox meta-DB (`zee db-sandbox --migrate`) + a real queenzee on
+loopback + real bearer tokens, driving real endpoints over HTTP —
+`GET /api/xell/self/routes` returning the legacy-only answer with the mesh unset; the same endpoint
+with mesh rows present returning a USED shared db through its MACHINE peer (published port kept, DSN
+re-addressed, credentials preserved) and owned roles through the xell's own peer with the full
+`fallback` block; and the identical payload through the real `scripts/zee routes` CLI.
+
+By test only (the honest limits): the provisioner relay (§6 phase 3) is exercised against tables and
+fakes, not a live provision; the bootstrap card's `mesh-machine-peer` step cannot be executed from a
+cage at all — `planBuildBootstrap` refuses with `cannot reach context '…': spawn docker ENOENT`,
+which is correct (a cage has no docker CLI, by design) and means the plan/perform path must be
+proven by a human on a machine with contexts. Every mesh path was exercised with the control plane
+ABSENT; nothing here has ever spoken to a live NetBird API.
+
+Two suites are red on `main` and were red before this work (proved by stashing onto clean HEAD):
+`test/manual-cage-claims.test.mjs` (4 — migration 115's anchors are no longer byte-present in the
+injected manual, which has been rewritten since) and `test/dk-verdict-contract.test.mjs` (2 —
+undeclared marker `IDENTITY_OK`, uncovered declared marker `WROTE_TRACKED`). Neither touches mesh
+code; left alone deliberately. Also worth knowing: a queenzee left running against the sandbox DB
+will reap the fixture xells out from under `test/netbird-provision-env.test.mjs` mid-run and make it
+look flaky — stop the server before running the db suites.
 
 ### NOT done (the honest list — each is a follow-up work item)
 
