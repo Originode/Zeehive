@@ -113,4 +113,10 @@ export const config = {
   netbirdApiToken: process.env.NETBIRD_API_TOKEN || null,
   // The mesh DNS domain peers resolve under (<hostname>.<domain>). NetBird's self-hosted default.
   meshDomain: process.env.MESH_DOMAIN || 'netbird.selfhosted',
+  // The zee-hive-net address cages route mesh traffic through (§3.5). Normally UNSET: the seal
+  // resolves the running mesh-gateway container's address per machine (lib/cxell.js
+  // resolveMeshGatewayIp), because docker reassigns it on every recreate. Set it only to point
+  // cages at a gateway this compose did not create — an explicit override that then never rots
+  // silently, because a wrong one shows up as a mesh route that goes nowhere.
+  meshGatewayIp: process.env.MESH_GATEWAY_IP || null,
 };

@@ -158,3 +158,32 @@ Both compose files already carry the services; the steps below are for a repo ch
    has live peers. `netbird_management_data` and `netbird_signal_data` are named volumes with
    explicit names, exactly like the `zeehive_*` volumes, so a backup/restore script can mount them
    by bare name.
+
+### The cages' hop onto the mesh (`mesh-gateway`, §3.5)
+
+A cxell runs **no** NetBird agent (mesh-plan DR-3: peer sprawl, `/dev/net/tun` per cage, no
+identity gained while the firewall seal exists). It reaches mesh addresses through ONE container:
+
+- `mesh-gateway` — the same `mesh` profile, a NetBird agent named `zeehive-gw` with `NET_ADMIN`,
+  `/dev/net/tun` and `ip_forward`, joined to **both** the compose network and `zee-hive-net` (the
+  network every cxell is already on; EXTERNAL — the queenzee's entrypoint creates it, compose must
+  never own it). Give it a setup key of its own in `docker/zeehive/.env`:
+  ```sh
+  NETBIRD_GATEWAY_SETUP_KEY=<a setup key minted on the control plane>
+  ```
+- The cage seal (`cxell-firewall.sh`, already root + `NET_ADMIN`) then adds ONE line:
+  `ip route replace 100.64.0.0/10 via <the gateway's zee-hive-net address>`.
+
+**You do not configure that address.** Docker assigns it and reassigns it on every recreate, so
+copying it into an `.env` would be one more baked address that rots — the fault this whole plan
+exists to delete. `lib/cxell.js resolveMeshGatewayIp` inspects the running `zeehive_mesh_gateway`
+on the **cage's own docker context** at seal time (`zee-hive-net` is per host, so a cage only ever
+routes through a gateway on its own machine) and passes it into the seal exec. A machine with no
+gateway container gets no mesh route at all, logged — its cages keep using the published ports.
+`MESH_GATEWAY_IP` in the queenzee's env overrides the lookup, for a gateway this compose did not
+create; setting it is itself an opt-in (it is honoured even with the mesh otherwise disabled).
+
+Note what this does **not** weaken: the seal still drops every prod db host:port first, and the
+control plane is default-deny between groups, so a cage with the route reaches only what a policy
+grants (mesh-plan §3.5). Live stand-up of the gateway, like the rest of the control plane, is a
+human's deploy — none of it has been exercised against a running NetBird.

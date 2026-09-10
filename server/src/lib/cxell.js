@@ -29,6 +29,7 @@ import { adapterFor, CLAUDE_ADAPTER, AUTH_MARKERS, SEED_MARKERS, AGENT_PROC_PATT
          HEADLESS_PROC_PATTERN, resultFrom, TURN_HOOK_MARKERS } from './cxell-runtimes.js';
 import { credentialVendorMismatch, scrubEnvValue } from './provider-tokens.js';
 import { gatewayEnv } from './gateway.js';
+import { meshEnabled } from './netbird.js';
 import { cxellCacheRunArgs, cxellCacheFixupCommand, CXELL_NPM_CACHE_DIR } from './npm-cache.js';
 import { prepUserScript, prepRootScript, parsePrepSteps, summarizePrepSteps,
          hasAptStep, normalizeSpawnPrep, preppedImageTag, preppedDockerfile,
@@ -1455,14 +1456,54 @@ export async function cloneIntoCxell({ ctx, name, worktree }) {
   return { updated };
 }
 
+// ── the MESH ROUTE the seal installs (docs/netbird-mesh-plan.md §3.5) ────────────────────────────
+// cxell-firewall.sh adds `ip route replace 100.64.0.0/10 via $MESH_GATEWAY_IP` when that variable
+// is set — and `docker exec` inherits NOTHING from the queenzee's own environment, so unless the
+// seal PASSES it the line can never fire. This is where it comes from.
+//
+// The address is DOCKER'S to assign and it changes every time the gateway container is recreated,
+// so an operator-copied value in a .env would be exactly the kind of baked lie this whole plan
+// exists to delete. So: resolve it at seal time, from the gateway container itself, on the CAGE'S
+// OWN context — zee-hive-net is per docker host, so a cage only ever routes through a gateway on
+// its own machine, and a machine without one legibly gets no mesh route (legacy ports stay the
+// whole story). `MESH_GATEWAY_IP` in the queenzee env still wins, for a gateway this compose did
+// not create. Mesh unset → no inspect and no env, so today's seal is byte-identical.
+export const MESH_GATEWAY_CONTAINER = 'zeehive_mesh_gateway';
+export const MESH_GATEWAY_NETWORK = 'zee-hive-net';
+
+// docker prints `<none>` for an absent network and an empty line for an absent container; anything
+// that is not a dotted quad is "no gateway", never a half-true route.
+export function parseGatewayIp(text) {
+  const ip = String(text || '').trim().split(/\s+/)[0] || '';
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) ? ip : null;
+}
+
+export async function resolveMeshGatewayIp(ctx, { inspect = null } = {}) {
+  if (config.meshGatewayIp) return parseGatewayIp(config.meshGatewayIp);
+  if (!meshEnabled()) return null;                       // mesh-less queenzee: no docker call at all
+  const run = inspect || ((c) => dk(c, ['inspect', '-f',
+    `{{with (index .NetworkSettings.Networks "${MESH_GATEWAY_NETWORK}")}}{{.IPAddress}}{{end}}`,
+    MESH_GATEWAY_CONTAINER], { timeoutMs: 15000 }).then((r) => r.out));
+  try {
+    return parseGatewayIp(await run(ctx));
+  } catch (e) {                                          // no gateway on this machine is ORDINARY
+    logline('cxell', `no mesh gateway on '${ctx || 'default'}' (${MESH_GATEWAY_CONTAINER}: ${e.message}) `
+      + '— sealing without a mesh route; legacy ports stay the answer');
+    return null;
+  }
+}
+
 // Apply the cxell egress policy (docker/zeehive/cxell-firewall.sh): default ALLOW, DROP only the
 // prod DB host:port pairs in blockTcp. The container is the real confinement boundary; this just
 // keeps the one thing that matters — the live production database — off-limits (unless the xell
 // is prod-bound, in which case the caller leaves its prod DB out of blockTcp). Root exec; the
 // zee runs as `zee` and cannot undo it.
-export async function sealCxell({ ctx, name, blockTcp = [] }) {
+// `meshGatewayIp` defaults to RESOLVING one (above); pass null to seal with no mesh route.
+export async function sealCxell({ ctx, name, blockTcp = [], meshGatewayIp = undefined, exec = dk }) {
   const env = blockTcp.length ? ['-e', `CXELL_BLOCK_TCP=${blockTcp.join(' ')}`] : [];
-  const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cxell-firewall.sh']);
+  const gw = meshGatewayIp === undefined ? await resolveMeshGatewayIp(ctx) : meshGatewayIp;
+  if (gw) env.push('-e', `MESH_GATEWAY_IP=${gw}`);
+  const r = await exec(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cxell-firewall.sh']);
   return r.out.trim().split('\n');
 }
 
