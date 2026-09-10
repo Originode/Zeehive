@@ -1361,6 +1361,48 @@ export async function selfTend(xell, { reason = null, clear = false } = {}) {
   };
 }
 
+// ── POST /api/xell/self/medic — a blocked zee calls the ⛑ MEDIC (the patient-voice card) ────────
+// Every zee (worker AND manager) may call it; opens no gate; blocks nothing. The call is RECORDED
+// server-side with the xell's infra evidence (lib/medic-calls.js collectCallEvidence), then routed
+// by the ONE decision: a LIVE medic attending this project → ATTACH (resume that medic with the call
+// verbatim + evidence in the background); none → RAISE (the call becomes an entry in
+// fleet.medic_emergency, source 'called', and a human dispatches — NOTHING auto-spawns). A second
+// call while one is live UPDATES the open call (the partial unique index is the rate limit).
+// `--clear` withdraws; `--status` reads the current call.
+export async function selfMedicCall(xell, { reason = null, kind = null, clear = false, status = false } = {}) {
+  const { raiseMedicCall, readMedicCallForXell, withdrawMedicCall } = await import('../lib/medic-calls.js');
+  const zee = await liveZee(xell.id);
+  if (clear) {
+    const row = await withdrawMedicCall(xell.id, { by: xell.slug });
+    logline('self', `${xell.slug} WITHDREW its medic call`);
+    return { ok: true, call: row, message: row
+      ? 'Medic call withdrawn — it no longer shows in the console ⛑. If the fault is still there, '
+        + 'the answer is a fresh `zee medic --reason "…"` when you are ready.'
+      : 'No live medic call was open to withdraw.' };
+  }
+  if (status) {
+    const row = await readMedicCallForXell(xell.id);
+    if (!row) return { ok: true, call: null, message: 'No medic call on record for this xell.' };
+    const lines = [`Your medic call is ${row.status}${row.medic_id ? ` (medic ${String(row.medic_id).slice(0, 8)})` : ''} — `,
+                   `"${row.reason}"`];
+    // A DECLINED call (the medic declined it with call_answer, OR a HUMAN dismissed it) always says
+    // WHY: the resolution note is exactly what the calling zee receives, and a zee reading its own
+    // status later must not have to guess whether the decline was "not a medic job" or something it
+    // can fix. The note is also delivered as a zee_message at decline time; this is the durable copy.
+    if (row.status === 'declined' && row.resolution) {
+      lines.push('', `Why it was declined: ${row.resolution}`);
+      lines.push('(A medic fixes ZEEHIVE config/infra. If the fault is in your own code or tests, '
+        + 'that is `zee tend`, not a medic. If you are still blocked, raise a FRESH `zee medic --reason "…"`.)');
+    } else if (row.status === 'withdrawn' && row.resolution) {
+      lines.push('', `Withdrawn: ${row.resolution}`);
+    } else if (row.status === 'resolved' && row.resolution) {
+      lines.push('', `Resolution: ${row.resolution}`);
+    }
+    return { ok: true, call: row, message: lines.join('\n').slice(0, 2000) };
+  }
+  return raiseMedicCall({ xell, reason, kind: kind || 'other', zeeId: zee?.id || null });
+}
+
 // ── POST /api/xell/self/hint-land · hint-ship — "this looks ready; a human should decide" ──────
 // The verb for the 100%-certain rule: a zee only calls the real, gated `zee land` / `zee ship` when
 // it is CERTAIN the job is done. Short of that — a landable checkpoint, a plausibly-shippable state

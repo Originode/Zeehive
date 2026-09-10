@@ -409,15 +409,45 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-blocker { display: flex; flex-direction: column; gap: 5px; background: var(--panel2);
   border: 1px solid var(--line); border-left: 2px solid rgba(229,85,78,.7); border-radius: 6px;
   padding: 8px 10px; }
-.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  flex-wrap: wrap; }
 .ny-blocker-date { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 .ny-blocker-body { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
   line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+/* A CALLED zee (medic_call 251) — the blocker row carries the zee's own words plus the infra
+   evidence stamped at call time, so a human can decide from the row itself. */
+.ny-called-evidence { display: flex; flex-direction: column; gap: 3px; margin-top: 2px;
+  padding-left: 8px; border-left: 1px solid var(--line); }
+.ny-called-ev { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted);
+  white-space: pre-wrap; word-break: break-word; }
 .needsyou .pill { background: rgba(229,85,78,.16); color: var(--text);
   border: 1px solid rgba(229,85,78,.6); border-radius: 5px; font-size: 12px; padding: 3px 9px;
   cursor: pointer; white-space: nowrap; }
 .needsyou .pill:hover { border-color: var(--down); background: rgba(229,85,78,.28); }
 .needsyou .pill:disabled { opacity: .55; cursor: default; }
+/* A DISMISS is the deliberate opposite of the red dispatch pill: a quiet ✕ that must never read as
+   an equal to "⛑ Dispatch medic". Secondary chrome only — muted text on the panel, hover turns it
+   the danger colour so the act is legible before it is clicked. */
+.needsyou .pill.pill-ghost, .setup-row .pill.pill-ghost {
+  background: transparent; border: 1px dashed var(--line); color: var(--muted);
+  font-weight: 400; }
+.needsyou .pill.pill-ghost:hover, .setup-row .pill.pill-ghost:hover {
+  border-color: var(--down); border-style: solid; color: var(--down);
+  background: rgba(229,85,78,.08); }
+/* The muted "N dismissed · UNDO" way-back under the medic panel (and the conditions editor). One
+   line, small, quiet — but the UNDO is a real link that deletes that one fingerprinted dismissal,
+   so a fault silenced by accident comes straight back on the next snapshot. */
+.ny-dismissed { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; padding: 6px 8px;
+  border-top: 1px dashed var(--line); color: var(--muted); font-size: 11px; }
+.ny-dismissed-label { opacity: .75; letter-spacing: .02em; }
+.ny-dismissed-one { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-family: 'Segoe UI', sans-serif; }
+.ny-dismissed-one b { color: var(--text); font-weight: 600; }
+.ny-dismissed-one .ny-why { color: var(--muted); }
+.ny-dismissed-one .undolink { background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--building); font-size: 11px; font-weight: 600; letter-spacing: .04em;
+  text-decoration: underline dotted; }
+.ny-dismissed-one .undolink:hover { color: var(--text); }
 
 /* ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) ──────────────────────────────────────────
    Medics have no xell, so they are in no honeycomb; this strip is their whole surface. Styled as a
@@ -474,9 +504,11 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .medic-msg-role { color: var(--muted); }
 .medic-msg-text { white-space: pre-wrap; word-break: break-word; }
 .medic-msg.user .medic-msg-text { color: var(--muted); }
-.medic-cards, .medic-workers { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
-.medic-card { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.medic-cards, .medic-workers, .medic-calls { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.medic-card, .medic-call { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .medic-card.pending { border-color: rgba(224,161,58,.55); }
+.medic-call.attended { border-color: rgba(234,85,78,.55); }
+.medic-call-res { color: var(--down); }
 .medic-gate { color: var(--muted); }
 .medic-tabs { display: flex; gap: 6px; }
 .medic-tabs .pill { margin-left: 0; }

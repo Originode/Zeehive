@@ -573,6 +573,7 @@ function usage() {
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
   zee turn --start | --end           report an INTERACTIVE turn boundary (a human or a manager typing into this cage's pane) — the ONE kind of turn the queenzee does not start and cannot see. The vendor CLI's own turn hooks call this for you; NOT gated, and it records NO cost (a hook knows a turn happened, not what it cost)
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
+  zee medic --reason "..." [--kind db|build|provision|network|other] [--status] [--clear]   call the ⛑ MEDIC in your OWN WORDS when a fault is NOT yours to fix (a wedged shared db, provision that will not burn in, INFRA-classed build failures). Opens no gate, blocks nothing, NEVER auto-spawns: recorded with this xell's infra evidence — attached to a LIVE medic already on the project (it resumes with your words) or RAISED as a CALLED emergency in the console ⛑ for a human to dispatch. A fault in your OWN code/tests is zee tend, not a medic. --kind labels the call; --status reads it; --clear withdraws it
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee db-sandbox [--migrate] [--status] [--stop]   start a REAL throwaway postgres INSIDE this cage (127.0.0.1 only) and print its DSN — how you verify database work when your assigned db is unusable. NOT gated, nothing to ask for: it dies with the container. --migrate applies db/migrations to it; --stop stops it; a second start returns the SAME DSN. It NEVER replaces your assigned DATABASE_URL — pass the DSN yourself, and report a broken assigned db rather than working around it
@@ -979,6 +980,34 @@ switch (cmd) {
       process.exit(1);
     }
     out(await req('POST', '/api/xell/self/tend', { reason: reason || null, clear }));
+    break;
+  }
+  case 'medic': {
+    // Call the ⛑ MEDIC in your own words — for a fault that is NOT yours to fix (ZEEHIVE
+    // config/infra, not your code/tests). Opens no gate, blocks nothing, NEVER auto-spawns: the
+    // server records the call with this xell's infra evidence, then routes it — attached to a LIVE
+    // medic already attending the project (that medic resumes with your words) or RAISED as a CALLED
+    // emergency in the console ⛑ for a human to dispatch. A second call while one is live UPDATES
+    // the open call (one live call per xell is the rate limit). --status reads your call; --clear
+    // withdraws it. A fault in your own code/tests is `zee tend`, not a medic — the answer to a call
+    // with no infra evidence says exactly that.
+    if (rest.includes('--status')) {
+      const r = await req('POST', '/api/xell/self/medic', { status: true });
+      console.log(JSON.stringify(r.json, null, 2));
+      process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    }
+    const clear = rest.includes('--clear');
+    const reason = flag('reason');
+    if (!clear && !reason) {
+      console.error('medic needs --reason "…" — say, in your OWN words, what is blocking you and '
+        + 'why it is ZEEHIVE config/infra (not your code):');
+      console.error('  zee medic --reason "shared dev db refuses every connection since the machine restart"');
+      console.error('  zee medic --reason "provision proof cannot burn in — the pool host is wedged" --kind provision');
+      console.error('(or --clear to withdraw an open medic call, --status to read it)');
+      process.exit(1);
+    }
+    const kind = flag('kind') || null;
+    out(await req('POST', '/api/xell/self/medic', { reason: reason || null, kind, clear }));
     break;
   }
   case 'ship': {

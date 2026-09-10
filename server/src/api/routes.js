@@ -83,7 +83,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdrawShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
+         selfTend, selfMedicCall, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
          selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
@@ -754,6 +754,105 @@ router.post('/medics/:id/message', requireQueenzeeLoops, async (req, res) => {
     const out = await resumeMedic(medic.id, { message: text });
     res.json({ ...out, message: 'resumed — the answer is its next turn' });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── MEDIC CALLS — the CALLED emergency's console surface. A call (medic_call, 251) is a blocked
+// zee's own words; when no live medic is attending the project it becomes an entry in
+// fleet.medic_emergency (source 'called') and THIS is the human's dispatch seam: brief a medic FROM
+// THE CALL, link call.medic_id, mark it attended. Nothing auto-spawns — a human clicks. ───────────
+router.get('/medic-calls', async (req, res) => {
+  try {
+    const { resolveProjectId } = await import('../lib/project-resolve.js');
+    const pid = await resolveProjectId({ project: req.query.project || null });
+    if (!pid) return res.status(400).json({ error: 'a project is required (?project=<id|name>)' });
+    const { listProjectMedicCalls } = await import('../lib/medic-calls.js');
+    res.json({ ok: true, calls: await listProjectMedicCalls(pid, { liveOnly: req.query.all !== '1' }) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/medic-calls/:callId/dispatch', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { dispatchMedic } = await import('../queenzee/medic-spawn.js');
+    const { readMedicCall, buildCallDispatchBrief, MEDIC_LIVE_STATUSES } =
+      await import('../lib/medic-calls.js');
+    const call = await readMedicCall(req.params.callId);
+    if (!call) return res.status(404).json({ error: 'no such medic call' });
+    const medicLive = call.medic_status && MEDIC_LIVE_STATUSES.includes(call.medic_status);
+    if (call.status === 'attended' && medicLive) {
+      return res.status(400).json({ error: 'this call is already attended — the medic is in the Bay' });
+    }
+    if (!['open', 'attended'].includes(call.status)) {
+      return res.status(400).json({ error: `this call is ${call.status} — only an OPEN call (or an `
+        + `attended call whose medic is no longer LIVE) can be dispatched` });
+    }
+    // An ATTENDED call whose medic is no longer LIVE is dispatchable again — a failed attach-resume
+    // leaves the call 'attended' against an errored medic, and that must not strand the emergency
+    // (SHOULD-5). The UPDATE below re-links the call to the fresh medic and keeps status 'attended'.
+    const task = buildCallDispatchBrief(call, call.xell_slug);
+    const out = await dispatchMedic({ targetProjectId: call.project_id, task });
+    const updated = await one(
+      `UPDATE medic_call SET medic_id=$2, status='attended', updated_at=now() WHERE id=$1 RETURNING *`,
+      [call.id, out.medic_id]);
+    broadcast('medic-call', updated);
+    res.json({ ...out, call_id: call.id,
+               message: 'medic attending from the CALL — watch the Bay; its answer goes back to the calling zee' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// A HUMAN says NO to a CALLED emergency — dismiss = DECLINE (distinct from the zee's own
+// withdrawMedicCall and the medic's answerMedicCall). A live zee is waiting on the answer, so the
+// note is REQUIRED (it is what the calling zee receives — the same contract answerMedicCall
+// enforces) and is POSTED BACK to the calling zee as a zee_message. Declined is final history like
+// any decline; a still-blocked zee raises a FRESH call. Same partial worker wall as dispatch: a
+// caged worker does not dismiss a medic ask.
+router.post('/medic-calls/:callId/dismiss', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { dismissMedicCall } = await import('../lib/medic-calls.js');
+    const out = await dismissMedicCall({
+      callId: req.params.callId,
+      note: String(req.body?.reason ?? req.body?.note ?? '').trim() || null,
+      by: String(req.body?.actor || 'human@console').slice(0, 200),
+    });
+    if (!out.ok) return res.status(400).json({ ...out, error: out.reason || out.error });
+    res.json({ ...out, message: 'Medic call DECLINED — the calling zee has been told why. '
+      + 'It no longer shows in the ⛑ needs-you panel; a still-blocked zee raises a fresh call.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// A HUMAN says NO to the ROWLESS suggestions — an INFRA emergency row (fleet medic_emergency,
+// source 'infra') or a CONDITION dispatch card. No call row to decline, so the dismissal is
+// persisted into medic_dismissal, fingerprinted on the EXACT text the human was shown: the same
+// fault stops nagging, a different fault (or edited body) raises again by itself. The project is
+// derived from the target row server-side — the caller never names a project to write into.
+// Same partial worker wall as the dispatch seams (an identified worker does not dismiss).
+router.post('/medic-dismissals', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { createMedicDismissal } = await import('../lib/medic-dismissals.js');
+    const out = await createMedicDismissal({
+      targetKind: req.body?.target_kind || null,
+      targetId: req.body?.target_id || null,
+      text: String(req.body?.text ?? req.body?.why ?? '').trim() || null,
+      reason: String(req.body?.reason || '').trim() || null,
+      by: String(req.body?.actor || 'human@console').slice(0, 200),
+    });
+    if (!out.ok) return res.status(400).json({ ...out, error: out.reason || out.error });
+    res.json({ ...out, message: 'Dismissed — this exact fault stops nagging the ⛑ bar. '
+      + 'A different fault on the same xell (or an edited condition) raises again by itself.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// UNDO a fingerprinted dismissal: the emergency it was hiding raises again at the next snapshot.
+router.delete('/medic-dismissals/:id', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { undoMedicDismissal } = await import('../lib/medic-dismissals.js');
+    const row = await undoMedicDismissal(req.params.id);
+    if (!row) return res.status(404).json({ error: 'no such dismissal' });
+    res.json({ ok: true, undone: row,
+               message: 'UNDONE — the dismissed fault raises again in the ⛑ panel at the next snapshot.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
 });
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
 // sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same
@@ -2165,6 +2264,17 @@ router.post('/xell/self/done', async (req, res) => {
 router.post('/xell/self/tend', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfTend(x, { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// A blocked zee calls the ⛑ MEDIC — `zee medic --reason "…"`. Token-scoped like every self verb,
+// every zee (worker AND manager) may call it, opens no gate, blocks nothing. The routing decision
+// (attach to a LIVE medic on the project, or RAISE as a called emergency) lives in lib/medic-calls.js.
+// {clear:true} withdraws the open call; {status:true} reads it.
+router.post('/xell/self/medic', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMedicCall(x, {
+      reason: req.body?.reason || null, kind: req.body?.kind || null,
+      clear: !!req.body?.clear, status: !!req.body?.status })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Readiness HINT (or --clear): "this looks land/ship-ready — a human should decide". Opens no gate

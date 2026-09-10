@@ -19,11 +19,13 @@
 //           config). container gets NO DELETE: deleting a container row is the reaper's act, and
 //           "any role that can UPDATE xell / DELETE container is a nested reaper"
 //           (docs/self-project-prod-data.md) is the incident this surface is drawn around.
-//   NONE  — xell, zee, medic, harness (no self-grant), provider_token, the gate tables
-//           (land/ship/seed/infra_request) and the ledgers (zee_turn, llm_gateway_request,
-//           medic_action — the DRIVER writes the audit on the owner pool, so the medic cannot
-//           forge or trim its own receipts). Enforced by ABSENCE of grant plus the belt-and-braces
-//           REVOKEs below for the tables that exist today.
+//   NONE  — xell, zee, medic, medic_call (NO table-wide grant — the calls/call_answer tools move a
+//           call's row on the owner pool, row-scoped in code; absence is the wall, so the answer
+//           scoping cannot be bypassed by a bare UPDATE), harness (no self-grant), provider_token,
+//           the gate tables (land/ship/seed/infra_request) and the ledgers (zee_turn,
+//           llm_gateway_request, medic_action — the DRIVER writes the audit on the owner pool, so
+//           the medic cannot forge or trim its own receipts). Enforced by ABSENCE of grant plus the
+//           belt-and-braces REVOKEs below for the tables that exist today.
 //
 // MEDICRW_MODE=simulate (inherited from SHIP_MODE when unset, the same contract as PRODRO_MODE)
 // mints nothing real and hands back a DSN that cannot authenticate — a nested queenzee exercising
@@ -51,6 +53,12 @@ export const MEDIC_WRITE_TABLES = {
   deploy_site: ['INSERT', 'UPDATE'],
   project_condition: ['INSERT', 'UPDATE', 'DELETE'],
   build_readiness_record: ['INSERT', 'UPDATE'],
+  // medic_call is DELIBERATELY ABSENT: a table-wide UPDATE grant on medic_call would let the medic
+  // re-open, re-assign or edit ANY call's row with no row guard — the answer scoping that belongs in
+  // code (answerMedicCall WHERE medic_id + status='attended') would be bypassable by a single UPDATE
+  // statement. The medic's door to a call is the row-scoped calls/call_answer tools, which run on
+  // the OWNER pool; the role keeps SELECT (the blanket grant) and nothing else (DR-8 — the role IS
+  // the confinement, and absence is the wall).
 };
 
 // project's writable CONFIG columns (column-scoped UPDATE — postgres supports it natively).
@@ -60,7 +68,7 @@ export const MEDIC_PROJECT_COLUMNS = ['registry', 'manifest', 'manifest_hash', '
 // restated here so the REVOKE half is explicit and testable (write grants never existed; this is
 // belt and braces against a future blanket grant).
 export const MEDIC_NO_WRITE_TABLES = [
-  'xell', 'zee', 'medic', 'medic_action', 'harness', 'provider_token',
+  'xell', 'zee', 'medic', 'medic_action', 'medic_call', 'medic_dismissal', 'harness', 'provider_token',
   'land_request', 'ship_request', 'prod_seed_request', 'prod_bind_request', 'infra_request',
   'credential_inject_request', 'manager_mint_request', 'done_suggestion',
   'zee_turn', 'llm_gateway_request',

@@ -462,6 +462,23 @@ export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditi
 // and, on the rollback value, the superseded manager-zee. The receipt says which: { plane:'meta',
 // medic_id } or { plane:'manager-zee', slug, … }. The BUTTON does not move; only what answers it.
 export const dispatchMedic = (condId) => siteCall(`/api/project-conditions/${condId}/dispatch-medic`, 'POST');
+// Dispatch the medic from a CALLED emergency (medic_call, 251): briefs the new medic FROM THE CALL
+// (the blocked zee's own words + evidence), links call.medic_id and marks it attended.
+export const dispatchMedicFromCall = (callId) => siteCall(`/api/medic-calls/${callId}/dispatch`, 'POST');
+// A HUMAN says NO to a CALLED emergency — dismiss = DECLINE (the note is REQUIRED and is POSTED
+// BACK to the calling zee as a message, so a blocked zee is never silently abandoned).
+export const dismissMedicCall = (callId, reason, actor = 'human@console') =>
+  siteCall(`/api/medic-calls/${callId}/dismiss`, 'POST', { reason, actor });
+// A HUMAN says NO to a ROWLESS suggestion (an INFRA emergency row or a condition dispatch card).
+// The dismissal is fingerprinted server-side on the exact `text` the human was shown, so the same
+// fault stops nagging but a different fault raises again by itself.
+export const dismissMedicSuggestion = (targetKind, targetId, text, reason, actor = 'human@console') =>
+  siteCall('/api/medic-dismissals', 'POST', { target_kind: targetKind, target_id: targetId, text, reason, actor });
+// UNDO a fingerprinted dismissal — the emergency it was hiding raises again at the next snapshot.
+export const undoMedicDismissal = (id) => siteCall(`/api/medic-dismissals/${id}`, 'DELETE');
+// Read a project's live medic calls (open + orphaned-attended) — the console's ⛑ panel feed.
+export const getMedicCalls = (projectId) => fetch(`/api/medic-calls?project=${encodeURIComponent(projectId)}`)
+  .then((r) => (r.ok ? r.json() : { ok: true, calls: [] }));
 
 // ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) — medics are NOT xells, so they appear in
 // NO xell-shaped read model: not the fleet snapshot, not the honeycomb, not the pool. These four
