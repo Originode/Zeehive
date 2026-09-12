@@ -46,7 +46,8 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
-const { probeBuildReadiness, buildReadinessForProject, registryForProject, dockerAdapter } = await import('../server/src/lib/build-readiness.js');
+const { probeBuildReadiness, buildReadinessForProject, registryForProject, dockerAdapter, bootstrappableFrom } = await import('../server/src/lib/build-readiness.js');
+const { MESH_CONTROL_PLANE_CONTAINER } = await import('../server/src/lib/netbird.js');
 
 // ── the stubbed docker adapter ──────────────────────────────────────────────
 // Dispatch on the first docker arg, like the real adapter's call sites. `reachable:false`
@@ -57,7 +58,7 @@ const { probeBuildReadiness, buildReadinessForProject, registryForProject, docke
 // interpolation error UNLESS the call carried opts.env with all five SPINOFF_*/GIT_COMMIT_HASH
 // contract vars — the false-negative the compose-env DR fixes. The stub records the last compose
 // call's args/opts so a test can assert `--env-file` and the env contract were passed.
-const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true, composeNeedsContract = false } = {}) => {
+const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true, composeNeedsContract = false, containers = {} } = {}) => {
   const stub = async (ctx, args, opts = {}) => {
     const [cmd] = args;
     if (cmd === 'info') {
@@ -90,8 +91,12 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
         ? { status: 0, stdout: `${name}\n`, stderr: '' }
         : { status: 1, stdout: '', stderr: `volume ${name} not found` };
     }
-    if (cmd === 'inspect') {  // alias detail — no attached containers in the stubs
-      return { status: 0, stdout: '', stderr: '' };
+    if (cmd === 'inspect') {
+      // Container detail (the mesh-control-plane probe): a key in `containers` names the state
+      // string `docker inspect <name> --format '{{.State.Status}}'` prints — 'running' or not.
+      const name = args[1];
+      if (name in containers) return { status: 0, stdout: `${containers[name]}\n`, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };   // the alias detail call has no containers
     }
     return { status: 0, stdout: '', stderr: '' };
   };
@@ -363,6 +368,70 @@ try {
   ok(ccHasEnv?.ok === true, `compose-resolves passes with a repo .env [${ccHasEnv?.detail}]`);
   ok(cEnvDocker.lastCompose.args.includes('--env-file'),
      `--env-file passed when the fixture repo has .env [${cEnvDocker.lastCompose.args.join(' ')}]`);
+
+  // ── bootstrappable: the console button's render condition (TKT-189, decision record) ──────────
+  // The button renders on readiness.bootstrappable, NOT status==='missing' (build-capability):
+  // the mesh control plane is performable yet never blocks a build, so a build-ready machine must
+  // still offer the stand-up. These pin the ONE classification authority's inputs and outputs.
+  console.log('\n── bootstrappableFrom: pure classification of "the plan will have a performable step" ──');
+  const bCheck = (check, extra = {}) => ({ check, ok: false, skipped: false, unknown: false, detail: '', ...extra });
+  ok(bootstrappableFrom([]) === false, 'no checks → nothing to perform');
+  ok(bootstrappableFrom([{ check: 'context-reachable', ok: true, skipped: false }]) === false, 'a green probe → nothing to perform');
+  ok(bootstrappableFrom([bCheck('shared-dev-db')]) === true, 'a failing shared-dev-db → provisionDevDb is performable');
+  ok(bootstrappableFrom([bCheck('mesh-control-plane')]) === true, 'the mesh control plane down → the stand-up is performable');
+  ok(bootstrappableFrom([{ check: 'mesh-control-plane', ok: false, skipped: false, unknown: true, detail: '' }]) === false,
+     'an UNKNOWN mesh control plane is not performable (never render a button into an unknown)');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: ['zt-net'], volumes: [], aliases: [] } })]) === true,
+     'a missing declared network → docker network create is performable');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: [], volumes: [{ name: 'v', create: 'empty' }], aliases: [] } })]) === true,
+     'a missing create:empty volume → docker volume create is performable');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: [], volumes: [{ name: 'v', create: null }], aliases: [] } })]) === false,
+     'a missing PLAIN volume is DATA — named, never created, so the button must not render');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: [], volumes: [], aliases: [{ network: 'n', aliases: ['a'] }] } })]) === false,
+     'lost aliases are a human action, not a bootstrap one');
+  ok(bootstrappableFrom([bCheck('requires-present')]) === false,
+     'a legacy recorded check without structured `missing` fails SAFE (no button into an unclassifiable plan)');
+
+  console.log('\n── the probe carries structured `missing` and a mesh-check row that never decides status ──');
+  const missStructured = miss.checks.find((c) => c.check === 'requires-present');
+  ok(missStructured?.missing?.networks?.includes('zt-net'), 'the network miss is named in missing.networks, not only free text');
+  ok(miss.bootstrappable === true, 'a missing declared network makes the pair bootstrappable [true]');
+
+  const pMeshVol = await insProject(`br-mvol-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [{ name: `zt-mvol-${tag}`, create: 'empty' }] } } } }, null);
+  const mVolCtx = `zt-mvol-${tag}`;
+  const mMeshVol = await insMachine(`br-mvol-${tag}`, mVolCtx, true);
+  await insSharedDevDb(pMeshVol, mVolCtx, 'mvol');
+  const volProbe = await probeBuildReadiness(await mach(mMeshVol), await proj(pMeshVol), { docker: makeDocker({ networks: new Set(), volumes: new Set() }) });
+  const volReq = volProbe.checks.find((c) => c.check === 'requires-present');
+  ok(volReq?.missing?.volumes?.[0]?.create === 'empty', 'the create:empty opt-in survives into the structured missing');
+  ok(volProbe.status === 'missing' && volProbe.bootstrappable === true,
+     `a missing create:empty volume reads missing AND bootstrappable [${volProbe.status}/${volProbe.bootstrappable}]`);
+
+  const pPlainVol = await insProject(`br-pvol-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [`zt-pvol-${tag}`] } } } }, null);
+  const mPlainCtx = `zt-pvol-${tag}`;
+  const mPlainVol = await insMachine(`br-pvol-${tag}`, mPlainCtx, true);
+  await insSharedDevDb(pPlainVol, mPlainCtx, 'pvol');
+  const plainProbe = await probeBuildReadiness(await mach(mPlainVol), await proj(pPlainVol), { docker: makeDocker({ networks: new Set(), volumes: new Set() }) });
+  ok(plainProbe.status === 'missing' && plainProbe.bootstrappable === false,
+     `a missing PLAIN volume reads missing but NOT bootstrappable [${plainProbe.status}/${plainProbe.bootstrappable}]`);
+
+  const pHost = await insProject(`br-host-${tag}`, {}, null);
+  const mHost = await insMachine(`br-host-${tag}`, 'default', true);
+  await insSharedDevDb(pHost, 'default', 'host');
+  const hostDown = await probeBuildReadiness(await mach(mHost), await proj(pHost),
+    { docker: makeDocker({ networks: new Set(), containers: { [MESH_CONTROL_PLANE_CONTAINER]: 'exited' } }) });
+  const meshCheck = hostDown.checks.find((c) => c.check === 'mesh-control-plane');
+  ok(hostDown.status === 'ok', `a down control plane does NOT make a build-ready host read missing [${hostDown.status}]`);
+  ok(meshCheck?.ok === false && meshCheck?.blocking === false, 'the mesh check fails but is marked non-blocking');
+  ok(hostDown.bootstrappable === true, 'a build-ready queenzee host with the control plane down is still bootstrappable');
+  const hostUp = await probeBuildReadiness(await mach(mHost), await proj(pHost),
+    { docker: makeDocker({ networks: new Set(), containers: { [MESH_CONTROL_PLANE_CONTAINER]: 'running' } }) });
+  ok(hostUp.bootstrappable === false, 'a running control plane on a green host → nothing to perform');
+  ok(hostUp.checks.find((c) => c.check === 'mesh-control-plane')?.ok === true, 'the mesh check passes when the container runs');
+  const offHost = green.checks.find((c) => c.check === 'mesh-control-plane');
+  ok(offHost?.skipped === true, 'a machine that is not the queenzee host SKIPS the mesh check (the control plane is not its business)');
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
