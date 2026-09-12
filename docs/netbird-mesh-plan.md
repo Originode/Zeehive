@@ -510,6 +510,11 @@ one more peer kind).
    router's own answers. Either give the peer an `extra_dns_labels` entry of `<slug>` (the field
    exists in v0.78.1 and is the supported way) or render the IP-suffixed name from
    `mesh_peer.ip`. Do it before a human is handed a DSN from `zee routes` to paste into psql.
+6. **Auto-mint the gateway setup key** (§11 honest limit (b)): the console stores and renders
+   `gateway_setup_key`, and the stand-up names it as the last hand-set value. It is one
+   `createSetupKey` call with `autoGroups: [<gateway group>]` — the mesh-gateway peer's one-off key
+   — after the first PAT exists. Confirm the group first (a setup key's auto-group must exist), then
+   generate it on the same human click, and the stand-up's "left by hand" line goes empty.
 
 ---
 
@@ -702,15 +707,117 @@ Reproduce: `node scripts/fetch-netbird-binaries.mjs` then
 the binary but an unmigrated meta-DB it proves the REST surface and skips the intent-row half
 loudly. Two consecutive full runs passed.
 
+### The mesh config lives in the meta-DB, the stand-up consumes it, and the first PAT is bootstrapped (2026-09-12, this xell — work item 9b512e60)
+
+The human-facing half of DR-1's §3.1 hole is closed. Before: standing the control plane up meant
+hand-editing the install's `.env` and `netbird/management.json`, and the first account/user/PAT had
+NO supported creator at all under `IdpManagerConfig.ManagerType: "none"`. Now: a human configures
+the mesh on the queenzee machine's card in the console, clicks stand-up, and neither file is edited
+by hand nor is a token pasted.
+
+- **The store.** `db/migrations/259_mesh_config_store.sql` (number from `zee migration-number`):
+  `mesh_config`, one row per `machine` (CASCADE), carrying `enabled`, `mesh_domain`, `api_url`, the
+  five management/dashboard port columns, `signal_uri`, `relay_endpoint`, and four secret+hint
+  pairs (`datastore_encryption_key`, `relay_auth_secret`, `api_token`, `gateway_setup_key`).
+  `lib/mesh-config.js` is the ONLY reader/writer: store→env→default per field, with the source
+  reported for each (the read model), secrets write-only (`{ set, hint }`, `provider_token`-style —
+  `nbp_…tail4` for the PAT), and a `generate` write that mints the datastore key / relay secret
+  server-side on an AUTHENTICATED HUMAN PUT (a human's click is not the unattended step the
+  "never mint secrets" rule binds). **Env backcompat:** a field the row does not set still resolves
+  from the operator env, and with no row `applyMeshConfig` leaves `config` exactly as it was.
+  `server/src/index.js` applies the row into the `config` seam at boot; `lib/netbird.js` and the
+  stand-up then resolve URL/token/ports with no knowledge of the console.
+- **The API (the contract the console builds against).** `GET /api/machines/:id/mesh-config`
+  (fields + hints + `resolved` — never a secret), `PUT …/mesh-config` (flat patch; omitted = leave,
+  `null` = clear, `"generate"` = mint; a bad value is a 400 that NAMES the field, an unknown field
+  is refused by name rather than dropped), and `GET …/mesh-status`: the bounded `probeManagementApi`
+  read, `mesh_peer` counts by status, and the route-source tally summary. `lib/mesh-status.js` never
+  throws for a mesh/DB outcome (a status page must answer when the plane is down).
+- **Meeting the console half (TKT-189, merged).** The panel was built in parallel and had chosen its
+  own read shapes (`fields.management_url`, `peers.counts`, `peers.list`, `management.reachable`,
+  `tally`). Rather than rewrite the landed panel, the server's read model also PROJECTS those names —
+  `fields` is the row under the console's four form names (`management_url` ↔ `api_url`, one alias
+  in `lib/mesh-config.js`'s `FIELD_ALIASES`), and `mesh-status` carries both the canonical
+  `ok`/`by_status`/`active`/`routes` keys and the console's `reachable`/`counts`/`list`/`tally`.
+  Two more consequences, both verified over real HTTP with the panel's verbatim save body: a PUT
+  that CARRIES a configuration ENABLES the machine's mesh (the panel has no separate on switch, and
+  a row left disabled would make the stand-up's bootstrapped PAT inert) — an explicit
+  `enabled: false` still wins and is sticky; and the generated datastore key appears in no GET.
+- **The stand-up consumes it.** `mesh-control-plane` now resolves the machine's row
+  (`meshResolvedForPerformer`) and renders `netbird/management.json` from it, runs
+  `compose --profile mesh up -d` with the row's domain/ports/secrets as the compose child's env (the
+  install's `.env` stops being the only place they live), and the CHANGE-ME refusal is preserved for
+  the no-config case: an EXISTING management.json is only ever FILLED where it still holds a
+  placeholder (`placeholderFill`), never overwritten — so "fill the example's CHANGE-ME" and "never
+  overwrite the operator's secret" are the same rule. `config.netbirdMgmt*Port`,
+  `netbirdSignalPort`, `netbirdRelayPort`, `netbirdDashHttpPort` and `netbirdGatewaySetupKey` were
+  added to `config.js` for this.
+- **The first PAT, automatically (§3.1 / §11 item 1's blocker).** `lib/netbird-bootstrap.js` is the
+  production version of the live harness's seed, guarded by the version pin: it reads the pin off
+  the RUNNING image (`docker inspect … {{.Config.Image}}` — the API has no unauthenticated version
+  endpoint, 401), refuses legibly on any version other than `PINNED_NETBIRD_VERSION` (0.78.1)
+  BEFORE stopping anything, copies the sqlite store out, seeds the account + network + owner user
+  (name/email field-encrypted with the datastore key) + "All" group + "Default" policy + the PAT,
+  chmods the store 0666 and copies it back (docker cp lands files root:root — the server must be
+  able to WRITE the store it owns), restarts, and proves the API answers with the bounded probe.
+  On every failure after the stop it RESTARTS the plane. The step then records the token into the
+  store (`recordBootstrappedPat`, hint-only in the audit receipt) and applies it — and only when NO
+  token exists anywhere, so an operator's env token is never overwritten. `alreadyPresent` (a
+  store that already has an account) and a refusal are a `warning` on an otherwise-`created` step,
+  never a failed stand-up.
+
+**Verified live (in-cage, against the real pinned v0.78.1 management server):** the LIVE HARNESS now
+runs off the production bootstrap. `test/netbird-live-api.test.mjs` boots the pinned plane once to
+migrate its store, then hands that store to `bootstrapFirstPat` through a faithful docker emulation
+(inspect→stop→cp out→seed→cp back→start; only the transport is emulated — no docker daemon in a
+cage) and the WHOLE suite runs on the token it minted. Asserted live: the plan's order, the pin read
+off the running image, the 0666 write-back, the bounded health probe, and a legible refusal on a
+`0.77.0` image that stops before it touches anything. The REST surface, intent-row paths and the real
+agent registration all still pass on that bootstrapped token.
+
+**Verified live (in-cage, HTTP):** a real queenzee on loopback against a migrated sandbox meta-DB
+(`zee db-sandbox --migrate`) — `GET /mesh-config` with no row (env resolved, readiness naming both
+missing secrets), `PUT` with `"generate"` (server-side key + relay secret; response carries HINTS
+only — the key and the env secret appear nowhere in the body), the seam taking over the RUNNING
+server (`mesh-status` then reports the console domain and the compose-internal API default), the
+CHANGE-ME paste 400, the typo 400, the `api_token: "generate"` refusal, the unknown-machine 404, and
+`GET /mesh-status` answering 200 with `management.ok:false` (refused) and zeroed peer/routes
+counters when no plane resolves. The log ring carries `datastore_encryption_key=<set>` and its hint —
+the values themselves appear nowhere in it.
+
+**By test only:** `test/mesh-config.test.mjs` (offline: precedence/hints/validation/`generate`,
+`seedFirstPat` against a real sqlite fixture, `bootstrapFirstPat` against a fake docker adapter over
+a real store file — sequence, mode, refusal-before-stop, restart-on-failure, byte-identical
+idempotence); `test/mesh-config-store.test.mjs` (db-backed: the real table + the real routes, hints,
+store-over-env, disabled-row inertness, clearing/rotation, `recordBootstrappedPat`, `peerCounts`,
+`meshStatusFor` with injected probe/tally); `test/build-bootstrap.test.mjs` (the performed stand-up:
+management.json GENERATED from the row, compose env carrying the row's domain/ports/secrets, the
+bootstrap handed the row's datastore key, the minted PAT recorded write-only with only its hint in
+the receipt, applied to the seam, and a second stand-up neither re-mints nor composes). All of the
+mesh/netbird suites plus `ship-boot-migrations`, `console-shell-not-cached`, `ext-api-base-config`
+and `queenzee-inproc-api-only` are green on this branch.
+
+**Honest limits (follow-ups):** (a) the stand-up's PAT bootstrap has never run against a REAL docker
+daemon — the live proof is the real management server reached through an emulated `docker cp`/`stop`/
+`start`, plus the argv sequence the code itself exports; a human on the queenzee machine must still
+click it once. (b) `gateway_setup_key` is stored/rendered/read but NOT auto-minted: the card
+authorizes `"generate"` only for the datastore key and the relay secret (the gateway key is issued by
+the control plane's setup-keys API, which is a different act from "mint random material"); mint one
+via `createSetupKey` and paste it in, or see §10. (c) `applyMeshConfig` writes the resolved values
+into the live `config`; disabling a row in the SAME process leaves the previously-applied seam values
+in place until restart (the env rules return at boot). The `resolved.source` for `api_url` therefore
+reads `env` after an apply that defaulted it — the VALUE is right, the provenance label is
+approximate. A restart (the normal path for a mesh config change to matter) is exact.
+
 ### NOT done (the honest list — each is a follow-up work item)
 
-1. **Standing up the control plane LIVE** (§3.1): a human on the queenzee machine runs
-   `docker compose --profile mesh up -d`, writes `netbird/management.json`, sets
-   `NETBIRD_API_URL`/`NETBIRD_API_TOKEN` (and `NETBIRD_GATEWAY_SETUP_KEY` for the gateway) in the
-   install's `.env`, and does the datastore backup. The compose seam is shipped and the API client
-   is now live-proven against v0.78.1 (§11), but the install's own running control plane is still
-   the human deploy — including the first account/user/PAT, which no supported path creates when
-   `IdpManagerConfig.ManagerType` is `"none"` (see §11's honest limits).
+1. **Standing up the control plane LIVE** (§3.1): a human on the queenzee machine CLICKS stand-up on
+   the machine's card — the console's mesh config supplies the domain/ports/secrets, the step renders
+   `netbird/management.json`, runs `docker compose --profile mesh up -d`, and the first
+   account/user/PAT is bootstrapped automatically (work item 9b512e60, §11 — no supported path
+   created it before, because `IdpManagerConfig.ManagerType` is `"none"`). What remains a human op:
+   doing it ONCE against a real daemon (the bootstrap's docker transport is emulated in-cage), the
+   datastore backup, and `NETBIRD_GATEWAY_SETUP_KEY` (see §11's honest limits (b)).
 2. **Per-cage mesh agents and in-cage mesh DNS** — named seams (DR-3, §3.5), not built. The cage's
    path to the mesh is the gateway route, not an in-cage agent.
 3. **Phase 5** (stop publishing ports, delete the allocator) — still gated on `source: legacy-port`

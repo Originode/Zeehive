@@ -18,6 +18,7 @@ import { refreshMedicRoleAtBoot } from './lib/medic-role.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { logHarnessSummary } from './lib/harness.js';
+import { applyMeshConfig } from './lib/mesh-config.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
@@ -158,6 +159,11 @@ try {
   // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
   // a harness that would brief a zee with a blank page is invisible otherwise.
   await logHarnessSummary();
+  // The mesh the console configured (migration 259): store-over-env into the config seam, so
+  // lib/netbird.js's URL/token and the stand-up's management.json render pick it up with no
+  // consumer knowing the console exists. Never throws — an install with no row (or no 259 yet)
+  // keeps exactly the env it had. See lib/mesh-config.js.
+  await applyMeshConfig();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }

@@ -30,6 +30,11 @@ import { config } from '../config.js';
 import { logline } from './logbus.js';
 import { probeTcp } from './mesh-routes.js';
 
+// THE VERSION PIN, in one place. netbird-bootstrap.js refuses to seed the store of any other
+// release, and the live harness (test/netbird-live-api.test.mjs) imports this rather than spelling
+// the number a second time — a bump then fails the live suite instead of drifting past it.
+export const PINNED_NETBIRD_VERSION = '0.78.1';
+
 // Both knobs present = the mesh exists for this queenzee. Absent = every entry point below is a
 // legible no-op, so callers never need their own guard.
 export function meshEnabled() {
