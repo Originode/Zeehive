@@ -22,7 +22,7 @@ much as one that denies an open one):
   silent one. `shipgate.js`, covered by `test/nested-queenzee-land-ship-guard.test.mjs`.
 - **So are the other ungated write paths this audit listed as "inert by accident".** They no longer
   depend on the cage: `landApproved` (the `update-ref` into the xource), every verb in `xellgit.js`,
-  every `nudge.js` continuation, `refreshZeeLiveInLiveCxells`, the image janitor and the harness
+  every `nudge.js` continuation, `refreshZeeToolingInLiveCxells`, the image janitor and the harness
   re-injection all take `mode = PROVISION_MODE` and report instead of acting when it is not `real`.
   Two tests pin the class: `nested-queenzee-fleet-guard` and `nested-queenzee-land-ship-guard`.
 - **What is still ungated is READ, and it is the open half of ticket #27**: `proddiff` (a loop) and

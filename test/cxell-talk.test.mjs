@@ -220,14 +220,17 @@ ok(typeof installZeeAttachIntoCxell === 'function' && ZEE_ATTACH_DEST === '/usr/
    'cxell.js installs it over the copy baked into the image');
 ok(zeeAttachSourcePath().endsWith(join('docker', 'zeehive', 'zee-attach.sh')), 'from the queenzee\'s own repo');
 const install = zeeAttachInstallCommands({ name: 'cxell_zt', src: '/src/zee-attach.sh' });
+const installShell = install[1].join(' ');
 ok(install[0][0] === 'cp' && install[1].includes('-u') && install[1].includes('0')
-   && install[1].join(' ').includes(`install -o root -g root -m 0755 /tmp/zee-attach.sh ${ZEE_ATTACH_DEST}`),
-   'root-owned and executable, like the CLI (a zee cannot rewrite the script that drains its own queue)');
+   && installShell.includes(`install -o root -g root -m 0755 /tmp/zee-attach.sh ${ZEE_ATTACH_DEST}.new.$$`)
+   && installShell.includes(`mv -f ${ZEE_ATTACH_DEST}.new.$$ ${ZEE_ATTACH_DEST}`),
+   'root-owned and executable, like the CLI (a zee cannot rewrite the script that drains its own '
+   + 'queue), and placed by an ATOMIC RENAME — it now also fires at boot, over cages that may be mid-turn');
 const dead = await installZeeAttachIntoCxell({ ctx: 'default', name: 'cxell_zt-does-not-exist' });
 ok(dead.installed === false && !!dead.reason, 'an unreachable cage is reported, never thrown (it runs at spawn AND at boot)');
 ok(read('server/src/queenzee/intake.js').includes('installZeeAttachIntoCxell({ ctx, name })'), 'the spawn path installs it');
 ok(/installZeeAttachIntoCxell\(\{ ctx, name \}\)/.test(read('server/src/lib/cxell.js').slice(
-     read('server/src/lib/cxell.js').indexOf('export async function refreshZeeLiveInLiveCxells'))),
+     read('server/src/lib/cxell.js').indexOf('export async function refreshZeeToolingInLiveCxells'))),
    'and the boot sweep refreshes it into every RUNNING cxell — or the queue would fill in cages that cannot drain it');
 
 // ── 6. sendKeysToCxellZee tells the caller WHICH happened ─────────────────────────────────────

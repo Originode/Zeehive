@@ -43,7 +43,7 @@ const IMAGE = process.env.CXELL_IMAGE || 'zeehive/zee-agent';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
 // and the .zeehive.env reconcile in provision.js): 'real' touches machines, anything else models.
-// The fleet-wide attend-path sweep below obeys it — see refreshZeeLiveInLiveCxells.
+// The fleet-wide zee-tooling sweep below obeys it — see refreshZeeToolingInLiveCxells.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 export const cxellName = (slug) => `cxell_${String(slug).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
 
@@ -1020,16 +1020,28 @@ export const ZEE_CLI_DEST = '/usr/local/bin/zee';
 // The path the queenzee installs FROM. Exported so a test can assert it is the authoritative CLI.
 export const zeeCliSourcePath = () => resolve(config.repoRoot, 'scripts', 'zee');
 
-// The exact docker argv sequence installZeeCliIntoCxell runs — pure, so it is assertable without a
+// The exact docker argv sequence each install*IntoCxell runs — pure, so it is assertable without a
 // daemon. `docker cp` lands the file as root; the exec then strips any trailing CR (a Windows
 // checkout would otherwise leave `#!/usr/bin/env node\r`, which dies as `node\r: No such file or
-// directory` — the same belt-and-braces the Dockerfile applies), chmods it executable and pins
-// root ownership so the zee cannot rewrite its own CLI.
+// directory` — the same belt-and-braces the Dockerfile applies) and pins root-owned/executable so
+// the zee cannot rewrite its own CLI.
+//
+// MID-TURN SAFETY. This now fires at BOOT as well as spawn, so the cage it writes into may be
+// mid-turn — a zee part-way through `zee report`, or (as I was) a long `zee build --wait`. The last
+// write to `dest` therefore has to be ATOMIC, and a bare `install … ${tmp} ${dest}` is not:
+// install(1) UNLINKS the destination and creates a fresh inode (verified — after the install an fd
+// opened on the old file has link count 0), so the path is ABSENT for the window between the two
+// syscalls. A `zee` invocation starting in that window exits "No such file or directory" for no
+// reason it can explain. So stage the file inside the DESTINATION's own directory (same filesystem,
+// so the move cannot degrade into a copy) and `mv -f` it over `dest`: rename(2) is atomic, so a
+// racing invocation opens either the old script or the new one — never neither, never a half-written
+// one. A zee already mid-invocation is unaffected either way: node read the file at exec.
 export function cxellFileInstallCommands({ name, src, dest, tmp }) {
+  const staged = `${dest}.new.$$`;
   return [
     ['cp', src, `${name}:${tmp}`],
     ['exec', '-u', '0', name, 'bash', '-lc',
-      `sed -i 's/\\r$//' ${tmp} && install -o root -g root -m 0755 ${tmp} ${dest} && rm -f ${tmp}`],
+      `sed -i 's/\\r$//' ${tmp} && install -o root -g root -m 0755 ${tmp} ${staged} && mv -f ${staged} ${dest} && rm -f ${tmp}`],
   ];
 }
 export function zeeCliInstallCommands({ name, src = zeeCliSourcePath() }) {
@@ -1087,19 +1099,33 @@ export async function installZeeAttachIntoCxell({ ctx = 'default', name }) {
   }
 }
 
-// Refresh the renderer into cxells that ALREADY EXIST — not just the ones we are about to spawn.
+// Refresh the zee TOOLING into cxells that ALREADY EXIST — the `zee` CLI plus the two attend-path
+// files — not just the ones we are about to spawn.
 //
-// The spawn-time install above only ever helped the next cage. Every cxell created before it
-// shipped kept the renderer baked into its image, so the terminal's ✱/⚒ chips wrote a view file
-// that nothing in there was watching: the chip lit up "hidden" and the feed went on showing
-// thinking. A toggle that confidently reports a state it did not apply is worse than one that
-// looks inert — which is exactly how this reached a human as "the buttons dont work".
+// The spawn-time installs above only ever helped the NEXT cage, so every cxell created before one
+// of them shipped kept whatever was baked into its image, and two failure classes came out of that:
+//
+//   * the RENDERER. The terminal's ✱/⚒ chips wrote a view file nothing in there was watching: the
+//     chip lit up "hidden" and the feed went on showing thinking. A toggle that confidently reports
+//     a state it did not apply is worse than one that looks inert — which is exactly how this
+//     reached a human as "the buttons dont work".
+//   * the CLI. A zee ALIVE ACROSS A SHIP kept the old `zee`, so a verb that ship added answered a
+//     bare "unknown command: medic" while the manual the zee was briefed with documented it. The
+//     manual arrives live from the meta-DB at spawn; the binary did not. The ship delivered the
+//     visibility and not one running zee could reach the verb — the exact "i dont see any asks
+//     being made" report this sweep exists to answer.
 //
 // Run at BOOT, which is also the moment after a ship (the queenzee restarts into the new code) —
-// so a shipped attend-path change reaches the RUNNING fleet instead of waiting for it to recycle.
-// It touches only /usr/local/bin inside cxells the queenzee owns, cannot affect a zee's work, and
-// every failure is per-cxell and logged rather than thrown: one unreachable cage must not stop the
-// sweep, and the sweep must never delay boot.
+// so a shipped CLI or attend-path change reaches the RUNNING fleet instead of waiting for every
+// cage to recycle. It touches only /usr/local/bin inside cxells the queenzee owns, cannot affect a
+// zee's work, and every failure is per-cxell and logged rather than thrown: one unreachable cage
+// must not stop the sweep, and the sweep must never delay boot. A MID-TURN cage is safe — the
+// installs place the new file by an atomic rename (see cxellFileInstallCommands), so an invocation
+// racing the sweep opens the old file or the new one, never neither.
+//
+// It does NOT replace rebuilding the zee-agent image, and the log says so whenever the sweep finds
+// a stale one: every OTHER baked file (cxell-sshd.sh, the agent CLIs, cxell-firewall.sh) is still
+// the old build and nothing here refreshes those. A repaired CLI is not a repaired image.
 //
 // AND IT OBEYS PROVISION_MODE, for the same reason the harness re-injection and the .zeehive.env
 // reconcile do: the caller (index.js) resolves these container names out of FLEET ROWS, and a
@@ -1107,39 +1133,63 @@ export async function installZeeAttachIntoCxell({ ctx = 'default', name }) {
 // So in simulate this boot sweep would `docker cp` + `docker exec -u 0` into every OTHER zee's live
 // cage, installing whatever /usr/local/bin files happen to be in the running zee's own worktree.
 // Report-only there; unchanged in real mode.
-export async function refreshZeeLiveInLiveCxells(listLiveCxells, { mode = PROVISION_MODE } = {}) {
+export async function refreshZeeToolingInLiveCxells(listLiveCxells, { mode = PROVISION_MODE } = {}) {
   let ok = 0;
   const failed = [];
   let cxells = [];
   try { cxells = await listLiveCxells(); } catch (e) {
-    logline('cxell', `live-feed renderer sweep skipped — could not list cxells (${String(e.message).slice(0, 120)})`);
+    logline('cxell', `zee-tooling sweep skipped — could not list cxells (${String(e.message).slice(0, 120)})`);
     return { swept: 0, ok: 0, failed: [] };
   }
   if (mode !== 'real') {
     // Say what it would have done, always — "nothing to sweep" and "not allowed to sweep" must not
     // look the same in the log.
     if (cxells.length) {
-      logline('cxell', `attend path NOT refreshed in ${cxells.length} running cxell(s) — PROVISION_MODE=`
-        + 'simulate: this queenzee models the fleet, it does not install files into its cages. Would '
-        + `have refreshed: ${cxells.map((c) => c.name).slice(0, 8).join(', ')}`);
+      logline('cxell', `zee tooling (CLI + live-feed renderer + attach script) NOT refreshed in `
+        + `${cxells.length} running cxell(s) — PROVISION_MODE=simulate: this queenzee models the `
+        + 'fleet, it does not install files into its cages. Would have refreshed: '
+        + `${cxells.map((c) => c.name).slice(0, 8).join(', ')}`);
     }
     return { swept: cxells.length, ok: 0, failed: [], dry_run: true };
   }
+  let staleImages = 0;
+  let staleExample = null;
   for (const { ctx = 'default', name } of cxells) {
-    // BOTH attend-path files, for one reason: they are two halves of the same pane. The renderer
-    // draws the feed; the attach script decides when the feed hands the pane over — and now drains
-    // the talk queue at that exact moment. A sweep that refreshed only one of them would leave a
-    // cage that queues messages nothing ever types in.
+    // The CLI FIRST, and its failure counts against the cage: a zee that cannot run a shipped verb
+    // is the stranded-zee failure this sweep was extended for, and it is worse than a stale pane
+    // filter. `staleLog: false` — the verdict is aggregated into ONE line below, not repeated per
+    // cage per boot (the DETECTOR still runs per cage; only the logline is pooled).
+    const c = await installZeeCliIntoCxell({ ctx, name, staleLog: false });
+    if (c.staleImage) { staleImages++; if (!staleExample) staleExample = { name, ...c }; }
+    // …then BOTH attend-path files, for one reason: they are two halves of the same pane. The
+    // renderer draws the feed; the attach script decides when the feed hands the pane over — and
+    // drains the talk queue at that exact moment. Refreshing only one would leave a cage that queues
+    // messages nothing ever types in.
     const r = await installZeeLiveIntoCxell({ ctx, name });
     const a = await installZeeAttachIntoCxell({ ctx, name });
-    if (r.installed && a.installed) ok++; else failed.push(name);
+    if (c.installed && r.installed && a.installed) ok++; else failed.push(name);
+  }
+  // ONCE for the sweep, not once per cage. On an un-rebuilt image this verdict is the same for every
+  // cage, so a per-cage line would be the same paragraph repeated fleet-wide on every boot — signal
+  // drowned by its own noise. NOT deleted: a silently stale image is how the CLI-drift bug's act two
+  // hid for a whole ship, and this is the only place the fleet is told its image needs rebuilding.
+  if (staleImages) {
+    const ex = staleExample;
+    logline('cxell', `!!! STALE CXELL IMAGE in ${staleImages}/${cxells.length} swept cxell(s) — e.g. `
+      + `${ex.name}: the \`zee\` baked into its image (sha ${String(ex.bakedSha).slice(0, 12)}) is NOT `
+      + `this queenzee's scripts/zee (sha ${String(ex.sourceSha).slice(0, 12)}). This sweep refreshed `
+      + 'the CLI in those cages, and that papers over the image FOR THE CLI ONLY — every other baked '
+      + 'file (cxell-sshd.sh, the agent CLIs, cxell-firewall.sh) is still the old build and nothing '
+      + 'refreshes those. Rebuild the image: git archive <sha> | docker build -f '
+      + 'docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -');
   }
   if (cxells.length) {
-    logline('cxell', `attend path (live-feed renderer + attach script) refreshed in ${ok}/${cxells.length} running cxell(s)`
+    logline('cxell', `zee tooling (CLI + live-feed renderer + attach script) refreshed in `
+      + `${ok}/${cxells.length} running cxell(s)`
       + (failed.length ? ` — not reachable: ${failed.slice(0, 5).join(', ')}` : '')
-      + ' (one mid-turn picks it up on its NEXT feed / attach)');
+      + ' (a mid-turn zee picks the CLI up on its NEXT invocation, the feed / attach on their next use)');
   }
-  return { swept: cxells.length, ok, failed };
+  return { swept: cxells.length, ok, failed, stale_image: staleImages };
 }
 
 // ── Is the IMAGE this cxell booted from actually built from the current code? ─────────────────
@@ -1167,7 +1217,12 @@ async function bakedZeeCliSha({ ctx, name }) {
 // Best-effort with a LOUD log, the same stance as the prompt-attachments copy above and the
 // cxell-image rebuild in self-ship.sh: the baked CLI is still there, so a failed refresh must not
 // sink a cxell spawn — but it must never be silent, because "silent" is this bug's whole story.
-export async function installZeeCliIntoCxell({ ctx = 'default', name }) {
+//
+// `staleLog: false` is for the fleet-wide boot sweep (refreshZeeToolingInLiveCxells) only: the
+// stale-image DETECTOR still runs for every cage it visits, but the sweep prints the verdict ONCE
+// for the whole fleet instead of once per cage per boot. A single cage repaired at spawn keeps the
+// per-cage line, which is where "a spawn quietly booted from a stale image" belongs.
+export async function installZeeCliIntoCxell({ ctx = 'default', name, staleLog = true }) {
   const src = zeeCliSourcePath();
   if (!existsSync(src)) {
     logline('cxell', `${name}: !!! could not refresh the zee CLI — ${src} is missing from the queenzee's `
@@ -1178,13 +1233,13 @@ export async function installZeeCliIntoCxell({ ctx = 'default', name }) {
   const baked = await bakedZeeCliSha({ ctx, name });
   const mine = createHash('sha256').update(readFileSync(src)).digest('hex');
   const staleImage = baked ? baked !== mine : null;
-  if (staleImage) {
+  if (staleImage && staleLog) {
     logline('cxell', `${name}: !!! STALE CXELL IMAGE — the \`zee\` baked into this container's image `
       + `(sha ${baked.slice(0, 12)}) is NOT this queenzee's scripts/zee (sha ${mine.slice(0, 12)}). The `
-      + 'zee-agent image was not rebuilt from the current code. The spawn-time refresh below papers '
-      + 'over it FOR THE CLI ONLY — every other baked file (cxell-sshd.sh, zee-attach.sh, the agent '
-      + 'CLIs, cxell-firewall.sh) is still the old build and nothing refreshes those. Rebuild the '
-      + 'image: git archive <sha> | docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -');
+      + 'zee-agent image was not rebuilt from the current code. The refresh below papers over it FOR '
+      + 'THE CLI ONLY (and the attend path) — every other baked file (cxell-sshd.sh, the agent CLIs, '
+      + 'cxell-firewall.sh) is still the old build and nothing refreshes those. Rebuild the image: '
+      + 'git archive <sha> | docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -');
   }
   try {
     for (const args of zeeCliInstallCommands({ name, src })) await dk(ctx, args);

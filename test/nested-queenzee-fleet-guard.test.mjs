@@ -16,7 +16,7 @@
 //      reinjectHarnessIntoLiveXells() → `docker exec cxell_<slug>`, with the slug straight off a
 //      fleet row. A zee editing a harness folder and booting the server would have written its own
 //      persona files over every other zee's.
-//   2. THE ATTEND-PATH BOOT SWEEP (lib/cxell.js refreshZeeLiveInLiveCxells) — same boot, same rows,
+//   2. THE ATTEND-PATH BOOT SWEEP (lib/cxell.js refreshZeeToolingInLiveCxells) — same boot, same rows,
 //      `docker cp` + `docker exec -u 0` into /usr/local/bin of every live cage.
 //   3. TEARDOWN (queenzee/reaper.js reapXell) — the most destructive of all, and it needs no human:
 //      the boot janitor finishes every inherited 'tearing-down' row, and the pool maintainer trims
@@ -41,7 +41,7 @@ const { config } = await import('../server/src/config.js');
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { recentLogs } = await import('../server/src/lib/logbus.js');
 const H = await import('../server/src/lib/harness.js');
-const { refreshZeeLiveInLiveCxells } = await import('../server/src/lib/cxell.js');
+const { refreshZeeToolingInLiveCxells } = await import('../server/src/lib/cxell.js');
 const { reapXell } = await import('../server/src/queenzee/reaper.js');
 const { sweepOrphanSpinImages } = await import('../server/src/lib/images.js');
 
@@ -144,15 +144,17 @@ try {
   const cages = async () => ([{ ctx: 'default', name: `cxell_${wearer.slug}` }]);
   resetDocker();
   n = since();
-  const sweepDry = await refreshZeeLiveInLiveCxells(cages);
+  const sweepDry = await refreshZeeToolingInLiveCxells(cages);
   ok(dockerCalls().length === 0, 'no docker cp, no docker exec');
   ok(sweepDry.dry_run === true && sweepDry.swept === 1 && sweepDry.ok === 0, 'it counts the cages and installs into none');
   ok(logsSince(n).some((m) => m.includes(`cxell_${wearer.slug}`) && /PROVISION_MODE=simulate/.test(m)),
      'naming the cages it would have written into');
   resetDocker();
-  const sweepReal = await refreshZeeLiveInLiveCxells(cages, { mode: 'real' });
+  const sweepReal = await refreshZeeToolingInLiveCxells(cages, { mode: 'real' });
   ok(dockerCalls().some((c) => c.startsWith('cp ') && c.includes(`cxell_${wearer.slug}`)) && sweepReal.swept === 1,
-     'real mode still copies the renderer + attach script in');
+     'real mode still copies the CLI + renderer + attach script in');
+  ok(dockerCalls().some((c) => c.includes(':/tmp/zee.cli')) && sweepReal.ok === 1,
+     '…including the `zee` CLI itself, which is what a zee alive across a ship is missing');
 
   // ── 3. TEARDOWN ───────────────────────────────────────────────────────────────────────────────
   // worktree_path deliberately points at nothing on disk: this test fences the DOCKER half of a

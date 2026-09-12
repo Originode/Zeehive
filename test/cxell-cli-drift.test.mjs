@@ -267,6 +267,15 @@ ok(cmds[1].slice(0, 3).join(' ') === 'exec -u 0', 'step 2 execs as ROOT (the zee
 ok(/sed -i 's\/\\r\$\/\/'/.test(shell), 'it strips a trailing CR (a Windows checkout would kill the shebang)');
 ok(/-o root -g root/.test(shell) && /0755/.test(shell), 'installs it root-owned and executable');
 ok(shell.includes(ZEE_CLI_DEST), `over ${ZEE_CLI_DEST}`);
+// MID-TURN SAFETY. The same sequence now runs at BOOT over cages that may be mid-turn, so the final
+// placement must be an atomic rename. `install … <dest>` alone is not: GNU install unlinks the
+// destination then creates a new inode, leaving the path ABSENT in between — a `zee` invoked in that
+// window dies "No such file or directory". Staging beside the destination keeps the rename on one
+// filesystem, so rename(2) applies and a racing invocation opens the old file or the new one.
+const stagedCli = `${ZEE_CLI_DEST}.new.$$`;
+ok(shell.includes(`install -o root -g root -m 0755 /tmp/zee.cli ${stagedCli}`)
+   && shell.includes(`mv -f ${stagedCli} ${ZEE_CLI_DEST}`),
+   'and places it by an atomic same-directory rename, never install(1) onto the live path (mid-turn)');
 
 // the spawn path calls it, and does not let a failure sink the cage
 const intake = read('server/src/queenzee/intake.js');
