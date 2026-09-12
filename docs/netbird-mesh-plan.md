@@ -149,6 +149,12 @@ containers over the stack network:
 <slug>.<mesh-domain>:5180 → webapp:5180
 ```
 
+> **Name caveat, verified live against v0.78.1 (§11):** NetBird publishes a peer as
+> `<slug>-<ip octet3>-<ip octet4>.<mesh-domain>`, not `<slug>.<mesh-domain>` (peer.go
+> `getPeerIPDNSLabel`). The spelling above is the INTENDED, stable name — the form the router's
+> answers and the manifest should carry — but it is not a name NetBird's DNS answers today. See
+> the §10 follow-up before handing this DSN to anything outside the router.
+
 The forward is iptables DNAT in the sidecar (or socat for a first cut) — generated from the
 same manifest `ports.*.internal` values the compose generator already reads. The
 `base/mod/slot` fields become **unused for reachability** and are kept only during migration
@@ -482,9 +488,12 @@ one more peer kind).
 2. **Relay throughput for db traffic** when a direct WireGuard path cannot be established
    (double-NAT between build hosts). LAN-internal peers should go direct; if a benchmark shows
    relay in the path for bulk db work, see DR-1's "changes our mind" (c).
-3. **The exact NetBird management API surface** (endpoints/fields in §5) is written from its
-   documented REST API; the builder must pin a management version and freeze `lib/netbird.js`
-   against it — the injected-adapter shape exists so that pinning is testable offline.
+3. **The exact NetBird management API surface** (endpoints/fields in §5) was written from its
+   documented REST API; the builder had to pin a management version and freeze `lib/netbird.js`
+   against it. **CLOSED (2026-09-12) — pinned to v0.78.1 and driven live**; the pinning caught two
+   real drifts (a 422 on every policy create, and the peer DNS-label scheme). See §11
+   "Live against a real NetBird management server" for the versions, the evidence, and the two
+   shapes that differ from the documented REST API.
 
 ## 10. Follow-ups after this lands
 
@@ -496,6 +505,11 @@ one more peer kind).
    phase 5.
 4. Retire `wireguard_server`/`wireguard_peer` + `lib/wireguard.js` once the dashboard covers
    the human-download case (supersession note goes in that change's DR).
+5. **Make the mesh name real** (found live, §11): NetBird answers
+   `<slug>-<ip3>-<ip4>.<mesh-domain>`, so §3.4's `<slug>.<mesh-domain>` resolves only for the
+   router's own answers. Either give the peer an `extra_dns_labels` entry of `<slug>` (the field
+   exists in v0.78.1 and is the supported way) or render the IP-suffixed name from
+   `mesh_peer.ip`. Do it before a human is handed a DSN from `zee routes` to paste into psql.
 
 ---
 
@@ -590,13 +604,91 @@ code; left alone deliberately. Also worth knowing: a queenzee left running again
 will reap the fixture xells out from under `test/netbird-provision-env.test.mjs` mid-run and make it
 look flaky — stop the server before running the db suites.
 
+### Live against a real NetBird management server (2026-09-12, this xell — §9.3 CLOSED)
+
+`lib/netbird.js` is no longer written from documentation. A REAL NetBird management server
+**v0.78.1** was booted on `127.0.0.1` inside the cage (sqlite store, no IdP, no TLS, no Signal) and
+every exported function was driven at it over HTTP by **`test/netbird-live-api.test.mjs`**.
+
+**The pin.** Management = `netbirdio/management:0.78.1`, pulled from the Docker Hub registry over
+HTTPS (there is no management binary on the GitHub release), linux/amd64 manifest
+`sha256:c78ba74d0747…`, binary `sha256:03325d3249c6…`. Client = the GitHub release
+`netbird_0.78.1_linux_amd64.tar.gz`, binary `sha256:dec903b426de…` (`netbird version` → 0.78.1).
+`scripts/fetch-netbird-binaries.mjs` re-pulls both and verifies those sha256s, so "verified against
+v0.78.1" cannot silently drift to a different build. The compose defaults are now pinned to the same
+tag (`docker-compose.bootstrap.yml` + `docker/zeehive/docker-compose.prod.yml`, all five `netbirdio/*`
+images) instead of `:latest`; bumping them means re-running the live test.
+
+**Live-verified (real server, real PAT, real rows):** `GET /api/peers` 200 with a live token and 401
+without one; `createSetupKey` → a real key that the control plane then lists with `usage_limit 1`,
+`ephemeral true`, unrevoked, carrying its `auto_groups`; `ensureGroup` create-then-find (one id, no
+duplicate); `listPeers`; `getPeerByHostname` (hit, and a stranger → `peer: null`, not a failure);
+`deletePeer` → real delete, and a repeat DELETE's **404 → `alreadyGone`**; `listPolicies`;
+`ensurePolicy` create + find-by-name idempotency + the no-ports variant; the real policy round-trips
+with the group ids, `protocol tcp`, `ports ["5432"]`, `enabled`; `ensureProdBindMeshPolicy` →
+exactly `xells→prod tcp:5432`; and against a migrated sandbox meta-DB (`zee db-sandbox --migrate`)
+the intent-row paths: `mintPeer` → `markPeerJoined` (caches the control plane's peer id + IP) →
+`deregisterXellPeers` (real delete + row stamp, idempotent) → `sweepOrphanMeshPeers` (a removed-row
+peer deleted, an unknown hostname reported and left alive). Finally a REAL `netbird` **agent**
+registered through the API with a setup key OUR client minted (e.g. `mesh-e2e-agent`, ip
+`100.64.33.167`, dns_label `mesh-e2e-agent-33-167.netbird.selfhosted`) and our client deregistered
+it — the end-to-end story this plan rests on.
+
+**Drift found and fixed (the point of the exercise):**
+
+1. **Every `ensurePolicy` call was a 422.** The rule body posted `source`/`destination` and no
+   `protocol`; the real `PolicyRuleUpdate` wants **`sources`/`destinations`**, a REQUIRED
+   **`protocol`**, and a rule-level **`enabled`** — the server answered
+   `422 specify either sources or source resources and destinations or destination resources`.
+   Ports are also refused on protocol `all`/`icmp`
+   (`for ALL or ICMP protocol ports is not allowed`), so the fix derives the protocol: `tcp` when
+   the rule names ports (the only grants this module makes are db ports), `all` otherwise, with
+   `ports` omitted there. Fix at `lib/netbird.js ensurePolicy`; `test/netbird-policies.test.mjs`
+   now pins the corrected body.
+2. **The peer DNS label is IP-suffixed, and the documented `<hostname>.<domain>` is wrong.**
+   `getPeerIPDNSLabel` (management/server/peer.go) builds
+   `<hostname>-<ipv4 octet 3>-<ipv4 octet 4>.<dns-domain>` — a peer `mesh-e2e-seed` on
+   `100.64.171.11` is published as `mesh-e2e-seed-171-11.netbird.selfhosted`, and that is exactly
+   what the API's `dns_label` field answered. `meshFqdn(hostname, ip)` now produces that name (and
+   the one-arg form is documented as the INTENDED name only); `getPeerByHostname` still resolves by
+   the authoritative `hostname` field, so peer lookup was never broken, but the §3.4
+   `<slug>.<mesh-domain>` DSN spelling is not a name NetBird DNS would answer — see the follow-up
+   in §10.
+3. **Read shape ≠ write shape.** The policy CREATE body takes group ID strings; the policy READ
+   body returns `GroupMinimum` objects (`{id,name,peers_count}`) for `sources`/`destinations`. No
+   code change needed (find-by-name reads only `name`/`id`), but a future consumer must not assume
+   symmetry.
+4. **`docker/zeehive/netbird/management.json.example` could not boot a real server.**
+   `DataStoreEncryptionKey: "CHANGE-ME-32-byte-…"` is not valid base64 → the server dies with
+   `failed to create field encryptor: decode encryption key: illegal base64 data at input byte 5`.
+   The example now carries a VALID base64 32-byte placeholder, and `test/netbird-compose.test.mjs`
+   asserts it decodes to 32 bytes. The example's `HttpConfig.Address` no longer exists in v0.78.1's
+   `HttpServerConfig` (the listen address is the `--port` flag) and is gone; the README says both.
+
+**Honest limits.** The install's own control plane is still not stood up (§3.1, item 1 below). The
+harness seeds the store by hand — with `IdpManagerConfig.ManagerType: "none"` there is NO supported
+way to create the first account/user/PAT, which is itself a finding for the human deploy — so those
+row shapes are read off the server's source and a future release could break the HARNESS before it
+breaks `lib/netbird.js`. The agent registers headless (no Signal server): the peer row and the
+registration are proven, a WireGuard tunnel is not; likewise no TLS/dashboard/relay/TURN. Peer rows
+for the read/delete assertions are seeded directly into sqlite (the REST API has no create-peer
+endpoint) — peer CREATION by a real agent is what the optional client section proves.
+
+Reproduce: `node scripts/fetch-netbird-binaries.mjs` then
+`zee db-sandbox --migrate` and
+`DATABASE_URL="$(…)" node test/netbird-live-api.test.mjs`. Without the binary it skips loudly; with
+the binary but an unmigrated meta-DB it proves the REST surface and skips the intent-row half
+loudly. Two consecutive full runs passed.
+
 ### NOT done (the honest list — each is a follow-up work item)
 
 1. **Standing up the control plane LIVE** (§3.1): a human on the queenzee machine runs
    `docker compose --profile mesh up -d`, writes `netbird/management.json`, sets
    `NETBIRD_API_URL`/`NETBIRD_API_TOKEN` (and `NETBIRD_GATEWAY_SETUP_KEY` for the gateway) in the
-   install's `.env`, and does the datastore backup. The compose seam is shipped; the running
-   control plane is not.
+   install's `.env`, and does the datastore backup. The compose seam is shipped and the API client
+   is now live-proven against v0.78.1 (§11), but the install's own running control plane is still
+   the human deploy — including the first account/user/PAT, which no supported path creates when
+   `IdpManagerConfig.ManagerType` is `"none"` (see §11's honest limits).
 2. **Per-cage mesh agents and in-cage mesh DNS** — named seams (DR-3, §3.5), not built. The cage's
    path to the mesh is the gateway route, not an in-cage agent.
 3. **Phase 5** (stop publishing ports, delete the allocator) — gated on `source: legacy-port`

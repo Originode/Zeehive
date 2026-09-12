@@ -215,6 +215,27 @@ ok(/netbird\/management\.json\.example/.test(readme), 'README points at the ship
 const example = JSON.parse(readFileSync(resolve(ROOT, 'docker/zeehive/netbird/management.json.example'), 'utf8'));
 ok(!!example && Array.isArray(example.Relay?.Addresses) && typeof example.DataStoreEncryptionKey === 'string',
    'management.json.example is valid JSON with the endpoints a human edits');
+// The example's datastore key must DECODE: a shipped "CHANGE-ME-…" phrase is not base64 and makes
+// the real server die on boot (`failed to create field encryptor: decode encryption key`). Filling
+// the example in must not require guessing that. (v0.78.1 behaviour; docs/netbird-mesh-plan.md §11.)
+const keyBytes = Buffer.from(example.DataStoreEncryptionKey, 'base64');
+ok(keyBytes.length === 32 && keyBytes.toString('base64') === example.DataStoreEncryptionKey,
+   `the example DataStoreEncryptionKey is valid base64 of 32 bytes (${keyBytes.length})`);
+
+section('the NetBird release is PINNED (not :latest) — the API surface is frozen against it');
+// lib/netbird.js is frozen against one release; the compose default must be that release, not
+// whatever `latest` points at tomorrow (docs/netbird-mesh-plan.md §11: v0.78.1, live-verified).
+const tagDefaults = new Set();
+for (const file of FILES) {
+  const images = readFileSync(file.path, 'utf8').match(/netbirdio\/[a-z]+:\$\{NETBIRD_[A-Z_]+_TAG:-([^}]+)\}/g) || [];
+  ok(images.length === 5, `${file.name}: five netbirdio images, each with a pinned-tag default (${images.length})`);
+  ok(images.every((i) => !i.includes(':-latest}')), `${file.name}: none of them falls back to :latest`);
+  for (const i of images) tagDefaults.add(i.slice(i.lastIndexOf(':-') + 2, -1));
+}
+ok(tagDefaults.size === 1 && /^\d+\.\d+\.\d+$/.test([...tagDefaults][0]),
+   `all five components default to ONE version tag (${[...tagDefaults].join(', ') || 'none'})`);
+ok([...tagDefaults][0] === '0.78.1',
+   'and it is the release test/netbird-live-api.test.mjs proved lib/netbird.js against (v0.78.1)');
 
 console.log(failures ? `\n${failures} FAILURE(S) ✗` : '\nALL PASSED ✓');
 process.exit(failures ? 1 : 0);

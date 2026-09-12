@@ -114,10 +114,12 @@ Both compose files already carry the services; the steps below are for a repo ch
 `docker/zeehive/docker-compose.prod.yml`. A standalone bootstrap install works the same but the
 `netbird/management.json` path is relative to wherever you keep `docker-compose.bootstrap.yml`.
 
-1. **Pin the NetBird tags.** NetBird moves fast and its images' flag surface changes between
-   releases (the consolidated port architecture landed around v0.29). Edit the four
-   `NETBIRD_*_TAG` vars in your `docker/zeehive/.env` to one release and check that release's
-   self-hosted docs before going further. The compose defaults (`:latest`) are for evaluation only.
+1. **Know which NetBird release you are running.** The compose defaults are now pinned to
+   **v0.78.1** — the release `lib/netbird.js` was proven against against a real management server
+   (`test/netbird-live-api.test.mjs`, docs/netbird-mesh-plan.md §11). The four `NETBIRD_*_TAG`
+   vars in your `docker/zeehive/.env` override them; NetBird moves fast, its flag and API surface
+   changes between releases, the old `:latest` defaults are gone on purpose — bump a tag only
+   together with a run of the live test, and check that release's self-hosted docs.
 2. **Write the management config.** Copy the example and edit the endpoints:
    ```sh
    cp netbird/management.json.example netbird/management.json   # from docker/zeehive/
@@ -126,6 +128,12 @@ Both compose files already carry the services; the steps below are for a repo ch
    (relative to the compose file, so `docker/zeehive/netbird/management.json` in a checkout). The
    example is valid JSON with placeholder `Signal` / `Relay` / datastore-encryption values; fill in
    the LAN addresses/ports you publish below and a real `DataStoreEncryptionKey`/relay secret.
+   **The datastore key must be valid base64 of exactly 32 bytes** — the shipped value decodes to 32
+   bytes so a copied example still boots, but generate your own and keep it versioned:
+   `openssl rand -base64 32`. (A `CHANGE-ME-…` phrase there is NOT valid base64 and the server dies
+   on boot with `failed to create field encryptor: decode encryption key`; verified against
+   v0.78.1, docs/netbird-mesh-plan.md §11.) The `HttpConfig.Address` key some older docs show is
+   gone in v0.78.1 — the listen address is the `--port` flag, not config.
 3. **Bring the control plane up.**
    ```sh
    docker compose -f docker/zeehive/docker-compose.prod.yml --profile mesh up -d

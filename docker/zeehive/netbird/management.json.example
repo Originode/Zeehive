@@ -10,10 +10,9 @@
   "ReverseProxy": { "TrustedHTTPProxies": [], "TrustedHTTPProxiesCount": 0, "TrustedPeers": ["0.0.0.0/0"] },
   "DisableDefaultPolicy": false,
   "Datadir": "",
-  "DataStoreEncryptionKey": "CHANGE-ME-32-byte-datastore-encryption-key",
+  "DataStoreEncryptionKey": "WkVFSElWRS1FWEFNUExFLURBVEFTVE9SRS1LRVkwMDA=",
   "StoreConfig": { "Engine": "sqlite" },
   "HttpConfig": {
-    "Address": "0.0.0.0:443",
     "AuthIssuer": "http://localhost:33074",
     "AuthAudience": "",
     "AuthKeysLocation": "",
