@@ -733,6 +733,16 @@ by hand nor is a token pasted.
   is refused by name rather than dropped), and `GET …/mesh-status`: the bounded `probeManagementApi`
   read, `mesh_peer` counts by status, and the route-source tally summary. `lib/mesh-status.js` never
   throws for a mesh/DB outcome (a status page must answer when the plane is down).
+- **Meeting the console half (TKT-189, merged).** The panel was built in parallel and had chosen its
+  own read shapes (`fields.management_url`, `peers.counts`, `peers.list`, `management.reachable`,
+  `tally`). Rather than rewrite the landed panel, the server's read model also PROJECTS those names —
+  `fields` is the row under the console's four form names (`management_url` ↔ `api_url`, one alias
+  in `lib/mesh-config.js`'s `FIELD_ALIASES`), and `mesh-status` carries both the canonical
+  `ok`/`by_status`/`active`/`routes` keys and the console's `reachable`/`counts`/`list`/`tally`.
+  Two more consequences, both verified over real HTTP with the panel's verbatim save body: a PUT
+  that CARRIES a configuration ENABLES the machine's mesh (the panel has no separate on switch, and
+  a row left disabled would make the stand-up's bootstrapped PAT inert) — an explicit
+  `enabled: false` still wins and is sticky; and the generated datastore key appears in no GET.
 - **The stand-up consumes it.** `mesh-control-plane` now resolves the machine's row
   (`meshResolvedForPerformer`) and renders `netbird/management.json` from it, runs
   `compose --profile mesh up -d` with the row's domain/ports/secrets as the compose child's env (the
