@@ -927,6 +927,7 @@ const PATCHABLE = [
   'registry',   // OCI registry for split builds (compile on one docker context, run on another)
   'auto_approve_land', 'auto_approve_ship',   // operator policy: skip the human gate (default off)
   'auto_approve_seed', 'auto_done',           // …and the seed/done policies (122): auto-run seeds, auto-confirm manager-suggested done
+  'auto_dispatch_medic',                      // …and the medic policy (255): dispatch a raised call with no human click
   'remote_url', // inbound-only fetch source (migration 032) — re-pointing it is safe, unlike repo_root
   'git_behavior', // how a NESTED project's repo joins its parent's git (submodule/subtree/main_repo)
 ];

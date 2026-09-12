@@ -18,6 +18,13 @@
 //   6. ATTACH: a LIVE medic on the project routes the raise to 'attached' — the call is linked to
 //      that medic and marked 'attended' (the warm resume itself is the driver's business; this test
 //      asserts the row routing, not the model turn).
+//   7. THE OPERATOR POLICY auto_dispatch_medic (255), BOTH states: OFF (default) a raise still
+//      parks OPEN for a human, exactly as today; ON a raise with no live medic is dispatched through
+//      the SAME seam the human click uses (dispatchMedicCall → 'attended' + a medic briefed from the
+//      call) and the calling zee is TOLD a policy did it. And the policy never overrides ATTACH: a
+//      live medic still takes the call rather than the policy dispatching a second one. It also
+//      does not reach where a click cannot: on an API-only instance (QUEENZEE_INPROC=false, where
+//      the dispatch route is refused 503) the call parks OPEN rather than spawning without the lock.
 process.env.MEDICRW_MODE = 'real';
 // The dispatch route is gated by requireQueenzeeLoops — only the process holding the single-queenzee
 // lock drives a spawn. config.js loads .zeehive.env at import (an API-only cxell projects
@@ -299,6 +306,74 @@ try {
   const deadList = await listProjectMedicCalls(deadProject.id, { liveOnly: true });
   ok(!deadList.some((c) => c.id === deadCall.call_id),
      'the retired xell\'s OPEN call is NOT in the live-only emergency feed');
+
+  // ── 7d. the OPERATOR POLICY: auto_dispatch_medic (255), BOTH states ────────
+  console.log('\n── auto_dispatch_medic OFF (default): a raise still parks for a human ──');
+  const offProject = { id: await insProject(`mc-off-p-${tag}`) };
+  const offXell = await insXell(offProject.id, `mc-off-${tag}`);
+  const medicsBeforeOff = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  const offRaise = await raiseMedicCall({ xell: offXell, reason: 'flag off — must park for a human',
+                                          kind: 'db', zeeId: null });
+  ok(offRaise.routed === 'raised', `flag OFF → routed 'raised' (got ${offRaise.routed})`);
+  ok(/human dispatches/.test(offRaise.message) && /NOTHING auto-spawns/.test(offRaise.message),
+     'flag OFF → the zee is still told a human dispatches and nothing auto-spawns');
+  const offCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [offRaise.call_id]);
+  ok(offCall.status === 'open' && offCall.medic_id === null,
+     'flag OFF → the call stays OPEN with no medic (the default is unchanged)');
+  ok((await one(`SELECT count(*)::int AS n FROM medic`)).n === medicsBeforeOff,
+     'flag OFF → no medic row was created (no dispatch happened)');
+
+  console.log('\n── auto_dispatch_medic ON: the SAME seam dispatches with no human click ──');
+  const onProject = { id: await insProject(`mc-on-p-${tag}`) };
+  const onXell = await insXell(onProject.id, `mc-on-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [onProject.id]);
+  const onRaise = await raiseMedicCall({ xell: onXell, reason: 'flag on — dispatch me now',
+                                         kind: 'db', zeeId: null });
+  ok(onRaise.ok === true && onRaise.routed === 'auto-dispatched' && !!onRaise.medic_id,
+     `flag ON → routed 'auto-dispatched' with a medic id (got ${onRaise.routed})`);
+  ok(/auto_dispatch_medic policy/.test(onRaise.message) && /no human click/.test(onRaise.message),
+     'the calling zee is TOLD a policy dispatched it, not a human');
+  const onCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [onRaise.call_id]);
+  ok(onCall.status === 'attended' && onCall.medic_id === onRaise.medic_id,
+     'the call is ATTENDED and linked to the dispatched medic — the human click\'s own outcome');
+  const onMedic = await one(`SELECT * FROM medic WHERE id=$1`, [onRaise.medic_id]);
+  ok(onMedic?.target_project_id === onProject.id, 'the dispatched medic targets the CALLING project');
+  ok(/flag on — dispatch me now/.test(onMedic?.brief || ''),
+     'the medic was briefed FROM THE CALL (the zee\'s own words are in the brief)');
+  ok((onMedic?.brief || '').includes(onXell.slug),
+     'the brief NAMES the calling xell (the same brief a human click produces)');
+  ok(onMedic?.condition_id === null,
+     'the dispatch is call-driven, not condition-driven (no condition was invented)');
+
+  console.log('\n── the policy never overrides ATTACH: a live medic still takes the call ──');
+  const attProject = { id: await insProject(`mc-att-p-${tag}`) };
+  const attXell = await insXell(attProject.id, `mc-att-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [attProject.id]);
+  const attMedic = await insMedic(attProject.id);   // status 'diagnosing' — already attending
+  const attRaise = await raiseMedicCall({ xell: attXell, reason: 'a live medic is already here',
+                                          kind: 'db', zeeId: null });
+  ok(attRaise.routed === 'attached' && attRaise.medic_id === attMedic.id,
+     'with the flag ON and a LIVE medic attending, the raise still ATTACHES (the policy only fills the gap a human would have filled)');
+
+  console.log('\n── API-only instance: the policy parks, because the click is refused there ──');
+  const apiProject = { id: await insProject(`mc-api-p-${tag}`) };
+  const apiXell = await insXell(apiProject.id, `mc-api-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [apiProject.id]);
+  const { config } = await import('../server/src/config.js');
+  const wasInproc = config.queenzeeInproc;
+  const apiMedicsBefore = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  let apiRaise;
+  try {
+    config.queenzeeInproc = false;   // the route's requireQueenzeeLoops refuses this instance
+    apiRaise = await raiseMedicCall({ xell: apiXell, reason: 'api-only must not drive a spawn',
+                                      kind: 'db', zeeId: null });
+  } finally { config.queenzeeInproc = wasInproc; }
+  ok(apiRaise.routed === 'raised', `an API-only instance parks the call (got ${apiRaise.routed})`);
+  const apiCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [apiRaise.call_id]);
+  ok(apiCall.status === 'open' && apiCall.medic_id === null,
+     'the call stays OPEN — the policy does not spawn where the ⛑ click would get a 503');
+  ok((await one(`SELECT count(*)::int AS n FROM medic`)).n === apiMedicsBefore,
+     'no medic row was created on the API-only instance');
 
   // ── 8. the ROUTES over real HTTP (a fresh project with NO live medic) ──────
   console.log('\n── the routes: zee medic (token-scoped), console list + dispatch (real HTTP) ──');
