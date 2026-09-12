@@ -111,6 +111,23 @@ export const config = {
   // the queenzee's env (surfaced as PRESENCE ONLY by `zee infra settings`, never the value).
   netbirdApiUrl: process.env.NETBIRD_API_URL || null,
   netbirdApiToken: process.env.NETBIRD_API_TOKEN || null,
+  // The management API a stand-up HEALTH-CHECKS before the operator has pointed the queenzee at it
+  // (NETBIRD_API_URL is set only AFTER the control plane is up — chicken and egg). NetBird's own
+  // compose default is the in-project service name (docker-compose.bootstrap.yml NB_MANAGEMENT_URL),
+  // which the queenzee container resolves on the compose network; a host-routed install overrides.
+  netbirdMgmtApiUrl: process.env.NETBIRD_MGMT_API_URL || null,
+  // The queenzee's OWN compose file — the file the mesh profile lives in. The bootstrap card's
+  // mesh-control-plane step drives `docker compose -f <this> --profile mesh up -d`. Defaults to the
+  // bootstrap compose beside the code tree (a host checkout); a containerized queenzee whose image
+  // carries no compose file sets MESH_COMPOSE_FILE to its install dir's compose file.
+  meshComposeFile: process.env.MESH_COMPOSE_FILE || resolve(repoRoot, 'docker-compose.bootstrap.yml'),
+  // management.json values ZEEHIVE may substitute into the shipped example. The two SECRETS are
+  // only ever taken from the operator's env — this code never generates key material, and a
+  // placeholder left in the template stays a placeholder (the stand-up refuses to start on one).
+  netbirdSignalUri: process.env.NETBIRD_SIGNAL_URI || null,
+  netbirdRelayEndpoint: process.env.NETBIRD_RELAY_ENDPOINT || null,
+  netbirdDatastoreEncryptionKey: process.env.NETBIRD_DATASTORE_ENCRYPTION_KEY || null,
+  netbirdRelayAuthSecret: process.env.NETBIRD_RELAY_AUTH_SECRET || null,
   // The mesh DNS domain peers resolve under (<hostname>.<domain>). NetBird's self-hosted default.
   meshDomain: process.env.MESH_DOMAIN || 'netbird.selfhosted',
   // The zee-hive-net address cages route mesh traffic through (§3.5). Normally UNSET: the seal
