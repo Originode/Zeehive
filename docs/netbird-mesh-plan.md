@@ -743,6 +743,11 @@ by hand nor is a token pasted.
   that CARRIES a configuration ENABLES the machine's mesh (the panel has no separate on switch, and
   a row left disabled would make the stand-up's bootstrapped PAT inert) — an explicit
   `enabled: false` still wins and is sticky; and the generated datastore key appears in no GET.
+  The read model also answers `editable`, which is the panel's read-only note AND the plan's own
+  condition — the mesh-profile services live in the queenzee's own compose project, so a machine
+  that is not the queenzee host has nothing to stand up and the form is closed. One expression
+  (`machine.docker_ctx === queenzeeHostCtx()`), read by both, so the button and the form cannot
+  disagree.
 - **The stand-up consumes it.** `mesh-control-plane` now resolves the machine's row
   (`meshResolvedForPerformer`) and renders `netbird/management.json` from it, runs
   `compose --profile mesh up -d` with the row's domain/ports/secrets as the compose child's env (the
