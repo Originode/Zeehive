@@ -7,9 +7,10 @@
 //   • QUEENZEE-performed, HUMAN-clicked. No agent ever runs docker; this module is the queenzee
 //     running the action a human started from the console.
 //   • It only CREATES what the project's manifest DECLARES for the spinoff (DEV) tier — external
-//     networks and the shared dev db. It NEVER invents infrastructure (no registry, no machine, no
-//     volume — a volume is DATA and is never auto-created), never removes/prunes/reconfigures
-//     anything that exists, and never touches a running container.
+//     networks, a volume the manifest explicitly marks `create: empty` (the project's own authority
+//     that empty is a valid start), and the shared dev db. It NEVER invents infrastructure (no
+//     registry, no machine, and never a PLAIN volume — a volume is DATA and is never auto-created),
+//     never removes/prunes/reconfigures anything that exists, and never touches a running container.
 //   • PLAN FIRST: performBuildBootstrap({ dryRun:true }) returns the ordered plan and performs
 //     nothing; the console shows that plan before a human commits.
 //   • Idempotent: a step re-checks before it creates, and re-running after a partial failure
@@ -29,7 +30,8 @@ import { one } from '../db/pool.js';
 import { config } from '../config.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
 import { sharedDevDb, provisionDevDb, queenzeeHostCtx } from './machines.js';
-import { meshEnabled, mintPeer, netbirdRequest, probeManagementApi } from './netbird.js';
+import { meshEnabled, mintPeer, netbirdRequest, probeManagementApi,
+         MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } from './netbird.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 
@@ -99,11 +101,6 @@ export async function hostProdDisclosure(machine, project, createNames = []) {
 // NOT gated on meshEnabled(): NETBIRD_API_URL/TOKEN are set AFTER stand-up (they point the queenzee
 // AT the plane), so gating on them would make the step that creates the control plane require the
 // control plane. The only gate is that this machine IS the queenzee's host.
-export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
-// The control plane only — NOT mesh-gateway (needs a human-minted setup key) and NOT the dashboard
-// (needs an OIDC provider). Both would crash-loop with an empty key/OIDC and make a good stand-up
-// look failed; the operator brings them up once the env below exists.
-export const MESH_CONTROL_PLANE_SERVICES = ['netbird-management', 'netbird-signal', 'netbird-relay'];
 const PLACEHOLDER_SECRET = /CHANGE-ME/i;
 
 // PURE: substitute the values ZEEHIVE knows into the shipped example and NOTHING else. The two
@@ -200,9 +197,11 @@ function meshOperatorEnv() {
 //   kind   'network' | 'shared-dev-db' | 'mesh-machine-peer' (performable) | 'cannot'
 //          (a human action, not a queenzee one)
 //   status 'planned' (not yet performed) | 'cannot' (never performable)
-// A step is 'cannot' when the bootstrap is NOT the right tool: a missing volume (DATA), a missing
-// registry / build machine (configuration + credentials, a human's decision), a compose file that
-// does not resolve (a repo/manifest defect), or an alias a running container lost (never touched).
+// A step is 'cannot' when the bootstrap is NOT the right tool: a PLAIN missing volume (DATA), a
+// missing registry / build machine (configuration + credentials, a human's decision), a compose
+// file that does not resolve (a repo/manifest defect), or an alias a running container lost (never
+// touched). It is 'planned' for a declared network, a `create: empty` volume, the shared dev db,
+// and (on the queenzee's own host) the mesh control plane.
 export async function planBuildBootstrap(machine, project, { docker = dockerAdapter } = {}) {
   // The probe reads project.db_coupling to decide whether a shared dev db is expected at all
   // (buildReadinessForProject attaches it from pool_config before probing). Attach it here too so
@@ -236,42 +235,48 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
     status: 'cannot', detail: reason, stderr: null,
   });
 
+  // The probe already INSPECTED every declared item and attached the misses as structure; the
+  // planner reads that structure instead of re-inspecting (the old `/missing required alias/`
+  // regex over free text is gone — decision record, item 2). Classification, per category:
   const req = check('requires-present');
   if (req && !req.ok) {
-    const requires = project.manifest?.tiers?.spinoff?.requires || {};
-    const nets = (requires.networks || []).map((n) =>
-      typeof n === 'string' ? { name: n, aliases: [] } : { name: n.name, aliases: n.aliases || [] });
-    const vols = requires.volumes || [];
-    const aliasComplaint = /missing required alias/.test(req.detail);
-    for (const n of nets) {
-      const r = await docker(machine.docker_ctx, ['network', 'inspect', n.name, '--format', '{{.Name}}']);
-      if (r.unknown) {
-        cannot(req, `network '${n.name}'`, null,
-          `could not verify network '${n.name}' on '${machine.docker_ctx}': ${r.reason}`);
-      } else if (r.status !== 0) {
+    const missing = req.missing || null;
+    if (!missing) {
+      // A check recorded before the structured shape (or one that could not be verified): name it
+      // rather than guess. The bootstrap never half-runs on a classification it does not have.
+      cannot(req, 'requires-present', null, req.detail);
+    } else {
+      for (const name of missing.networks || []) {
         steps.push({
-          kind: 'network', target: n.name,
-          why: `required external network '${n.name}' does not exist on '${machine.docker_ctx}'`,
-          action: `docker network create ${n.name}`,
+          kind: 'network', target: name,
+          why: `required external network '${name}' does not exist on '${machine.docker_ctx}'`,
+          action: `docker network create ${name}`,
           status: 'planned', detail: null, stderr: null,
         });
-      } else if (aliasComplaint && req.detail.includes(n.name)) {
-        cannot(req, `network '${n.name}' aliases`, null,
-          `network '${n.name}' exists on '${machine.docker_ctx}' but the probe reports missing `
-          + `required alias(es) — a container was recreated without them. The bootstrap never `
-          + `reconfigures a running container; re-create it via compose.`);
       }
-    }
-    for (const v of vols) {
-      const r = await docker(machine.docker_ctx, ['volume', 'inspect', v]);
-      if (r.unknown) {
-        cannot(req, `volume '${v}'`, null,
-          `could not verify volume '${v}' on '${machine.docker_ctx}': ${r.reason}`);
-      } else if (r.status !== 0) {
-        cannot(req, `volume '${v}'`, null,
-          `required external volume '${v}' does not exist on '${machine.docker_ctx}' — external `
-          + `volumes are DATA and are NEVER auto-created. Create it from the project's bootstrap `
-          + `doc, then re-check.`);
+      for (const a of missing.aliases || []) {
+        cannot(req, `network '${a.network}' aliases`, null,
+          `network '${a.network}' exists on '${machine.docker_ctx}' but is missing required `
+          + `alias(es): ${(a.aliases || []).join(', ')} — a container was recreated without them. `
+          + `The bootstrap never reconfigures a running container; re-create it via compose.`);
+      }
+      for (const v of missing.volumes || []) {
+        if (v.create === 'empty') {
+          // The manifest — the project's OWN authority — declares empty a valid start (decision
+          // record, item 3). Every other volume is DATA: named, never created.
+          steps.push({
+            kind: 'volume', target: v.name,
+            why: `required external volume '${v.name}' does not exist on '${machine.docker_ctx}' `
+              + `and the manifest marks it safe to create empty`,
+            action: `docker volume create ${v.name}`,
+            status: 'planned', detail: null, stderr: null,
+          });
+        } else {
+          cannot(req, `volume '${v.name}'`, null,
+            `required external volume '${v.name}' does not exist on '${machine.docker_ctx}' — external `
+            + `volumes are DATA and are NEVER auto-created. Create it from the project's bootstrap `
+            + `doc, then re-check.`);
+        }
       }
     }
   }
@@ -416,6 +421,35 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
     }
     return { status: 'created',
              detail: `network '${step.target}' created on '${machine.docker_ctx}'`, stderr: null };
+  }
+
+  if (step.kind === 'volume') {
+    // The create:empty opt-in only (decision record, item 3). Same idempotent shape as the network
+    // performer: inspect → create → tolerate the "already exists" race, so a re-run after a partial
+    // failure cannot fail on a volume the first run made.
+    const exists = await docker(machine.docker_ctx, ['volume', 'inspect', step.target]);
+    if (!exists.unknown && exists.status === 0) {
+      return { status: 'already-present',
+               detail: `volume '${step.target}' already exists on '${machine.docker_ctx}'`, stderr: null };
+    }
+    const r = await docker(machine.docker_ctx, ['volume', 'create', step.target]);
+    if (r.unknown) {
+      return { status: 'failed',
+               detail: `could not create volume '${step.target}' on '${machine.docker_ctx}': ${r.reason}`,
+               stderr: null };
+    }
+    if (r.status !== 0) {
+      if (/already exists/i.test((r.stderr || '') + (r.stdout || ''))) {
+        return { status: 'already-present',
+                 detail: `volume '${step.target}' already exists on '${machine.docker_ctx}' (appeared between check and create)`,
+                 stderr: null };
+      }
+      return { status: 'failed',
+               detail: `docker volume create '${step.target}' failed on '${machine.docker_ctx}'`,
+               stderr: (r.stderr || r.stdout || '').trim() };
+    }
+    return { status: 'created',
+             detail: `volume '${step.target}' created (empty) on '${machine.docker_ctx}'`, stderr: null };
   }
 
   if (step.kind === 'shared-dev-db') {

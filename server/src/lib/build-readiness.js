@@ -13,12 +13,20 @@
 // returns a verdict a human reads where the pool knobs are set:
 //
 //     { status: 'ok'|'unknown'|'missing', error: string|null,
-//       checks: [{ check, ok, skipped, unknown, detail }] }
+//       bootstrappable: boolean,
+//       checks: [{ check, ok, skipped, unknown, blocking?, missing?, detail }] }
 //
-//   ok      → every check passed; a build can work here.
-//   missing → at least one check FAILED (a definite missing prerequisite is named).
+//   ok      → every BLOCKING check passed; a build can work here.
+//   missing → at least one blocking check FAILED (a definite missing prerequisite is named).
 //   unknown → nothing failed, but a check could not be run (unreachable context, docker
 //             absent, timeout) — "unknown/unreachable" is a first-class verdict, never green.
+//
+//   bootstrappable → the bootstrap card will have something PERFORMABLE to create here. This is
+//             the console's render condition for the 🔧 button, so that a shown button always
+//             acts (docs/build-bootstrap-button-contract-decision-record.md). It is deliberately
+//             NOT the same question as `status`: the mesh control plane is a performable
+//             prerequisite that does not block a build, so a machine can read `ok` AND be
+//             bootstrappable at once. See bootstrappableFrom().
 //
 // WHAT IT DELIBERATELY DOES NOT DO (same contract as preflight.js):
 //   • It never WRITES. No row, no docker object, no provision, no build. A probe that
@@ -38,8 +46,9 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
-import { sharedDevDb, defaultBuildCtxFor } from './machines.js';
+import { sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx } from './machines.js';
 import { serverRoleIsProcess } from './manifest.js';
+import { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } from './netbird.js';
 
 export const BUILD_READINESS_TIMEOUT_MS = 8000;
 
@@ -155,12 +164,15 @@ async function checkComposeResolves(machine, project, docker) {
 // The alias half of verifyRequires (provision.js ~698-720): a declared alias that resolves to
 // nothing is the known "db recreated by docker run drops the compose alias → the whole fleet
 // crash-loops" failure. Runs only when the network exists AND the manifest declares aliases.
+// Returns a check row; a miss is a definite fail carrying `missing.aliases` — structured, the way
+// the planner reads it (the old `/missing required alias/` regex over free text is gone).
 async function checkNetworkAliases(ctx, network, aliases, docker) {
   const r = await docker(ctx, ['network', 'inspect', network, '--format',
     '{{range $id, $c := .Containers}}{{$c.Name}} {{end}}']);
   if (r.unknown) return unk('requires-present', `could not inspect network '${network}' on '${ctx}': ${r.reason}`);
   if (r.status !== 0) {
-    return fail('requires-present', `required network '${network}' does not exist on '${ctx}'`);
+    return { ...fail('requires-present', `required network '${network}' does not exist on '${ctx}'`),
+             missing: { networks: [network], volumes: [], aliases: [] } };
   }
   const attached = (r.stdout || '').trim().split(/\s+/).filter(Boolean);
   const found = new Set();
@@ -175,8 +187,9 @@ async function checkNetworkAliases(ctx, network, aliases, docker) {
   }
   const missing = aliases.filter((a) => !found.has(a));
   if (missing.length) {
-    return fail('requires-present',
-      `network '${network}' on '${ctx}' is missing required alias(es): ${missing.join(', ')}`);
+    return { ...fail('requires-present',
+               `network '${network}' on '${ctx}' is missing required alias(es): ${missing.join(', ')}`),
+             missing: { networks: [], volumes: [], aliases: [{ network, aliases: missing }] } };
   }
   return pass('requires-present', `network '${network}' on '${ctx}' has alias(es) ${aliases.join(', ')}`);
 }
@@ -184,34 +197,118 @@ async function checkNetworkAliases(ctx, network, aliases, docker) {
 // CHECK 3 — the manifest-declared spinoff prerequisites (tiers.spinoff.requires) exist on this
 // machine's daemon. Mirrors verifyRequires() but never throws and never auto-creates: a missing
 // network/volume is a named 'missing' fact, an unreachable daemon is 'unknown'.
+//
+// It collects EVERY miss instead of returning on the first (decision record, item 1) and attaches
+// them as STRUCTURED data — `missing: { networks: [name], volumes: [{name, create}], aliases:
+// [{network, aliases}] }` — because the bootstrap's performability is decided per CATEGORY: a
+// missing declared network is something the bootstrap creates, a plain missing volume is DATA and
+// never is. A free-text detail cannot tell the two apart; this structure can, and the planner and
+// bootstrappableFrom() read the SAME rows.
 async function checkRequiresPresent(machine, project, docker) {
   const requires = project.manifest?.tiers?.spinoff?.requires || {};
   const nets = (requires.networks || []).map((n) =>
     typeof n === 'string' ? { name: n, aliases: [] } : { name: n.name, aliases: n.aliases || [] });
-  const vols = requires.volumes || [];
+  const vols = (requires.volumes || []).map((v) =>
+    typeof v === 'string' ? { name: v, create: null } : { name: v.name, create: v.create || null });
   if (!nets.length && !vols.length) {
     return skip('requires-present', 'manifest declares no tiers.spinoff.requires — nothing to verify');
   }
+  const missing = { networks: [], volumes: [], aliases: [] };
+  const details = [];
+  let unknown = null;                       // first unverifiable item; a definite miss still wins
+  const merge = (m) => {
+    missing.networks.push(...m.networks); missing.volumes.push(...m.volumes); missing.aliases.push(...m.aliases);
+  };
   for (const n of nets) {
     const r = await docker(machine.docker_ctx, ['network', 'inspect', n.name, '--format', '{{.Name}}']);
-    if (r.unknown) return unk('requires-present', `could not inspect network '${n.name}' on '${machine.docker_ctx}': ${r.reason}`);
+    if (r.unknown) {
+      unknown = unknown || unk('requires-present', `could not inspect network '${n.name}' on '${machine.docker_ctx}': ${r.reason}`);
+      continue;
+    }
     if (r.status !== 0) {
-      return fail('requires-present', `required network '${n.name}' does not exist on '${machine.docker_ctx}'`);
+      missing.networks.push(n.name);
+      details.push(`required network '${n.name}' does not exist on '${machine.docker_ctx}'`);
+      continue;
     }
     if (n.aliases.length) {
       const a = await checkNetworkAliases(machine.docker_ctx, n.name, n.aliases, docker);
-      if (!a.ok) return a;
+      if (a.unknown) { unknown = unknown || a; continue; }
+      if (!a.ok) { merge(a.missing); details.push(a.detail); }
     }
   }
   for (const v of vols) {
-    const r = await docker(machine.docker_ctx, ['volume', 'inspect', v]);
-    if (r.unknown) return unk('requires-present', `could not inspect volume '${v}' on '${machine.docker_ctx}': ${r.reason}`);
+    const r = await docker(machine.docker_ctx, ['volume', 'inspect', v.name]);
+    if (r.unknown) {
+      unknown = unknown || unk('requires-present', `could not inspect volume '${v.name}' on '${machine.docker_ctx}': ${r.reason}`);
+      continue;
+    }
     if (r.status !== 0) {
-      return fail('requires-present', `required external volume '${v}' does not exist on '${machine.docker_ctx}' — it is DATA and is never auto-created`);
+      missing.volumes.push(v);
+      details.push(`required external volume '${v.name}' does not exist on '${machine.docker_ctx}'`
+        + (v.create === 'empty' ? ' (the manifest opts in to creating it empty)' : ' — it is DATA and is never auto-created'));
     }
   }
+  // A definite miss beats "could not tell": we KNOW the machine is missing a declared item. Only
+  // when nothing is definitively missing does an unverifiable item make the check unknown.
+  if (details.length) return { ...fail('requires-present', details.join(' · ')), missing };
+  if (unknown) return unknown;
   return pass('requires-present',
     `declared spinoff requires present on '${machine.docker_ctx}' (${nets.length} net(s), ${vols.length} volume(s))`);
+}
+
+// CHECK 6 — the NetBird CONTROL PLANE (docs/netbird-mesh-plan.md §3.1). The mesh-profile services
+// live in the queenzee's OWN compose project, so this check only applies to the machine whose
+// docker context IS the queenzee's. Its result must NOT decide the build verdict: a machine builds
+// perfectly well with no mesh, so a control plane that is down must never turn a ✓ build into ✗.
+// What it decides is `bootstrappable` — the stand-up is exactly the kind of prerequisite the
+// bootstrap card can create, and hiding the button on a machine that reads `ok` is the defect this
+// check exists to fix (ticket #189: "so mesh-control-plane is offered").
+async function checkMeshControlPlane(machine, docker) {
+  if (machine.docker_ctx !== queenzeeHostCtx()) {
+    return skip('mesh-control-plane',
+      `not the queenzee host — the control plane runs on '${queenzeeHostCtx()}'`);
+  }
+  const r = await docker(machine.docker_ctx,
+    ['inspect', MESH_CONTROL_PLANE_CONTAINER, '--format', '{{.State.Status}}']);
+  if (r.unknown) {
+    return unk('mesh-control-plane',
+      `could not check the NetBird control plane on '${machine.docker_ctx}': ${r.reason}`);
+  }
+  if (r.status === 0 && /running/i.test((r.stdout || '').trim())) {
+    return pass('mesh-control-plane',
+      `NetBird control plane '${MESH_CONTROL_PLANE_CONTAINER}' is running on '${machine.docker_ctx}'`);
+  }
+  return { ...fail('mesh-control-plane',
+    `the NetBird control plane is not running on '${machine.docker_ctx}' — the mesh-profile services `
+    + `(${MESH_CONTROL_PLANE_SERVICES.join(', ')}) are not up`),
+    blocking: false };   // performable, but never a reason a BUILD cannot work
+}
+
+// PURE, and the ONE authority on "will the bootstrap have something to DO for this pair?" — the
+// console's 🔧 button renders on this boolean, and the decision record's contract is that a shown
+// button always acts (docs/build-bootstrap-button-contract-decision-record.md). True means the
+// planner's classification will find at least one PERFORMABLE step:
+//   • a failing shared-dev-db                          → provisionDevDb
+//   • a missing declared NETWORK                       → `docker network create`
+//   • a missing volume the manifest marks create:'empty' → `docker volume create`
+//   • the mesh control plane down on the queenzee host  → `compose --profile mesh up -d`
+// A requires-present failure that is ONLY a plain-volume miss or lost network ALIASES is NOT
+// performable — the planner names those as human steps — so this stays false and the button does
+// not render. A recorded check from before the structured `missing` field carries only free text:
+// fail SAFE there (false) rather than render a button into a plan with nothing to perform.
+export function bootstrappableFrom(checks = []) {
+  const byName = (n) => checks.find((c) => c.check === n);
+  const definiteFail = (c) => !!c && c.ok === false && c.unknown !== true;
+  if (definiteFail(byName('shared-dev-db'))) return true;
+  if (definiteFail(byName('mesh-control-plane'))) return true;
+  const req = byName('requires-present');
+  if (definiteFail(req)) {
+    const missing = req.missing;
+    if (!missing) return false;
+    if ((missing.networks || []).length) return true;
+    if ((missing.volumes || []).some((v) => v && v.create === 'empty')) return true;
+  }
+  return false;
 }
 
 // CHECK 4 — this machine has the project's shared dev db ON it. A dev xell's app tier must
@@ -275,16 +372,21 @@ export async function probeBuildReadiness(machine, project, { docker = dockerAda
   checks.push(await checkRequiresPresent(machine, project, docker));
   checks.push(await checkSharedDevDb(project, machine));
   checks.push(await checkRegistryForHandoff(machine, project));
+  // Recorded, never user-entered, and never a reason a build fails: the mesh control plane.
+  checks.push(await checkMeshControlPlane(machine, docker));
 
-  const definite = checks.filter((c) => !c.ok && !c.unknown);
-  const unknown = checks.filter((c) => c.unknown);
+  // A failing check that is `blocking: false` is a performable-but-optional prerequisite (the mesh
+  // control plane): it does not make the machine unable to build, so it does not decide `status`.
+  // Everything else that fails definitely is `missing`, exactly as before.
+  const definite = checks.filter((c) => !c.ok && !c.unknown && c.blocking !== false);
+  const unknown = checks.filter((c) => c.unknown && c.blocking !== false);
   let status = 'ok';
   if (definite.length) status = 'missing';
   else if (unknown.length) status = 'unknown';
   const error = status === 'ok' ? null
     : (definite.length ? definite : unknown)
         .map((c) => `${c.check}: ${c.detail}`).join(' · ');
-  return { status, error, checks };
+  return { status, error, bootstrappable: bootstrappableFrom(checks), checks };
 }
 
 // Every machine (enabled or not — a disabled one still holding pool knobs deserves an answer)
@@ -340,6 +442,10 @@ export async function upsertBuildReadinessRecord(machineId, projectId, { status,
 // probe click. Returns the same per-machine shape buildReadinessForProject does; a machine with
 // no record has status null (the badge shows "not checked yet"). `recorded:false` distinguishes
 // "never probed" from a real verdict.
+//
+// `bootstrappable` is DERIVED from the stored checks on read (one authority, bootstrappableFrom)
+// rather than stored as a column: the record predates it, the checks are what the classification
+// actually needs, and a stored boolean could disagree with the rows it was derived from.
 export async function recordedBuildReadinessForProject(projectId) {
   const project = await one(`SELECT id FROM project WHERE id=$1`, [projectId]);
   if (!project) throw new Error('project not found');
@@ -363,6 +469,7 @@ export async function recordedBuildReadinessForProject(projectId) {
     status: r.status || null,
     error: r.error || null,
     checks: r.checks || [],
+    bootstrappable: r.status ? bootstrappableFrom(r.checks || []) : false,
     probed_at: r.probed_at || null,
     recorded: !!r.status,
   }));

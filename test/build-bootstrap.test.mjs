@@ -456,10 +456,13 @@ try {
   // runs `compose --profile mesh up -d` for the three control-plane services ONLY, and health-checks
   // the management API. A secret is never invented, and the API token is named as a human's.
   console.log('\n── the bootstrap CARD stands up the NetBird control plane on the queenzee host (§3.1) ──');
-  const {
-    renderManagementJson, managementJsonMissingSecrets, ensureManagementJson,
-    MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES,
-  } = await import('../server/src/lib/build-bootstrap.js');
+  const { renderManagementJson, managementJsonMissingSecrets, ensureManagementJson } =
+    await import('../server/src/lib/build-bootstrap.js');
+  // The control plane's container/service names live in lib/netbird.js — ONE authority the probe
+  // (build-readiness.js) and this performer both read, so a button cannot check one container while
+  // the step starts another.
+  const { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } =
+    await import('../server/src/lib/netbird.js');
   const EXAMPLE = path.join(REPO, 'docker/zeehive/netbird/management.json.example');
   const exampleText = fs.readFileSync(EXAMPLE, 'utf8');
   ok(managementJsonMissingSecrets(JSON.parse(exampleText)).length === 2,
