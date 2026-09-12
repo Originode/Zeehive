@@ -45,7 +45,8 @@ const { probeBuildReadiness, dockerAdapter } = await import('../server/src/lib/b
 // and a recorder so a test can assert nothing was created during a dry run. `networks` is the live
 // set — a created network lands in it, so a SECOND perform sees it already-present (idempotence).
 const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true,
-                      createNetworks = new Set(), failNetworkCreate = null, failNetworkInspect = null } = {}) => {
+                      createNetworks = new Set(), failNetworkCreate = null, failNetworkInspect = null,
+                      runningContainers = new Set(), failCompose = null } = {}) => {
   const calls = [];
   const stub = async (ctx, args) => {
     calls.push(args.join(' '));
@@ -55,6 +56,7 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
       return { status: 0, stdout: '28.0.0\n', stderr: '' };
     }
     if (cmd === 'compose') {
+      if (failCompose) return { status: 1, stdout: '', stderr: failCompose };
       return composeOk
         ? { status: 0, stdout: '', stderr: '' }
         : { status: 1, stdout: '', stderr: 'error: service "server" refers to undefined network' };
@@ -81,7 +83,14 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
         ? { status: 0, stdout: `${name}\n`, stderr: '' }
         : { status: 1, stdout: '', stderr: `volume ${name} not found` };
     }
-    if (cmd === 'inspect') return { status: 0, stdout: '', stderr: '' };
+    // `docker inspect <name> --format {{.State.Status}}` — the mesh-control-plane step's liveness
+    // read. A name in runningContainers answers 'running'; anything else answers empty (not running).
+    if (cmd === 'inspect') {
+      const name = args[1];
+      return runningContainers.has(name)
+        ? { status: 0, stdout: 'running\n', stderr: '' }
+        : { status: 0, stdout: '', stderr: '' };
+    }
     return { status: 0, stdout: '', stderr: '' };
   };
   stub.calls = calls;
@@ -111,13 +120,17 @@ const makeProvision = ({ fail = null, throwAlreadyRunning = false } = {}) => {
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
-const createdMachines = [], createdProjects = [];
+const createdMachines = [], createdProjects = [], tmpDirs = [];
+// The control-plane section mutates process-wide config; remember the originals to restore in finally.
+let savedSecrets = null;
 // Every fixture project shares one repo root that ACTUALLY has a compose file — so compose-resolves
 // passes and the plans stay about the prerequisites under test (a missing compose is a 'cannot'
 // that would otherwise pollute every plan).
 const fs = await import('node:fs');
 const os = await import('node:os');
 const path = await import('node:path');
+const { fileURLToPath } = await import('node:url');
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), `bs-${tag}-`));
 fs.writeFileSync(path.join(repoDir, 'docker-compose.spinoff.yml'),
   'services:\n  server:\n    image: example:latest\n  webapp:\n    image: example:latest\n');
@@ -437,6 +450,147 @@ try {
      'a mint failure degrades the mesh STEP to failed, never blocks the bootstrap, and leaves no row');
   meshOff();
 
+  // ── MESH CONTROL PLANE via the bootstrap CARD (§3.1 / §11 NOT-done #1) ──────
+  // Standing NetBird up stops being a raw human op: on the QUEENZEE's OWN context the card plans a
+  // mesh-control-plane step; the perform writes netbird/management.json from the shipped example,
+  // runs `compose --profile mesh up -d` for the three control-plane services ONLY, and health-checks
+  // the management API. A secret is never invented, and the API token is named as a human's.
+  console.log('\n── the bootstrap CARD stands up the NetBird control plane on the queenzee host (§3.1) ──');
+  const {
+    renderManagementJson, managementJsonMissingSecrets, ensureManagementJson,
+    MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES,
+  } = await import('../server/src/lib/build-bootstrap.js');
+  const EXAMPLE = path.join(REPO, 'docker/zeehive/netbird/management.json.example');
+  const exampleText = fs.readFileSync(EXAMPLE, 'utf8');
+  ok(managementJsonMissingSecrets(JSON.parse(exampleText)).length === 2,
+     'the shipped example names BOTH placeholder secrets (the stand-up refuses on them)');
+  const substituted = JSON.parse(renderManagementJson(exampleText,
+    { datastoreEncryptionKey: 'k'.repeat(32), signalUri: 'netbird-signal:80', relayAddress: 'relay://netbird-relay:33080' }));
+  ok(substituted.DataStoreEncryptionKey === 'k'.repeat(32) && substituted.Signal.URI === 'netbird-signal:80'
+     && substituted.Relay.Addresses[0] === 'relay://netbird-relay:33080',
+     'renderManagementJson substitutes ONLY the configured values — it generates no key material');
+
+  // The install dir: a compose file with no netbird/ beside it (the generator falls back to the
+  // repo's shipped example, exactly as a bootstrap install does from a checkout).
+  const cpDir = fs.mkdtempSync(path.join(os.tmpdir(), `bs-cp-${tag}-`));
+  tmpDirs.push(cpDir);
+  const composeFile = path.join(cpDir, 'docker-compose.bootstrap.yml');
+  fs.writeFileSync(composeFile, 'name: zeehive\nservices:\n  netbird-management:\n    image: example\n');
+  const genRefused = ensureManagementJson(composeFile);
+  ok(genRefused.error && /NETBIRD_DATASTORE_ENCRYPTION_KEY/.test(genRefused.error)
+     && /NETBIRD_RELAY_AUTH_SECRET/.test(genRefused.error),
+     `placeholder secrets REFUSE the stand-up, naming both env vars [${genRefused.error?.slice(0, 80)}…]`);
+  ok(!fs.existsSync(path.join(cpDir, 'netbird', 'management.json')),
+     'a placeholder-secret management.json is never written (invent/store no secret)');
+
+  savedSecrets = { k: config.netbirdDatastoreEncryptionKey, s: config.netbirdRelayAuthSecret, url: config.meshComposeFile };
+  config.netbirdDatastoreEncryptionKey = 'a'.repeat(32);
+  config.netbirdRelayAuthSecret = 'relay-secret-from-operator';
+  const genOk = ensureManagementJson(composeFile);
+  const mjPath = path.join(cpDir, 'netbird', 'management.json');
+  const written = JSON.parse(fs.readFileSync(mjPath, 'utf8'));
+  ok(!genOk.error && genOk.written === true, `with the operator's secrets set, management.json is written [${genOk.error || 'ok'}]`);
+  ok(written.DataStoreEncryptionKey === 'a'.repeat(32) && written.Relay.Secret === 'relay-secret-from-operator',
+     'the written config carries the OPERATOR secrets, never generated ones');
+  fs.writeFileSync(mjPath, JSON.stringify({ ...written, Signal: { URI: 'operator-sig:80' } }));
+  const regen = ensureManagementJson(composeFile);
+  ok(!regen.written && !regen.error
+     && JSON.parse(fs.readFileSync(mjPath, 'utf8')).Signal.URI === 'operator-sig:80',
+     "an operator's own management.json is checked, never overwritten");
+  const noExample = ensureManagementJson(path.join(cpDir, 'elsewhere', 'docker-compose.bootstrap.yml'), { repoRoot: cpDir });
+  ok(noExample.error && /management\.json\.example/.test(noExample.error),
+     `no template anywhere → a named cannot, never a crash [${noExample.error?.slice(0, 70)}…]`);
+
+  config.meshComposeFile = composeFile;
+  const pCp = await insProject(`bs-cp-${tag}`, {});
+  let mCp = (await one(`SELECT id FROM machine WHERE docker_ctx='default'`))?.id;
+  if (!mCp) mCp = await insMachine(`bs-cp-${tag}`, 'default', true);
+  const mCpOther = await insMachine(`bs-cp-other-${tag}`, `zt-bs-cp-${tag}`, true);
+  await insDevDb(pCp, 'default', `bs_${tag}_cp_db`);
+  await insDevDb(pCp, `zt-bs-cp-${tag}`, `bs_${tag}_cp_other_db`);
+  const dockerCp = makeDocker({ reachable: true, networks: new Set() });
+
+  const planOther = await planBuildBootstrap(await row('machine', mCpOther), await row('project', pCp), { docker: dockerCp });
+  ok(!planOther.steps.some((s) => s.kind === 'mesh-control-plane'),
+     'a machine that is NOT the queenzee host gets no control-plane step');
+  const planCp = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp), { docker: dockerCp });
+  const cpStep = planCp.steps.find((s) => s.kind === 'mesh-control-plane');
+  ok(cpStep?.status === 'planned' && cpStep?.target === 'default',
+     `the queenzee host's plan names the performable stand-up [${cpStep?.status}]`);
+  ok(MESH_CONTROL_PLANE_SERVICES.every((svc) => (cpStep?.action || '').includes(svc)),
+     `the action names the three control-plane services [${cpStep?.action}]`);
+
+  const dockerRunning = makeDocker({ reachable: true, networks: new Set(),
+    runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });
+  const planUp = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp), { docker: dockerRunning });
+  const upStep = planUp.steps.find((s) => s.kind === 'mesh-control-plane');
+  ok(upStep?.status === 'already-present' && /running/.test(upStep?.detail || ''),
+     'a running control plane is REPORTED (already-present), not silently omitted');
+
+  const dryCp = await performBuildBootstrap(pCp, mCp, { dryRun: true, docker: dockerCp, provisionDb: makeProvision() });
+  ok(dryCp.status === 'planned'
+     && !dockerCp.calls.some((c) => c.includes('--profile mesh')),
+     'a DRY run issues no compose call for the control plane');
+
+  const dockerGo = makeDocker({ reachable: true, networks: new Set() });
+  const probeOk = async () => ({ ok: true, host: 'netbird-management', port: 443, verdict: 'ok' });
+  const perfCp = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerGo,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
+  const cpRes = perfCp.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(cpRes?.status === 'created', `the perform brings the control plane up [${cpRes?.status}]`);
+  const upCall = dockerGo.calls.find((c) => c.includes('--profile mesh'));
+  ok(upCall === `compose -f ${composeFile} --profile mesh up -d ${MESH_CONTROL_PLANE_SERVICES.join(' ')}`,
+     `compose is invoked with the three mesh services ONLY (never the queenzee's own) [${upCall}]`);
+  ok(/NETBIRD_API_TOKEN/.test(cpRes?.detail || '') && /NETBIRD_GATEWAY_SETUP_KEY/.test(cpRes?.detail || '')
+     && /No secret was minted or stored/.test(cpRes?.detail || ''),
+     'the receipt names the env a human must still set, and that no secret was minted');
+  const cpRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCp.action_id]);
+  ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
+     'the stand-up is RECORDED in the audit steps');
+
+  // Idempotence: the container now answers 'running' → already-present, no second compose up.
+  const dockerUp2 = makeDocker({ reachable: true, networks: new Set(),
+    runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });
+  const perfCp2 = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerUp2,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
+  const cpRes2 = perfCp2.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(cpRes2?.status === 'already-present' && !dockerUp2.calls.some((c) => c.includes('--profile mesh')),
+     `a second perform reports already-present and issues no compose [${cpRes2?.status}]`);
+
+  // A control plane that came up but does not answer its API is a FAILED step, not a green lie.
+  const dockerBad = makeDocker({ reachable: true, networks: new Set() });
+  const perfBad = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerBad,
+    provisionDb: makeProvision(), actor: 'tester@xell',
+    mesh: { probeApi: async () => ({ ok: false, host: 'netbird-management', port: 443, verdict: 'refused' }) } });
+  const badRes = perfBad.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(badRes?.status === 'failed' && /management API/.test(badRes?.detail || ''),
+     `an unanswering management API is reported failed [${badRes?.status}]`);
+
+  // compose failure surfaces its real stderr
+  const dockerFail = makeDocker({ reachable: true, networks: new Set(),
+    failCompose: 'Error response from daemon: all predefined address pools have been fully subnetted' });
+  const perfFailCp = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerFail,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
+  const failCpRes = perfFailCp.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(failCpRes?.status === 'failed' && /fully subnetted/.test(failCpRes?.stderr || ''),
+     `a compose failure surfaces its REAL stderr [${failCpRes?.stderr?.slice(0, 50)}…]`);
+
+  // a missing compose file is a named cannot (the install's path is unknowable from a cage/image)
+  config.meshComposeFile = path.join(cpDir, 'not-here.yml');
+  const perfNoFile = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: makeDocker({ networks: new Set() }),
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
+  const noFileRes = perfNoFile.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(noFileRes?.status === 'cannot' && /MESH_COMPOSE_FILE/.test(noFileRes?.detail || ''),
+     `a missing queenzee compose file names MESH_COMPOSE_FILE [${noFileRes?.detail?.slice(0, 60)}…]`);
+
+  // a CAGE has no docker: the whole action refuses legibly, and nothing is composed. That refusal
+  // is correct — the stand-up runs on a machine with docker, never inside a cxell.
+  const noDocker = async () => ({ unknown: true, reason: 'spawn docker ENOENT' });
+  const perfCage = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: noDocker,
+    provisionDb: makeProvision(), actor: 'caged@xell', mesh: { probeApi: probeOk } });
+  ok(perfCage.status === 'refused' && /ENOENT/.test(perfCage.reason || ''),
+     `a cage (no docker CLI) refuses the whole action legibly [${perfCage.reason?.slice(0, 60)}…]`);
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('TEST ERROR:', e);
@@ -453,6 +607,14 @@ try {
     }
     if (createdMachines.length) await q(`DELETE FROM machine WHERE id = ANY($1::uuid[])`, [createdMachines]).catch(() => {});
     fs.rmSync(repoDir, { recursive: true, force: true });
+    for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
+    // The control-plane section mutates process-wide config (compose path + operator secrets) to
+    // drive the generator; restore whatever the environment had so a later suite is unaffected.
+    if (savedSecrets) {
+      config.netbirdDatastoreEncryptionKey = savedSecrets.k;
+      config.netbirdRelayAuthSecret = savedSecrets.s;
+      config.meshComposeFile = savedSecrets.url;
+    }
   } catch (e) { console.error('CLEANUP ERROR:', e); }
   await pool.end();
 }
