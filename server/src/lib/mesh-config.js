@@ -451,11 +451,19 @@ export async function meshConfigFor(machineId) {
   const row = (await one(`SELECT * FROM mesh_config WHERE machine_id=$1`, [machineId])) || {};
   const resolved = resolveMeshConfig(row, envSnapshot());
   const hintOf = (f) => secretHint(f, row[f]);
+  const isHost = machine.docker_ctx === queenzeeHostCtx();
   return {
     machine_id: machineId,
     machine_key: machine.key,
     docker_ctx: machine.docker_ctx,
-    is_queenzee_host: machine.docker_ctx === queenzeeHostCtx(),
+    is_queenzee_host: isHost,
+    // The console's read-only flag (web/src/Mesh.jsx): the mesh-profile services live in the
+    // queenzee's OWN compose project, so a machine that is not the queenzee host has nothing to
+    // stand up and the panel says so instead of offering a form that cannot act. The SAME
+    // condition the stand-up plan uses to decide whether the step exists at all
+    // (lib/build-bootstrap.js: `machine.docker_ctx === queenzeeHostCtx()`), so the button and the
+    // form can never disagree.
+    editable: isHost,
     configured: Boolean(row.machine_id),
     // The console's switch and the honest "is it live" answer. A row can exist, be enabled, and
     // still not be applied when no writer has run yet in this process (there is no such state:

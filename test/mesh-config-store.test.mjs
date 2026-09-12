@@ -133,6 +133,24 @@ try {
     ok(read.is_queenzee_host === false, 'a machine that is not the queenzee host is marked as such');
   }
 
+  section('editable is the panel\'s read-only note, and the same fact the stand-up plan uses');
+  {
+    const offHost = await mc.meshConfigFor(machineId);
+    ok(offHost.editable === false,
+       'a machine that is not the queenzee host cannot stand the plane up — the panel says read-only');
+    // The mesh-profile services live in the queenzee's OWN compose project, so the ctx IS the
+    // answer. Flip it and back rather than inserting a second `default` machine, which would be
+    // visible to every other resolver for the length of the test.
+    await q(`UPDATE machine SET docker_ctx='default' WHERE id=$1`, [machineId]);
+    try {
+      const onHost = await mc.meshConfigFor(machineId);
+      ok(onHost.editable === true && onHost.is_queenzee_host === true,
+         'the queenzee host itself is editable — configure and stand up');
+    } finally {
+      await q(`UPDATE machine SET docker_ctx=$1 WHERE id=$2`, [machine.docker_ctx, machineId]);
+    }
+  }
+
   section('the console\'s own field name (management_url) round-trips as api_url');
   {
     const put = await putJSON(`${BASE}/machines/${machineId}/mesh-config`, { management_url: 'https://mgmt.console:443' });
