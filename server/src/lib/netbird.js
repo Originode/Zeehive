@@ -17,6 +17,14 @@
 // The management API token is queenzee config (env), never a row; a minted setup key is
 // returned ONCE to the caller (for injection into the joining agent's env) and never stored —
 // only its id rides on the row, for audit.
+//
+// PINNED API — NetBird management v0.78.1. This module is frozen against that release: its
+// request/response shapes were verified against a REAL management server (sqlite store, no IdP)
+// booted on loopback by test/netbird-live-api.test.mjs, and the compose defaults are pinned to the
+// same tag (docker-compose*.yml, docker/zeehive/README.md). Two drifts the live server caught are
+// recorded at their fix sites: the policy rule body (`ensurePolicy` — sources/destinations, a
+// required protocol, no ports on ALL) and NetBird's IP-suffixed peer DNS label (`meshFqdn`).
+// Bumping the release means re-running that live test, not editing this comment.
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { logline } from './logbus.js';
@@ -27,10 +35,30 @@ export function meshEnabled() {
   return Boolean(config.netbirdApiUrl && config.netbirdApiToken);
 }
 
-// The mesh hostname's fully-qualified form (<hostname>.<mesh-domain>) — what a resolver on the
-// mesh answers. PURE, so URL/DSN derivation is table-testable.
-export function meshFqdn(hostname) {
-  return hostname ? `${hostname}.${config.meshDomain}` : null;
+// The mesh hostname's fully-qualified form — what a resolver on the mesh answers. PURE, so
+// URL/DSN derivation is table-testable.
+//
+// DRIFT, verified against a REAL management server v0.78.1 (docs/netbird-mesh-plan.md §11):
+// NetBird does NOT answer `<hostname>.<dns-domain>`. `getPeerIPDNSLabel`
+// (management/server/peer.go) builds the peer's DNS label as
+// `<hostname>-<ipv4 octet 3>-<ipv4 octet 4>` (the 3rd/4th octets of the assigned mesh IP), and
+// the API's `dns_label` response field is that label + the domain — e.g. peer `e2e-probe-peer`
+// on 100.64.170.38 answered `e2e-probe-peer-170-38.netbird.selfhosted`. Pass the peer's mesh IP
+// to get the name the control plane actually publishes; with no IP the one-arg form is the
+// INTENDED name only (what the plan's manifest/DSN text spells), never a resolvable NetBird name.
+export function meshFqdn(hostname, ip = null) {
+  if (!hostname) return null;
+  const o = ipv4Octets(ip);
+  return o ? `${hostname}-${o[2]}-${o[3]}.${config.meshDomain}` : `${hostname}.${config.meshDomain}`;
+}
+
+// The four octets of a dotted-quad IPv4, or null for anything else (an IPv6 mesh address, a
+// missing/blank ip). NetBird's DNS-label rule is IPv4-only — a v6 peer gets NO dns_label.
+function ipv4Octets(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(ip ?? '').trim());
+  if (!m) return null;
+  const o = m.slice(1).map(Number);
+  return o.every((n) => n <= 255) ? o : null;
 }
 
 // ── the bounded adapter (injectable; the default speaks HTTP to the management API) ──────────────
@@ -86,10 +114,18 @@ export async function listPeers({ request = netbirdRequest } = {}) {
 }
 
 // The peer a hostname resolved to, or null when none — an absent peer is data, not a failure.
+// The API's `hostname` field is the authoritative one (the agent logs in with it and the
+// control plane echoes it verbatim), so that is the match. The dns_label fallbacks cover the
+// two real shapes: a caller that already holds the published FQDN, and a peer whose published
+// label is the IP-suffixed form of THIS hostname (meshFqdn(hostname, p.ip)) — a bare
+// `p.dns_label === hostname` never matches a real v0.78.1 server, whose labels always carry the
+// domain and the IP suffix (see meshFqdn above).
 export async function getPeerByHostname(hostname, { request = netbirdRequest } = {}) {
   const r = await listPeers({ request });
   if (!r.ok) return r;
-  const peer = r.peers.find((p) => p.hostname === hostname || p.dns_label === hostname) || null;
+  const peer = r.peers.find((p) => p.hostname === hostname
+    || p.dns_label === hostname
+    || (p.dns_label && p.dns_label === meshFqdn(hostname, p.ip))) || null;
   return { ok: true, peer };
 }
 
@@ -148,8 +184,16 @@ export async function listPolicies({ request = netbirdRequest } = {}) {
 // module owns the mapping. Never creates a BROAD prod grant — policyIsDefaultDenySafe refuses it
 // before a single control-plane call, so the "prod seal does not weaken" line is structural, not a
 // hope. Mesh disabled → a legible no-op, exactly like every other entry point here.
+//
+// DRIFT, verified against a REAL management server v0.78.1 (docs/netbird-mesh-plan.md §11): the
+// rule body this module originally sent (`source`/`destination`, no `protocol`) is refused 422
+// "specify either sources or source resources and destinations or destination resources". The
+// real PolicyRuleUpdate wants `sources`/`destinations`, a required `protocol` (all|tcp|udp|icmp|
+// netbird-ssh) and a required `enabled`; and ports are ILLEGAL on protocol `all`/`icmp` ("for ALL
+// or ICMP protocol ports is not allowed"). So the protocol is derived: a rule that names ports is
+// a tcp grant (every port grant this module makes is a db port), a portless rule is `all`.
 export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], ports = [],
-                                     description = null },
+                                     description = null, protocol = null },
                                    { request = netbirdRequest } = {}) {
   if (!meshEnabled()) return { ok: false, disabled: true, reason: 'mesh disabled' };
   if (!name || !sourceGroups.length || !destGroups.length) {
@@ -173,6 +217,8 @@ export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], p
     if (!rg.ok) return rg;
     dstIds.push(rg.id);
   }
+  const granted = ports.length ? ports.map(String) : [];
+  const ruleProtocol = protocol || (granted.length ? 'tcp' : 'all');
   const body = {
     name,
     description: description || `ZEEHIVE mesh policy '${name}' (docs/netbird-mesh-plan.md §3.5)`,
@@ -180,11 +226,16 @@ export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], p
     rules: [{
       name,
       description: description || null,
+      enabled: true,
       action: 'accept',
       bidirectional: false,
-      source: srcIds,
-      destination: dstIds,
-      ports: ports.length ? ports.map(String) : [],
+      protocol: ruleProtocol,
+      sources: srcIds,
+      destinations: dstIds,
+      // Omitted on a portless (protocol 'all') rule: the API refuses ports on ALL/ICMP, and an
+      // explicit [] would be the same shape the real server hands back for a full-protocol rule —
+      // either way the ONLY port lists this module ever posts are the narrow, named db grants.
+      ...(granted.length ? { ports: granted } : {}),
     }],
   };
   const r = await request('POST', '/api/policies', body);

@@ -78,6 +78,29 @@ try {
   section('meshFqdn (pure)');
   ok(nb.meshFqdn('wise-delta-a1b2') === `wise-delta-a1b2.${config.meshDomain}`, 'hostname + mesh domain');
   ok(nb.meshFqdn(null) === null, 'no hostname → null, never ".domain"');
+  // The REAL rule, read off peer.go getPeerIPDNSLabel and confirmed against a live v0.78.1 server
+  // (test/netbird-live-api.test.mjs): the published label carries octets 3 and 4 of the mesh IP.
+  ok(nb.meshFqdn('wise-delta-a1b2', '100.64.170.38') === `wise-delta-a1b2-170-38.${config.meshDomain}`,
+     'with the mesh IP, the real NetBird label form (<host>-<octet3>-<octet4>)');
+  ok(nb.meshFqdn('wise-delta-a1b2', 'fd00:4e42::1') === `wise-delta-a1b2.${config.meshDomain}`
+     && nb.meshFqdn('wise-delta-a1b2', 'not-an-ip') === `wise-delta-a1b2.${config.meshDomain}`,
+     'a v6/absent IP has no octet pair → the intended name, never a bogus suffix');
+
+  section('getPeerByHostname (real dns_label shape)');
+  const dnsApi = makeApi({ peers: [
+    // what a real server lists: hostname is the login name, dns_label carries the domain + suffix
+    { id: 'p-real', hostname: 'agent-1', ip: '100.64.170.38', dns_label: 'agent-1-170-38.netbird.selfhosted' },
+  ] });
+  const byHost = await nb.getPeerByHostname('agent-1', { request: dnsApi.request });
+  ok(byHost.ok && byHost.peer?.id === 'p-real', 'the authoritative `hostname` field matches');
+  const byFqdn = await nb.getPeerByHostname('agent-1-170-38.netbird.selfhosted', { request: dnsApi.request });
+  ok(byFqdn.ok && byFqdn.peer?.id === 'p-real', 'and a caller holding the published FQDN finds it too');
+  const fqdnOnly = makeApi({ peers: [
+    { id: 'p-suffix', hostname: '', ip: '100.64.170.38', dns_label: 'agent-1-170-38.netbird.selfhosted' },
+  ] });
+  const byDerived = await nb.getPeerByHostname('agent-1', { request: fqdnOnly.request });
+  ok(byDerived.ok && byDerived.peer?.id === 'p-suffix',
+     'a peer listed without a hostname is still found via meshFqdn(hostname, ip)');
 
   section('setup: project + xells');
   const proj = await one(

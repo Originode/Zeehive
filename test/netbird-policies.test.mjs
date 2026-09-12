@@ -11,7 +11,9 @@
 //   • mesh DISABLED → ensurePolicy / ensureProdBindMeshPolicy are legible no-ops (the standing
 //     invariant), and prodBindPolicyName is a pure slug → name mapping
 //   • ensurePolicy: idempotent find-by-name (no duplicate POSTs), group-name resolution via
-//     ensureGroup, POST body shape (rules with group ids + ports), verdict objects — never throws
+//     ensureGroup, POST body shape (rules with sources/destinations ids, a derived protocol, ports
+//     — the shape a REAL v0.78.1 server accepts; test/netbird-live-api.test.mjs proves it live),
+//     verdict objects — never throws
 //   • the BROAD prod grant is refused STRUCTURALLY: zero control-plane calls happen for a
 //     dest=prod + ports=['*'] policy
 //   • ensureProdBindMeshPolicy: the one flip a prod bind ensures — xells → prod:<dbPort> — and
@@ -112,8 +114,15 @@ ok(apiNew.state.groups.some((g) => g.name === 'xells') && apiNew.state.groups.so
 const post = apiNew.state.calls.find((c) => c.startsWith('POST /api/policies'));
 ok(!!post, 'the policy POST ran');
 const posted = apiNew.state.policies[0];
-ok(posted?.rules?.[0]?.source?.includes('g-1') && posted?.rules?.[0]?.destination?.includes('g-2'),
-   'the POST body carries group ids, not names');
+// The body shape is the one a REAL management server v0.78.1 accepts (test/netbird-live-api
+// .test.mjs proves it live): rule keys `sources`/`destinations` (not source/destination), a
+// required `protocol`, and a rule-level `enabled`. The original source/destination + no-protocol
+// body was refused 422 "specify either sources or source resources and destinations or
+// destination resources" — see docs/netbird-mesh-plan.md §11.
+ok(posted?.rules?.[0]?.sources?.includes('g-1') && posted?.rules?.[0]?.destinations?.includes('g-2'),
+   'the POST body carries group ids under sources/destinations, not names');
+ok(posted?.rules?.[0]?.protocol === 'tcp' && posted?.rules?.[0]?.enabled === true,
+   "a port grant is a tcp rule (protocol 'tcp') and is enabled — ports on 'all' are refused by the real API");
 ok(JSON.stringify(posted?.rules?.[0]?.ports) === JSON.stringify(['5432']),
    'the POST body grants the named port, narrow by construction');
 
@@ -144,8 +153,8 @@ const apiBind = makeApi();
 const bind = await ensureProdBindMeshPolicy('wise-delta-a1b2', { request: apiBind.request });
 ok(bind.ok && bind.created === true, 'a fresh prod bind ensures the narrow policy');
 const bindPolicy = apiBind.state.policies.find((p) => p.name === 'prod-db-for-wise-delta-a1b2');
-ok(bindPolicy?.rules?.[0]?.source?.some((_, i) => apiBind.state.groups[i]?.name === 'xells')
-   || JSON.stringify(bindPolicy?.rules?.[0]?.source) === JSON.stringify(['g-1']),
+ok(bindPolicy?.rules?.[0]?.sources?.some((_, i) => apiBind.state.groups[i]?.name === 'xells')
+   || JSON.stringify(bindPolicy?.rules?.[0]?.sources) === JSON.stringify(['g-1']),
    'the bind policy sources the xells group');
 ok(bindPolicy?.rules?.[0]?.ports?.length === 1 && bindPolicy.rules[0].ports[0] === '5432',
    'the grant is the single db port — narrow by construction');
