@@ -13,6 +13,7 @@ import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisi
          registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices, checkMachineConnection,
          getBuildReadiness, planBuildBootstrap, performBuildBootstrap } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
+import MeshPanel from './Mesh.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
 const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
@@ -274,6 +275,9 @@ function MachineHead({ m, projectId, poolingDead = false, readiness = null, read
           {devDbElsewhere ? '⚠ no dev db — provision' : '＋ dev db'}
         </button>
       )}
+      {/* The mesh panel (ticket #189): per-machine NetBird config + the human-gated control-plane
+          stand-up + the observe read. Opt-in behind 🌐 mesh, like 📱 devices above. */}
+      <MeshPanel m={m} projectId={projectId} onChanged={onChanged} />
     </div>
   );
 }

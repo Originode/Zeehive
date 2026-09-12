@@ -1079,6 +1079,43 @@ a.cbox:hover { border-color: var(--accent); }
 /* device host (035): the 📱 capability toggle + the actions panel under a can_device header */
 .mx-device.on { color: #6fe39a; }
 .mx-devpanel { margin-top: 5px; }
+/* the MESH panel (TKT-189): per-machine NetBird config + human-gated stand-up + observe */
+.mx-meshpanel { margin-top: 5px; }
+.mx-meshbtn { font-size: 10px; background: none; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 5px; padding: 1px 6px; cursor: pointer; }
+.mx-meshbtn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-meshsections { margin-top: 4px; display: flex; flex-direction: column; gap: 5px; border-left: 2px solid var(--line);
+  padding-left: 7px; }
+.mx-meshsec { font-size: 10.5px; }
+.mx-meshhead { color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-size: 9px; margin-bottom: 2px; }
+.mx-meshfield { display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+.mx-meshfield .k { color: var(--muted); flex: none; width: 116px; }
+.mx-meshfield input { flex: 1 1 auto; min-width: 0; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--text); border-radius: 4px; padding: 1px 4px; font-size: 10.5px; }
+.mx-meshfield input::placeholder { color: var(--muted); }
+.mx-meshgen, .mx-meshplan, .mx-meshsave, .mx-meshgo, .mx-meshrefresh {
+  background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 4px;
+  padding: 1px 5px; font-size: 10px; cursor: pointer; }
+.mx-meshgen:hover:not(:disabled), .mx-meshplan:hover:not(:disabled),
+.mx-meshsave:hover:not(:disabled), .mx-meshrefresh:hover:not(:disabled) { border-color: var(--accent); }
+.mx-meshgo { color: #ffb4a2; border-color: rgba(229,85,78,.5); }
+.mx-meshgo:hover:not(:disabled) { color: var(--text); border-color: var(--down); }
+.mx-meshrow { display: flex; align-items: center; gap: 6px; margin-top: 3px; flex-wrap: wrap; }
+.mx-meshhint, .mx-meshnote { color: var(--muted); font-size: 9.5px; }
+.mx-mesherr { color: #ffb4a2; font-size: 10px; margin-top: 2px; }
+.mx-meshstep { margin-top: 2px; }
+.mx-meshstep.planned b { color: #e0a53b; }
+.mx-meshstep.already-present b { color: var(--up); }
+.mx-meshstep.cannot b, .mx-meshstep.failed b { color: var(--down); }
+.mx-meshobs { display: flex; flex-direction: column; gap: 2px; }
+.mx-meshhealth.ok { color: var(--up); }
+.mx-meshhealth.down { color: var(--down); }
+.mx-meshpeers { color: var(--text); }
+.mx-meshtally-head { color: var(--muted); }
+.mx-meshtable { border-collapse: collapse; margin-top: 2px; }
+.mx-meshtable th, .mx-meshtable td { border: 1px solid var(--line); padding: 0 5px; font-size: 10px; text-align: right; }
+.mx-meshtable th:first-child, .mx-meshtable td:first-child { text-align: left; }
+.mx-meshbykind { display: flex; flex-wrap: wrap; gap: 7px; color: var(--muted); margin-top: 2px; }
 .mx-devbtn { font-size: 11px; background: rgba(53,196,107,.12); color: #9fe8bd;
   border: 1px solid rgba(53,196,107,.5); border-radius: 5px; padding: 2px 7px; cursor: pointer; }
 .mx-devbtn:hover:not(:disabled) { background: rgba(53,196,107,.25); }
