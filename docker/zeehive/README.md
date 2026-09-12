@@ -87,9 +87,21 @@ New Project → Clone from GitHub. Staged, each step reversible:
 control plane — `netbird-management`, `netbird-signal`, `netbird-relay`, `netbird-dashboard` —
 gated behind the **`mesh` compose profile**. That is a deliberate choice: an unscoped `up -d`
 boots the pre-mesh stack, and the mesh stays off until a human stands it up **and** points the
-queenzee at it. The compose files are only the definition; **live stand-up is a human's deploy,
-not something the queenzee does for you**, and it has not been verified in a cage — this section
-is the record of how to do it, and it will need adjusting to the NetBird tag you pin (see below).
+queenzee at it.
+
+**Standing the control plane up is now a step on the human-gated build-bootstrap card, not a raw
+shell op.** On the machine the queenzee runs on (`docker_ctx = 'default'`), the card's
+**`mesh-control-plane`** step (a) writes `netbird/management.json` from the shipped example using
+values from the queenzee's env, (b) runs `docker compose --profile mesh up -d netbird-management
+netbird-signal netbird-relay`, (c) health-checks the management API, and (d) tells you exactly which
+env **you** must still set by hand. It never mints or stores a secret: the datastore key and relay
+secret come only from your env, and the API token is NetBird's own token flow. From a cxell/cage the
+docker call refuses legibly — the stand-up runs on a machine with docker, never inside a cage.
+
+The compose files are the definition and the manual path below stays authoritative for
+`docker/zeehive/docker-compose.prod.yml` (the card drives the **bootstrap** compose,
+`docker-compose.bootstrap.yml`, by default). Live stand-up still has not been exercised against a
+running NetBird — this section will need adjusting to the NetBird tag you pin (see below).
 
 ### What it is, and why the datastore is a one-way door
 
@@ -110,9 +122,34 @@ is the record of how to do it, and it will need adjusting to the NetBird tag you
 
 ### Standing it up (one-time bootstrap)
 
-Both compose files already carry the services; the steps below are for a repo checkout driving
-`docker/zeehive/docker-compose.prod.yml`. A standalone bootstrap install works the same but the
-`netbird/management.json` path is relative to wherever you keep `docker-compose.bootstrap.yml`.
+**The automated path (recommended): the build-bootstrap card.** On the queenzee host, open the
+human-gated **infra** card (🔧 / `zee infra bootstrap`) and run the build bootstrap for the project
+on the `default` machine — or call the API (`POST /api/build-bootstrap/plan` then `.../perform`). The
+plan reports whether the control plane is up (`already-present`) or performable (`planned`); a dry
+run shows the step without touching docker. To let the card write the config, put these in the
+queenzee's env **before** the perform:
+
+```sh
+NETBIRD_DATASTORE_ENCRYPTION_KEY=<a real key you generate — the card never generates one>
+NETBIRD_RELAY_AUTH_SECRET=<a real relay secret you generate>
+NETBIRD_SIGNAL_URI=netbird-signal:80                 # optional; defaults are sensible
+NETBIRD_RELAY_ENDPOINT=relay://netbird-relay:33080   # optional
+MESH_COMPOSE_FILE=/path/to/docker-compose.bootstrap.yml  # only if not the repo's own file
+```
+
+The generated `netbird/management.json` is **gitignored on purpose** — it carries the datastore key
+and relay secret and must never ride into a landing. If the values are left at the template's
+`CHANGE-ME` placeholders the step refuses, naming both env vars, and writes nothing.
+
+After the perform, the step's receipt names the rest of the human work, which the card never does for
+you: **`NETBIRD_API_URL`** and **`NETBIRD_API_TOKEN`** (a token minted on the control plane via
+NetBird's own flow) to point the queenzee at it — see step 4 — and **`NETBIRD_GATEWAY_SETUP_KEY`**
+for the cage gateway — see §3.5 below. No secret is minted or stored by the step.
+
+**The manual path** (also what the card does, spelled out). Both compose files carry the services;
+the steps below are for a repo checkout driving `docker/zeehive/docker-compose.prod.yml`. A
+standalone bootstrap install works the same but the `netbird/management.json` path is relative to
+wherever you keep `docker-compose.bootstrap.yml`.
 
 1. **Pin the NetBird tags.** NetBird moves fast and its images' flag surface changes between
    releases (the consolidated port architecture landed around v0.29). Edit the four

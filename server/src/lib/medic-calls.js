@@ -11,7 +11,13 @@
 //   • ROUTING: if a LIVE medic is attending the project (status NOT retired/converged/errored) the
 //     call ATTACHES — linked to that medic (status 'attended') and the medic is resumed with the
 //     call verbatim + evidence in the background. If none is, the call RAISES: it becomes an entry in
-//     fleet.medic_emergency (source 'called') and a human dispatches. NOTHING auto-spawns a medic.
+//     fleet.medic_emergency (source 'called') and a human dispatches. NOTHING auto-spawns a medic —
+//     that is the DEFAULT, project-scoped, and unchanged.
+//   • OPERATOR POLICY (255): a project may opt IN to auto_dispatch_medic, and then a RAISED call is
+//     dispatched for it instead of parking for a human. The policy goes through the SAME seam a
+//     human's ⛑ click uses (dispatchMedicCall below) so it can never reach further than the click:
+//     same refusals, same no-live-medic re-dispatch rule, and it parks the call as OPEN on an
+//     API-only instance where the click is refused with 503. The calling zee is TOLD a policy did it.
 //   • ONE LIVE CALL PER XELL is the rate limit: a partial unique index keeps a single 'open'/
 //     'attended' row per xell, and a second call UPDATES that row instead of inserting.
 //   • THE PATIENT IS GONE when its xell retires: the call is WITHDRAWN with a stated reason
@@ -20,6 +26,7 @@
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { broadcast } from './events.js';
+import { config } from '../config.js';
 // The INFRA card marker, imported from proof-routing.js — the ONE source of truth for what a
 // provision fault card looks like. collectCallEvidence folds in ONLY cards carrying this marker;
 // the project_conditions list on a live project also carries general impediments (grok auth, an
@@ -158,6 +165,38 @@ function formatEvidence(evidence) {
   return arr.map((e, i) => `  ${i + 1}. [${e.trust}] ${e.label}: ${String(e.detail || '').slice(0, 300)}`);
 }
 
+// ── THE DISPATCH SEAM — ONE path for a human's ⛑ click AND the auto_dispatch_medic policy ────────
+// POST /medic-calls/:callId/dispatch (the console) and raiseMedicCall's policy branch both come
+// through HERE, so the refusals are identical and the policy cannot reach further than a click.
+// The caller maps a refusal's `status` onto its HTTP answer; the policy just leaves the call OPEN
+// for a human. Callers pass the row read by readMedicCall (it carries medic_status + xell_slug);
+// the policy branch (which holds the xell row, not a readMedicCall join) passes xellSlug instead,
+// so the medic's brief names the calling xell either way.
+export async function dispatchMedicCall(call, { by = 'human@console', xellSlug = null } = {}) {
+  if (!call) return { ok: false, refused: true, status: 404, reason: 'no such medic call' };
+  const medicLive = call.medic_status && MEDIC_LIVE_STATUSES.includes(call.medic_status);
+  if (call.status === 'attended' && medicLive) {
+    return { ok: false, refused: true, status: 400,
+             reason: 'this call is already attended — the medic is in the Bay' };
+  }
+  if (!['open', 'attended'].includes(call.status)) {
+    return { ok: false, refused: true, status: 400,
+             reason: `this call is ${call.status} — only an OPEN call (or an attended call whose `
+               + 'medic is no longer LIVE) can be dispatched' };
+  }
+  // An ATTENDED call whose medic is no longer LIVE is dispatchable again — a failed attach-resume
+  // leaves the call 'attended' against an errored medic, and that must not strand the emergency
+  // (SHOULD-5). The UPDATE below re-links the call to the fresh medic and keeps status 'attended'.
+  const { dispatchMedic } = await import('../queenzee/medic-spawn.js');
+  const task = buildCallDispatchBrief(call, xellSlug || call.xell_slug);
+  const out = await dispatchMedic({ targetProjectId: call.project_id, task });
+  const updated = await one(
+    `UPDATE medic_call SET medic_id=$2, status='attended', updated_at=now() WHERE id=$1 RETURNING *`,
+    [call.id, out.medic_id]);
+  broadcast('medic-call', updated);
+  return { ok: true, ...out, call_id: call.id, call: updated, dispatched_by: by };
+}
+
 // ── RAISE (or re-raise): the one routing decision ────────────────────────────────────────────────
 export async function raiseMedicCall({ xell, reason = null, kind = 'other', zeeId = null } = {}) {
   if (!xell?.id || !xell?.project_id) throw new Error('a medic call needs a xell');
@@ -221,6 +260,36 @@ export async function raiseMedicCall({ xell, reason = null, kind = 'other', zeeI
     [xell.project_id, xell.id, zid, k, why.slice(0, 20000), JSON.stringify(evidence)]);
   broadcast('medic-call', call);
   logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} RAISED/RE-RAISED (open)`);
+
+  // OPERATOR POLICY (255): the project opted IN to auto_dispatch_medic — dispatch the call through
+  // the SAME seam a human's click uses, instead of parking it for a human. The config guard is the
+  // lib-level mirror of the route's requireQueenzeeLoops: an API-only instance refuses the click, so
+  // the policy must not drive a spawn there either — the call parks OPEN, exactly as it does today.
+  const project = await one(`SELECT auto_dispatch_medic FROM project WHERE id=$1`, [xell.project_id]);
+  if (project?.auto_dispatch_medic) {
+    if (!config.queenzeeInproc) {
+      logline('medic-call', `${xell.slug}: auto_dispatch_medic is ON but this is an API-only instance `
+        + `(QUEENZEE_INPROC=false) — call ${String(call.id).slice(0, 8)} parks OPEN for a human`);
+    } else {
+      const out = await dispatchMedicCall(call, { by: 'auto-dispatch@policy', xellSlug: xell.slug });
+      if (out.ok) {
+        logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} AUTO-DISPATCHED `
+          + `to medic ${String(out.medic_id).slice(0, 8)} — auto_dispatch_medic policy (no human click)`);
+        return {
+          ok: true, routed: 'auto-dispatched', call_id: call.id, medic_id: out.medic_id,
+          evidence: evidence.length,
+          message: 'Your medic call is on record, and this project\'s auto_dispatch_medic policy '
+            + `dispatched a medic to it automatically (medic ${String(out.medic_id).slice(0, 8)}) — no `
+            + 'human click was needed. Watch the Medic Bay; its answer will arrive in your inbox. '
+            + adviceForEvidence(evidence),
+        };
+      }
+      // The seam refused (e.g. a concurrent raise already attended it) — fall through to the honest
+      // RAISED answer rather than claim a dispatch that did not happen.
+      logline('medic-call', `${xell.slug}: auto_dispatch_medic dispatch refused for call `
+        + `${String(call.id).slice(0, 8)} (${out.reason}) — parked OPEN for a human`);
+    }
+  }
   return {
     ok: true, routed: 'raised', call_id: call.id, evidence: evidence.length,
     message: 'Your medic call is on record. No live medic is attending this project, so it now shows '
