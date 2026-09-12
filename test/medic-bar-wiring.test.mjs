@@ -13,7 +13,9 @@
 //      ("main does not build since …"), the SAME rule as the ProjectSetup row button. Two copies of
 //      the rule drifting apart is exactly how the button reappears in one place and not the other;
 //   3. the ⛑ button's styles exist (an unstyled button on the one line that cannot scroll is a
-//      button nobody sees as one).
+//      button nobody sees as one);
+//   4. the auto_dispatch_medic toggle (255) exists in the console AND its dispatch path is the SAME
+//      seam the button drives — a policy on a parallel path is the thing that card forbids.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -137,6 +139,14 @@ ok(/router\.post\('\/medic-calls\/:callId\/dismiss'/.test(routesSrc)
 ok(/export function fingerprintMedicText/.test(dismissLib)
    && /ON CONFLICT \(project_id, target_kind, target_id, fingerprint\)/.test(dismissLib),
    'medic-dismissals.js fingerprints the shown text and upserts per target (no timers — the fingerprint IS the expiry)');
+
+console.log('\n── the auto_dispatch_medic policy (255): console toggle + ONE dispatch seam ──');
+ok(/field="auto_dispatch_medic"/.test(app) && /label="medics"/.test(app),
+   'App.jsx renders the auto_dispatch_medic switch beside the other auto-* policies');
+ok(/field === 'auto_dispatch_medic'[\s\S]{0,400}showConfirm/.test(app),
+   'enabling it asks for confirmation — it dispatches with no human click (the same treatment ships/seeds/done get)');
+ok(/dispatchMedicCall\(call/.test(routesSrc),
+   'the console dispatch route drives the SHARED dispatchMedicCall seam (the policy cannot take a parallel path)');
 
 console.log(fail ? `\n${fail} FAILURE(S)\n` : '\nall good\n');
 process.exit(fail ? 1 : 0);
