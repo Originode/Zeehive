@@ -30,6 +30,11 @@ import { config } from '../config.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
 import { sharedDevDb, provisionDevDb, queenzeeHostCtx } from './machines.js';
 import { meshEnabled, mintPeer, netbirdRequest, probeManagementApi } from './netbird.js';
+// The container name lives with the store path it guards (netbird-bootstrap.js owns both halves of
+// the same fact); re-exported here because this module's step and its tests have always named it.
+import { MESH_CONTROL_PLANE_CONTAINER, bootstrapFirstPat } from './netbird-bootstrap.js';
+import { applyMeshConfig, composeEnvFor, meshResolvedForPerformer, recordBootstrappedPat } from './mesh-config.js';
+export { MESH_CONTROL_PLANE_CONTAINER };
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 
@@ -86,25 +91,39 @@ export async function hostProdDisclosure(machine, project, createNames = []) {
 // hand-write netbird/management.json, set NETBIRD_API_URL/TOKEN/NETBIRD_GATEWAY_SETUP_KEY, back up
 // the datastore. It is now a STEP on this same human-gated bootstrap card: the queenzee performs it
 // on its OWN docker context (the machine it runs on — where the control plane's compose project
-// lives), writes management.json from the shipped example, brings up ONLY the three control-plane
-// services, health-checks the management API, and names the env the operator still sets by hand.
+// lives), renders management.json from the values the human saved in the console (or the operator's
+// env — lib/mesh-config.js resolves store-over-env), brings up ONLY the three control-plane
+// services, health-checks the management API, and then bootstraps the FIRST API token into the
+// pinned store so the queenzee can actually talk to the plane it just created.
 //
 // Two lines this step never crosses:
-//   • It never invents or stores a secret. The management API token is minted through NetBird's own
-//     flow by a human; the two management.json secrets are taken from the operator's env or left as
-//     placeholders, and a placeholder REFUSES the stand-up rather than starting NetBird on a known
-//     example secret.
+//   • It never INVENTs a secret. The datastore key and relay secret come from the mesh config (a
+//     human's console click may have minted them — that is the human act) or the operator's env; a
+//     placeholder REFUSES the stand-up rather than starting NetBird on a known example secret. The
+//     one credential this step does create, the first PAT, is minted by 0.78.1's own store format
+//     under the version pin (lib/netbird-bootstrap.js) and stored write-only in the mesh config.
 //   • It never touches the queenzee's own containers: compose is invoked with the three mesh service
 //     names, so the server/webapp/meta-db are not in the command at all.
 // NOT gated on meshEnabled(): NETBIRD_API_URL/TOKEN are set AFTER stand-up (they point the queenzee
 // AT the plane), so gating on them would make the step that creates the control plane require the
 // control plane. The only gate is that this machine IS the queenzee's host.
-export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
 // The control plane only — NOT mesh-gateway (needs a human-minted setup key) and NOT the dashboard
 // (needs an OIDC provider). Both would crash-loop with an empty key/OIDC and make a good stand-up
-// look failed; the operator brings them up once the env below exists.
+// look failed; the operator brings them up once the gateway key below exists.
 export const MESH_CONTROL_PLANE_SERVICES = ['netbird-management', 'netbird-signal', 'netbird-relay'];
 const PLACEHOLDER_SECRET = /CHANGE-ME/i;
+
+// The overrides the shipped example is rendered with: the resolved mesh config, which is the
+// console's row over the operator's env (lib/mesh-config.js). Read from `config` because
+// applyMeshConfig has already folded the row in — the stand-up does not need a second lookup.
+function managementJsonOverrides() {
+  return {
+    signalUri: config.netbirdSignalUri,
+    relayAddress: config.netbirdRelayEndpoint,
+    relaySecret: config.netbirdRelayAuthSecret,
+    datastoreEncryptionKey: config.netbirdDatastoreEncryptionKey,
+  };
+}
 
 // PURE: substitute the values ZEEHIVE knows into the shipped example and NOTHING else. The two
 // secret fields are only ever taken from the operator's env — this function never generates key
@@ -125,28 +144,59 @@ export function renderManagementJson(templateText, overrides = {}) {
 export function managementJsonMissingSecrets(doc) {
   const missing = [];
   if (PLACEHOLDER_SECRET.test(String(doc?.DataStoreEncryptionKey || ''))) {
-    missing.push('DataStoreEncryptionKey (set NETBIRD_DATASTORE_ENCRYPTION_KEY)');
+    missing.push('DataStoreEncryptionKey (set it in the console\'s mesh config, or NETBIRD_DATASTORE_ENCRYPTION_KEY)');
   }
   if (PLACEHOLDER_SECRET.test(String(doc?.Relay?.Secret || ''))) {
-    missing.push('Relay.Secret (set NETBIRD_RELAY_AUTH_SECRET)');
+    missing.push('Relay.Secret (set it in the console\'s mesh config, or NETBIRD_RELAY_AUTH_SECRET)');
   }
   return missing;
 }
 
+// PURE: the overrides that may REPLACE a placeholder in an existing file — and only a placeholder.
+// A value an operator put there themselves is never a candidate, which is the line that makes
+// "fill the example's CHANGE-ME" and "never overwrite the operator's secret" the same rule.
+export function placeholderFill(doc, overrides = {}) {
+  const fill = {};
+  if (overrides.datastoreEncryptionKey && PLACEHOLDER_SECRET.test(String(doc?.DataStoreEncryptionKey || ''))) {
+    fill.datastoreEncryptionKey = overrides.datastoreEncryptionKey;
+  }
+  if (overrides.relaySecret && PLACEHOLDER_SECRET.test(String(doc?.Relay?.Secret || ''))) {
+    fill.relaySecret = overrides.relaySecret;
+  }
+  return fill;
+}
+
 // Materialize <composeDir>/netbird/management.json (the path the compose files bind-mount) from the
-// shipped example, idempotently: an operator's own file is NEVER overwritten, it is only checked for
-// placeholders. Returns { file, written } or { error } — never throws for an outcome.
-export function ensureManagementJson(composeFile, { repoRoot = config.repoRoot } = {}) {
+// shipped example, idempotently. Returns { file, written, filled? } or { error } — never throws for
+// an outcome.
+//
+// An operator's own file is never OVERWRITTEN: a value they set is left exactly as it is. The one
+// write this makes to an existing file is filling a still-placeholder secret with a value the mesh
+// config actually has — refusing to do that would leave "paste it in the console" unable to finish
+// the job it was clicked for, and hand-editing the file as the only way out.
+export function ensureManagementJson(composeFile, { repoRoot = config.repoRoot, overrides = managementJsonOverrides() } = {}) {
   const dir = dirname(composeFile);
   const file = join(dir, 'netbird', 'management.json');
   if (existsSync(file)) {
     try {
-      const missing = managementJsonMissingSecrets(JSON.parse(readFileSync(file, 'utf8')));
-      if (missing.length) {
+      const text = readFileSync(file, 'utf8');
+      const doc = JSON.parse(text);
+      const missing = managementJsonMissingSecrets(doc);
+      if (!missing.length) return { file, written: false };
+      const fill = placeholderFill(doc, overrides);
+      if (!Object.keys(fill).length) {
         return { error: `netbird/management.json at '${file}' still carries placeholder secret(s): `
-          + `${missing.join(', ')} — fill them in and re-run. ZEEHIVE never invents or stores a secret.` };
+          + `${missing.join(', ')} — set them in the console's mesh config (or the queenzee's env) and `
+          + `re-run the stand-up, or fill them in by hand. ZEEHIVE never invents or stores a secret.` };
       }
-      return { file, written: false };
+      const rendered = renderManagementJson(text, fill);
+      const still = managementJsonMissingSecrets(JSON.parse(rendered));
+      if (still.length) {
+        return { error: `netbird/management.json at '${file}' still needs ${still.join(', ')} — set `
+          + `them in the console's mesh config (or the queenzee's env) and re-run the stand-up.` };
+      }
+      writeFileSync(file, rendered);
+      return { file, written: true, filled: true };
     } catch (e) {
       return { error: `netbird/management.json at '${file}' is not readable JSON (${e.message})` };
     }
@@ -159,16 +209,12 @@ export function ensureManagementJson(composeFile, { repoRoot = config.repoRoot }
       + `from — point MESH_COMPOSE_FILE at the install's compose file (which sits beside its netbird/ `
       + `directory), or copy docker/zeehive/netbird/management.json.example to '${file}' and fill it in.` };
   }
-  const rendered = renderManagementJson(readFileSync(example, 'utf8'), {
-    signalUri: config.netbirdSignalUri,
-    relayAddress: config.netbirdRelayEndpoint,
-    relaySecret: config.netbirdRelayAuthSecret,
-    datastoreEncryptionKey: config.netbirdDatastoreEncryptionKey,
-  });
+  const rendered = renderManagementJson(readFileSync(example, 'utf8'), overrides);
   const missing = managementJsonMissingSecrets(JSON.parse(rendered));
   if (missing.length) {
     return { error: `the control plane's management config still needs ${missing.join(', ')} before `
-      + `it can start — set those on the queenzee's install and re-run. No secret was invented or written.` };
+      + `it can start — set them in the console's mesh config (or the queenzee's env) and re-run. `
+      + `No secret was invented or written.` };
   }
   try {
     mkdirSync(dirname(file), { recursive: true });
@@ -179,11 +225,11 @@ export function ensureManagementJson(composeFile, { repoRoot = config.repoRoot }
   return { file, written: true };
 }
 
-// The env a human still sets AFTER the services are up. NETBIRD_API_TOKEN is minted on the control
-// plane through NetBird's own flow and handed to the queenzee's env by a human — this step never
-// mints or stores it. NETBIRD_GATEWAY_SETUP_KEY is a one-off key for the mesh-gateway peer; the
-// queenzee's own env does not carry it (the gateway container reads the install .env), so it is
-// always named rather than probed.
+// What a human still has to provide AFTER the services are up. The mesh config (console) or the
+// operator env may already carry the first two — NETBIRD_API_URL/TOKEN are resolved from both by
+// lib/mesh-config.js, and the first PAT is bootstrapped by this step when neither has one.
+// NETBIRD_GATEWAY_SETUP_KEY is a one-off key for the mesh-gateway peer; the queenzee's own env does
+// not carry it (the gateway container reads the install .env), so it is always named, not probed.
 function meshOperatorEnv() {
   const missing = [];
   const already = [];
@@ -444,9 +490,9 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
 
   if (step.kind === 'mesh-control-plane') {
     // The stand-up (§3.1). Idempotent at every stage: an already-running management container skips
-    // compose, an existing management.json is checked but never overwritten, and a second perform
-    // after a successful one reports already-present. A refused secret, a missing compose file or an
-    // unreachable daemon is a NAMED cannot — never a half-started control plane.
+    // compose, an existing management.json has only its placeholders filled (never an operator's own
+    // value), and a second perform after a successful one reports already-present. A refused secret,
+    // a missing compose file or an unreachable daemon is a NAMED cannot — never a half-started plane.
     const file = config.meshComposeFile;
     if (!file || !existsSync(file)) {
       return { status: 'cannot',
@@ -455,6 +501,15 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
                  + `lives in the queenzee's own compose project, on the queenzee's own docker context.`,
                stderr: null };
     }
+    // THE CONSOLE'S VALUES for THIS machine, with the secrets (the one reader that must have them —
+    // the API layer never calls this). Everything the step does below is stated in terms of these,
+    // so the console is the source of truth and the env is only the fallback.
+    const performer = await meshResolvedForPerformer(machine.id);
+    const values = performer.values;
+    const mjOverrides = {
+      signalUri: values.signal_uri, relayAddress: values.relay_endpoint,
+      relaySecret: values.relay_auth_secret, datastoreEncryptionKey: values.datastore_encryption_key,
+    };
     const insp = await docker(machine.docker_ctx,
       ['inspect', MESH_CONTROL_PLANE_CONTAINER, '--format', '{{.State.Status}}']);
     if (insp.unknown) {
@@ -465,10 +520,13 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
     const running = insp.status === 0 && /running/i.test((insp.stdout || '').trim());
     let started = false;
     if (!running) {
-      const mj = ensureManagementJson(file);
+      const mj = ensureManagementJson(file, { overrides: mjOverrides });
       if (mj.error) return { status: 'cannot', detail: mj.error, stderr: null };
+      // The ports/domain/secrets ride as ENV on the compose child, never as argv: they are what the
+      // containers are created with, and the install's .env stops being the only place they live.
       const up = await docker(machine.docker_ctx,
-        ['compose', '-f', file, '--profile', 'mesh', 'up', '-d', ...MESH_CONTROL_PLANE_SERVICES]);
+        ['compose', '-f', file, '--profile', 'mesh', 'up', '-d', ...MESH_CONTROL_PLANE_SERVICES],
+        { env: composeEnvFor(values) });
       if (up.unknown) {
         return { status: 'failed',
                  detail: `could not run compose on '${machine.docker_ctx}': ${up.reason}`, stderr: null };
@@ -483,20 +541,55 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
     // Health-check the management API (bounded dial + retry; injected for tests, same seam as the
     // netbird request adapter the machine-peer step takes).
     const hc = await (mesh.probeApi || probeManagementApi)({});
-    const { missing, already } = meshOperatorEnv();
-    const envLine = `by hand on the queenzee: ${missing.join(', ')}`
-      + (already.length ? ` (already set: ${already.join(', ')})` : '');
     if (!hc.ok) {
+      const { missing, already } = meshOperatorEnv();
+      const envLine = `by hand on the queenzee: ${missing.join(', ')}`
+        + (already.length ? ` (already set: ${already.join(', ')})` : '');
       return { status: 'failed',
                detail: `the control plane containers ${started ? 'started' : 'are running'} from '${file}' but `
                  + `the management API at ${hc.host}:${hc.port} is not answering `
                  + `(${hc.verdict || hc.reason}) — check the service logs; then set ${envLine}.`,
                stderr: null };
     }
+    // THE FIRST PAT (§3.1 / §11): a ManagerType-none plane has no supported way to create its first
+    // account, so with no token anywhere this bootstraps it into the pinned store and records it in
+    // the mesh config. Only when NO token exists — an operator's env token is never overwritten.
+    let patNote = null;
+    let warning = null;
+    if (!config.netbirdApiToken) {
+      const boot = await (mesh.bootstrapPat || bootstrapFirstPat)({
+        docker, ctx: machine.docker_ctx, dataKey: values.datastore_encryption_key,
+        probe: mesh.probeApi || probeManagementApi,
+        ...(mesh.storeDir ? { storeDir: mesh.storeDir } : {}),
+        ...(mesh.openStore ? { openStore: mesh.openStore } : {}),
+      });
+      if (boot.ok) {
+        const cfg = await recordBootstrappedPat(machine.id, boot.token, { values: performer.values });
+        await applyMeshConfig({ machineId: machine.id });
+        patNote = `The first API token was bootstrapped into the control plane (v${boot.version}) and `
+          + `stored write-only in this machine's mesh config (hint ${cfg.secrets.api_token.hint}) — the `
+          + `queenzee now reaches the plane without a hand-set env token.`;
+      } else if (boot.alreadyPresent || boot.refused) {
+        warning = `the first API token was NOT bootstrapped: ${boot.reason}`;
+      } else {
+        warning = `the first API token could not be bootstrapped: ${boot.reason}`;
+      }
+    }
+    const { missing, already } = meshOperatorEnv();
+    const envLine = missing.length
+      ? `Still set by hand on the queenzee: ${missing.join(', ')}`
+        + (already.length ? ` (already set: ${already.join(', ')})` : '')
+      : `Nothing left by hand (already set: ${already.join(', ')})`;
+    const secretLine = patNote
+      ? patNote
+      : `No secret was minted or stored by this step — the datastore key and relay secret come from `
+        + `the mesh config (console or env), and the first PAT is bootstrapped here when none exists.`;
     return { status: started ? 'created' : 'already-present',
+             ...(warning ? { warning } : {}),
              detail: `control plane ${started ? 'brought up' : 'already running'} on '${machine.docker_ctx}' `
                + `(${MESH_CONTROL_PLANE_SERVICES.join(', ')}) — the management API answered at `
-               + `${hc.host}:${hc.port}. Set ${envLine}. No secret was minted or stored by this step.`,
+               + `${hc.host}:${hc.port}. ${envLine} ${secretLine}`
+               + (warning ? ` ${warning}` : ''),
              stderr: null };
   }
 

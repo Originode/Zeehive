@@ -33,6 +33,8 @@ import { listMachines, createMachine, updateMachine, deleteMachine, provisionDev
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
 import { buildReadinessForProject, recordedBuildReadinessForProject, recordBuildReadinessProbe } from '../lib/build-readiness.js';
 import { performBuildBootstrap } from '../lib/build-bootstrap.js';
+import { meshConfigFor, setMeshConfig } from '../lib/mesh-config.js';
+import { meshStatusFor } from '../lib/mesh-status.js';
 import {
   requireInfra, infraReadiness, infraProof, infraBootstrapPlan, infraBootstrap,
   infraSettings, infraPropose, decideInfraRequest, buildMedicDispatchBrief, selfProjectId,
@@ -1756,6 +1758,37 @@ router.delete('/machines/:id', async (req, res) => {
 router.get('/machines/:id/check', async (req, res) => {
   try { res.json(await checkMachineConnection(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// ── the mesh, configured from the console (docs/netbird-mesh-plan.md §3.1; migration 259) ────
+// The contract the console builds against, and the one this API keeps: FIELDS IN, HINTS OUT.
+//   GET  → the row's non-secret values, a { set, hint } per secret, and `resolved` — what the
+//          queenzee would ACTUALLY use right now (the row over the operator's env over the shipped
+//          defaults, lib/mesh-config.js). No GET ever returns a secret.
+//   PUT  → a flat patch of the fields below (plus `by` for the audit line). Omitted = leave as is;
+//          null = clear (secrets and api_url/signal_uri/relay_endpoint); the literal "generate" =
+//          mint server-side (datastore_encryption_key, relay_auth_secret ONLY — the other two
+//          credentials are issued by the control plane). A validation failure is a 400 that NAMES
+//          the field; an unknown field is refused by name rather than dropped.
+// The row is per machine, so the form on the queenzee-host machine's card is the one that drives
+// the stand-up (build-bootstrap's mesh-control-plane step reads it).
+router.get('/machines/:id/mesh-config', async (req, res) => {
+  try { res.json(await meshConfigFor(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.put('/machines/:id/mesh-config', async (req, res) => {
+  try {
+    const { by, ...patch } = req.body || {};
+    res.json(await setMeshConfig(req.params.id, patch, { actor: by || 'human@console' }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// One machine's mesh, as a status page: the management API probe (bounded), the mesh_peer counts by
+// status, and the route-source tally summary (lib/mesh-status.js). Read-only; owns no verb.
+router.get('/machines/:id/mesh-status', async (req, res) => {
+  try {
+    const machine = await one(`SELECT id, key, docker_ctx FROM machine WHERE id=$1`, [req.params.id]);
+    if (!machine) return res.status(404).json({ error: 'machine not found' });
+    res.json(await meshStatusFor(machine, { url: req.query.url || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Per-project pool size on a machine (machine_pool) — the matrix pool knob writes here.
 router.put('/machines/:id/pool', async (req, res) => {
