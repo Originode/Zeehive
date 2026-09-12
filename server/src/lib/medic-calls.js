@@ -159,8 +159,10 @@ function formatEvidence(evidence) {
 // POST /medic-calls/:callId/dispatch (the console) and raiseMedicCall's policy branch both come
 // through HERE, so the refusals are identical and the policy cannot reach further than a click.
 // The caller maps a refusal's `status` onto its HTTP answer; the policy just leaves the call OPEN
-// for a human. Callers pass the row read by readMedicCall (it carries medic_status + xell_slug).
-export async function dispatchMedicCall(call, { by = 'human@console' } = {}) {
+// for a human. Callers pass the row read by readMedicCall (it carries medic_status + xell_slug);
+// the policy branch (which holds the xell row, not a readMedicCall join) passes xellSlug instead,
+// so the medic's brief names the calling xell either way.
+export async function dispatchMedicCall(call, { by = 'human@console', xellSlug = null } = {}) {
   if (!call) return { ok: false, refused: true, status: 404, reason: 'no such medic call' };
   const medicLive = call.medic_status && MEDIC_LIVE_STATUSES.includes(call.medic_status);
   if (call.status === 'attended' && medicLive) {
@@ -176,7 +178,7 @@ export async function dispatchMedicCall(call, { by = 'human@console' } = {}) {
   // leaves the call 'attended' against an errored medic, and that must not strand the emergency
   // (SHOULD-5). The UPDATE below re-links the call to the fresh medic and keeps status 'attended'.
   const { dispatchMedic } = await import('../queenzee/medic-spawn.js');
-  const task = buildCallDispatchBrief(call, call.xell_slug);
+  const task = buildCallDispatchBrief(call, xellSlug || call.xell_slug);
   const out = await dispatchMedic({ targetProjectId: call.project_id, task });
   const updated = await one(
     `UPDATE medic_call SET medic_id=$2, status='attended', updated_at=now() WHERE id=$1 RETURNING *`,
@@ -259,7 +261,7 @@ export async function raiseMedicCall({ xell, reason = null, kind = 'other', zeeI
       logline('medic-call', `${xell.slug}: auto_dispatch_medic is ON but this is an API-only instance `
         + `(QUEENZEE_INPROC=false) — call ${String(call.id).slice(0, 8)} parks OPEN for a human`);
     } else {
-      const out = await dispatchMedicCall(call, { by: 'auto-dispatch@policy' });
+      const out = await dispatchMedicCall(call, { by: 'auto-dispatch@policy', xellSlug: xell.slug });
       if (out.ok) {
         logline('medic-call', `${xell.slug}: medic call ${String(call.id).slice(0, 8)} AUTO-DISPATCHED `
           + `to medic ${String(out.medic_id).slice(0, 8)} — auto_dispatch_medic policy (no human click)`);

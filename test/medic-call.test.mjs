@@ -22,7 +22,9 @@
 //      parks OPEN for a human, exactly as today; ON a raise with no live medic is dispatched through
 //      the SAME seam the human click uses (dispatchMedicCall → 'attended' + a medic briefed from the
 //      call) and the calling zee is TOLD a policy did it. And the policy never overrides ATTACH: a
-//      live medic still takes the call rather than the policy dispatching a second one.
+//      live medic still takes the call rather than the policy dispatching a second one. It also
+//      does not reach where a click cannot: on an API-only instance (QUEENZEE_INPROC=false, where
+//      the dispatch route is refused 503) the call parks OPEN rather than spawning without the lock.
 process.env.MEDICRW_MODE = 'real';
 // The dispatch route is gated by requireQueenzeeLoops — only the process holding the single-queenzee
 // lock drives a spawn. config.js loads .zeehive.env at import (an API-only cxell projects
@@ -338,6 +340,8 @@ try {
   ok(onMedic?.target_project_id === onProject.id, 'the dispatched medic targets the CALLING project');
   ok(/flag on — dispatch me now/.test(onMedic?.brief || ''),
      'the medic was briefed FROM THE CALL (the zee\'s own words are in the brief)');
+  ok((onMedic?.brief || '').includes(onXell.slug),
+     'the brief NAMES the calling xell (the same brief a human click produces)');
   ok(onMedic?.condition_id === null,
      'the dispatch is call-driven, not condition-driven (no condition was invented)');
 
@@ -350,6 +354,26 @@ try {
                                           kind: 'db', zeeId: null });
   ok(attRaise.routed === 'attached' && attRaise.medic_id === attMedic.id,
      'with the flag ON and a LIVE medic attending, the raise still ATTACHES (the policy only fills the gap a human would have filled)');
+
+  console.log('\n── API-only instance: the policy parks, because the click is refused there ──');
+  const apiProject = { id: await insProject(`mc-api-p-${tag}`) };
+  const apiXell = await insXell(apiProject.id, `mc-api-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [apiProject.id]);
+  const { config } = await import('../server/src/config.js');
+  const wasInproc = config.queenzeeInproc;
+  const apiMedicsBefore = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  let apiRaise;
+  try {
+    config.queenzeeInproc = false;   // the route's requireQueenzeeLoops refuses this instance
+    apiRaise = await raiseMedicCall({ xell: apiXell, reason: 'api-only must not drive a spawn',
+                                      kind: 'db', zeeId: null });
+  } finally { config.queenzeeInproc = wasInproc; }
+  ok(apiRaise.routed === 'raised', `an API-only instance parks the call (got ${apiRaise.routed})`);
+  const apiCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [apiRaise.call_id]);
+  ok(apiCall.status === 'open' && apiCall.medic_id === null,
+     'the call stays OPEN — the policy does not spawn where the ⛑ click would get a 503');
+  ok((await one(`SELECT count(*)::int AS n FROM medic`)).n === apiMedicsBefore,
+     'no medic row was created on the API-only instance');
 
   // ── 8. the ROUTES over real HTTP (a fresh project with NO live medic) ──────
   console.log('\n── the routes: zee medic (token-scoped), console list + dispatch (real HTTP) ──');
