@@ -52,6 +52,7 @@ import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
 import { ContainerMenu, isBusy } from './Container.jsx';
 import MachineMatrix from './Machines.jsx';
+import MeshStatusChip from './MeshStatus.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 // a zee's badge: the AI PROVIDER's coin, wearing its harness (the honeycomb draws the same thing)
 import FleetPause from './FleetPause.jsx';
@@ -249,6 +250,10 @@ export default function App() {
   const [diffs, setDiffs] = useState({});
   const [dismissed, setDismissed] = useState({});
   const [logs, setLogs] = useState([]);
+  // { key, n } — the status line's mesh chip was clicked: open and scroll to THAT machine's Mesh
+  // panel. The nonce (n) rises on every click so a second click re-lands, and it is threaded
+  // through MachineMatrix → MachineHead → MeshPanel (a plain boolean would only work once).
+  const [meshFocus, setMeshFocus] = useState(null);
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   // Queenzee↔xell activity events from the SSE stream — the honeycomb's animated lines. Each new
@@ -1864,6 +1869,17 @@ export default function App() {
             </span>
           );
         })()}
+        {/* MESH CONTROL PLANE — is the routing substrate up? Sits beside the gateway chip because
+            it is the other half of the same question ("is our own infrastructure answering?"), and
+            it is ALWAYS rendered: the point of the card is that a human must not have to already
+            suspect the mesh to learn it is gone. Mesh DOWN is an outage (the fleet falls back to
+            legacy ports) and renders as a loud danger pill; not-set-up is a quiet neutral chip; up
+            is a calm green chip; a read that failed says so muted rather than crying wolf
+            (MeshStatus.jsx / meshStatus.js). Click-through opens the queenzee-host machine's Mesh
+            panel — the surface that configures and stands the plane up. */}
+        <MeshStatusChip machines={fleet.machines}
+                        onOpenMesh={(key) => setMeshFocus((f) => ({ key, n: (f?.n || 0) + 1 }))} />
+
         {/* FLEET-CUMULATIVE BURN — spend only (tokens + $). Remaining provider quotas are the
             SEPARATE "limits" chip below — deliberately not mixed, so the two questions stay clear. */}
         {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0
@@ -2031,7 +2047,7 @@ export default function App() {
                      projectId={projectId || project.id}
                      spinoffIsProcess={(project.manifest?.roles?.server?.runner
                        || project.manifest?.tiers?.spinoff?.runner) === 'process'}
-                     onMenu={openMenu} onChanged={refresh} />
+                     onMenu={openMenu} onChanged={refresh} meshFocus={meshFocus} />
 
       {/* The decision UI (held landing / open PR, with Approve/Reject) now renders INLINE under the
           "waiting on you" bar when its chip is clicked — next to nothing else, and the flower on the

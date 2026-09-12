@@ -20,7 +20,8 @@ const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
 
 const fail = (what) => (e) => showAlert(`${what} failed: ${e?.error || e?.message || e}`, { variant: 'error' });
 
-export default function MachineMatrix({ machines, containers, projectId, spinoffIsProcess, onMenu, onChanged }) {
+export default function MachineMatrix({ machines, containers, projectId, spinoffIsProcess, onMenu, onChanged,
+                                        meshFocus = null }) {
   const ms = machines || [];
   // The device row is opt-in: shown only when this project actually uses devices (a device chip
   // exists, or a machine is marked can_device), so ordinary projects keep a 4-row matrix.
@@ -119,6 +120,9 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
                        hasDevDb={all.some((c) => devDb(c) && c.docker_ctx === col.m.docker_ctx)}
                        devDbElsewhere={all.some(devDb)}
                        empty={!all.some((c) => ctxOf(c) === col.m.docker_ctx)}
+                       // The status line's mesh chip clicked through to THIS column: pass its
+                       // nonce down so the panel below opens and scrolls into view.
+                       meshFocus={meshFocus && meshFocus.key === col.m.key ? meshFocus.n : null}
                        onChanged={onChanged} />
         : <div key={`col-${i}`} className="mx-head elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">elsewhere</div>;
       })}
@@ -143,7 +147,7 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
 // A machine's header: identity + the policy knobs, edited in place. Numbers commit on blur/Enter;
 // every change PATCHes and refreshes, so what you read is always the server's truth.
 function MachineHead({ m, projectId, poolingDead = false, readiness = null, readinessBusy = false,
-                       onRecheck = null, hasDevDb, devDbElsewhere, empty, onChanged }) {
+                       onRecheck = null, hasDevDb, devDbElsewhere, empty, onChanged, meshFocus = null }) {
   const [busy, setBusy] = useState(false);
   // Connection check state — the Deploy tab's per-machine "can the queenzee reach this host with
   // the settings on its row?" probe. null = not checked yet; { checking:true } = in flight; a
@@ -277,7 +281,7 @@ function MachineHead({ m, projectId, poolingDead = false, readiness = null, read
       )}
       {/* The mesh panel (ticket #189): per-machine NetBird config + the human-gated control-plane
           stand-up + the observe read. Opt-in behind 🌐 mesh, like 📱 devices above. */}
-      <MeshPanel m={m} projectId={projectId} onChanged={onChanged} />
+      <MeshPanel m={m} projectId={projectId} onChanged={onChanged} focus={meshFocus} />
     </div>
   );
 }

@@ -738,6 +738,23 @@ a.cbox:hover { border-color: var(--accent); }
 .statusline .gateway-health { color: var(--muted); font-size: 14px; }
 .statusline .gateway-health.gateway_down { color: var(--danger, #c44); font-weight: 600; }
 .statusline .gateway-health.gateway_unknown { color: var(--amber, #d4a017); }
+/* MESH CONTROL PLANE — the same "the WORD is the signal, colour is reinforcement" rule, with one
+   deliberate exception: mesh_down is not a coloured word, it is a PILL. The card's requirement is
+   that a downed control plane be the most obvious thing in the console, and a red word among muted
+   grey ones is scanned past — an inverse-video danger pill is not. It is always rendered, so a
+   human never has to already suspect the mesh to learn it is gone; not-set-up stays quiet (that
+   state is a decision, not a fault) and an unreadable status stays muted (never a false MESH DOWN). */
+.statusline .mesh-status { font-size: 14px; }
+.statusline .mesh-status.mesh_not_set_up { color: var(--muted); }
+.statusline .mesh-status.mesh_not_set_up:hover { color: var(--text); }
+.statusline .mesh-status.mesh_ok { color: var(--up); }
+.statusline .mesh-status.mesh_unknown { color: var(--amber, #d4a017); }
+.statusline .mesh-status:hover { text-decoration: underline; }
+.statusline .mesh-status.loud {
+  color: #fff; background: var(--down); border: 1px solid var(--down); border-radius: 20px;
+  padding: 1px 10px; font-weight: 700; letter-spacing: .02em; text-decoration: none;
+  animation: mesh-down-pulse 2s ease-in-out infinite; }
+@keyframes mesh-down-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .72; } }
 .statusline .providerlimits-name { color: var(--muted); font-size: 12px; }
 /* Project setup: remaining limit next to each provider account. */
 .token-usage-limit {

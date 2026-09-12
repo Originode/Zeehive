@@ -18,7 +18,7 @@
 // The bodies are PURE FUNCTIONS OF PROPS (the MeshConfigBody/MeshStandUpBody/MeshObserveBody split,
 // the same one Directives.jsx makes): the fetches live in MeshSections, so a test can render each
 // body with a fixture through react-dom/server and read the markup back.
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { showAlert, showPrompt } from './Dialog.jsx';
 import { getMeshConfig, putMeshConfig, getMeshStatus, planBuildBootstrap, performBuildBootstrap } from './api.js';
 
@@ -334,10 +334,23 @@ function MeshSections({ m, projectId, onChanged }) {
 }
 
 // The toggle MachineHead renders. Closed by default: the panel is an opt-in surface, like 📱 devices.
-export default function MeshPanel({ m, projectId, onChanged = null }) {
+//
+// `focus` is the CLICK-THROUGH from the status line's mesh indicator (MeshStatus.jsx): a changing
+// nonce (not a boolean) so every click lands here again, opening THIS machine's panel and scrolling
+// it into view. Without it a MESH DOWN chip could only tell a human that something is wrong, not
+// take them to the thing the card says fixes it.
+export default function MeshPanel({ m, projectId, onChanged = null, focus = null }) {
   const [open, setOpen] = useState(false);
+  const box = useRef(null);
+  useEffect(() => {
+    if (focus == null) return;
+    setOpen(true);
+    // After the open paints, not before — a closed panel has no height to scroll to.
+    const raf = globalThis.requestAnimationFrame || ((f) => setTimeout(f, 0));
+    raf(() => box.current?.scrollIntoView?.({ block: 'center', behavior: 'smooth' }));
+  }, [focus]);
   return (
-    <div className="mx-meshpanel" data-testid={`mx-meshpanel-${m.key}`}>
+    <div className="mx-meshpanel" data-testid={`mx-meshpanel-${m.key}`} ref={box}>
       <button className="mx-meshbtn" disabled={!projectId} onClick={() => setOpen((o) => !o)}
               data-testid={`mx-mesh-${m.key}`}
               title="Mesh control plane (NetBird): configure the management connection, stand the control plane up (human-gated), and observe management health, peer counts and the mesh-vs-legacy route tally">

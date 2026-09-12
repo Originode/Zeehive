@@ -7,14 +7,24 @@
 // mesh_peer counts, the phase-5 route-source tally). It also asks that the bootstrap 🔧 button be
 // widened to `readiness.bootstrappable`.
 //
+// The card ADDED before that one shipped: mesh status must be the MOST OBVIOUS thing in the console
+// when the control plane is down — hence the always-visible status-line chip (MeshStatus.jsx), with
+// the loud MESH DOWN pill, the quiet "not set up" chip, and a click-through to the machine's panel.
+//
 // There is no browser here and no linter. So:
 //   1. the WIRING is asserted against source text (the "an import nothing renders" bug class, and the
 //      "a Dialog helper called but not imported" bug class — see prod-asks-console.test.mjs);
 //   2. the BODIES are pure functions of props, so they are rendered with react-dom/server and the
-//      markup read back — including the one rule that matters most: a SECRET's value is NEVER rendered.
+//      markup read back — including the one rule that matters most: a SECRET's value is NEVER rendered;
+//   3. the STATES are a pure word function (mesh-status.js), pinned state by state in plain node —
+//      above all that a FAILED read is muted and never a false MESH DOWN;
+//   4. the JOIN is exercised over a real socket: the real api.js fetches a stub answering the
+//      documented routes, and the real chip renders the answer. The server half lands separately
+//      (bold-ember), so this is what turns that join into one sync instead of a rewrite.
 import { buildSync } from 'esbuild';
 import { readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { createServer } from 'node:http';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -23,6 +33,9 @@ const read = (p) => readFileSync(p, 'utf8');
 const src = {
   mesh: read('web/src/Mesh.jsx'),
   machines: read('web/src/Machines.jsx'),
+  status: read('web/src/MeshStatus.jsx'),
+  statuslib: read('web/src/meshStatus.js'),
+  app: read('web/src/App.jsx'),
   api: read('web/src/api.js'),
   routes: read('server/src/api/routes.js'),
 };
@@ -62,11 +75,41 @@ ok(/an empty field on save means unchanged|empty secret = unchanged|Empty secret
 ok(/value=\{draft\[k\]/.test(src.mesh) && !/value=\{secrets\[k\]/.test(src.mesh),
    'a secret input is bound to the DRAFT only — the stored value is never bound back into it');
 
+// ── 1b. wiring: the ALWAYS-VISIBLE mesh indicator in the console chrome ───────────────────────
+// The card ADDED after the panel: mesh status must be the most obvious thing in the console when
+// the control plane is down. An indicator nobody mounted (or a click-through nobody plumbed) is the
+// failure mode this asserts against.
+console.log('\n── wiring: the status line shows the mesh chip and clicks through to the panel ──');
+ok(/import MeshStatusChip from '\.\/MeshStatus\.jsx'/.test(src.app), 'App.jsx imports the mesh status chip');
+ok(/<MeshStatusChip machines=\{fleet\.machines\}/.test(src.app),
+   'App.jsx RENDERS it in the chrome, fed the machine list (it is always on screen, not behind a panel)');
+ok(/mesh-status/.test(src.status) && /data-loud/.test(src.status),
+   'the chip carries the state as ATTRIBUTES (mesh-status / data-kind / data-loud), not just colour');
+ok(/role=\{word\.loud \? 'status'/.test(src.status), 'the loud state is announced (role=status), not only styled');
+ok(/MESH_POLL_MS/.test(src.statuslib) && /setInterval\(read, MESH_POLL_MS\)/.test(src.status),
+   'it polls gently on its own timer (getMeshConfig/getMeshStatus — the SAME reads the panel uses)');
+ok(/getMeshConfig\(id\)/.test(src.status) && /getMeshStatus\(id\)/.test(src.status),
+   'the chip reads the panel\'s two endpoints for the queenzee-host machine');
+ok(/is_queenzee_host/.test(src.status), 'it resolves the machine from is_queenzee_host (the plane lives in the queenzee\'s compose)');
+// The click-through: chip → App state → MachineMatrix → MachineHead → MeshPanel.
+ok(/onOpenMesh=\{\(key\) => setMeshFocus/.test(src.app), 'the chip\'s click raises meshFocus in App');
+ok(/meshFocus=\{meshFocus\}/.test(src.app), 'App passes meshFocus to the machine matrix');
+ok(/meshFocus && meshFocus\.key === col\.m\.key \? meshFocus\.n : null/.test(src.machines),
+   'Machines.jsx routes the nonce to the matching machine column only');
+ok(/<MeshPanel m=\{m\}[^>]*focus=\{meshFocus\}/.test(src.machines), 'MachineHead passes focus to the Mesh panel');
+ok(/setOpen\(true\)/.test(src.mesh) && /scrollIntoView/.test(src.mesh),
+   'the panel OPENS and scrolls into view on focus (a click-through that lands nowhere is not one)');
+ok(/\[focus\]/.test(src.mesh), 'the focus nonce is an effect dependency — a second click lands again');
+// The style rule the whole point rests on: mesh DOWN is a pill, not a coloured word.
+const css = read('web/src/styles.css');
+ok(/\.mesh-status\.loud/.test(css) && /background: var\(--down\)/.test(css),
+   'MESH DOWN is styled as a filled danger pill (a red word among grey ones gets scanned past)');
+
 // ── 2. the pure bodies, rendered ──────────────────────────────────────────────────────────────
 console.log('\n── the CONFIG body: hints shown, values never; Generate on the key only ──');
 let React, renderToStaticMarkup;
 const built = [];
-let M;
+let M, S, API;
 try {
   // BUNDLE, not transform: Mesh.jsx imports ./Dialog.jsx (JSX), which node cannot load directly.
   // React stays external so the test and the bundle share one React instance (hooks + SSR).
@@ -75,6 +118,21 @@ try {
     platform: 'browser', jsx: 'automatic', external: ['react', 'react-dom'] });
   built.push(out);
   M = await import('../' + out);
+  // …and the status chip, whose pure BODY is what the state assertions below render. Bundled the
+  // same way: it imports api.js and Mesh.jsx, so this also proves the chip's imports resolve.
+  const outStatus = 'web/src/.meshstatus.test-build.mjs';
+  buildSync({ entryPoints: ['web/src/MeshStatus.jsx'], outfile: outStatus, bundle: true, format: 'esm',
+    platform: 'browser', jsx: 'automatic', external: ['react', 'react-dom'] });
+  built.push(outStatus);
+  S = await import('../' + outStatus);
+  // …and the REAL fetch layer, for the over-a-socket contract check in section 4. api.js reads the
+  // Vite base off import.meta.env, which plain node does not have — define it to the identity so
+  // the wrapper builds its documented relative URLs.
+  const outApi = 'web/src/.meshapi.test-build.mjs';
+  buildSync({ entryPoints: ['web/src/api.js'], outfile: outApi, bundle: true, format: 'esm',
+    platform: 'browser', define: { 'import.meta.env.BASE_URL': '"/"' } });
+  built.push(outApi);
+  API = await import('../' + outApi);
   React = require_('react');
   renderToStaticMarkup = require_('react-dom/server').renderToStaticMarkup;
 } finally { for (const f of built) rmSync(f, { force: true }); }
@@ -145,6 +203,163 @@ const days = M.tallyDays({ days: [ { day: '2026-09-11', source: 'mesh', n: 1 },
   { day: '2026-09-12', source: 'mesh', n: 2 }, { day: '2026-09-12', source: 'legacy-port', n: 3 } ] });
 ok(days.length === 2 && days[0].day === '2026-09-12' && days[0].mesh === 2 && days[0].legacy === 3,
    'tallyDays merges rows by day, newest first');
+
+
+// ── 3. the ALWAYS-VISIBLE indicator: four states, and the honesty rule ────────────────────────
+// The word is a pure function (meshStatus.js), so the states are pinned in plain node; the chip's
+// BODY is rendered to check that the word actually reaches the screen with its loudness attached.
+console.log('\n── the mesh status word: down is loud, not-set-up is quiet, unread is never DOWN ──');
+const { meshStatusWord, meshConfigured, MESH_POLL_MS } = await import('../web/src/meshStatus.js');
+const HOST = { key: 'mardale', id: 'm1', is_queenzee_host: true };
+const CFG = { fields: { management_url: 'https://mesh.example:33073' }, secrets: { api_token: { set: true } } };
+const word = (o) => meshStatusWord({ machineKey: 'mardale', ...o });
+
+// `address` is what the chip passes from the CONFIG read — the status read need not repeat the URL.
+const down = word({ configured: true, address: CFG.fields.management_url,
+  status: { management: { reachable: false, error: 'connection refused' } } });
+ok(down.kind === 'mesh_down' && down.loud === true, 'configured + management unreachable → mesh_down, LOUD');
+ok(/MESH DOWN/.test(down.chip) && /mesh\.example:33073/.test(down.chip),
+   'the down chip says MESH DOWN and names the address that does not answer');
+ok(/connection refused/.test(down.why), 'and the reason rides the tooltip');
+
+const okw = word({ configured: true, status: { management: { reachable: true } } });
+ok(okw.kind === 'mesh_ok' && okw.loud === false, 'management reachable → mesh_ok, calm (not loud)');
+
+const off = word({ configured: false, status: { management: { reachable: false, error: 'refused' } } });
+ok(off.kind === 'mesh_not_set_up' && off.loud === false && off.chip === 'mesh: not set up',
+   'deliberately unconfigured → a quiet "mesh: not set up", even if something answers / does not');
+ok(/legacy-port/.test(off.why), 'and the tooltip explains legacy-port is the designed fallback, not a fault');
+
+// THE HONESTY RULE: a read that FAILED is not a verdict. my own branch has no mesh-status route yet
+// (bold-ember's server half lands separately) — a 404 must NOT be rendered as MESH DOWN.
+const unread = word({ configured: true, error: 'read mesh status → 404' });
+ok(unread.kind === 'mesh_unknown' && unread.loud === false,
+   'a FAILED status read is muted/unknown — never the loud state (a 404 is not an outage)');
+ok(/404/.test(unread.why) && /not a verdict|READ failure/.test(unread.why),
+   'and it says the read failed rather than claiming anything about the plane');
+ok(word({ configured: null, error: null }).loud === false, 'no verdict at all is never loud either');
+ok(meshStatusWord({}).kind === 'mesh_unknown', 'the word always answers (no undefined state to render)');
+
+console.log('\n── meshConfigured: the tri-state behind "deliberately not set up" ──');
+ok(meshConfigured(CFG, null) === true, 'a management URL means configured');
+ok(meshConfigured(null, { enabled: true }) === true, 'an explicit enabled from the status read wins');
+ok(meshConfigured({ enabled: false, fields: { management_url: 'x' } }, null) === false,
+   'an explicit false wins over inferred config (the fleet is OFF on purpose)');
+ok(meshConfigured({ fields: {}, secrets: { api_token: { set: true } } }, null) === true,
+   'a stored secret alone means configured (someone intends this fleet to mesh)');
+ok(meshConfigured({ fields: {}, secrets: {} }, { management: { reachable: false } }) === false,
+   'an empty config read cleanly → FALSE (deliberately not set up), not unknown');
+ok(meshConfigured(null, { management: { reachable: false } }) === null,
+   'an UNREADABLE config with nothing said → null (cannot claim "not set up")');
+ok(word({ configured: null, status: { management: { reachable: false } } }).kind === 'mesh_down',
+   '…but an ANSWERED status still reports the outage — the config read is not needed for that');
+ok(typeof MESH_POLL_MS === 'number' && MESH_POLL_MS >= 30000, `the poll is GENTLE [${MESH_POLL_MS}ms]`);
+
+console.log('\n── the rendered chip: every state on screen, at the right loudness ──');
+const chip = (props) => renderToStaticMarkup(React.createElement(S.MeshStatusChipBody, props));
+const downHtml = chip({ host: HOST, cfg: CFG, onOpenMesh: () => {},
+  status: { management: { reachable: false, error: 'refused' } } });
+ok(/data-testid="mesh-status"/.test(downHtml) && /data-kind="mesh_down"/.test(downHtml),
+   'the down state renders with data-kind=mesh_down');
+ok(/data-loud="1"/.test(downHtml) && /class="mesh-status mesh_down loud"/.test(downHtml),
+   'and is marked loud — that is what the danger pill styles on');
+ok(/MESH DOWN/.test(downHtml), 'the words MESH DOWN are on screen, not only in a tooltip');
+const offHtml = chip({ host: HOST, cfg: { fields: {}, secrets: {} }, status: { management: { reachable: false } } });
+ok(/mesh_not_set_up/.test(offHtml) && /mesh: not set up/.test(offHtml) && !/data-loud/.test(offHtml),
+   'not-configured renders the quiet chip with NO loud marker');
+const okHtml = chip({ host: HOST, cfg: CFG, status: { management: { reachable: true } } });
+ok(/mesh_ok/.test(okHtml) && /mesh: up/.test(okHtml), 'up renders the calm green chip');
+const unreadHtml = chip({ host: HOST, cfg: CFG, error: 'boom' });
+ok(/mesh_unknown/.test(unreadHtml) && !/data-loud/.test(unreadHtml),
+   'an unreadable status renders muted — no false alarm from a broken read');
+ok(chip({ host: null, cfg: CFG, status: null }) === '', 'no queenzee-host machine → nothing to say (renders nothing)');
+ok(/Click to open the Mesh panel on mardale/.test(downHtml), 'the chip says where a click takes you');
+ok(/cursor:pointer/.test(downHtml), 'and it reads as clickable when a click-through is wired');
+ok(chip({ host: HOST, cfg: CFG, status: { management: { reachable: false } }, onOpenMesh: null })
+   .indexOf('cursor:pointer') === -1, 'with no click-through wired it does not pretend to be a button');
+// The click-through actually fires with the machine key (the panel is per-machine).
+let openedWith = null;
+const chipAny = React.createElement(S.MeshStatusChipBody, { host: HOST, cfg: CFG,
+  status: { management: { reachable: false } }, onOpenMesh: (k) => { openedWith = k; } });
+// renderToStaticMarkup cannot dispatch events; assert the handler is reachable via the element props
+// the same way (a wrapper that renders the element and calls its onClick).
+const el = S.MeshStatusChipBody({ host: HOST, cfg: CFG, status: { management: { reachable: false } },
+  onOpenMesh: (k) => { openedWith = k; } });
+el.props.onClick();
+ok(openedWith === 'mardale', 'clicking the chip opens the mardale machine\'s Mesh panel');
+ok(!!chipAny, 'the chip is a plain element (no wrapper state to desync the click-through)');
+
+
+// ── 4. the JOIN: real HTTP → the real api.js → the real chip ──────────────────────────────────
+// The server half is built in parallel (bold-ember) and is NOT on this branch — today both routes
+// answer 404. So the CONTRACT is pinned here instead: a stub answers the two documented routes, the
+// REAL web/src/api.js fetches them over a real socket, and the REAL chip body renders the answer.
+// When the server half lands, a shape mismatch fails THIS test rather than shipping a chip that
+// reads "no verdict" forever — the join is meant to be one sync, and this is what makes it one.
+console.log('\n── the join: real HTTP → api.js → the chip (the contract the server half must answer) ──');
+let payload = null;
+const stub = createServer((req, res) => {
+  const send = (code, body) => res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+  if (!payload || !(req.url || '').startsWith(payload.route)) return send(404, { error: 'not found' });
+  // a JSON body, or the raw HTML express actually answers an unknown route with
+  if (payload.raw !== undefined) {
+    return res.writeHead(payload.status || 200, { 'content-type': 'text/html' }).end(payload.raw);
+  }
+  send(payload.status || 200, payload.body);
+});
+await new Promise((r) => stub.listen(0, '127.0.0.1', r));
+const origin = `http://127.0.0.1:${stub.address().port}`;
+const realFetch = globalThis.fetch;
+// api.js fetches RELATIVE urls (a browser resolves them against the page origin); node has no page,
+// so resolve them against the stub. Everything else about the path is the app's own code.
+globalThis.fetch = (u, o) => realFetch(String(u).startsWith('/') ? origin + u : u, o);
+try {
+  const HOSTM = { key: 'mardale', id: 'm1', is_queenzee_host: true };
+  const CFG_BODY = { fields: { management_url: 'https://mesh.example:33073' },
+                     secrets: { api_token: { set: true, hint: 'abcd…wxyz' },
+                                datastore_encryption_key: { set: false } } };
+  // One full pass exactly as the chip makes it: config read, status read, word, markup.
+  const pass = async (cfgBody, statusCase) => {
+    payload = { route: '/api/machines/m1/mesh-config', body: cfgBody };
+    const cfg = M.normalizeMeshConfig(await API.getMeshConfig('m1'));
+    payload = { route: '/api/machines/m1/mesh-status', ...statusCase };
+    let status = null, error = null;
+    try { status = await API.getMeshStatus('m1'); } catch (e) { error = e.message; }
+    return { cfg, status, error,
+      html: renderToStaticMarkup(React.createElement(S.MeshStatusChipBody,
+        { host: HOSTM, cfg, status, error, onOpenMesh: () => {} })) };
+  };
+
+  const downJoin = await pass(CFG_BODY, { body: { management: { reachable: false, error: 'ECONNREFUSED' },
+    peers: { counts: { machine: 2, total: 2 } } } });
+  ok(/data-kind="mesh_down"/.test(downJoin.html) && /data-loud="1"/.test(downJoin.html),
+     'the documented down payload, fetched over HTTP, renders the LOUD MESH DOWN chip');
+  ok(/ECONNREFUSED/.test(downJoin.html), 'and the reason the server gave survives the trip');
+  ok(/mesh\.example:33073/.test(downJoin.html), 'and the configured address is named in the chip');
+
+  const upJoin = await pass(CFG_BODY, { body: { management: { reachable: true }, peers: { counts: { total: 2 } } } });
+  ok(/data-kind="mesh_ok"/.test(upJoin.html) && !/data-loud/.test(upJoin.html),
+     'the documented up payload renders the calm chip');
+
+  const offJoin = await pass({ fields: {}, secrets: {} }, { body: { management: { reachable: false } } });
+  ok(/data-kind="mesh_not_set_up"/.test(offJoin.html) && /mesh: not set up/.test(offJoin.html),
+     'an EMPTY config payload (deliberately unconfigured) renders the quiet chip');
+
+  const goneJoin = await pass(CFG_BODY, { status: 404, raw: '<!DOCTYPE html><html><body>Cannot GET</body></html>' });
+  ok(/data-kind="mesh_unknown"/.test(goneJoin.html) && !/data-loud/.test(goneJoin.html),
+     'a 404 status route (this branch today, answered as express HTML) renders MUTED — not an outage');
+  ok(/404/.test(goneJoin.error || ''), `the read failure names the status [${goneJoin.error}]`);
+  const refusedJoin = await pass(CFG_BODY, { status: 500, body: { error: 'mesh-status blew up' } });
+  ok(/mesh-status blew up/.test(refusedJoin.html) && !/data-loud/.test(refusedJoin.html),
+     'a server that DID answer with an error is still a read failure — muted, and the server\'s own words are shown');
+  // The write-only rule survives the join too: whatever the server sends back, no secret VALUE —
+  // there is none in the contract, and the chip must not render one if a server ever sent it.
+  ok(!/value="/.test(downJoin.html) || !/abcd/.test(downJoin.html),
+     'no secret material is rendered by the chip, even from a server that offered a hint');
+} finally {
+  globalThis.fetch = realFetch;
+  await new Promise((r) => stub.close(r));
+}
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);
