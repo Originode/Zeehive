@@ -13,6 +13,7 @@ import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisi
          registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices, checkMachineConnection,
          getBuildReadiness, planBuildBootstrap, performBuildBootstrap } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
+import MeshPanel from './Mesh.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
 const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
@@ -274,6 +275,9 @@ function MachineHead({ m, projectId, poolingDead = false, readiness = null, read
           {devDbElsewhere ? '⚠ no dev db — provision' : '＋ dev db'}
         </button>
       )}
+      {/* The mesh panel (ticket #189): per-machine NetBird config + the human-gated control-plane
+          stand-up + the observe read. Opt-in behind 🌐 mesh, like 📱 devices above. */}
+      <MeshPanel m={m} projectId={projectId} onChanged={onChanged} />
     </div>
   );
 }
@@ -347,15 +351,23 @@ export function BuildReady({ m, readiness, busy = false, onRecheck = null }) {
 // queenzee-performed action that CREATES the dev prerequisites the build-readiness probe names as
 // missing. PLAN FIRST: clicking fetches the plan (dry run), shows exactly what will happen, and
 // only after a human commits does it perform — then it re-runs the probe so the badge flips to the
-// now-true verdict. Enabled only when the probe says something is missing; a refused plan (a name
-// the prod tier also declares, an unreachable context) is shown, never half-run. A host that also
-// runs this project's PROD stack is DISCLOSED in the plan (the human confirms), not refused — on
-// the single-host topology dev and prod share the docker host, so refusing would switch the
-// bootstrap off on the most common installation.
+// now-true verdict. A refused plan (a name the prod tier also declares, an unreachable context) is
+// shown, never half-run. A host that also runs this project's PROD stack is DISCLOSED in the plan
+// (the human confirms), not refused — on the single-host topology dev and prod share the docker
+// host, so refusing would switch the bootstrap off on the most common installation.
+//
+// IT RENDERS ON `readiness.bootstrappable`, NOT `status === 'missing'` (ticket #189,
+// docs/build-bootstrap-button-contract-decision-record.md). `status` is about BUILDING; the button
+// is about CREATING, and the two part company on a machine that can build fine yet has a
+// performable prerequisite outstanding — the mesh control plane on the queenzee's own host. That
+// machine reads ✓ build and 'ok', so a status-gated button could never offer the stand-up the
+// bootstrap card knows how to do. The contract is preserved, not weakened: `bootstrappable` is the
+// server's shared classification of "the planner will have at least one PERFORMABLE step here"
+// (lib/build-readiness.js bootstrappableFrom), so a shown button still always acts.
 function BootstrapButton({ m, projectId, readiness, onDone, onChanged }) {
   const [busy, setBusy] = useState(false);
-  const missing = readiness?.status === 'missing';
-  if (!missing) return null;
+  const bootstrappable = !!readiness?.bootstrappable;
+  if (!bootstrappable) return null;
 
   const stepLine = (s) => {
     if (s.kind === 'disclosure') return `⚠ ${s.detail}`;
@@ -373,11 +385,20 @@ function BootstrapButton({ m, projectId, readiness, onDone, onChanged }) {
         return;
       }
       const steps = plan?.plan || plan?.steps || [];
-      if (!steps.length) { showAlert(`${m.key} has nothing the bootstrap can create — the probe says it can build here.`, { variant: 'info' }); return; }
+      // Defensive, not expected: the button renders on the server's `bootstrappable` classification,
+      // so a live plan should have something performable. If the RECORDED verdict was stale (a human
+      // fixed the prerequisite since the last probe), say so AND re-probe, so the badge that offered
+      // the button stops offering it instead of the button quietly doing nothing.
+      if (!steps.length) {
+        showAlert(`${m.key} has nothing the bootstrap can create — the probe says it is ready. Re-checking the badge.`, { variant: 'info' });
+        onDone?.();
+        return;
+      }
       const planText = steps.map(stepLine).join('\n');
       const performable = steps.filter((s) => s.status === 'planned');
       if (!performable.length) {
-        showAlert(`Nothing to perform on ${m.key} — what the probe found missing is not something a bootstrap can create:\n\n${planText}`, { variant: 'info' });
+        showAlert(`Nothing to perform on ${m.key} — what the probe found missing is not something a bootstrap can create:\n\n${planText}\n\nThe badge will re-check.`, { variant: 'info' });
+        onDone?.();
         return;
       }
       if (!(await showConfirm(`Bootstrap ${m.key} for this project?\n\n${performable.length} action(s) — creates DEV prerequisites only, never touches prod or a running container:\n\n${planText}\n\nContinue?`, { okLabel: 'Bootstrap' }))) return;
@@ -395,7 +416,7 @@ function BootstrapButton({ m, projectId, readiness, onDone, onChanged }) {
 
   return (
     <button className="mx-bs" data-testid={`mx-bootstrap-${m.key}`} disabled={busy} onClick={run}
-            title={`One-click: create the DEV prerequisites the build-ready probe says ${m.key} is missing (networks the manifest declares, its shared dev db). Shows the plan first, incl. a disclosure if this host also runs PROD; idempotent; refuses an unreachable context or a name the prod tier declares.`}>
+            title={`One-click: create the DEV prerequisites the build-ready probe says ${m.key} is missing (networks the manifest declares, a volume the manifest marks create:empty, its shared dev db) or stand up the mesh control plane when ${m.key} is the queenzee's own host. Shows the plan first, incl. a disclosure if this host also runs PROD; idempotent; refuses an unreachable context or a name the prod tier declares.`}>
       {busy ? '⏳…' : '🔧 bootstrap'}
     </button>
   );

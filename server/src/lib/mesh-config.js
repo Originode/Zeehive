@@ -44,6 +44,10 @@ export const SECRET_FIELDS = ['datastore_encryption_key', 'relay_auth_secret', '
 // are generatable, for the reason in the header.
 export const GENERATABLE_FIELDS = ['datastore_encryption_key', 'relay_auth_secret'];
 export const GENERATE = 'generate';
+// The console names the management URL `management_url` (web/src/Mesh.jsx's form, TKT-189) and the
+// column is `api_url`. One alias, normalized on the way IN and projected on the way OUT — so the
+// panel needs no translation layer and this module keeps the column's own name as the canonical one.
+const FIELD_ALIASES = { management_url: 'api_url' };
 // The management.json placeholders the stand-up refuses. A console paste carrying one is refused at
 // write time instead — the same rule, moved to the click that could have created it.
 const PLACEHOLDER = /CHANGE-ME/i;
@@ -280,7 +284,14 @@ function validateNonSecret(field, value) {
 export function planMeshWrite(patch, current = {}) {
   const cols = {};
   const next = { ...current };
-  for (const [field, raw] of Object.entries(patch)) {
+  // Normalize the console's alias first: a canonical key already present wins over its alias.
+  const given = patch || {};
+  const normalized = { ...given };
+  for (const [alias, canonical] of Object.entries(FIELD_ALIASES)) {
+    if (alias in given && !(canonical in given)) normalized[canonical] = given[alias];
+    delete normalized[alias];
+  }
+  for (const [field, raw] of Object.entries(normalized)) {
     if (!MESH_FIELDS.includes(field)) throw new Error(`unknown mesh config field '${field}'`);
     if (SECRET_FIELDS.includes(field)) {
       if (raw === GENERATE) {
@@ -332,6 +343,11 @@ export async function setMeshConfig(machineId, patch = {}, { actor = 'human@cons
   if (!machine) throw new Error('machine not found');
   const row = (await one(`SELECT * FROM mesh_config WHERE machine_id=$1`, [machineId])) || {};
   const { cols } = planMeshWrite(patch, row);
+  // A console write that CARRIES a configuration ENABLES this machine's mesh. The row a human fills
+  // in is a decision, not a draft (the panel has no separate "on" switch), and a row left disabled
+  // would make the stand-up's bootstrapped PAT inert — the one outcome §1 forbids. An explicit
+  // `enabled` in the patch always wins, and an UPDATE never flips it.
+  if (!row.machine_id && !('enabled' in (patch || {}))) cols.enabled = true;
   const fields = Object.keys(cols);
   if (!fields.length) return meshConfigFor(machineId);
   const sets = fields.map((f, i) => `"${f}" = $${i + 3}`).join(', ');
@@ -450,6 +466,14 @@ export async function meshConfigFor(machineId) {
       mesh_domain: row.mesh_domain ?? DEFAULT_MESH_DOMAIN,
       api_url: row.api_url ?? null,
       ...Object.fromEntries(PORT_FIELDS.map((f) => [f, row[f] ?? DEFAULT_PORTS[f]])),
+      signal_uri: row.signal_uri ?? null,
+      relay_endpoint: row.relay_endpoint ?? null,
+    },
+    // The CONSOLE's projection of the row: its four form fields under its own names, so the panel
+    // binds `fields[k]` directly (web/src/Mesh.jsx). `values` above stays canonical.
+    fields: {
+      management_url: row.api_url ?? null,
+      mesh_domain: row.mesh_domain ?? DEFAULT_MESH_DOMAIN,
       signal_uri: row.signal_uri ?? null,
       relay_endpoint: row.relay_endpoint ?? null,
     },

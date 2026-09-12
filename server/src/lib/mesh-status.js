@@ -51,13 +51,27 @@ export async function meshStatusFor(machine, { probe = probeManagementApi, tally
   }
   let peers;
   try {
-    peers = peerCounts(await q(
+    const rows = await q(
       `SELECT status, count(*)::int AS n FROM mesh_peer WHERE machine_id=$1 GROUP BY status`,
-      [machine.id]));
+      [machine.id]);
+    const counts = peerCounts(rows);
+    // The rows themselves, newest first, for the panel's peer list. Optional on purpose: the
+    // COUNTS are the fact, the list is a convenience, and a pre-249 schema must not fail the read.
+    let list = [];
+    try {
+      list = await q(
+        `SELECT hostname, kind, status, nb_peer_id, ip FROM mesh_peer
+          WHERE machine_id=$1 ORDER BY created_at DESC LIMIT 50`, [machine.id]);
+    } catch { /* counts stand alone */ }
+    // `counts` is the console's name for `by_status` + total (web/src/Mesh.jsx); both are emitted so
+    // neither reader needs a translation layer.
+    peers = { ...counts, counts: { ...counts.by_status, total: counts.total }, list };
   } catch (e) {
     peers = { ...peerCounts([]), error: e.message };
   }
   const t = await tally({});
+  const routes = { window_days: t.window_days, by_source: t.by_source, by_kind: t.by_kind,
+                   days: t.days || [], error: t.error };
   return {
     machine_id: machine.id,
     machine_key: machine.key,
@@ -72,10 +86,12 @@ export async function meshStatusFor(machine, { probe = probeManagementApi, tally
       updated_at: cfg.updated_at,
       updated_by: cfg.updated_by,
     },
-    management: { ok: management.ok, host: management.host, port: management.port,
-                  verdict: management.verdict, url: management.url,
-                  ...(management.reason ? { reason: management.reason } : {}) },
+    // `reachable`/`error` are the console's names for `ok`/`reason` (web/src/Mesh.jsx).
+    management: { ok: management.ok, reachable: management.ok, host: management.host,
+                  port: management.port, verdict: management.verdict, url: management.url,
+                  ...(management.reason ? { reason: management.reason, error: management.reason } : {}) },
     peers,
-    routes: { window_days: t.window_days, by_source: t.by_source, by_kind: t.by_kind, error: t.error },
+    routes,
+    tally: routes,
   };
 }

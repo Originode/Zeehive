@@ -582,8 +582,9 @@ export const getBuildReadiness = (projectId, refresh) =>
 // idempotently and re-runs the probe. QUEENZEE-performed; a prod tier/container/stack is refused.
 export const planBuildBootstrap = (projectId, machineId) =>
   siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: true });
-export const performBuildBootstrap = (projectId, machineId, actor) =>
-  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: false, by: actor });
+export const performBuildBootstrap = (projectId, machineId, actor, kinds) =>
+  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST',
+    { dry_run: false, by: actor, ...(kinds?.length ? { kinds } : {}) });
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
 export const getSharedContainers = (projectId) => fetch(`/api/projects/${projectId}/containers`).then((r) => r.json());
@@ -896,6 +897,28 @@ export async function provisionMachineDevDb(machineId, projectId) {
   });
   return jsonOrThrow(r, 'provision dev db');
 }
+
+// ── mesh (NetBird control plane), per machine (TKT-189) ───────────────────────
+// The console half of the mesh card. The server half is built in parallel (bold-ember); these
+// wrappers are deliberately THIN so the join is one sync, and read the contract shape:
+//
+//   GET  /api/machines/:id/mesh-config  → { fields, secrets, editable? }
+//        `fields`  non-secret config: management_url, mesh_domain, signal_uri, relay_endpoint.
+//        `secrets` PER SECRET: presence + a display HINT only — NEVER the value. The three secrets
+//                  are api_token, datastore_encryption_key, gateway_setup_key.
+//   PUT  /api/machines/:id/mesh-config  ← { ...fields, api_token?, datastore_encryption_key?,
+//                                            gateway_setup_key? }
+//        plaintext secrets; an empty/omitted secret means UNCHANGED (the write-only rule). This
+//        path exists even when auto-bootstrap is on — rotation is a human's, not a build's.
+//   GET  /api/machines/:id/mesh-status  → { management: { reachable }, peers: { counts }, tally }
+//        management health, mesh_peer counts, and the phase-5 route-source tally
+//        ({ window_days, by_source, by_kind, days, error }) — rendered simply.
+export const getMeshConfig = (machineId) =>
+  fetch(`/api/machines/${machineId}/mesh-config`).then((r) => jsonOrThrow(r, 'read mesh config'));
+export const putMeshConfig = (machineId, body) =>
+  siteCall(`/api/machines/${machineId}/mesh-config`, 'PUT', body);
+export const getMeshStatus = (machineId) =>
+  fetch(`/api/machines/${machineId}/mesh-status`).then((r) => jsonOrThrow(r, 'read mesh status'));
 
 // ── device xhips (035): mobile devices as a container role ────────────────────
 // The registered SHARED (physical) devices for a project — the pool a xell links from.

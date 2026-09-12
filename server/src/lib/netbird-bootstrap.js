@@ -39,7 +39,7 @@ import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PINNED_NETBIRD_VERSION, probeManagementApi } from './netbird.js';
+import { MESH_CONTROL_PLANE_CONTAINER, PINNED_NETBIRD_VERSION, probeManagementApi } from './netbird.js';
 import { DEFAULT_MESH_DOMAIN, DEFAULT_PEER_NET } from './mesh-config.js';
 import { logline } from './logbus.js';
 
@@ -47,7 +47,9 @@ import { logline } from './logbus.js';
 // mounts the netbird_management_data volume at /var/lib/netbird; the harness's --datadir is the same
 // directory shape).
 export const MESH_STORE_IN_CONTAINER = '/var/lib/netbird/store.db';
-export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
+// The container this bootstrap stops/seeds/restarts. ONE authority (lib/netbird.js), re-exported so
+// a caller can name the store and the container it lives in from the same module.
+export { MESH_CONTROL_PLANE_CONTAINER };
 // The harness's literal, which the real server accepted and numbered peers out of. Kept verbatim.
 export const DEFAULT_PEER_NET_V6 = 'fd00:4e42:1234:5678::';
 const XID_ALPHABET = '0123456789abcdefghijklmnopqrstuv';

@@ -298,14 +298,14 @@ console.log('\n── spawn detects a STALE zee-agent image (the act-two check) 
 ok(/sha256sum/.test(cxellLib) && /createHash\('sha256'\)/.test(cxellLib),
    'it compares the baked CLI to the queenzee\'s own scripts/zee by sha256');
 const preamble = fn.slice(0, fn.indexOf('for (const args of zeeCliInstallCommands'));
-ok(/bakedZeeCliSha\(/.test(preamble),
-   'the baked sha is read BEFORE the install overwrites it (afterwards the evidence is gone)');
+ok(/bakedCxellFileShas\(/.test(preamble),
+   'the baked shas are read BEFORE the install overwrites the CLI (afterwards that evidence is gone)');
 ok(/staleImage/.test(preamble) && /!!! STALE CXELL IMAGE/.test(preamble),
    'a mismatch is logged loudly as a STALE CXELL IMAGE');
 ok(/CLI ONLY|CLI only/.test(preamble),
    'and says plainly that the refresh repairs the CLI ONLY — the other baked files stay stale');
 ok(/cli\.staleImage/.test(intake), 'intake surfaces the verdict on the spawn line too');
-ok(/catch\s*{\s*return null;?\s*}/.test(cxellLib.slice(cxellLib.indexOf('async function bakedZeeCliSha'))),
+ok(/catch\s*{\s*return null;?\s*}/.test(cxellLib.slice(cxellLib.indexOf('async function bakedCxellFileShas'))),
    'an unreadable baked copy is "unknown", never an error (the check can never sink a spawn)');
 
 // ── (e) usage vs the MANUAL: a verb a zee has must be a verb its manual mentions ──────────────

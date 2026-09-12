@@ -1284,8 +1284,11 @@ router.get('/projects/:id/build-readiness', async (req, res) => {
 router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res) => {
   try {
     const dryRun = req.body?.dry_run !== false;
+    // `kinds` scopes a perform to named step kinds (the Mesh panel's control-plane stand-up); the
+    // plan and its guards are still the whole picture — only the performed subset narrows.
+    const kinds = Array.isArray(req.body?.kinds) && req.body.kinds.length ? req.body.kinds : null;
     res.json(await performBuildBootstrap(req.params.id, req.params.machineId, {
-      dryRun, actor: req.body?.by || 'human@console',
+      dryRun, actor: req.body?.by || 'human@console', kinds,
     }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -1768,7 +1771,10 @@ router.get('/machines/:id/check', async (req, res) => {
 //          null = clear (secrets and api_url/signal_uri/relay_endpoint); the literal "generate" =
 //          mint server-side (datastore_encryption_key, relay_auth_secret ONLY — the other two
 //          credentials are issued by the control plane). A validation failure is a 400 that NAMES
-//          the field; an unknown field is refused by name rather than dropped.
+//          the field; an unknown field is refused by name rather than dropped. `management_url` is
+//          accepted as the console form's name for `api_url` (lib/mesh-config.js's FIELD_ALIASES),
+//          and a write that CARRIES a configuration ENABLES the machine's mesh unless the patch says
+//          `enabled: false` — the human filling the form in is the decision, not a draft.
 // The row is per machine, so the form on the queenzee-host machine's card is the one that drives
 // the stand-up (build-bootstrap's mesh-control-plane step reads it).
 router.get('/machines/:id/mesh-config', async (req, res) => {

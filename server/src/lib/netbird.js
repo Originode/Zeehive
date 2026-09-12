@@ -96,6 +96,18 @@ const failed = (r, what) => ({
   reason: `${what}: ${r.reason || `HTTP ${r.status}${r.json?.message ? ` — ${r.json.message}` : ''}`}`,
 });
 
+// ── the control plane's container identity (docs/netbird-mesh-plan.md §3.1) ─────────────────────
+// ONE authority for the mesh-profile services' names: the readiness probe reports whether the
+// control plane is running (build-readiness.js) and the bootstrap card's mesh-control-plane step
+// stands it up (build-bootstrap.js), and both must name the same container and the same three
+// services — a copy in each file is how a button ends up checking a different container than the
+// one the performer starts.
+export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
+// The control plane only — NOT mesh-gateway (needs a human-minted setup key) and NOT the dashboard
+// (needs an OIDC provider). Both would crash-loop with an empty key/OIDC and make a good stand-up
+// look failed; the operator brings them up once the env below exists.
+export const MESH_CONTROL_PLANE_SERVICES = ['netbird-management', 'netbird-signal', 'netbird-relay'];
+
 // ── the stand-up health check (docs/netbird-mesh-plan.md §3.1 / §11 NOT-done #1) ────────────────
 // The control plane is stood up BEFORE the operator can set NETBIRD_API_URL (that env points the
 // queenzee AT the plane), so the health check cannot go through the authenticated client above.

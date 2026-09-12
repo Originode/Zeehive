@@ -41,12 +41,14 @@ const { planBuildBootstrap, performBuildBootstrap, guardDevOnly } = await import
 const { probeBuildReadiness, dockerAdapter } = await import('../server/src/lib/build-readiness.js');
 
 // ── the stubbed docker adapter ──────────────────────────────────────────────
-// Same dispatch shape as build-readiness.test.mjs, PLUS a `create` verb for `docker network create`
-// and a recorder so a test can assert nothing was created during a dry run. `networks` is the live
-// set — a created network lands in it, so a SECOND perform sees it already-present (idempotence).
+// Same dispatch shape as build-readiness.test.mjs, PLUS `create` verbs for `docker network create`
+// and `docker volume create` (the create:empty opt-in) and a recorder so a test can assert nothing
+// was created during a dry run. `networks`/`volumes` are the live sets — a created object lands in
+// them, so a SECOND perform sees it already-present (idempotence).
 const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true,
                       createNetworks = new Set(), failNetworkCreate = null, failNetworkInspect = null,
-                      runningContainers = new Set(), failCompose = null } = {}) => {
+                      runningContainers = new Set(), failCompose = null,
+                      createVolumes = new Set(), failVolumeCreate = null } = {}) => {
   const calls = [];
   const envCalls = [];
   const stub = async (ctx, args, opts) => {
@@ -80,7 +82,14 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
       }
     }
     if (cmd === 'volume') {
+      const sub = args[1];   // inspect | create
       const name = args[2];
+      if (sub === 'create') {
+        if (failVolumeCreate) return { status: 1, stdout: '', stderr: failVolumeCreate };
+        if (volumes.has(name)) return { status: 1, stdout: '', stderr: `volume with name ${name} already exists` };
+        volumes.add(name); createVolumes.add(name);
+        return { status: 0, stdout: name, stderr: '' };
+      }
       return volumes.has(name)
         ? { status: 0, stdout: `${name}\n`, stderr: '' }
         : { status: 1, stdout: '', stderr: `volume ${name} not found` };
@@ -194,6 +203,47 @@ try {
   const volStep = plan2.steps.find((s) => s.target.includes('bs_data'));
   ok(volStep?.status === 'cannot', `missing volume reported 'cannot' [${volStep?.status}]`);
   ok(/DATA/.test(volStep?.detail || ''), `the cannot reason says volumes are DATA [${volStep?.detail}]`);
+
+  // ── a volume the manifest marks create:'empty' IS performable (decision record, item 3) ──────
+  console.log('\n── a create:empty volume is planned and created; a plain one still never is ──');
+  const pEmpty = await insProject(`bs-empty-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [{ name: 'bs_empty_data', create: 'empty' }] } } } });
+  const mEmpty = await insMachine(`bs-empty-${tag}`, `zt-bs-empty-${tag}`, true);
+  await insDevDb(pEmpty, `zt-bs-empty-${tag}`, `bs_${tag}_empty_db`);
+  const emptyVols = new Set();
+  const dockerEmpty = makeDocker({ networks: new Set(), volumes: emptyVols });
+  const planEmpty = await planBuildBootstrap(await row('machine', mEmpty), await row('project', pEmpty), { docker: dockerEmpty });
+  const eStep = planEmpty.steps.find((s) => s.target === 'bs_empty_data');
+  ok(eStep?.status === 'planned' && eStep?.kind === 'volume',
+     `the create:empty opt-in → a performable volume step [${eStep?.kind}:${eStep?.status}]`);
+  ok(/docker volume create/.test(eStep?.action || ''), `the volume step names its action [${eStep?.action}]`);
+  const perfEmpty = await performBuildBootstrap(pEmpty, mEmpty,
+    { dryRun: false, docker: dockerEmpty, provisionDb: makeProvision(), actor: 'tester@xell' });
+  ok(perfEmpty.status === 'performed', `performing the create:empty plan succeeds [${perfEmpty.status}]`);
+  ok(emptyVols.has('bs_empty_data'), 'the volume was actually created');
+  const perfEmpty2 = await performBuildBootstrap(pEmpty, mEmpty,
+    { dryRun: false, docker: dockerEmpty, provisionDb: makeProvision(), actor: 'tester@xell' });
+  ok(perfEmpty2.status === 'already-present', `a second perform is idempotent [${perfEmpty2.status}]`);
+  ok(!perfEmpty2.results.some((s) => s.status === 'created'), 'the second perform created nothing');
+
+  // A plain volume alongside the opt-in one stays DATA: the classification is per-category, not per-plan.
+  const pMixed = await insProject(`bs-mixed-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [{ name: 'bs_mixed_empty', create: 'empty' }, 'bs_mixed_plain'] } } } });
+  const mMixed = await insMachine(`bs-mixed-${tag}`, `zt-bs-mixed-${tag}`, true);
+  await insDevDb(pMixed, `zt-bs-mixed-${tag}`, `bs_${tag}_mixed_db`);
+  const planMixed = await planBuildBootstrap(await row('machine', mMixed), await row('project', pMixed), { docker: makeDocker({ networks: new Set() }) });
+  ok(planMixed.steps.find((s) => s.target === 'bs_mixed_empty')?.status === 'planned', 'the opt-in volume is planned');
+  ok(planMixed.steps.find((s) => s.target.includes('bs_mixed_plain'))?.status === 'cannot', 'the plain volume is still cannot');
+
+  // A volume that appears BETWEEN the inspect and the create (a concurrent create) is NOT a failure.
+  const pVolRace = await insProject(`bs-vrace-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [{ name: 'bs_vrace_data', create: 'empty' }] } } } });
+  const mVolRace = await insMachine(`bs-vrace-${tag}`, `zt-bs-vrace-${tag}`, true);
+  await insDevDb(pVolRace, `zt-bs-vrace-${tag}`, `bs_${tag}_vrace_db`);
+  const raceDocker = makeDocker({ networks: new Set(), failVolumeCreate: 'volume with name bs_vrace_data already exists' });
+  const perfVolRace = await performBuildBootstrap(pVolRace, mVolRace,
+    { dryRun: false, docker: raceDocker, provisionDb: makeProvision(), actor: 'tester@xell' });
+  ok(perfVolRace.status === 'already-present', `a volume created between inspect and create reads already-present [${perfVolRace.status}]`);
 
   // ── performing an all-cannot plan is RECORDED too (the declined action must be as
   //    readable afterwards as one that acted — the manager's review rule) ──────
@@ -462,10 +512,13 @@ try {
   // runs `compose --profile mesh up -d` for the three control-plane services ONLY, and health-checks
   // the management API. A secret is never invented, and the API token is named as a human's.
   console.log('\n── the bootstrap CARD stands up the NetBird control plane on the queenzee host (§3.1) ──');
-  const {
-    renderManagementJson, managementJsonMissingSecrets, ensureManagementJson, placeholderFill,
-    MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES,
-  } = await import('../server/src/lib/build-bootstrap.js');
+  const { renderManagementJson, managementJsonMissingSecrets, ensureManagementJson, placeholderFill } =
+    await import('../server/src/lib/build-bootstrap.js');
+  // The control plane's container/service names live in lib/netbird.js — ONE authority the probe
+  // (build-readiness.js) and this performer both read, so a button cannot check one container while
+  // the step starts another.
+  const { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } =
+    await import('../server/src/lib/netbird.js');
   const EXAMPLE = path.join(REPO, 'docker/zeehive/netbird/management.json.example');
   const exampleText = fs.readFileSync(EXAMPLE, 'utf8');
   ok(managementJsonMissingSecrets(JSON.parse(exampleText)).length === 2,
@@ -553,6 +606,21 @@ try {
   const cpRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCp.action_id]);
   ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
      'the stand-up is RECORDED in the audit steps');
+
+  // A SCOPED perform (the Mesh panel's stand-up) creates ONLY the named kinds: standing the control
+  // plane up must not create a project's networks/dev-db as a side effect of a mesh-only action.
+  const pScoped = await insProject(`bs-scoped-${tag}`,
+    { tiers: { spinoff: { requires: { networks: ['bs_scoped_net'] } } } });
+  await insDevDb(pScoped, 'default', `bs_${tag}_scoped_db`);
+  const dockerScoped = makeDocker({ reachable: true, networks: new Set() });
+  const scoped = await performBuildBootstrap(pScoped, mCp, { dryRun: false, docker: dockerScoped,
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeOk } });
+  ok(scoped.results.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
+     'a scoped perform runs the requested mesh stand-up');
+  ok(!scoped.results.some((s) => s.kind === 'network'),
+     'and does NOT perform the unrelated network step it was not asked for');
+  ok(!dockerScoped.calls.some((c) => c.includes('network') && c.includes('create')),
+     'no unrelated network was created as a side effect');
 
   // Idempotence: the container now answers 'running' → already-present, no second compose up.
   const dockerUp2 = makeDocker({ reachable: true, networks: new Set(),

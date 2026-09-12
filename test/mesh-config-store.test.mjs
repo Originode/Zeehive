@@ -133,6 +133,37 @@ try {
     ok(read.is_queenzee_host === false, 'a machine that is not the queenzee host is marked as such');
   }
 
+  section('the console\'s own field name (management_url) round-trips as api_url');
+  {
+    const put = await putJSON(`${BASE}/machines/${machineId}/mesh-config`, { management_url: 'https://mgmt.console:443' });
+    ok(put.status === 200, `the console's PUT is accepted [${put.status}]`);
+    ok(put.data.fields.management_url === 'https://mgmt.console:443' && put.data.fields.mesh_domain === 'mesh.console',
+       `GET projects the row under the console's field names [${JSON.stringify(put.data.fields)}]`);
+    ok(put.data.values.api_url === 'https://mgmt.console:443', 'and the write landed in the canonical column');
+    const cleared = await putJSON(`${BASE}/machines/${machineId}/mesh-config`, { management_url: null });
+    ok(cleared.data.fields.management_url === null, 'a cleared management_url reads back empty, not stale');
+  }
+
+  section('a config-carrying console write ENABLES the machine (no separate on switch in the panel)');
+  {
+    const second = (await one(
+      `INSERT INTO machine (key, docker_ctx, can_build, enabled) VALUES ($1,$2,true,true) RETURNING id`,
+      [`mc-${tag}-c`, `zt-mc-${tag}-c`])).id;
+    machineIds.push(second);
+    // The panel's save body is {...fields} + non-empty secret drafts — no `enabled`.
+    const put = await putJSON(`${BASE}/machines/${second}/mesh-config`, {
+      management_url: 'https://mgmt.console:443', mesh_domain: 'mesh.console', datastore_encryption_key: 'generate' });
+    ok(put.data.enabled === true && put.data.applied === true,
+       `a row the console filled in is ENABLED and applied [enabled ${put.data.enabled}]`);
+    ok(config.netbirdApiUrl === 'https://mgmt.console:443',
+       'so the queenzee can reach the plane it just described, before any stand-up ran');
+    // An UPDATE never flips the switch, and an explicit value always wins.
+    const off = await putJSON(`${BASE}/machines/${second}/mesh-config`, { enabled: false });
+    const stillOff = await putJSON(`${BASE}/machines/${second}/mesh-config`, { mesh_domain: 'mesh.again' });
+    ok(off.data.enabled === false && stillOff.data.enabled === false,
+       'disabling is sticky across later writes (an update does not re-enable)');
+  }
+
   section('a disabled row is inert; the env rules again');
   {
     await putJSON(`${BASE}/machines/${machineId}/mesh-config`, { enabled: false });
@@ -209,6 +240,17 @@ try {
        `counts are this machine\'s, by status [${JSON.stringify(status.peers.by_status)}]`);
     ok(status.routes.by_source.mesh === 5 && status.routes.by_source['legacy-port'] === 1 && status.routes.window_days === 14,
        'the route-source tally summary is the telemetry phase 5 is gated on');
+    // The console's projection of the same facts (web/src/Mesh.jsx): peers.counts, peers.list,
+    // management.reachable, tally — emitted alongside the canonical keys so the panel needs no
+    // translation layer, and pinned here so the two shapes cannot drift apart silently.
+    ok(status.peers.counts.total === 3 && status.peers.counts.joined === 1 && status.peers.counts.removed === 0,
+       'peers.counts is by_status + total under the console\'s name');
+    ok(status.peers.list.length === 3 && status.peers.list.every((p) => p.hostname && p.kind === 'machine' && p.status),
+       'peers.list carries the rows themselves (hostname · kind · status)');
+    ok(status.management.reachable === true && status.management.error === undefined,
+       'management.reachable mirrors the probe');
+    ok(status.tally === status.routes && Array.isArray(status.tally.days),
+       'tally is the console\'s name for the same route summary, days included');
     ok(status.mesh.api_token.set === true && status.mesh.api_token.hint === 'nbp_…AAAA'
        && !JSON.stringify(status).includes(`nbp_${'A'.repeat(36)}`),
        'status carries the token HINT only — never the value');
