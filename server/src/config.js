@@ -128,6 +128,17 @@ export const config = {
   netbirdRelayEndpoint: process.env.NETBIRD_RELAY_ENDPOINT || null,
   netbirdDatastoreEncryptionKey: process.env.NETBIRD_DATASTORE_ENCRYPTION_KEY || null,
   netbirdRelayAuthSecret: process.env.NETBIRD_RELAY_AUTH_SECRET || null,
+  // The control plane's published ports and the gateway peer's one-off setup key. They have no
+  // other home in config because nothing else reads them: lib/mesh-config.js resolves them
+  // (console row → this env → the compose default) and lib/build-bootstrap.js hands them to
+  // `docker compose` so the containers are created with the ports the human set. Store-over-env
+  // applies here like everywhere else in the mesh seam — see lib/mesh-config.js.
+  netbirdMgmtGrpcPort: int(process.env.NETBIRD_MGMT_GRPC_PORT, 33073),
+  netbirdMgmtApiPort: int(process.env.NETBIRD_MGMT_API_PORT, 33074),
+  netbirdSignalPort: int(process.env.NETBIRD_SIGNAL_PORT, 10000),
+  netbirdRelayPort: int(process.env.NETBIRD_RELAY_PORT, 33080),
+  netbirdDashHttpPort: int(process.env.NETBIRD_DASH_HTTP_PORT, 33081),
+  netbirdGatewaySetupKey: process.env.NETBIRD_GATEWAY_SETUP_KEY || null,
   // The mesh DNS domain peers resolve under (<hostname>.<domain>). NetBird's self-hosted default.
   meshDomain: process.env.MESH_DOMAIN || 'netbird.selfhosted',
   // The zee-hive-net address cages route mesh traffic through (§3.5). Normally UNSET: the seal
