@@ -553,6 +553,24 @@ one more peer kind).
   `decideProdBind` flips the one narrow `xells→prod:<db>` policy a human-approved prod bind needs.
   Tests: `test/build-bootstrap.test.mjs`, `test/mesh-routes.test.mjs`, `test/netbird-policies.test.mjs`,
   `test/netbird-compose.test.mjs`. The committed `docker-compose.spinoff.yml` is untouched.
+- **Follow-up 3 — route-source telemetry** (§10.3, the gate for phase 5): migration 254
+  `mesh_route_stat`, ONE COUNTER ROW PER (UTC day, target_kind, source) — a tally, not a play-by-play,
+  because what the gate asks is a count over a window. `lib/mesh-route-telemetry.js` keeps the same
+  pure/thin split the rest of the router uses: `routeSources()` classifies a finished answer and
+  `tallyFromRows()` sums rows (both table-testable with no db), while `recordRouteSources()` bumps the
+  counter in ONE statement and swallows its own failure — a telemetry row must never fail the answer
+  it describes, and a database behind the ledger degrades to "no telemetry", never to a broken
+  `zee routes` (both proven live by dropping the table). `selfRoutes` records every answer it returns;
+  the read is `zee routes --tally [--days N]` (MANAGER-only, migration 258 documents it in the manager
+  manual) → `GET /api/xell/self/routes/tally`, 14-day window by default, clamped to 90, returning
+  `by_source` + `by_kind` + the raw per-day rows and soft-failing to an `error` string rather than
+  failing the read. The seam is a flag on the router's own verb, NOT a field on the routes answer —
+  §3.4's contract is about ONE xell and its shape is untouched — and NOT `zee ops`, whose digest
+  `test/delivery-telemetry.test.mjs` (TKT-42) pins against growth. Test:
+  `test/mesh-route-telemetry.test.mjs`; live-verified in-cage over HTTP (legacy answer → 3 legacy
+  bumps; joined peer → 3 mesh bumps; the tally read back through `GET /api/xell/self/routes/tally`,
+  manager 200 / worker refusal).
+  Phase 5 itself is NOT part of this: no port line, allocator path or compose file changed.
 - **The cage's route was dead; the seal now resolves it** (`b012a91f`): the `ip route replace` line
   above landed with the gateway, but nothing ever set `MESH_GATEWAY_IP` — `sealCxell` shells
   `docker exec -u 0 … cxell-firewall.sh` and `docker exec` inherits nothing, so the branch could
@@ -599,7 +617,8 @@ look flaky — stop the server before running the db suites.
    control plane is not.
 2. **Per-cage mesh agents and in-cage mesh DNS** — named seams (DR-3, §3.5), not built. The cage's
    path to the mesh is the gateway route, not an in-cage agent.
-3. **Phase 5** (stop publishing ports, delete the allocator) — gated on `source: legacy-port`
-   telemetry, as planned.
+3. **Phase 5** (stop publishing ports, delete the allocator) — still gated on `source: legacy-port`
+   telemetry, as planned. The telemetry itself now exists (§11, follow-up 3): the gate is a decision
+   to make off `zee routes --tally`, not a tool still to build.
 4. The **current backlog** on the wedged hosts still needs one human prune (or a medic
    `docker_repair` dispatch per machine) — the janitor keeps it flat only from then on.
