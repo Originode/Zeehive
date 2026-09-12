@@ -48,8 +48,10 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
                       createNetworks = new Set(), failNetworkCreate = null, failNetworkInspect = null,
                       runningContainers = new Set(), failCompose = null } = {}) => {
   const calls = [];
-  const stub = async (ctx, args) => {
+  const envCalls = [];
+  const stub = async (ctx, args, opts) => {
     calls.push(args.join(' '));
+    if (opts?.env) envCalls.push({ args: args.join(' '), env: opts.env });
     const [cmd] = args;
     if (cmd === 'info') {
       if (!reachable) return { unknown: true, reason: `connection refused (stub) to ${ctx}` };
@@ -94,6 +96,7 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
     return { status: 0, stdout: '', stderr: '' };
   };
   stub.calls = calls;
+  stub.envCalls = envCalls;
   return stub;
 };
 
@@ -121,6 +124,9 @@ const makeProvision = ({ fail = null, throwAlreadyRunning = false } = {}) => {
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
 const createdMachines = [], createdProjects = [], tmpDirs = [];
+// Machines this suite writes a mesh_config row for (the queenzee-host machine may pre-exist, so it
+// is not in createdMachines — the row must be dropped by hand).
+const meshConfigMachines = [];
 // The control-plane section mutates process-wide config; remember the originals to restore in finally.
 let savedSecrets = null;
 // Every fixture project shares one repo root that ACTUALLY has a compose file — so compose-resolves
@@ -457,7 +463,7 @@ try {
   // the management API. A secret is never invented, and the API token is named as a human's.
   console.log('\n── the bootstrap CARD stands up the NetBird control plane on the queenzee host (§3.1) ──');
   const {
-    renderManagementJson, managementJsonMissingSecrets, ensureManagementJson,
+    renderManagementJson, managementJsonMissingSecrets, ensureManagementJson, placeholderFill,
     MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES,
   } = await import('../server/src/lib/build-bootstrap.js');
   const EXAMPLE = path.join(REPO, 'docker/zeehive/netbird/management.json.example');
@@ -591,6 +597,91 @@ try {
   ok(perfCage.status === 'refused' && /ENOENT/.test(perfCage.reason || ''),
      `a cage (no docker CLI) refuses the whole action legibly [${perfCage.reason?.slice(0, 60)}…]`);
 
+  // ── THE STORE IS THE SOURCE: the console's row drives the stand-up (§1 + §2 + §3) ─────────────
+  // The card's own claim, asserted end to end: a human configures the mesh in the console (one
+  // mesh_config row here), clicks stand-up, and the step (a) renders management.json from the row,
+  // (b) creates the containers with the row's domain/ports/secrets as compose env, (c) bootstraps
+  // the first PAT and records it write-only, and (d) leaves nothing for a human to hand-edit.
+  console.log('\n── the stand-up consumes the mesh config STORE and bootstraps the first PAT ──');
+  const NEW_KEY = Buffer.alloc(32, 7).toString('base64');
+  const SEAM_KEYS = ['netbirdApiUrl', 'netbirdApiToken', 'meshDomain', 'netbirdSignalUri', 'netbirdRelayEndpoint',
+    'netbirdDatastoreEncryptionKey', 'netbirdRelayAuthSecret', 'netbirdGatewaySetupKey',
+    'netbirdMgmtGrpcPort', 'netbirdMgmtApiPort', 'netbirdSignalPort', 'netbirdRelayPort', 'netbirdDashHttpPort'];
+  savedSecrets = { ...savedSecrets, seam: Object.fromEntries(SEAM_KEYS.map((k) => [k, config[k]])) };
+
+  // A FRESH install dir: no netbird/ beside the compose file, so the step generates management.json
+  // from the shipped example using the console's values (the no-hand-edit path a human clicks).
+  const cpDir3 = fs.mkdtempSync(path.join(os.tmpdir(), `bs-cp3-${tag}-`));
+  tmpDirs.push(cpDir3);
+  const composeFile3 = path.join(cpDir3, 'docker-compose.bootstrap.yml');
+  fs.writeFileSync(composeFile3, 'name: zeehive\nservices:\n  netbird-management:\n    image: example\n');
+
+  // The console write, as it lands in the meta-DB: the secrets are the row's (the datastore key came
+  // from the console's generate; the relay secret was pasted), and NO api_token exists yet.
+  await q(`INSERT INTO mesh_config (machine_id, enabled, mesh_domain, mgmt_api_port, signal_uri, relay_endpoint,
+      datastore_encryption_key, relay_auth_secret, updated_by)
+    VALUES ($1, true, 'console.mesh', 3443, 'netbird-signal:10000', 'relay://netbird-relay:33080', $2, 'relay-auth-from-console', 'tester@console')`,
+    [mCp, NEW_KEY]);
+  meshConfigMachines.push(mCp);
+
+  // Only the TWO placeholder secrets of an EXISTING file are ever filled — a URI an operator set is
+  // never second-guessed. (Pure, so this cannot be confounded by the perform below.)
+  const fillOnly = placeholderFill(JSON.parse(exampleText),
+    { datastoreEncryptionKey: NEW_KEY, relaySecret: 'x', signalUri: 'y' });
+  ok(fillOnly.datastoreEncryptionKey === NEW_KEY && fillOnly.relaySecret === 'x' && fillOnly.signalUri === undefined,
+     'an existing management.json has ONLY its placeholder secrets filled — a URI is never invented into it');
+
+  config.meshComposeFile = composeFile3;
+  const dockerPat = makeDocker({ reachable: true, networks: new Set() });
+  let bootArgs = null;
+  const perfPat = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerPat,
+    provisionDb: makeProvision(), actor: 'tester@console', mesh: {
+      probeApi: probeOk,
+      bootstrapPat: async (args) => { bootArgs = args; return { ok: true, token: `nbp_${'B'.repeat(36)}`, version: '0.78.1' }; },
+      request: async () => ({ status: 500, json: { message: 'stub' } }),
+    } });
+  const patRes = perfPat.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(patRes?.status === 'created' && /bootstrapped into the control plane/.test(patRes?.detail || ''),
+     `the stand-up bootstraps the first PAT when no token exists anywhere [${patRes?.status}]`);
+  ok((patRes?.detail || '').includes('nbp_…BBBB') && !(patRes?.detail || '').includes(`nbp_${'B'.repeat(36)}`),
+     'the receipt names the token HINT only — the token itself never rides the receipt');
+  ok(bootArgs?.dataKey === NEW_KEY && bootArgs?.probe === probeOk,
+     "the bootstrap got the ROW's datastore key (its account rows are encrypted with the plane's own key)");
+  const genDoc = JSON.parse(fs.readFileSync(path.join(cpDir3, 'netbird', 'management.json'), 'utf8'));
+  ok(genDoc.DataStoreEncryptionKey === NEW_KEY && genDoc.Relay.Secret === 'relay-auth-from-console'
+     && genDoc.Signal.URI === 'netbird-signal:10000' && genDoc.Relay.Addresses[0] === 'relay://netbird-relay:33080',
+     'management.json was GENERATED from the console row — the shipped placeholder is gone, no hand-edit');
+  ok(managementJsonMissingSecrets(genDoc).length === 0, 'and no placeholder survives it');
+  const patEnv = dockerPat.envCalls.find((c) => c.args.includes('--profile mesh'))?.env || {};
+  ok(patEnv.MESH_DOMAIN === 'console.mesh' && patEnv.NETBIRD_MGMT_API_PORT === '3443'
+     && patEnv.NETBIRD_RELAY_AUTH_SECRET === 'relay-auth-from-console'
+     && patEnv.NETBIRD_RELAY_ENDPOINT === 'relay://netbird-relay:33080'
+     && patEnv.NETBIRD_MGMT_API_URL === 'https://netbird-management:443',
+     `the compose child carries the console's domain/ports/secrets as env [${Object.keys(patEnv).length} vars]`);
+  const storedRow = await one(`SELECT * FROM mesh_config WHERE machine_id=$1`, [mCp]);
+  ok(storedRow.api_token === `nbp_${'B'.repeat(36)}` && storedRow.enabled === true
+     && storedRow.updated_by === 'stand-up@queenzee',
+     'the bootstrapped PAT is persisted into the store, attributed to the stand-up');
+  ok(config.netbirdApiToken === `nbp_${'B'.repeat(36)}` && config.netbirdApiUrl === 'https://netbird-management:443'
+     && config.meshDomain === 'console.mesh' && config.netbirdMgmtApiPort === 3443
+     && config.netbirdDatastoreEncryptionKey === NEW_KEY,
+     'and lib/netbird.js + the stand-up now resolve URL/domain/ports/key from the store (the seam)');
+
+  // A second stand-up must NOT re-mint: the token resolves from the store now.
+  let bootCalls = 0;
+  const dockerPat2 = makeDocker({ reachable: true, networks: new Set(),
+    runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });
+  const perfPat2 = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerPat2,
+    provisionDb: makeProvision(), actor: 'tester@console', mesh: {
+      probeApi: probeOk,
+      bootstrapPat: async () => { bootCalls++; return { ok: true, token: 'nope' }; },
+      request: async () => ({ status: 500, json: { message: 'stub' } }),
+    } });
+  const patRes2 = perfPat2.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(bootCalls === 0 && /No secret was minted or stored/.test(patRes2?.detail || '')
+     && !dockerPat2.calls.some((c) => c.includes('--profile mesh')),
+     'a second stand-up neither re-mints nor composes — the store is the source of truth');
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('TEST ERROR:', e);
@@ -598,6 +689,7 @@ try {
 } finally {
   // clean up what THIS test created, whatever happened (house rule: tests clean up in a finally)
   try {
+    for (const id of meshConfigMachines) await q(`DELETE FROM mesh_config WHERE machine_id=$1`, [id]).catch(() => {});
     for (const p of createdProjects) {
       await q(`DELETE FROM build_bootstrap_action WHERE project_id=$1`, [p]).catch(() => {});
       await q(`DELETE FROM deploy_site WHERE project_id=$1`, [p]).catch(() => {});
@@ -614,6 +706,8 @@ try {
       config.netbirdDatastoreEncryptionKey = savedSecrets.k;
       config.netbirdRelayAuthSecret = savedSecrets.s;
       config.meshComposeFile = savedSecrets.url;
+      // The store-applied seam (applyMeshConfig) — restore every key so a later suite sees the env.
+      for (const [k, v] of Object.entries(savedSecrets.seam || {})) config[k] = v;
     }
   } catch (e) { console.error('CLEANUP ERROR:', e); }
   await pool.end();
