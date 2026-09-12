@@ -164,6 +164,22 @@ try {
        'disabling is sticky across later writes (an update does not re-enable)');
   }
 
+  section('a write carrying NO configuration never enables the mesh by itself');
+  {
+    // The route strips `by`, so `{}` here is what an empty body (or the panel's save before its
+    // config read resolved, when `fields` is still {}) actually sends. It is not a decision: no row,
+    // no enabled default, nothing for the chrome to read as a configured-but-unreachable plane.
+    const third = (await one(
+      `INSERT INTO machine (key, docker_ctx, can_build, enabled) VALUES ($1,$2,true,true) RETURNING id`,
+      [`mc-${tag}-d`, `zt-mc-${tag}-d`])).id;
+    machineIds.push(third);
+    const empty = await putJSON(`${BASE}/machines/${third}/mesh-config`, {});
+    ok(empty.status === 200 && empty.data.enabled === false && empty.data.applied === false,
+       `an empty write enables nothing [enabled ${empty.data.enabled}]`);
+    const none = await one(`SELECT 1 AS x FROM mesh_config WHERE machine_id=$1`, [third]);
+    ok(!none, 'and it plants no row at all');
+  }
+
   section('a disabled row is inert; the env rules again');
   {
     await putJSON(`${BASE}/machines/${machineId}/mesh-config`, { enabled: false });

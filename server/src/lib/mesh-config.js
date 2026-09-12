@@ -346,8 +346,11 @@ export async function setMeshConfig(machineId, patch = {}, { actor = 'human@cons
   // A console write that CARRIES a configuration ENABLES this machine's mesh. The row a human fills
   // in is a decision, not a draft (the panel has no separate "on" switch), and a row left disabled
   // would make the stand-up's bootstrapped PAT inert — the one outcome §1 forbids. An explicit
-  // `enabled` in the patch always wins, and an UPDATE never flips it.
-  if (!row.machine_id && !('enabled' in (patch || {}))) cols.enabled = true;
+  // `enabled` in the patch always wins, and an UPDATE never flips it. A patch that carries NOTHING
+  // (an empty body, or the panel's own save on a config it never managed to read) is not a decision
+  // and must never enable the mesh by itself — it would plant an enabled default row and, on the
+  // chrome's read, a false "MESH DOWN" for a plane nobody configured.
+  if (!row.machine_id && Object.keys(cols).length && !('enabled' in (patch || {}))) cols.enabled = true;
   const fields = Object.keys(cols);
   if (!fields.length) return meshConfigFor(machineId);
   const sets = fields.map((f, i) => `"${f}" = $${i + 3}`).join(', ');
