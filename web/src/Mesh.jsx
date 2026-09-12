@@ -278,6 +278,9 @@ function MeshSections({ m, projectId, onChanged }) {
     setBusy(true); setPlanErr(null);
     try {
       const r = await planBuildBootstrap(projectId, m.id);
+      // A refused plan (an unreachable daemon) is not "this machine has no control-plane step" —
+      // say why, rather than letting the host-only note take the blame.
+      if (r?.refused || r?.status === 'refused') { setPlan(null); setPlanErr(r.refused || r.reason || 'the bootstrap refused'); setPlanned(true); return; }
       const steps = r?.plan || r?.steps || [];
       setPlan(steps.find((s) => s.kind === 'mesh-control-plane') || null);
       setPlanned(true);

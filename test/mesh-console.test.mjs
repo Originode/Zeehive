@@ -41,6 +41,8 @@ ok(/putMeshConfig = \(machineId, body\) =>/.test(src.api), 'putMeshConfig takes 
 // The stand-up must be SCOPED: standing up the mesh must not create the project's networks/dev-db.
 ok(/performBuildBootstrap\(projectId, m\.id, [^,)]+, \['mesh-control-plane'\]\)/.test(src.mesh),
    'the panel performs ONLY the mesh-control-plane step (kinds-scoped)');
+ok(/r\?\.refused \|\| r\?\.status === 'refused'/.test(src.mesh) && /setPlanErr\(r\.refused/.test(src.mesh),
+   'a refused plan surfaces its reason, not the misleading "not the queenzee host" note');
 ok(/kinds/.test(src.api.slice(src.api.indexOf('performBuildBootstrap'))) && /kinds/.test(src.routes),
    'the kinds scope is passed through api.js to the server route');
 // The typed-word gate, not a bare click (the Ship/ProdData house pattern).
