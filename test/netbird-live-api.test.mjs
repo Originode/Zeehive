@@ -60,6 +60,10 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 const section = (t) => console.log(`\n── ${t} ──`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A failed verdict must FAIL an assertion, never crash the harness on `.peers`/`.policies`: the
+// reason belongs in the output, and the ok() message template is evaluated even when it is false.
+const listOf = (r, key) => (r?.ok && Array.isArray(r[key]) ? r[key] : []);
+const why = (r) => (r?.ok ? '' : ` — ${r?.reason || 'no verdict reason'}`);
 
 const firstExisting = (...paths) => paths.find((p) => p && existsSync(p)) || null;
 // NETBIRD_BIN_DIR is what scripts/fetch-netbird-binaries.mjs populates (--dir).
@@ -308,7 +312,12 @@ try {
   server = startMgmt();
   const ready = await waitFor(async () => {
     if (server.exitCode !== null) return null;
-    try { await fetch(`http://127.0.0.1:${apiPort}/api/peers`); return true; } catch { return null; }
+    try {
+      // Consume the body: an unconsumed response leaves undici's pooled socket dirty, and the
+      // next request on it can hang to its abort bound (seen once against a real server).
+      await (await fetch(`http://127.0.0.1:${apiPort}/api/peers`)).text();
+      return true;
+    } catch { return null; }
   }, { timeoutMs: 40000, everyMs: 200 });
   ok(!!ready, 'the real management server answers HTTP on 127.0.0.1 (phase 2)');
   if (!ready) throw new Error(`server never listened — see ${logPath}`);
@@ -323,7 +332,10 @@ try {
   const ping = await nb.netbirdRequest('GET', '/api/peers');
   ok(ping.status === 200 && Array.isArray(ping.json), `GET /api/peers → 200 + array (${ping.status})`);
   const noAuth = await fetch(`http://127.0.0.1:${apiPort}/api/peers`);
-  ok(noAuth.status === 401 || noAuth.status === 403, `and the same call with NO token is refused (${noAuth.status})`);
+  // Consume the body — see the readiness note above.
+  const noAuthBody = await noAuth.text();
+  ok((noAuth.status === 401 || noAuth.status === 403) && noAuthBody.trim().length > 0,
+     `and the same call with NO token is refused (${noAuth.status})`);
 
   section('ensureGroup — real create-then-find is idempotent');
   const g1 = await nb.ensureGroup('xells');
@@ -348,8 +360,9 @@ try {
 
   section('listPeers / getPeerByHostname — against real peer rows');
   const lp = await nb.listPeers();
-  ok(lp.ok === true && Array.isArray(lp.peers) && lp.peers.length >= SEED_PEERS.length,
-     `listPeers answers the real array (${lp.peers.length} peers)`);
+  const lpPeers = listOf(lp, 'peers');
+  ok(lp.ok === true && lpPeers.length >= SEED_PEERS.length,
+     `listPeers answers the real array (${lpPeers.length} peers)${why(lp)}`);
   const found = await nb.getPeerByHostname('mesh-e2e-seed');
   ok(found.ok === true && found.peer?.id === SEED_PEERS[0].id, 'getPeerByHostname finds a real peer by hostname');
   ok(found.peer?.ip === SEED_PEERS[0].ip, `and carries the LIVE half — the assigned mesh ip (${found.peer?.ip})`);
@@ -364,7 +377,8 @@ try {
   const delAgain = await nb.deletePeer(SEED_PEERS[0].id);
   ok(delAgain.ok === true && delAgain.alreadyGone === true, 'a repeat DELETE answers 404 → alreadyGone (idempotent)');
   const afterDel = await nb.listPeers();
-  ok(!afterDel.peers.some((p) => p.id === SEED_PEERS[0].id), 'the peer is really gone from the control plane');
+  ok(!listOf(afterDel, 'peers').some((p) => p.id === SEED_PEERS[0].id),
+     `the peer is really gone from the control plane${why(afterDel)}`);
 
   section('ensurePolicy — the drift fix, verified against the real API');
   const polName = `e2e-narrow-${Date.now()}`;
@@ -375,7 +389,7 @@ try {
      `the corrected rule body is ACCEPTED (id ${pol.id})${pol.ok ? '' : ` — ${pol.reason}`}`);
   const pl = await nb.listPolicies();
   ok(pl.ok === true, 'listPolicies answers the real array');
-  const realPol = pl.ok ? pl.policies.find((p) => p.id === pol.id) : null;
+  const realPol = listOf(pl, 'policies').find((p) => p.id === pol.id) || null;
   ok(!!realPol, 'the policy round-trips through GET /api/policies');
   const rule = realPol?.rules?.[0];
   ok(rule?.protocol === 'tcp' && Array.isArray(rule?.ports) && rule.ports[0] === '5432',
@@ -397,7 +411,8 @@ try {
   section('ensurePolicy without ports — protocol all, no ports (the ALL/ICMP constraint)');
   const allPol = await nb.ensurePolicy({ name: `${polName}-all`, sourceGroups: ['xells'], destGroups: ['xells'] });
   ok(allPol.ok === true, `a portless policy is accepted (id ${allPol.id})${allPol.ok ? '' : ` — ${allPol.reason}`}`);
-  const allReal = (await nb.listPolicies()).policies.find((p) => p.id === allPol.id);
+  const allPl = await nb.listPolicies();
+  const allReal = listOf(allPl, 'policies').find((p) => p.id === allPol.id) || null;
   ok(allReal?.rules?.[0]?.protocol === 'all' && !allReal?.rules?.[0]?.ports,
      'and the real rule is protocol all with NO ports (the API forbids ports on ALL/ICMP)');
 
@@ -405,7 +420,8 @@ try {
   const xellSlug = `e2e-x-${Date.now()}`;
   const bind = await nb.ensureProdBindMeshPolicy(xellSlug);
   ok(bind.ok === true && bind.created === true, 'the prod-bind policy is ensured');
-  const bindReal = (await nb.listPolicies()).policies.find((p) => p.name === nb.prodBindPolicyName(xellSlug));
+  const bindPl = await nb.listPolicies();
+  const bindReal = listOf(bindPl, 'policies').find((p) => p.name === nb.prodBindPolicyName(xellSlug)) || null;
   ok(bindReal?.rules?.[0]?.protocol === 'tcp' && bindReal?.rules?.[0]?.ports?.[0] === '5432',
      'and in the real store it is exactly xells→prod tcp:5432 — narrow by construction');
   const rebind = await nb.ensureProdBindMeshPolicy(xellSlug);
@@ -453,7 +469,8 @@ try {
     const dereg = await nb.deregisterXellPeers(xell.id);
     ok(dereg.ok === true && dereg.removed === 1, `the xell's peer is deregistered${dereg.ok ? '' : `: ${dereg.problems}`}`);
     const gone = await nb.listPeers();
-    ok(!gone.peers.some((p) => p.id === SEED_PEERS[1].id), 'and it is really gone from the real control plane');
+    ok(!listOf(gone, 'peers').some((p) => p.id === SEED_PEERS[1].id),
+       `and it is really gone from the real control plane${why(gone)}`);
     const goneRow = await one(`SELECT * FROM mesh_peer WHERE hostname='mesh-e2e-join'`);
     ok(goneRow.status === 'removed' && goneRow.removed_at !== null, 'the intent row says removed, with a timestamp');
     ok((await nb.deregisterXellPeers(xell.id)).removed === 0, 'a second deregister is a no-op (idempotent)');
@@ -465,7 +482,8 @@ try {
     ok(sweep.ok === true && sweep.deleted.includes('mesh-e2e-removed'),
        `dead-by-intent peer deleted by the janitor (${sweep.deleted.join(', ') || 'none'})`);
     ok(sweep.unknown.includes('mesh-e2e-orphan'), 'an unknown hostname is REPORTED, never deleted');
-    const survivor = (await nb.listPeers()).peers.find((p) => p.id === SEED_PEERS[3].id);
+    const survivorList = await nb.listPeers();
+    const survivor = listOf(survivorList, 'peers').find((p) => p.id === SEED_PEERS[3].id);
     ok(!!survivor, 'the stranger peer is still there — the shared control plane was not over-reaped');
 
     // ── the real agent (optional): a client registers with a key OUR client minted ────────────
@@ -500,7 +518,7 @@ try {
       }, { timeoutMs: 45000, everyMs: 500 });
       if (seen) {
         ok(true, `the real agent registered (peer ${seen.id}, ip ${seen.ip}, dns_label ${seen.dns_label})`);
-        const listed = (await nb.listPeers()).peers.some((p) => p.id === seen.id);
+        const listed = listOf(await nb.listPeers(), 'peers').some((p) => p.id === seen.id);
         ok(listed, 'and a real agent\'s peer rides out of listPeers');
         const agentDel = await nb.deletePeer(seen.id);
         ok(agentDel.ok === true && agentDel.deleted === true, 'and our client can deregister it');

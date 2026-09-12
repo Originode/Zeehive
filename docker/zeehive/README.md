@@ -165,12 +165,13 @@ wherever you keep `docker-compose.bootstrap.yml`.
    (relative to the compose file, so `docker/zeehive/netbird/management.json` in a checkout). The
    example is valid JSON with placeholder `Signal` / `Relay` / datastore-encryption values; fill in
    the LAN addresses/ports you publish below and a real `DataStoreEncryptionKey`/relay secret.
-   **The datastore key must be valid base64 of exactly 32 bytes** — the shipped value decodes to 32
-   bytes so a copied example still boots, but generate your own and keep it versioned:
-   `openssl rand -base64 32`. (A `CHANGE-ME-…` phrase there is NOT valid base64 and the server dies
-   on boot with `failed to create field encryptor: decode encryption key`; verified against
-   v0.78.1, docs/netbird-mesh-plan.md §11.) The `HttpConfig.Address` key some older docs show is
-   gone in v0.78.1 — the listen address is the `--port` flag, not config.
+   **The datastore key must be valid base64 of exactly 32 bytes**, e.g. `openssl rand -base64 32`.
+   The shipped `CHANGE-ME-…` value is deliberately NOT a usable key: it does not decode, so the
+   server dies on boot with `failed to create field encryptor: decode encryption key` (verified
+   against v0.78.1, docs/netbird-mesh-plan.md §11), and the bootstrap card refuses to stand the
+   plane up on it. Generate your own and keep it versioned; it is the one-way door to the datastore.
+   The `HttpConfig.Address` key some older docs show is gone in v0.78.1 — the listen address is the
+   `--port` flag, not config.
 3. **Bring the control plane up.**
    ```sh
    docker compose -f docker/zeehive/docker-compose.prod.yml --profile mesh up -d
@@ -230,5 +231,7 @@ create; setting it is itself an opt-in (it is honoured even with the mesh otherw
 
 Note what this does **not** weaken: the seal still drops every prod db host:port first, and the
 control plane is default-deny between groups, so a cage with the route reaches only what a policy
-grants (mesh-plan §3.5). Live stand-up of the gateway, like the rest of the control plane, is a
-human's deploy — none of it has been exercised against a running NetBird.
+grants (mesh-plan §3.5). The client half is now live-verified — `lib/netbird.js` is driven against a
+real v0.78.1 management server by `test/netbird-live-api.test.mjs` (mesh-plan §11) — but the
+gateway hop is still test-only, and **live stand-up is a human's deploy**: of the gateway, like the
+rest of the control plane, and none of it has been exercised against a running NetBird.

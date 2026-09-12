@@ -676,12 +676,16 @@ it — the end-to-end story this plan rests on.
    body returns `GroupMinimum` objects (`{id,name,peers_count}`) for `sources`/`destinations`. No
    code change needed (find-by-name reads only `name`/`id`), but a future consumer must not assume
    symmetry.
-4. **`docker/zeehive/netbird/management.json.example` could not boot a real server.**
-   `DataStoreEncryptionKey: "CHANGE-ME-32-byte-…"` is not valid base64 → the server dies with
-   `failed to create field encryptor: decode encryption key: illegal base64 data at input byte 5`.
-   The example now carries a VALID base64 32-byte placeholder, and `test/netbird-compose.test.mjs`
-   asserts it decodes to 32 bytes. The example's `HttpConfig.Address` no longer exists in v0.78.1's
-   `HttpServerConfig` (the listen address is the `--port` flag) and is gone; the README says both.
+4. **`docker/zeehive/netbird/management.json.example`'s key is not a usable key — by design.**
+   The shipped `DataStoreEncryptionKey: "CHANGE-ME-32-byte-…"` is not valid base64 → a server booted
+   straight from the copied example dies with `failed to create field encryptor: decode encryption
+   key: illegal base64 data at input byte 5` (observed on v0.78.1). A real key must be base64 of
+   exactly 32 bytes; the README now says so and how to generate one (`openssl rand -base64 32`), and
+   `test/netbird-compose.test.mjs` pins BOTH halves: the shipped value still carries the `CHANGE-ME`
+   marker (so the bootstrap card's stand-up refusal keeps firing) and it is NOT a decodable key (so
+   a copied example can never boot the plane on a public secret). The example's
+   `HttpConfig.Address` no longer exists in v0.78.1's `HttpServerConfig` (the listen address is the
+   `--port` flag) and is gone.
 
 **Honest limits.** The install's own control plane is still not stood up (§3.1, item 1 below). The
 harness seeds the store by hand — with `IdpManagerConfig.ManagerType: "none"` there is NO supported

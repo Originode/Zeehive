@@ -215,12 +215,17 @@ ok(/netbird\/management\.json\.example/.test(readme), 'README points at the ship
 const example = JSON.parse(readFileSync(resolve(ROOT, 'docker/zeehive/netbird/management.json.example'), 'utf8'));
 ok(!!example && Array.isArray(example.Relay?.Addresses) && typeof example.DataStoreEncryptionKey === 'string',
    'management.json.example is valid JSON with the endpoints a human edits');
-// The example's datastore key must DECODE: a shipped "CHANGE-ME-…" phrase is not base64 and makes
-// the real server die on boot (`failed to create field encryptor: decode encryption key`). Filling
-// the example in must not require guessing that. (v0.78.1 behaviour; docs/netbird-mesh-plan.md §11.)
+// The example's datastore key is a PLACEHOLDER and must stay recognizable as one: the real server
+// cannot decode it (v0.78.1 dies with `failed to create field encryptor: decode encryption key`,
+// docs/netbird-mesh-plan.md §11) and lib/build-bootstrap.js refuses a stand-up on it, naming
+// NETBIRD_DATASTORE_ENCRYPTION_KEY. If it ever became a real-looking key, a copied example would
+// boot the control plane on a public secret. So assert BOTH halves: marker present, not decodable.
 const keyBytes = Buffer.from(example.DataStoreEncryptionKey, 'base64');
-ok(keyBytes.length === 32 && keyBytes.toString('base64') === example.DataStoreEncryptionKey,
-   `the example DataStoreEncryptionKey is valid base64 of 32 bytes (${keyBytes.length})`);
+ok(/CHANGE-ME/i.test(example.DataStoreEncryptionKey)
+   && !(keyBytes.length === 32 && keyBytes.toString('base64') === example.DataStoreEncryptionKey),
+   'the example DataStoreEncryptionKey is a CHANGE-ME placeholder, not a usable key');
+ok(/openssl rand -base64 32/.test(readme),
+   'README tells the human to generate a real 32-byte base64 key');
 
 section('the NetBird release is PINNED (not :latest) — the API surface is frozen against it');
 // lib/netbird.js is frozen against one release; the compose default must be that release, not
