@@ -93,7 +93,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
-         selfProviderEnv, selfRoutes } from '../queenzee/self.js';
+         selfProviderEnv, selfRoutes, selfRouteTally } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
@@ -758,7 +758,9 @@ router.post('/medics/:id/message', requireQueenzeeLoops, async (req, res) => {
 // ── MEDIC CALLS — the CALLED emergency's console surface. A call (medic_call, 251) is a blocked
 // zee's own words; when no live medic is attending the project it becomes an entry in
 // fleet.medic_emergency (source 'called') and THIS is the human's dispatch seam: brief a medic FROM
-// THE CALL, link call.medic_id, mark it attended. Nothing auto-spawns — a human clicks. ───────────
+// THE CALL, link call.medic_id, mark it attended. Nothing auto-spawns BY DEFAULT — a human clicks;
+// a project that opts in to auto_dispatch_medic (255) has raiseMedicCall drive the SAME lib seam
+// (medic-calls.js dispatchMedicCall) for it, with the same refusals. ─────────────────────────────
 router.get('/medic-calls', async (req, res) => {
   try {
     const { resolveProjectId } = await import('../lib/project-resolve.js');
@@ -772,30 +774,13 @@ router.post('/medic-calls/:callId/dispatch', requireQueenzeeLoops, async (req, r
   try {
     const g = await refuseWorkerZeeToken(req);
     if (g) return res.status(403).json(g);
-    const { dispatchMedic } = await import('../queenzee/medic-spawn.js');
-    const { readMedicCall, buildCallDispatchBrief, MEDIC_LIVE_STATUSES } =
-      await import('../lib/medic-calls.js');
+    // The seam itself lives in medic-calls.js so the auto_dispatch_medic policy (255) drives the
+    // EXACT same path with the EXACT same refusals — this route is just the human's entrance to it.
+    const { readMedicCall, dispatchMedicCall } = await import('../lib/medic-calls.js');
     const call = await readMedicCall(req.params.callId);
-    if (!call) return res.status(404).json({ error: 'no such medic call' });
-    const medicLive = call.medic_status && MEDIC_LIVE_STATUSES.includes(call.medic_status);
-    if (call.status === 'attended' && medicLive) {
-      return res.status(400).json({ error: 'this call is already attended — the medic is in the Bay' });
-    }
-    if (!['open', 'attended'].includes(call.status)) {
-      return res.status(400).json({ error: `this call is ${call.status} — only an OPEN call (or an `
-        + `attended call whose medic is no longer LIVE) can be dispatched` });
-    }
-    // An ATTENDED call whose medic is no longer LIVE is dispatchable again — a failed attach-resume
-    // leaves the call 'attended' against an errored medic, and that must not strand the emergency
-    // (SHOULD-5). The UPDATE below re-links the call to the fresh medic and keeps status 'attended'.
-    const task = buildCallDispatchBrief(call, call.xell_slug);
-    const out = await dispatchMedic({ targetProjectId: call.project_id, task });
-    const updated = await one(
-      `UPDATE medic_call SET medic_id=$2, status='attended', updated_at=now() WHERE id=$1 RETURNING *`,
-      [call.id, out.medic_id]);
-    broadcast('medic-call', updated);
-    res.json({ ...out, call_id: call.id,
-               message: 'medic attending from the CALL — watch the Bay; its answer goes back to the calling zee' });
+    const out = await dispatchMedicCall(call, { by: req.body?.actor || 'human@console' });
+    if (!out.ok) return res.status(out.status || 400).json({ ...out, error: out.reason });
+    res.json({ ...out, message: 'medic attending from the CALL — watch the Bay; its answer goes back to the calling zee' });
   } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
 });
 // A HUMAN says NO to a CALLED emergency — dismiss = DECLINE (distinct from the zee's own
@@ -2343,6 +2328,16 @@ router.get('/xell/self/provider-env', async (req, res) => {
 // self-scoped, opens no gate — the live counterpart of the .zeehive.env snapshot.
 router.get('/xell/self/routes', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfRoutes(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// The tally HALF of the same router read (MANAGER only, `zee routes --tally`): the per-day count of
+// mesh-vs-legacy answers per target kind — the number phase 5 is gated on (migration 254,
+// lib/mesh-route-telemetry.js). A route of its own, deliberately: the routes answer above is a
+// settled contract about ONE xell's stack, and it must not grow (the TKT-42 lesson that kept
+// `zee ops` from absorbing delivery telemetry).
+router.get('/xell/self/routes/tally', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfRouteTally(x, { days: req.query.days ?? null })); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.get('/xell/self/env', async (req, res) => {

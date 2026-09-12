@@ -2138,6 +2138,9 @@ function AutoApprove({ project, projectId, onChanged }) {
       if (field === 'auto_done'
         && !(await showConfirm('Auto-done xells?\n\nA DONE SUGGESTION from a MANAGER zee will be confirmed immediately with NO human review — marking the task done and tearing that xell down. A worker\'s own `zee done` still needs a human. The reap\'s own guards (e.g. an actively-working xell) still apply.',
           { variant: 'danger', okLabel: 'Enable auto-done' }))) return;
+      if (field === 'auto_dispatch_medic'
+        && !(await showConfirm('Auto-DISPATCH the medic?\n\nA zee\'s medic call will be dispatched to the medic plane immediately with NO human click — the same call that would otherwise park as a CALLED emergency for a human to dispatch from the ⛑ panel. It goes through the SAME dispatch seam as the ⛑ button (same refusals, and still nothing for a call that already has a live medic).',
+          { variant: 'danger', okLabel: 'Enable auto-dispatch' }))) return;
     }
     setBusy(true);
     try { await updateProject(projectId, { [field]: checked }); onChanged?.(); }
@@ -2162,6 +2165,8 @@ function AutoApprove({ project, projectId, onChanged }) {
               title="Automatically approve every production seed — SQL runs on the LIVE database with no human reading it (still only files already on main, from server/sql/seeds/)." />
       <Switch field="auto_done" label="done" danger
               title="Automatically confirm a MANAGER's done suggestion — the xell is marked done and torn down with no human review (a worker's own `zee done` still needs a human)." />
+      <Switch field="auto_dispatch_medic" label="medics" danger
+              title="Automatically DISPATCH the medic for a zee's medic call that has no live medic to attach to — the call no longer parks as a CALLED emergency for a human click. Same dispatch seam and refusals as the ⛑ button." />
     </span>
   );
 }

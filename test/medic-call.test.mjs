@@ -18,6 +18,24 @@
 //   6. ATTACH: a LIVE medic on the project routes the raise to 'attached' — the call is linked to
 //      that medic and marked 'attended' (the warm resume itself is the driver's business; this test
 //      asserts the row routing, not the model turn).
+//   7. THE BADGE FACT (256): the fleet snapshot carries `medic_call:{live,kind}` on the xell row for
+//      an OPEN call or an ATTENDED call whose medic is no longer live — the honeycomb paints the ⛑
+//      from that fact and must not re-query (fleet.js fetchXellRows).
+//   8. THE PATIENT IS GONE (256): retiring a xell WITHDRAWS its live call with a reason
+//      (withdrawMedicCallsForRetiredXell, driven by reaper.js) instead of letting the fleet fold-in's
+//      retired-exclusion swallow it — the receipt survives in the history.
+//   9. THE BACKFILL (migration 256): the migration's own SQL marks a pre-existing retired-xell call
+//      withdrawn with the same reason, and touches nothing the rule would not catch.
+//  10. BOTH PATHS CARRY IT (256): the badge fact is asserted on getFleet AND on streamXells — the
+//      progressive path the honeycomb actually paints from. One shared helper, two callers: covering
+//      only one would let a param slip in the other paint a hive of hexes with no ⛑ and stay green.
+//  11. THE OPERATOR POLICY auto_dispatch_medic (255), BOTH states: OFF (default) a raise still
+//      parks OPEN for a human, exactly as today; ON a raise with no live medic is dispatched through
+//      the SAME seam the human click uses (dispatchMedicCall → 'attended' + a medic briefed from the
+//      call) and the calling zee is TOLD a policy did it. And the policy never overrides ATTACH: a
+//      live medic still takes the call rather than the policy dispatching a second one. It also
+//      does not reach where a click cannot: on an API-only instance (QUEENZEE_INPROC=false, where
+//      the dispatch route is refused 503) the call parks OPEN rather than spawning without the lock.
 process.env.MEDICRW_MODE = 'real';
 // The dispatch route is gated by requireQueenzeeLoops — only the process holding the single-queenzee
 // lock drives a spawn. config.js loads .zeehive.env at import (an API-only cxell projects
@@ -36,7 +54,9 @@ const {
   raiseMedicCall, collectCallEvidence, readMedicCallForXell,
   listProjectMedicCalls, withdrawMedicCall, answerMedicCall, dismissMedicCall,
   buildCallAttachMessage, buildCallDispatchBrief,
+  withdrawMedicCallsForRetiredXell, RETIRED_PATIENT_WITHDRAWAL_REASON,
 } = await import('../server/src/lib/medic-calls.js');
+const { readFileSync } = await import('node:fs');
 const { fingerprintMedicText, createMedicDismissal, undoMedicDismissal, listMedicDismissals } =
   await import('../server/src/lib/medic-dismissals.js');
 
@@ -300,6 +320,74 @@ try {
   ok(!deadList.some((c) => c.id === deadCall.call_id),
      'the retired xell\'s OPEN call is NOT in the live-only emergency feed');
 
+  // ── 7d. the OPERATOR POLICY: auto_dispatch_medic (255), BOTH states ────────
+  console.log('\n── auto_dispatch_medic OFF (default): a raise still parks for a human ──');
+  const offProject = { id: await insProject(`mc-off-p-${tag}`) };
+  const offXell = await insXell(offProject.id, `mc-off-${tag}`);
+  const medicsBeforeOff = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  const offRaise = await raiseMedicCall({ xell: offXell, reason: 'flag off — must park for a human',
+                                          kind: 'db', zeeId: null });
+  ok(offRaise.routed === 'raised', `flag OFF → routed 'raised' (got ${offRaise.routed})`);
+  ok(/human dispatches/.test(offRaise.message) && /NOTHING auto-spawns/.test(offRaise.message),
+     'flag OFF → the zee is still told a human dispatches and nothing auto-spawns');
+  const offCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [offRaise.call_id]);
+  ok(offCall.status === 'open' && offCall.medic_id === null,
+     'flag OFF → the call stays OPEN with no medic (the default is unchanged)');
+  ok((await one(`SELECT count(*)::int AS n FROM medic`)).n === medicsBeforeOff,
+     'flag OFF → no medic row was created (no dispatch happened)');
+
+  console.log('\n── auto_dispatch_medic ON: the SAME seam dispatches with no human click ──');
+  const onProject = { id: await insProject(`mc-on-p-${tag}`) };
+  const onXell = await insXell(onProject.id, `mc-on-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [onProject.id]);
+  const onRaise = await raiseMedicCall({ xell: onXell, reason: 'flag on — dispatch me now',
+                                         kind: 'db', zeeId: null });
+  ok(onRaise.ok === true && onRaise.routed === 'auto-dispatched' && !!onRaise.medic_id,
+     `flag ON → routed 'auto-dispatched' with a medic id (got ${onRaise.routed})`);
+  ok(/auto_dispatch_medic policy/.test(onRaise.message) && /no human click/.test(onRaise.message),
+     'the calling zee is TOLD a policy dispatched it, not a human');
+  const onCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [onRaise.call_id]);
+  ok(onCall.status === 'attended' && onCall.medic_id === onRaise.medic_id,
+     'the call is ATTENDED and linked to the dispatched medic — the human click\'s own outcome');
+  const onMedic = await one(`SELECT * FROM medic WHERE id=$1`, [onRaise.medic_id]);
+  ok(onMedic?.target_project_id === onProject.id, 'the dispatched medic targets the CALLING project');
+  ok(/flag on — dispatch me now/.test(onMedic?.brief || ''),
+     'the medic was briefed FROM THE CALL (the zee\'s own words are in the brief)');
+  ok((onMedic?.brief || '').includes(onXell.slug),
+     'the brief NAMES the calling xell (the same brief a human click produces)');
+  ok(onMedic?.condition_id === null,
+     'the dispatch is call-driven, not condition-driven (no condition was invented)');
+
+  console.log('\n── the policy never overrides ATTACH: a live medic still takes the call ──');
+  const attProject = { id: await insProject(`mc-att-p-${tag}`) };
+  const attXell = await insXell(attProject.id, `mc-att-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [attProject.id]);
+  const attMedic = await insMedic(attProject.id);   // status 'diagnosing' — already attending
+  const attRaise = await raiseMedicCall({ xell: attXell, reason: 'a live medic is already here',
+                                          kind: 'db', zeeId: null });
+  ok(attRaise.routed === 'attached' && attRaise.medic_id === attMedic.id,
+     'with the flag ON and a LIVE medic attending, the raise still ATTACHES (the policy only fills the gap a human would have filled)');
+
+  console.log('\n── API-only instance: the policy parks, because the click is refused there ──');
+  const apiProject = { id: await insProject(`mc-api-p-${tag}`) };
+  const apiXell = await insXell(apiProject.id, `mc-api-${tag}`);
+  await q(`UPDATE project SET auto_dispatch_medic=true WHERE id=$1`, [apiProject.id]);
+  const { config } = await import('../server/src/config.js');
+  const wasInproc = config.queenzeeInproc;
+  const apiMedicsBefore = (await one(`SELECT count(*)::int AS n FROM medic`)).n;
+  let apiRaise;
+  try {
+    config.queenzeeInproc = false;   // the route's requireQueenzeeLoops refuses this instance
+    apiRaise = await raiseMedicCall({ xell: apiXell, reason: 'api-only must not drive a spawn',
+                                      kind: 'db', zeeId: null });
+  } finally { config.queenzeeInproc = wasInproc; }
+  ok(apiRaise.routed === 'raised', `an API-only instance parks the call (got ${apiRaise.routed})`);
+  const apiCall = await one(`SELECT * FROM medic_call WHERE id=$1`, [apiRaise.call_id]);
+  ok(apiCall.status === 'open' && apiCall.medic_id === null,
+     'the call stays OPEN — the policy does not spawn where the ⛑ click would get a 503');
+  ok((await one(`SELECT count(*)::int AS n FROM medic`)).n === apiMedicsBefore,
+     'no medic row was created on the API-only instance');
+
   // ── 8. the ROUTES over real HTTP (a fresh project with NO live medic) ──────
   console.log('\n── the routes: zee medic (token-scoped), console list + dispatch (real HTTP) ──');
   const { router } = await import('../server/src/api/routes.js');
@@ -502,6 +590,127 @@ try {
   const lineStill = await one(`SELECT body FROM project_condition WHERE id=$1`, [condLine.id]);
   ok(!!lineStill && lineStill.body.includes('PROVISION-INFRA'),
      'dismissal NEVER deletes the condition line — it only hides the dispatch ask');
+
+  // ── 13. THE BADGE FACT (256): the fleet row SAYS a live call is out there ──
+  // The honeycomb paints a ⛑ on the hex and must not re-query per hexagon, so the fact rides the
+  // fleet snapshot's xell row. It must track the SAME live predicate as the ⛑ feed: OPEN, or
+  // ATTENDED with a medic that is no longer live. The row is what the canvas reads; this drives
+  // getFleet — the real read model — not the predicate in isolation.
+  console.log('\n── the ⛑ badge fact rides the xell row (the honeycomb must not re-query) ──');
+  const badgeProject = { id: await insProject(`mc-badge-p-${tag}`) };
+  const badgeXell = await insLiveBlockedXell(badgeProject.id, `mc-badge-${tag}`,
+                                             'badge test preflight failing');
+  const rowOf = (f) => (f.xells || []).find((x) => x.id === badgeXell.id);
+  const b0 = await getFleet(badgeProject.id);
+  ok(rowOf(b0)?.medic_call === null,
+     'no call → the row carries NO badge fact (medic_call is null)');
+  const bRaise = await raiseMedicCall({ xell: badgeXell, reason: 'the badge should show for this',
+                                        kind: 'build', zeeId: null });
+  const b1 = await getFleet(badgeProject.id);
+  ok(rowOf(b1)?.medic_call?.live === true && rowOf(b1)?.medic_call?.kind === 'build',
+     'an OPEN call → the row carries medic_call {live:true, kind:"build"}');
+  await withdrawMedicCall(badgeXell.id, { by: 'test' });
+  const b2 = await getFleet(badgeProject.id);
+  ok(rowOf(b2)?.medic_call === null,
+     'a withdrawn call → the badge fact is cleared (the hex loses the ⛑)');
+  // ATTENDED while its medic is LIVE is being handled — no badge (the same rule the ⛑ feed uses).
+  // Point the call at a medic the attach path NEVER resumes: the sandbox has no provider creds, so
+  // the auto-resume of an attached medic errors it moments later (the caveat section 7 documents),
+  // and a racing status would make this assertion about the driver, not about the predicate. The
+  // row-level routing is what is under test, exactly as section 7 re-points its call for the same
+  // reason.
+  const badgeMedic = await insMedic(badgeProject.id);           // status 'diagnosing' — live
+  await q(`UPDATE medic_call SET medic_id=$2, status='attended', updated_at=now() WHERE id=$1`,
+          [bRaise.call_id, badgeMedic.id]);
+  const b3 = await getFleet(badgeProject.id);
+  ok(rowOf(b3)?.medic_call === null,
+     'an ATTENDED call whose medic is LIVE → no badge (it is being handled)');
+  await q(`UPDATE medic SET status='errored' WHERE id=$1`, [badgeMedic.id]);
+  const b4 = await getFleet(badgeProject.id);
+  ok(rowOf(b4)?.medic_call?.live === true && rowOf(b4)?.medic_call?.kind === 'build',
+     'the same call with its medic no longer live → the badge is BACK (the emergency is real again)');
+
+  // ── 14. THE PATIENT IS GONE: retirement WITHDRAWS, never swallows (256) ────
+  console.log('\n── a retired patient\'s call is WITHDRAWN with a reason (receipt survives) ──');
+  const goneProject = { id: await insProject(`mc-gone-p-${tag}`) };
+  const goneXell = await insXell(goneProject.id, `mc-gone-${tag}`);
+  const gRaise = await raiseMedicCall({ xell: goneXell, reason: 'still blocked when the xell is reaped',
+                                        kind: 'db', zeeId: null });
+  const withdrawnRows = await withdrawMedicCallsForRetiredXell(goneXell.id);
+  ok(withdrawnRows.length === 1 && withdrawnRows[0].id === gRaise.call_id
+     && withdrawnRows[0].status === 'withdrawn',
+     'retiring the patient withdraws exactly its one live call');
+  const gRow = await one(`SELECT * FROM medic_call WHERE id=$1`, [gRaise.call_id]);
+  ok(gRow.status === 'withdrawn' && /patient is gone/.test(gRow.resolution || ''),
+     'the withdrawal CARRIES THE REASON (the receipt, not a silent delete)');
+  ok(gRow.resolution === RETIRED_PATIENT_WITHDRAWAL_REASON,
+     'the reason is the ONE exported string (code and migration must say the same thing)');
+  ok((await countLive(goneXell.id)).n === 0, 'no live call survives the retirement');
+  ok(!(await listProjectMedicCalls(goneProject.id, { liveOnly: true })).some((c) => c.id === gRaise.call_id),
+     'the call leaves the live-only ⛑ feed (a dead xell cannot be blocked)');
+  ok((await listProjectMedicCalls(goneProject.id, { liveOnly: false })).some((c) => c.id === gRaise.call_id),
+     '…but the RECEIPT survives in the full history — that is the whole point');
+  ok((await withdrawMedicCallsForRetiredXell(goneXell.id)).length === 0,
+     'running the withdrawal again is a no-op (idempotent — nothing left to withdraw)');
+
+  // ── 15. THE BACKFILL (migration 256): pre-existing retired-xell calls ─────
+  console.log('\n── migration 256 backfills the retired-xell calls that predate the rule ──');
+  const backProject = { id: await insProject(`mc-back-p-${tag}`) };
+  const backXell = await insXell(backProject.id, `mc-back-${tag}`);
+  await q(`UPDATE xell SET status='retired' WHERE id=$1`, [backXell.id]);
+  // The exact shape the old code silently filtered: an OPEN call on an already-retired xell.
+  const backCall = await raiseMedicCall({ xell: backXell, reason: 'predates the retirement rule',
+                                          kind: 'other', zeeId: null });
+  // …and a LIVE xell's open call, which the rule must NOT catch. Its own project: one xource ref
+  // ('main') per project is unique, and insXell opens one per xell.
+  const backLiveProject = { id: await insProject(`mc-back-live-p-${tag}`) };
+  const backLive = await insXell(backLiveProject.id, `mc-back-live-${tag}`);
+  const liveCall = await raiseMedicCall({ xell: backLive, reason: 'a live patient — leave me alone',
+                                          kind: 'db', zeeId: null });
+  // Run the migration's OWN sql (it is a guarded UPDATE, so re-running on the sandbox is safe) —
+  // that is what will run on deploy, so that is what the backfill is asserted against.
+  const mig256 = readFileSync(new URL('../db/migrations/256_medic_call_retired_patient_withdrawal.sql',
+                                      import.meta.url), 'utf8');
+  await q(mig256);
+  const backRow = await one(`SELECT * FROM medic_call WHERE id=$1`, [backCall.call_id]);
+  ok(backRow.status === 'withdrawn' && /patient is gone/.test(backRow.resolution || ''),
+     'the migration marks the pre-existing retired-xell call withdrawn with the SAME reason');
+  const liveRow = await one(`SELECT status FROM medic_call WHERE id=$1`, [liveCall.call_id]);
+  ok(liveRow.status === 'open',
+     'a LIVE xell\'s open call is untouched — the backfill only catches rows the new rule would');
+  ok((await listProjectMedicCalls(backProject.id, { liveOnly: false })).some((c) => c.id === backCall.call_id),
+     'the backfilled receipt is readable in the history (the operator\'s clean slate, not a delete)');
+  await q(mig256);   // second run
+  const backRow2 = await one(`SELECT status, resolution FROM medic_call WHERE id=$1`, [backCall.call_id]);
+  ok(backRow2.status === 'withdrawn' && backRow2.resolution === backRow.resolution,
+     're-running the migration changes nothing (idempotent forward-only ledger)');
+
+  // ── 16. THE SAME FACT ON THE PROGRESSIVE PATH (256) ───────────────────────
+  // fetchXellRows has TWO callers and the badge change bound a second parameter to BOTH: getFleet
+  // (section 13) and streamXells — the path that paints hexagons one at a time as the fleet loads.
+  // §13 alone would leave the streamed path covered by nothing, so a param-order slip there would
+  // paint a hive of hexes with no badges and no test would say so. Drive the real stream, not the
+  // shared helper, because the helper is exactly what is NOT in doubt.
+  console.log('\n── the ⛑ rides the STREAMED row too (the canvas paints from this path) ──');
+  const { streamXells } = await import('../server/src/lib/fleet.js');
+  const streamProject = { id: await insProject(`mc-stream-p-${tag}`) };
+  const streamXell = await insXell(streamProject.id, `mc-stream-${tag}`);
+  const seen = [];
+  const streamedProj = await streamXells(streamProject.id, async (x) => { seen.push(x); });
+  ok(!!streamedProj, 'streamXells returns the project (the query ran — both params bound)');
+  ok(seen.length === 1 && 'medic_call' in seen[0],
+     'every streamed row carries the medic_call key (the canvas reads a fact, never a query)');
+  ok(seen[0]?.medic_call === null, 'no call → null, so no hex is painted with a ⛑');
+  await raiseMedicCall({ xell: streamXell, reason: 'the streamed hex must wear the ⛑',
+                         kind: 'build', zeeId: null });
+  const seen2 = [];
+  await streamXells(streamProject.id, async (x) => { seen2.push(x); });
+  ok(seen2[0]?.medic_call?.live === true && seen2[0]?.medic_call?.kind === 'build',
+     'an OPEN call → the STREAMED row reports {live:true, kind:"build"}');
+  ok(!('medic_call_status' in (seen2[0] || {})) && !('medic_call_kind' in (seen2[0] || {})),
+     'the raw columns are stripped by decorateXell (the row carries the verdict, not the columns)');
+  ok(seen2[0]?.hive_status !== undefined,
+     'hive_status is untouched beside it — the badge is not a colour, it rides alongside the status');
 } catch (e) {
   console.error('UNCAUGHT', e);
   fail++;

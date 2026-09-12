@@ -28,6 +28,7 @@
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { logline } from './logbus.js';
+import { probeTcp } from './mesh-routes.js';
 
 // Both knobs present = the mesh exists for this queenzee. Absent = every entry point below is a
 // legible no-op, so callers never need their own guard.
@@ -89,6 +90,46 @@ const failed = (r, what) => ({
   ok: false,
   reason: `${what}: ${r.reason || `HTTP ${r.status}${r.json?.message ? ` — ${r.json.message}` : ''}`}`,
 });
+
+// ── the stand-up health check (docs/netbird-mesh-plan.md §3.1 / §11 NOT-done #1) ────────────────
+// The control plane is stood up BEFORE the operator can set NETBIRD_API_URL (that env points the
+// queenzee AT the plane), so the health check cannot go through the authenticated client above.
+// It is a bounded TCP dial to the management API's own host:port instead: the port answering is
+// exactly the fact "the management service came up and is serving". NetBird serves the API over
+// HTTPS with a self-signed cert by default, which a TLS probe would reject for the wrong reason —
+// a dial proves the listener without caring about the cert. The compose default is the in-project
+// service name the queenzee container resolves; NETBIRD_API_URL / NETBIRD_MGMT_API_URL override.
+export const NETBIRD_MGMT_API_DEFAULT = 'https://netbird-management:443';
+
+export function managementApiTarget({ url = null } = {}) {
+  const raw = url || config.netbirdApiUrl || config.netbirdMgmtApiUrl || NETBIRD_MGMT_API_DEFAULT;
+  try {
+    const u = new URL(raw);
+    return { url: raw, host: u.hostname,
+             port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80) };
+  } catch {
+    return { url: raw, host: null, port: null };
+  }
+}
+
+// Best-effort by contract, like every mesh entry point: a control plane still starting answers
+// 'refused' for a few seconds, so a bounded retry loop gives it the moment NetBird needs to bind.
+// Anything other than a clean 'ok' is reported, never thrown.
+export async function probeManagementApi({ url = null, attempts = 6, intervalMs = 1000,
+                                           probe = probeTcp } = {}) {
+  const target = managementApiTarget({ url });
+  if (!target.host) {
+    return { ok: false, ...target, verdict: 'unknown',
+             reason: `unparseable management API URL '${target.url}'` };
+  }
+  let verdict = 'unknown';
+  for (let i = 0; i < Math.max(1, attempts); i++) {
+    verdict = await probe(target.host, target.port, 3000);
+    if (verdict === 'ok') break;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { ok: verdict === 'ok', ...target, verdict };
+}
 
 // ── the management API, one function per verb the plan names (§5) ───────────────────────────────
 

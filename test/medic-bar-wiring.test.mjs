@@ -13,7 +13,9 @@
 //      ("main does not build since …"), the SAME rule as the ProjectSetup row button. Two copies of
 //      the rule drifting apart is exactly how the button reappears in one place and not the other;
 //   3. the ⛑ button's styles exist (an unstyled button on the one line that cannot scroll is a
-//      button nobody sees as one).
+//      button nobody sees as one);
+//   4. the auto_dispatch_medic toggle (255) exists in the console AND its dispatch path is the SAME
+//      seam the button drives — a policy on a parallel path is the thing that card forbids.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -137,6 +139,52 @@ ok(/router\.post\('\/medic-calls\/:callId\/dismiss'/.test(routesSrc)
 ok(/export function fingerprintMedicText/.test(dismissLib)
    && /ON CONFLICT \(project_id, target_kind, target_id, fingerprint\)/.test(dismissLib),
    'medic-dismissals.js fingerprints the shown text and upserts per target (no timers — the fingerprint IS the expiry)');
+
+// ── THE ⛑ ON THE HEX (256) — the surface a human actually scans ─────────────────────────────────
+// The bug's first half: `grep medic web/src/hive/` returned ZERO hits, so four open calls sat
+// invisible on the honeycomb for two days. A zee with a live call now wears a ⛑ BADGE on its hex —
+// the fact rides the fleet row (one lateral, no per-hexagon query), and it is a BADGE, never a
+// hive_status colour, because a xell can be working/idle/awaiting-done and still be blocked.
+// These are static checks like the rest of this file: no browser in CI, so the wiring is read.
+console.log('\n── the ⛑ BADGE on the honeycomb hex (a zee with a live call is visible) ──');
+const hiveSrc = read('web/src/hive/HiveCanvas.jsx');
+ok(/function drawMedicBadge\(/.test(hiveSrc),
+   'HiveCanvas.jsx defines drawMedicBadge (the badge, drawn like the burn "!")');
+ok(/drawMedicBadge\(ctx, cx, cy, size, x\.medic_call\)/.test(hiveSrc),
+   '…and calls it with the FLEET ROW fact x.medic_call (the canvas must not re-query)');
+ok(/mc\?\.live/.test(hiveSrc) && /size < 24/.test(hiveSrc),
+   'it bails out with no live call, and at size<24 exactly like the "!" badge (same geometry)');
+ok(hiveSrc.includes('⛑'),
+   'the badge draws a ⛑ glyph (not a colour, not a word buried in the card)');
+ok(/medic_call_status/.test(fleetSrc) && /FROM medic_call mc/.test(fleetSrc)
+   && /MEDIC_LIVE_STATUSES/.test(fleetSrc),
+   'fleet.js resolves the live call on the xell row from the ONE live-status set (medic-calls.js)');
+ok(/x\.medic_call = x\.medic_call_status/.test(fleetSrc),
+   'decorateXell carries medic_call {live,kind} on the row the canvas reads');
+
+console.log('\n── a call never silently vanishes: retirement WITHDRAWS it (256) ──');
+const reaperSrc = read('server/src/queenzee/reaper.js');
+const callsLib = read('server/src/lib/medic-calls.js');
+ok(/import \{[^}]*withdrawMedicCallsForRetiredXell[^}]*\} from '\.\.\/lib\/medic-calls\.js'/.test(reaperSrc)
+   && /await withdrawMedicCallsForRetiredXell\(xellId\)/.test(reaperSrc),
+   'reaper.js withdraws a retired patient\'s live calls (the receipt, not the fleet filter)');
+ok(/export async function withdrawMedicCallsForRetiredXell/.test(callsLib)
+   && /RETIRED_PATIENT_WITHDRAWAL_REASON/.test(callsLib),
+   'medic-calls.js owns the withdrawal + the ONE reason string (code and migration agree)');
+ok(/MEDIC_NO_WRITE_TABLES = \[[\s\S]*?'medic_call'/.test(roleSrc),
+   'medic_call is still on the medic NO-WRITE wall (the withdrawal is queenzee bookkeeping, not a medic grant)');
+const mig256 = read('db/migrations/256_medic_call_retired_patient_withdrawal.sql');
+ok(/UPDATE medic_call mc/.test(mig256) && /x\.status = 'retired'/.test(mig256)
+   && /mc\.status IN \('open', 'attended'\)/.test(mig256) && /patient is gone/.test(mig256),
+   'migration 256 backfills ONLY live calls on retired xells, with the same reason (the clean slate)');
+
+console.log('\n── the auto_dispatch_medic policy (255): console toggle + ONE dispatch seam ──');
+ok(/field="auto_dispatch_medic"/.test(app) && /label="medics"/.test(app),
+   'App.jsx renders the auto_dispatch_medic switch beside the other auto-* policies');
+ok(/field === 'auto_dispatch_medic'[\s\S]{0,400}showConfirm/.test(app),
+   'enabling it asks for confirmation — it dispatches with no human click (the same treatment ships/seeds/done get)');
+ok(/dispatchMedicCall\(call/.test(routesSrc),
+   'the console dispatch route drives the SHARED dispatchMedicCall seam (the policy cannot take a parallel path)');
 
 console.log(fail ? `\n${fail} FAILURE(S)\n` : '\nall good\n');
 process.exit(fail ? 1 : 0);

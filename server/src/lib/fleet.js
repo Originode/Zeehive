@@ -17,6 +17,9 @@ import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { listProjectConditions } from './current-conditions.js';
 import { fingerprintMedicText } from './medic-dismissals.js';
+// The live-medic status set — the badge predicate (256) binds it into fetchXellRows so the honeycomb
+// and the ⛑ feed decide "is this call live?" from the SAME source.
+import { MEDIC_LIVE_STATUSES } from './medic-calls.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
@@ -175,7 +178,15 @@ async function fetchXellRows(pid) {
             (SELECT mx.slug FROM xell mx WHERE mx.id = x.manager_xell_id) AS manager_slug,
             EXISTS(SELECT 1 FROM deploy_lock dl2 WHERE dl2.project_id = x.project_id
                      AND dl2.container = 'prod') AS prod_lock_active,
-            dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
+            dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase,
+            -- THE MEDIC CALL BADGE (256). Does a LIVE call ride this xell? A call is live when it is
+            -- OPEN (awaiting a human dispatch) or ATTENDED while its medic is no longer live (the
+            -- emergency is real again) — the SAME predicate the CALLED fold-in below and
+            -- listProjectMedicCalls use. It must ride the ROW because the honeycomb paints from the
+            -- fleet snapshot and the xells stream, and a badge that re-queried per hexagon would be
+            -- worse than no badge; a badge that disagreed with the ⛑ panel would be worse still.
+            -- Bound as $2 (MEDIC_LIVE_STATUSES, lib/medic-calls.js) so the live set has ONE source.
+            mcl.kind AS medic_call_kind, mcl.status AS medic_call_status
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
        LEFT JOIN xell_pause_state xps ON xps.xell_id = x.id
@@ -202,6 +213,20 @@ async function fetchXellRows(pid) {
           WHERE se.xell_id = x.id AND se.hook_event_name IN ('env-alert','env-alert-clear')
        ) eva ON true
        LEFT JOIN harness hn ON hn.id = x.harness_id
+       -- the xell's LIVE medic call, if any (migration 251's medic_call; the badge predicate 256).
+       -- One lateral, newest first: the row carries the kind so the hover/card can say what the zee
+       -- called about. A xell with only history (resolved/declined/withdrawn) has no row here.
+       LEFT JOIN LATERAL (
+         SELECT mc.kind, mc.status
+           FROM medic_call mc
+           LEFT JOIN medic m ON m.id = mc.medic_id
+          WHERE mc.xell_id = x.id
+            AND (mc.status = 'open'
+                 OR (mc.status = 'attended'
+                     AND (mc.medic_id IS NULL OR m.status IS NULL
+                          OR NOT (m.status = ANY($2::text[])))))
+          ORDER BY mc.updated_at DESC LIMIT 1
+       ) mcl ON true
        JOIN xource xo ON xo.id = x.xource_id
        -- The xell's zee, PREFERRING a living one but falling back to the most recent dead one.
        -- The old join took only living zees, so a session whose PROCESS died (app closed, laptop
@@ -235,7 +260,7 @@ async function fetchXellRows(pid) {
           LIMIT 1
        ) env ON true
       WHERE x.project_id = $1 AND x.status <> 'retired'
-      ORDER BY x.created_at`, [pid]);
+      ORDER BY x.created_at`, [pid, MEDIC_LIVE_STATUSES]);
 }
 
 // Can a browser shell open into this container row? Mirrors terminal-bridge.resolveShellTarget:
@@ -361,6 +386,15 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     proofFailed: !!x.proof_error,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
+  // THE MEDIC CALL (256): a xell with a LIVE call wears a ⛑ badge on its hex. It rides HERE, not on
+  // hive_status, and that is deliberate — a xell can be working, idle or awaiting-done and still have
+  // a call open, so the colour must keep meaning what it means. The fact is resolved in SQL (one
+  // lateral, no per-hexagon query); this just shapes it for the canvas. `kind` lets a hover say what
+  // the zee called about. Null when the call was answered, declined or withdrawn.
+  x.medic_call = x.medic_call_status
+    ? { live: true, kind: x.medic_call_kind || 'other' }
+    : null;
+  delete x.medic_call_kind; delete x.medic_call_status;
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
   // hive_status already says THAT one is open; this says WHAT FOR — the console renders it beside
   // the ask instead of sending the human into the session to find out.

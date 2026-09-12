@@ -6,6 +6,11 @@ dist/
 build/
 .env
 .env.local
+# The generated NetBird control-plane config (docker/zeehive/netbird/management.json or the
+# bootstrap install's own netbird/). It carries the datastore encryption key and relay secret, so
+# the mesh-control-plane bootstrap step writes it and it must NEVER ride into a landing. The
+# committed example (management.json.example) is the template; this rule ignores only the live file.
+netbird/management.json
 *.log
 npm-debug.log*
 .DS_Store

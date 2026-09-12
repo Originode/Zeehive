@@ -259,6 +259,39 @@ function drawBurnAlert(ctx, cx, cy, size, ba) {
   ctx.restore();
 }
 
+// THE MEDIC CALL BADGE (migration 256): a xell with a LIVE call — one OPEN (awaiting a human
+// dispatch) or ATTENDED by a medic that is no longer live — wears a ⛑ pinned to its LOWER-RIGHT
+// vertex. It is a BADGE, deliberately not a hive_status colour: a xell can be working, idle or
+// awaiting-done and still be blocked behind an infra fault, so the colour must keep meaning what it
+// means. Geometry is the burn-alert "!" badge's, mirrored across the horizontal axis (30° math =
+// hexCorners i=1): the two right vertices carry the two "look here" facts — over budget above, the
+// medic below — while identity (the provider coin) keeps the upper-left. Painted OUTSIDE the card
+// clip, last, like the burn alert. `mc` is the fleet row's medic_call: { live, kind } (null = none).
+// The disc is WHITE with the glyph in medic red, so it reads as its own thing beside the red "!"
+// (and stays legible if the ⛑ falls back to a monochrome glyph, where fillStyle is what paints it).
+function drawMedicBadge(ctx, cx, cy, size, mc) {
+  if (!mc?.live) return;
+  if (size < 24) return;                 // too small to read a badge — the same bail-out as the "!"
+  const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 260);
+  const angle = (30 * Math.PI) / 180;    // 30° math = the lower-right vertex
+  const dist = size * 0.80;
+  const bx = cx + dist * Math.cos(angle);
+  const by = cy + dist * Math.sin(angle);
+  const br = Math.max(4, size * 0.14);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2);
+  ctx.fillStyle = withAlpha('#ffffff', 0.95);
+  ctx.shadowColor = COL.error; ctx.shadowBlur = br * 0.9 * pulse;
+  ctx.fill();
+  ctx.lineWidth = 1.2; ctx.strokeStyle = '#0d1017'; ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.font = `800 ${br * 1.3}px 'Segoe UI', sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = COL.error;
+  ctx.fillText('⛑', bx, by + 0.5);
+  ctx.restore();
+}
+
 // Red pause icon (two vertical bars) drawn where the yellow "working" dot would be — used when a xell
 // is paused (fleet-wide, project-scoped or per-xell). The ⏸ character is clear enough at hex scales.
 function drawPausedIcon(ctx, x, y, r) {
@@ -2259,6 +2292,9 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
   // The over-budget spend-alert ring + badge rides OUTSIDE the clip, last, so it never competes
   // with the card's own lines (migration 206 — per-provider alert amount set in Project setup).
   drawBurnAlert(ctx, cx, cy, size, x.burn_alert);
+  // …and the ⛑ for a xell with a live medic call (256) — the other badge a human scanning the hive
+  // must not miss. Its own vertex, so an over-budget xell that ALSO called the medic shows both.
+  drawMedicBadge(ctx, cx, cy, size, x.medic_call);
   ctx.restore();
 }
 
