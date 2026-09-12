@@ -3,11 +3,16 @@
 // A machine hosts (or reaches) the self-hosted NetBird mesh (docs/netbird-mesh-plan.md). This
 // panel is the three things a human needs about it, per the card:
 //
-//   CONFIG    the meta-DB mesh config: non-secret fields + the THREE write-only secrets. A secret
-//             is never rendered back — only a stored HINT is — and an empty field on save means
-//             UNCHANGED. The datastore encryption key has a Generate button because it is key
-//             MATERIAL the server deliberately refuses to invent; the API token and gateway setup
-//             key are paste fields, so ROTATION exists even though the bootstrap auto-provisions.
+//   CONFIG    the meta-DB mesh config, edited through a full-size STEP WIZARD (a modal overlay,
+//             not the cramped inline form this replaced — "a compact dropdown I can barely
+//             click"). The panel shows a read-only summary + a prominent "configure" button; the
+//             wizard walks management → coordination → secrets → review with big inputs and the
+//             field hints VISIBLE, not hidden in tooltips. The write-only rule is unchanged: a
+//             secret is never rendered back — only a stored HINT is — and an empty field on save
+//             means UNCHANGED. The datastore encryption key has a Generate button because it is
+//             key MATERIAL the server deliberately refuses to invent; the API token and gateway
+//             setup key are paste fields, so ROTATION exists even though the bootstrap
+//             auto-provisions.
 //   STAND UP  the `mesh-control-plane` bootstrap step surfaced as its own human-gated action, with
 //             the same typed-word confirmation as the ship/prod gates. It performs ONLY that step
 //             (api performBuildBootstrap `kinds`), never the project's networks or dev db.
@@ -15,9 +20,10 @@
 //             (mesh vs legacy-port, per day) — rendered simply, because the question "can we drop
 //             legacy ports yet?" is answered by a count, not a chart.
 //
-// The bodies are PURE FUNCTIONS OF PROPS (the MeshConfigBody/MeshStandUpBody/MeshObserveBody split,
-// the same one Directives.jsx makes): the fetches live in MeshSections, so a test can render each
-// body with a fixture through react-dom/server and read the markup back.
+// The bodies are PURE FUNCTIONS OF PROPS (the MeshWizardStepBody/MeshWizardReviewBody/
+// MeshConfigSummaryBody/MeshStandUpBody/MeshObserveBody split, the same one Directives.jsx makes):
+// the fetches live in MeshSections, so a test can render each body with a fixture through
+// react-dom/server and read the markup back.
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { showAlert, showPrompt } from './Dialog.jsx';
 import { getMeshConfig, putMeshConfig, getMeshStatus, planBuildBootstrap, performBuildBootstrap } from './api.js';
@@ -73,41 +79,200 @@ export function normalizeMeshConfig(r = {}) {
   return { fields, secrets, editable: r.editable !== false };
 }
 
-// ── CONFIG ───────────────────────────────────────────────────────────────────
-// Pure body: `fields` is the draft, `secrets` the STORED state, `draft` the pending secret values
-// (always empty unless the human typed/generated one this session).
-export function MeshConfigBody({ fields = {}, secrets = {}, draft = {}, setField, setSecret, onSave, busy = false, err = null, note = null }) {
+// ── CONFIG: the wizard ───────────────────────────────────────────────────────
+// The wizard's page plan. Each page names which MESH_FIELDS / MESH_SECRETS it edits, plus a blurb
+// that says what this page configures — VISIBLE text, because the compact form buried every
+// explanation in a tooltip and the whole point of the wizard is that a human can read and click it.
+export const MESH_WIZARD_STEPS = [
+  { key: 'management', title: 'Management connection',
+    blurb: 'Where the NetBird control plane answers. Leave the management URL empty and the mesh '
+      + 'stays a legible no-op: every route falls back to legacy host:port.',
+    fields: ['management_url', 'mesh_domain'], secrets: [] },
+  { key: 'coordination', title: 'Signal & relay',
+    blurb: 'The coordination services peers are told about: the signal service brokers direct '
+      + 'connections, the relay is the fallback hop when a peer cannot connect directly.',
+    fields: ['signal_uri', 'relay_endpoint'], secrets: [] },
+  { key: 'secrets', title: 'Secrets',
+    blurb: 'All three are WRITE-ONLY: the stored value is never shown, only that it is set. '
+      + 'An empty field on save means unchanged — type or generate a value only to set or rotate it.',
+    fields: [], secrets: ['api_token', 'datastore_encryption_key', 'gateway_setup_key'] },
+  { key: 'review', title: 'Review & save',
+    blurb: 'Nothing has been stored yet. Check the values below, then save.',
+    fields: [], secrets: [] },
+];
+
+const fieldDef = (k) => MESH_FIELDS.find((f) => f[0] === k);
+const secretDef = (k) => MESH_SECRETS.find((s) => s[0] === k);
+
+// Pure body for ONE wizard page: big labelled inputs, the hint under each field as readable text.
+// `fields` is the draft of the non-secret values, `secrets` the STORED state (hints only), `draft`
+// the pending secret values (always empty unless the human typed/generated one this session).
+export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}, setField, setSecret, busy = false }) {
+  if (!step) return null;
+  return (
+    <div className="mx-wizstep" data-testid={`mesh-wizard-step-${step.key}`}>
+      <div className="mx-wizblurb">{step.blurb}</div>
+      {step.fields.map((k) => {
+        const [, label, hint] = fieldDef(k) || [k, k, ''];
+        return (
+          <label className="mx-wizfield" key={k}>
+            <span className="k">{label}</span>
+            <input type="text" value={fields[k] ?? ''} disabled={busy} data-testid={`mesh-field-${k}`}
+                   placeholder="—" onChange={(e) => setField?.(k, e.target.value)} />
+            <span className="mx-wizhint">{hint}</span>
+          </label>
+        );
+      })}
+      {step.secrets.map((k) => {
+        const [, label, gen, hint] = secretDef(k) || [k, k, false, ''];
+        return (
+          <label className="mx-wizfield mx-wizsecret" key={k}>
+            <span className="k">{label} <em className="mx-wizstored">— {secretHint(secrets[k])}</em></span>
+            <span className="mx-wizinrow">
+              <input type="password" value={draft[k] ?? ''} disabled={busy} data-testid={`mesh-secret-${k}`}
+                     autoComplete="new-password"
+                     placeholder={secrets[k]?.set ? 'stored — empty means unchanged' : 'not set — type to set'}
+                     onChange={(e) => setSecret?.(k, e.target.value)} />
+              {gen && (
+                <button type="button" className="mx-wizgen" disabled={busy} data-testid={`mesh-generate-${k}`}
+                        title="Generate 32 random bytes (base64) into the field. Nothing is stored until you save; saving replaces the stored key and the control plane must be restarted with it."
+                        onClick={() => setSecret?.(k, generateDatastoreKey())}>generate</button>
+              )}
+            </span>
+            <span className="mx-wizhint">{hint}</span>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+// Pure body for the last page: every non-secret value as it will be saved, every secret as
+// unchanged / will-be-set — NEVER the secret value itself.
+export function MeshWizardReviewBody({ fields = {}, secrets = {}, draft = {} }) {
+  return (
+    <div className="mx-wizreview" data-testid="mesh-wizard-review">
+      {MESH_FIELDS.map(([k, label]) => (
+        <div className="mx-wizrevrow" key={k}>
+          <span className="k">{label}</span>
+          <span className="v">{fields[k] || '—'}</span>
+        </div>
+      ))}
+      {MESH_SECRETS.map(([k, label]) => (
+        <div className="mx-wizrevrow" key={k}>
+          <span className="k">{label}</span>
+          <span className="v">{draft[k] ? (secrets[k]?.set ? 'will be REPLACED' : 'will be SET')
+            : `unchanged (${secretHint(secrets[k])})`}</span>
+        </div>
+      ))}
+      <div className="mx-wizhint" data-testid="mesh-secret-note">
+        secrets are write-only — the stored value is never shown, only that it is set;
+        an empty field on save means unchanged
+      </div>
+    </div>
+  );
+}
+
+// The stateful wizard modal: a full-size overlay (the dlg-overlay pattern from Dialog.jsx) with
+// one page at a time, a step rail, Back/Next, and Save on the review page. It owns the DRAFT
+// (fields seeded from the stored config, secrets always starting empty); nothing reaches the
+// server until Save, which hands the write-only-merged body to `onSave`. Escape / backdrop / ✕
+// close it and the draft is discarded — the stored config was never touched.
+export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSave, onClose, busy = false, err = null }) {
+  const [i, setI] = useState(0);
+  const [fields, setFields] = useState({ ...initialFields });
+  const [draft, setDraft] = useState({});
+  const step = MESH_WIZARD_STEPS[i];
+  const last = i === MESH_WIZARD_STEPS.length - 1;
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); onClose?.(); } };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const save = () => {
+    // Empty secret = unchanged (the write-only rule): only non-empty drafts are sent.
+    const body = { ...fields };
+    for (const [k] of MESH_SECRETS) if (draft[k]) body[k] = draft[k];
+    onSave?.(body);
+  };
+
+  return (
+    <div className="mx-wizoverlay" data-testid="mesh-wizard"
+         onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
+      <div className="mx-wiz" role="dialog" aria-modal="true" aria-label={`Configure the NetBird control plane on ${machineKey}`}>
+        <div className="mx-wizhead">
+          <span className="mx-wiztitle">🌐 NetBird control plane — {machineKey}</span>
+          <button type="button" className="mx-wizclose" data-testid="mesh-wizard-close" title="Close — discards unsaved edits"
+                  onClick={() => onClose?.()}>✕</button>
+        </div>
+        <div className="mx-wizrail">
+          {MESH_WIZARD_STEPS.map((s, n) => (
+            <button type="button" key={s.key} data-testid={`mesh-wizard-goto-${s.key}`}
+                    className={`mx-wizdot${n === i ? ' on' : ''}${n < i ? ' done' : ''}`}
+                    onClick={() => setI(n)}>
+              <b>{n + 1}</b> {s.title}
+            </button>
+          ))}
+        </div>
+        <div className="mx-wizbody">
+          <div className="mx-wizsteptitle">{step.title}</div>
+          {step.key === 'review'
+            ? <>
+                <div className="mx-wizblurb">{step.blurb}</div>
+                <MeshWizardReviewBody fields={fields} secrets={secrets} draft={draft} />
+              </>
+            : <MeshWizardStepBody step={step} fields={fields} secrets={secrets} draft={draft} busy={busy}
+                                  setField={(k, v) => setFields((f) => ({ ...f, [k]: v }))}
+                                  setSecret={(k, v) => setDraft((d) => ({ ...d, [k]: v }))} />}
+          {err && <div className="mx-mesherr">{err}</div>}
+        </div>
+        <div className="mx-wizfoot">
+          <button type="button" className="mx-wizback" data-testid="mesh-wizard-back" disabled={busy || i === 0}
+                  onClick={() => setI((n) => Math.max(0, n - 1))}>‹ back</button>
+          {!last && (
+            <button type="button" className="mx-wiznext" data-testid="mesh-wizard-next" disabled={busy}
+                    onClick={() => setI((n) => Math.min(MESH_WIZARD_STEPS.length - 1, n + 1))}>next ›</button>
+          )}
+          {last && (
+            <button type="button" className="mx-wizsave" data-testid="mesh-save" disabled={busy || !onSave}
+                    title="Save the config. Secrets are write-only: an empty secret field means unchanged."
+                    onClick={save}>{busy ? '⏳…' : 'save config'}</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// The panel's read-only CONFIG summary + the button that opens the wizard. Pure body: the summary
+// shows current values (secrets as hints, never values) so the panel still answers "what is set?"
+// at a glance; all EDITING lives in the wizard.
+export function MeshConfigSummaryBody({ fields = {}, secrets = {}, editable = true, onConfigure, err = null, note = null }) {
   return (
     <div className="mx-meshsec" data-testid="mesh-config">
       <div className="mx-meshhead">config</div>
       {MESH_FIELDS.map(([k, label, hint]) => (
-        <label className="mx-meshfield" key={k} title={hint}>
+        <div className="mx-meshsumrow" key={k} title={hint}>
           <span className="k">{label}</span>
-          <input type="text" value={fields[k] ?? ''} disabled={busy} data-testid={`mesh-field-${k}`}
-                 placeholder="—" onChange={(e) => setField?.(k, e.target.value)} />
-        </label>
+          <span className="v">{fields[k] || '—'}</span>
+        </div>
       ))}
-      {MESH_SECRETS.map(([k, label, gen, hint]) => (
-        <label className="mx-meshfield mx-meshsecret" key={k} title={`${hint}\n\nWrite-only: an empty field on save means unchanged.`}>
+      {MESH_SECRETS.map(([k, label, , hint]) => (
+        <div className="mx-meshsumrow" key={k} title={hint}>
           <span className="k">{label}</span>
-          <input type="password" value={draft[k] ?? ''} disabled={busy} data-testid={`mesh-secret-${k}`}
-                 autoComplete="new-password"
-                 placeholder={secretHint(secrets[k])} onChange={(e) => setSecret?.(k, e.target.value)} />
-          {gen && (
-            <button type="button" className="mx-meshgen" disabled={busy} data-testid={`mesh-generate-${k}`}
-                    title="Generate 32 random bytes (base64) into the field. Nothing is stored until you save; saving replaces the stored key and the control plane must be restarted with it."
-                    onClick={() => setSecret?.(k, generateDatastoreKey())}>generate</button>
-          )}
-        </label>
+          <span className="v">{secretHint(secrets[k])}</span>
+        </div>
       ))}
       <div className="mx-meshrow">
-        <button className="mx-meshsave" disabled={busy || !onSave} data-testid="mesh-save"
-                title="Save the config. Secrets are write-only: an empty secret field means unchanged." onClick={onSave}>
-          {busy ? '⏳…' : 'save config'}
+        <button type="button" className="mx-meshconfigure" data-testid="mesh-configure"
+                disabled={!editable || !onConfigure}
+                title={editable ? 'Open the setup wizard: management connection, signal & relay, secrets, review — full-size inputs, nothing stored until you save.'
+                  : 'this host does not run the control plane; the config is read-only here.'}
+                onClick={onConfigure}>
+          ⚙ configure control plane…
         </button>
-        <span className="mx-meshhint" data-testid="mesh-secret-note">
-          secrets are write-only — the stored value is never shown, only that it is set
-        </span>
       </div>
       {err && <div className="mx-mesherr">{err}</div>}
       {note && <div className="mx-meshnote">{note}</div>}
@@ -240,12 +405,12 @@ export function MeshObserveBody({ status = null, err = null, onRefresh }) {
   );
 }
 
-// The stateful section loader: one fetch each for config and status, then the three pure bodies.
+// The stateful section loader: one fetch each for config and status, then the pure bodies.
 function MeshSections({ m, projectId, onChanged }) {
   const [cfg, setCfg] = useState(null);
   const [fields, setFields] = useState({});
   const [storedSecrets, setStoredSecrets] = useState({});
-  const [draft, setDraft] = useState({});
+  const [wizardOpen, setWizardOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [cfgErr, setCfgErr] = useState(null);
   const [cfgNote, setCfgNote] = useState(null);
@@ -259,7 +424,7 @@ function MeshSections({ m, projectId, onChanged }) {
   const loadConfig = useCallback(async () => {
     try {
       const r = normalizeMeshConfig(await getMeshConfig(m.id));
-      setCfg(r); setFields(r.fields || {}); setStoredSecrets(r.secrets || {}); setDraft({}); setCfgErr(null);
+      setCfg(r); setFields(r.fields || {}); setStoredSecrets(r.secrets || {}); setCfgErr(null);
     } catch (e) { setCfgErr(e.message || String(e)); }
   }, [m.id]);
 
@@ -270,14 +435,14 @@ function MeshSections({ m, projectId, onChanged }) {
 
   useEffect(() => { loadConfig(); loadStatus(); }, [loadConfig, loadStatus]);
 
-  const save = async () => {
+  // The wizard hands over the write-only-merged body (empty secret = unchanged — the merge lives
+  // in MeshWizard.save); a failed save keeps the wizard open with the error, a good one closes it.
+  const save = async (body) => {
     setSaving(true); setCfgErr(null); setCfgNote(null);
     try {
-      // Empty secret = unchanged (the write-only rule): only non-empty drafts are sent.
-      const body = { ...fields };
-      for (const [k] of MESH_SECRETS) if (draft[k]) body[k] = draft[k];
       await putMeshConfig(m.id, body);
       setCfgNote('saved.');
+      setWizardOpen(false);
       await loadConfig();
       onChanged?.();
     } catch (e) { setCfgErr(e.message || String(e)); }
@@ -319,10 +484,13 @@ function MeshSections({ m, projectId, onChanged }) {
 
   return (
     <div className="mx-meshsections">
-      <MeshConfigBody fields={fields} secrets={storedSecrets} draft={draft} busy={saving}
-                      setField={(k, v) => setFields((f) => ({ ...f, [k]: v }))}
-                      setSecret={(k, v) => setDraft((d) => ({ ...d, [k]: v }))}
-                      onSave={save} err={cfgErr} note={cfgNote} />
+      <MeshConfigSummaryBody fields={fields} secrets={storedSecrets} editable={cfg?.editable !== false}
+                             onConfigure={() => { setCfgNote(null); setWizardOpen(true); }}
+                             err={cfgErr} note={cfgNote} />
+      {wizardOpen && (
+        <MeshWizard machineKey={m.key} initialFields={fields} secrets={storedSecrets} busy={saving}
+                    onSave={save} onClose={() => setWizardOpen(false)} err={cfgErr} />
+      )}
       <MeshStandUpBody step={plan} planned={planned} busy={busy} err={planErr}
                        onPlan={loadPlan} onPerform={() => standUp(plan)} />
       <MeshObserveBody status={status} err={statusErr} onRefresh={loadStatus} />
