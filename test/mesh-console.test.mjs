@@ -131,6 +131,11 @@ const obs = renderToStaticMarkup(React.createElement(M.MeshObserveBody, { status
 } }));
 ok(/management: unreachable/.test(obs) && /connection refused/.test(obs), 'the management health is shown with its reason');
 ok(/machine 3/.test(obs) && /xell 12/.test(obs), 'the peer counts are listed');
+const obsList = renderToStaticMarkup(React.createElement(M.MeshObserveBody, { status: {
+  management: { reachable: true },
+  peers: { counts: { total: 1 }, list: [{ id: 'p1', hostname: 'wise-delta-a1b2', kind: 'xell', status: 'joined' }] },
+} }));
+ok(/wise-delta-a1b2 · xell · joined/.test(obsList), 'a peer list, when the server answers one, renders hostname · kind · status');
 ok(/mesh 7 · legacy-port 2/.test(obs), 'the tally totals mesh vs legacy-port');
 ok(/<td>2026-09-12<\/td><td>7<\/td><td>2<\/td>/.test(obs), 'the per-day row shows mesh and legacy side by side');
 ok(/db: mesh 7 \/ legacy 2/.test(obs), 'the per-kind breakdown is shown');

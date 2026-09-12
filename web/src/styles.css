@@ -1111,6 +1111,7 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-meshhealth.ok { color: var(--up); }
 .mx-meshhealth.down { color: var(--down); }
 .mx-meshpeers { color: var(--text); }
+.mx-meshpeerlist { color: var(--muted); font-size: 9.5px; }
 .mx-meshtally-head { color: var(--muted); }
 .mx-meshtable { border-collapse: collapse; margin-top: 2px; }
 .mx-meshtable th, .mx-meshtable td { border: 1px solid var(--line); padding: 0 5px; font-size: 10px; text-align: right; }

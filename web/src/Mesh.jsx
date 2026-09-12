@@ -179,6 +179,7 @@ export function tallyDays(tally) {
 export function MeshObserveBody({ status = null, err = null, onRefresh }) {
   const mgmt = status?.management || null;
   const counts = status?.peers?.counts || null;
+  const peers = status?.peers?.list || status?.peers?.rows || null;   // present iff the server answers a list
   const tally = status?.tally || null;
   const days = tallyDays(tally);
   return (
@@ -197,6 +198,15 @@ export function MeshObserveBody({ status = null, err = null, onRefresh }) {
           {counts && (
             <div className="mx-meshpeers" data-testid="mesh-peers">
               peers: {Object.entries(counts).map(([k, v]) => `${k} ${num(v)}`).join(' · ') || 'none'}
+            </div>
+          )}
+          {Array.isArray(peers) && peers.length > 0 && (
+            <div className="mx-meshpeerlist" data-testid="mesh-peer-list">
+              {peers.map((p, i) => (
+                <div key={p.id || p.hostname || i}>
+                  {p.hostname || p.name || p.id} · {p.kind || '?'} · {p.status || '?'}
+                </div>
+              ))}
             </div>
           )}
           {tally && (
