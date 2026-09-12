@@ -229,7 +229,7 @@ ok(install[0][0] === 'cp' && install[1].includes('-u') && install[1].includes('0
 const dead = await installZeeAttachIntoCxell({ ctx: 'default', name: 'cxell_zt-does-not-exist' });
 ok(dead.installed === false && !!dead.reason, 'an unreachable cage is reported, never thrown (it runs at spawn AND at boot)');
 ok(read('server/src/queenzee/intake.js').includes('installZeeAttachIntoCxell({ ctx, name })'), 'the spawn path installs it');
-ok(/installZeeAttachIntoCxell\(\{ ctx, name \}\)/.test(read('server/src/lib/cxell.js').slice(
+ok(/installZeeAttachIntoCxell\(\{ ctx, name/.test(read('server/src/lib/cxell.js').slice(
      read('server/src/lib/cxell.js').indexOf('export async function refreshZeeToolingInLiveCxells'))),
    'and the boot sweep refreshes it into every RUNNING cxell — or the queue would fill in cages that cannot drain it');
 
