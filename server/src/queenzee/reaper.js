@@ -18,6 +18,7 @@ import { deregisterXellPeers } from '../lib/netbird.js';
 import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
 import { releaseXellShips } from './shipgate.js';
 import { collectDispatchLoss, reportDispatchLoss } from '../lib/dispatch-loss.js';
+import { withdrawMedicCallsForRetiredXell } from '../lib/medic-calls.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
 // the .zeehive.env reconcile): 'real' touches machines, anything else models. A teardown is the
@@ -414,6 +415,19 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
   const retired = await one(
     `UPDATE xell SET status='retired', retired_at=now(), is_pooled=false WHERE id=$1 RETURNING *`, [xellId]);
   broadcast('xell', retired);
+
+  // THE PATIENT IS GONE (254/256). The fleet's CALLED fold-in excludes a retired xell — correctly,
+  // because a dead xell cannot be blocked — but that filter was also where an open call vanished:
+  // the row stayed in the table, out of every feed, with no resolution. So the retirement WITHDRAWS
+  // every live call it raised, with a stated reason, and the receipt survives in the history. That
+  // is what keeps the exclusion HONEST: nothing is hiding behind it. Best-effort — a failure here
+  // must never sink a reap, and migration 256 backfills anything this path misses.
+  await withdrawMedicCallsForRetiredXell(xellId).then((rows) => {
+    if (rows.length) {
+      logline('reaper', `withdrew ${rows.length} medic call(s) on retired ${xell.slug} — the patient is gone`);
+    }
+  }).catch((e) => logline('reaper',
+    `medic-call withdrawal failed for ${xell.slug} (call rows left for the janitor): ${e.message}`));
 
   // The DB row is retired either way (the xell is gone as far as the fleet is concerned), but do
   // NOT report a clean teardown when the folder is still on disk — that is how orphaned worktrees

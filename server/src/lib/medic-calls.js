@@ -14,6 +14,9 @@
 //     fleet.medic_emergency (source 'called') and a human dispatches. NOTHING auto-spawns a medic.
 //   • ONE LIVE CALL PER XELL is the rate limit: a partial unique index keeps a single 'open'/
 //     'attended' row per xell, and a second call UPDATES that row instead of inserting.
+//   • THE PATIENT IS GONE when its xell retires: the call is WITHDRAWN with a stated reason
+//     (withdrawMedicCallsForRetiredXell, driven by the reaper; migration 256 backfilled the rows that
+//     predate it) rather than being filtered out of the ⛑ feed and lost without a receipt.
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { broadcast } from './events.js';
@@ -25,6 +28,13 @@ import { INFRA_MARK } from './proof-routing.js';
 
 export const MEDIC_CALL_KINDS = ['db', 'build', 'provision', 'network', 'other'];
 export const MEDIC_CALL_STATUSES = ['open', 'attended', 'resolved', 'declined', 'withdrawn'];
+// The reason stamped on a call whose patient is gone (migration 256). ONE string, used by the
+// reaper's automatic withdrawal AND quoted verbatim by the backfill migration — a receipt only means
+// something if the two say the same thing. Kept here (not in the migration, which cannot import)
+// because this is the code path a live retirement takes; the migration text must match.
+export const RETIRED_PATIENT_WITHDRAWAL_REASON =
+  'withdrawn automatically: the patient is gone — its xell retired, so no medic can attend this call. '
+  + 'The fault, if it still exists, belongs to a fresh xell with a fresh call.';
 // A medic that is ATTENDING a project — the attach target. Terminal medic statuses mean the project
 // has no live medic, so a call must RAISE rather than attach to a corpse. Exported so the dispatch
 // route and the tools read the SAME live-set: a call whose medic is no longer live is dispatchable
@@ -259,6 +269,31 @@ export async function withdrawMedicCall(xellId, { by = null } = {}) {
     logline('medic-call', `xell ${xellId}: medic call ${String(row.id).slice(0, 8)} WITHDRAWN`);
   }
   return row;
+}
+
+// ── THE PATIENT IS GONE — a retired xell's live calls are WITHDRAWN, never silently dropped ──────
+// The fleet's CALLED fold-in (fleet.js) and listProjectMedicCalls both EXCLUDE a retired xell: a dead
+// xell cannot be blocked, so its row must stop nagging the ⛑ bar. That exclusion was also where a
+// call VANISHED — a zee called, its xell was reaped, and the open row sat in the table out of every
+// feed with no receipt and no resolution. This makes the disappearance EXPLICIT: at the moment the
+// reaper retires a xell (reaper.js), every live call it raised is set 'withdrawn' with the reason
+// above, so the history says WHY it stopped being an emergency. `medic_call` stays on the medic's
+// NO-WRITE wall — this is the queenzee's own bookkeeping, not a medic action.
+//
+// Best-effort by contract: a failure here must never sink a reap. The caller logs and moves on; the
+// migration backfills anything this path missed.
+export async function withdrawMedicCallsForRetiredXell(xellId, {
+  reason = RETIRED_PATIENT_WITHDRAWAL_REASON,
+} = {}) {
+  const rows = await q(
+    `UPDATE medic_call SET status='withdrawn', resolution=$2, updated_at=now()
+      WHERE xell_id=$1 AND status IN ('open','attended') RETURNING *`,
+    [xellId, reason]);
+  for (const row of rows) {
+    broadcast('medic-call', row);
+    logline('medic-call', `xell ${xellId}: medic call ${String(row.id).slice(0, 8)} WITHDRAWN — patient retired`);
+  }
+  return rows;
 }
 
 // List the calls the MEDIC BAY and fleet read: a project's OPEN calls (awaiting a human dispatch),
