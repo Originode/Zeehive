@@ -26,6 +26,9 @@
 //      retired-exclusion swallow it — the receipt survives in the history.
 //   9. THE BACKFILL (migration 256): the migration's own SQL marks a pre-existing retired-xell call
 //      withdrawn with the same reason, and touches nothing the rule would not catch.
+//  10. BOTH PATHS CARRY IT (256): the badge fact is asserted on getFleet AND on streamXells — the
+//      progressive path the honeycomb actually paints from. One shared helper, two callers: covering
+//      only one would let a param slip in the other paint a hive of hexes with no ⛑ and stay green.
 process.env.MEDICRW_MODE = 'real';
 // The dispatch route is gated by requireQueenzeeLoops — only the process holding the single-queenzee
 // lock drives a spawn. config.js loads .zeehive.env at import (an API-only cxell projects
@@ -606,6 +609,33 @@ try {
   const backRow2 = await one(`SELECT status, resolution FROM medic_call WHERE id=$1`, [backCall.call_id]);
   ok(backRow2.status === 'withdrawn' && backRow2.resolution === backRow.resolution,
      're-running the migration changes nothing (idempotent forward-only ledger)');
+
+  // ── 16. THE SAME FACT ON THE PROGRESSIVE PATH (256) ───────────────────────
+  // fetchXellRows has TWO callers and the badge change bound a second parameter to BOTH: getFleet
+  // (section 13) and streamXells — the path that paints hexagons one at a time as the fleet loads.
+  // §13 alone would leave the streamed path covered by nothing, so a param-order slip there would
+  // paint a hive of hexes with no badges and no test would say so. Drive the real stream, not the
+  // shared helper, because the helper is exactly what is NOT in doubt.
+  console.log('\n── the ⛑ rides the STREAMED row too (the canvas paints from this path) ──');
+  const { streamXells } = await import('../server/src/lib/fleet.js');
+  const streamProject = { id: await insProject(`mc-stream-p-${tag}`) };
+  const streamXell = await insXell(streamProject.id, `mc-stream-${tag}`);
+  const seen = [];
+  const streamedProj = await streamXells(streamProject.id, async (x) => { seen.push(x); });
+  ok(!!streamedProj, 'streamXells returns the project (the query ran — both params bound)');
+  ok(seen.length === 1 && 'medic_call' in seen[0],
+     'every streamed row carries the medic_call key (the canvas reads a fact, never a query)');
+  ok(seen[0]?.medic_call === null, 'no call → null, so no hex is painted with a ⛑');
+  await raiseMedicCall({ xell: streamXell, reason: 'the streamed hex must wear the ⛑',
+                         kind: 'build', zeeId: null });
+  const seen2 = [];
+  await streamXells(streamProject.id, async (x) => { seen2.push(x); });
+  ok(seen2[0]?.medic_call?.live === true && seen2[0]?.medic_call?.kind === 'build',
+     'an OPEN call → the STREAMED row reports {live:true, kind:"build"}');
+  ok(!('medic_call_status' in (seen2[0] || {})) && !('medic_call_kind' in (seen2[0] || {})),
+     'the raw columns are stripped by decorateXell (the row carries the verdict, not the columns)');
+  ok(seen2[0]?.hive_status !== undefined,
+     'hive_status is untouched beside it — the badge is not a colour, it rides alongside the status');
 } catch (e) {
   console.error('UNCAUGHT', e);
   fail++;
