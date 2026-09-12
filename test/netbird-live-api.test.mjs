@@ -33,16 +33,21 @@
 //       DATABASE_URL=… node test/netbird-live-api.test.mjs
 //
 // The FIRST-PRINCIPLES bit: with no IdP (IdpManagerConfig.ManagerType = "none") a real server has
-// no way to make its first user or PAT — there is no self-serve endpoint and no CLI for it. So the
-// harness seeds the sqlite store exactly as the server's own code writes it: the account + its
-// network, a user whose name/email are AES-256-GCM field-encrypted with the datastore key, the
-// "All" group + "Default" policy, seeded peers, and a PAT (`nbp_`+secret+base62(crc32(secret)) at
-// exactly 6 chars, hashed base64(sha256(plain))). Those shapes were read off the server's source;
-// they are as much a part of "prove it against the real thing" as the assertions below.
+// no way to make its first user or PAT — there is no self-serve endpoint and no CLI for it. That
+// hole is now filled by PRODUCTION code (lib/netbird-bootstrap.js, "the first API token is
+// bootstrapped automatically"), and this harness is where it is proven against the real server:
+// boot once to migrate the store, stop, let bootstrapFirstPat inspect the running image for the
+// version pin, copy the store out, seed the account + its network + a user whose name/email are
+// AES-256-GCM field-encrypted with the datastore key + the "All" group + "Default" policy + a PAT
+// (`nbp_`+secret+base62(crc32(secret)) at exactly 6 chars, hashed base64(sha256(plain))), copy it
+// back and restart — and then the WHOLE suite runs on the token that bootstrap minted.
+//
+// What stays harness-local is the PEER fixture (four peers in the states the mesh_peer paths need),
+// because peers are rows a real agent writes, not something a bootstrap ever fabricates.
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { createHash, createCipheriv, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, createWriteStream } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, copyFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -53,7 +58,10 @@ import { config } from '../server/src/config.js';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 // ── the pin (docs/netbird-mesh-plan.md §11) ────────────────────────────────────────────────────
-const PINNED_NETBIRD_VERSION = '0.78.1';
+// Imported from lib/netbird.js, NOT spelled again here: a version bump then fails THIS suite
+// instead of drifting past it (netbird-bootstrap.js refuses any other version by design).
+const { PINNED_NETBIRD_VERSION } = await import('../server/src/lib/netbird.js');
+const boot = await import('../server/src/lib/netbird-bootstrap.js');
 const DEFAULT_BIN_DIR = join(homedir(), '.cache', 'zeehive', 'netbird', PINNED_NETBIRD_VERSION);
 
 let fail = 0;
@@ -167,43 +175,13 @@ async function stop(child, { graceMs = 5000 } = {}) {
   if (!exited) child.kill('SIGKILL');
 }
 
-// ── the store seed (the shapes the server's own code writes) ───────────────────────────────────
-const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-function crc32(buf) {
-  let c, crc = 0xFFFFFFFF;
-  for (let i = 0; i < buf.length; i++) {
-    c = (crc ^ buf[i]) & 0xFF;
-    for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xEDB88320 : c >>> 1;
-    crc = (crc >>> 8) ^ c;
-  }
-  return (crc ^ 0xFFFFFFFF) >>> 0;
-}
-// util/pat: `nbp_` + a 30-char secret + base62(crc32(secret)) LEFT-PADDED WITH SPACES to 6. The
-// server decodes that padding, so only a crc encoding that is already 6 base62 chars survives.
-function mintPat() {
-  for (;;) {
-    const secret = randomBytes(64).toString('base64url').replace(/[^0-9A-Za-z]/g, '').slice(0, 30);
-    if (secret.length !== 30) continue;
-    let n = crc32(Buffer.from(secret, 'utf8'));
-    let enc = '';
-    while (n > 0) { enc = ALPHABET[n % 62] + enc; n = Math.floor(n / 62); }
-    if (enc.length !== 6) continue;
-    const token = `nbp_${secret}${enc}`;
-    return { token, hashed: createHash('sha256').update(token).digest('base64') };
-  }
-}
-// util/crypt.FieldEncrypt: AES-256-GCM, base64(nonce || ciphertext || tag), 12-byte nonce.
-function encryptField(plaintext) {
-  const nonce = randomBytes(12);
-  const c = createCipheriv('aes-256-gcm', Buffer.from(dataKey, 'base64'), nonce);
-  const ct = Buffer.concat([c.update(plaintext, 'utf8'), c.final()]);
-  return Buffer.concat([nonce, ct, c.getAuthTag()]).toString('base64');
-}
-
-const ACCT = 'e2eliveacct000000000000000000';
-const USER = 'e2eliveuser000000000000000000';
-const ALL_GROUP = 'e2eliveallgroup0000000000000';
-const DEF_POLICY = 'e2elivedefpolicy000000000000';
+// ── the PEER fixture, plus a faithful docker emulation ─────────────────────────────────────────
+// The ACCOUNT half of the seed is no longer written by this harness: lib/netbird-bootstrap.js's
+// seedFirstPat is PRODUCTION code now ("the first API token is bootstrapped automatically"), and
+// the phases below drive IT — which is also what proves its row shapes against this exact release.
+// What stays harness-local is four peers in the states the mesh_peer paths need: rows a real agent
+// writes, not something a bootstrap ever fabricates. They are seeded while the server is stopped
+// (sqlite takes one writer at a time).
 const SEED_PEERS = [
   // 0: the peer getPeerByHostname/listPeers inspect, then deletePeer deletes for real
   { id: 'seedpeerlive000000000000000000', hostname: 'mesh-e2e-seed', ip: '100.64.171.11' },
@@ -215,35 +193,12 @@ const SEED_PEERS = [
   { id: 'seedpeerlive000000000000000003', hostname: 'mesh-e2e-orphan', ip: '100.64.171.14' },
 ];
 
-function seedStore() {
+// Writes the peer rows (and their membership in the account's "All" group, read out of the store
+// the bootstrap just seeded — so this also asserts that group exists).
+function seedPeers({ accountId }) {
   const db = new DatabaseSync(join(dataDir, 'store.db'));
+  const groupId = db.prepare(`SELECT id FROM groups WHERE account_id=? AND name='All'`).get(accountId)?.id || null;
   const now = new Date().toISOString().replace('T', ' ').replace('Z', '+00:00');
-  const netV4 = JSON.stringify({ IP: '100.64.0.0', Mask: Buffer.from([255, 255, 0, 0]).toString('base64') });
-  const netV6 = JSON.stringify({
-    IP: 'fd00:4e42:1234:5678::',
-    Mask: Buffer.concat([Buffer.alloc(8, 0xff), Buffer.alloc(8, 0)]).toString('base64'),
-  });
-  db.prepare(`INSERT INTO accounts (id, created_by, created_at, domain, domain_category,
-      is_domain_primary_account, network_identifier, network_net, network_net_v6, network_serial,
-      settings_groups_propagation_enabled, settings_jwt_groups_enabled,
-      settings_peer_login_expiration_enabled, settings_peer_inactivity_expiration_enabled)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(ACCT, USER, now, 'e2e.local', 'private', 1, 'e2e-net', netV4, netV6, 0, 1, 0, 0, 0);
-  db.prepare(`INSERT INTO users (id, account_id, role, is_service_user, non_deletable, blocked,
-      pending_approval, created_at, issued, name, email)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(USER, ACCT, 'owner', 0, 1, 0, 0, now, 'api', encryptField('e2e'), encryptField('e2e@e2e.local'));
-  db.prepare(`INSERT INTO groups (id, account_id, name, issued) VALUES (?,?,?,?)`)
-    .run(ALL_GROUP, ACCT, 'All', 'api');
-  db.prepare(`INSERT INTO policies (id, account_id, name, description, enabled) VALUES (?,?,?,?,?)`)
-    .run(DEF_POLICY, ACCT, 'Default', 'This policy allows all traffic between peers (default rule)', 1);
-  db.prepare(`INSERT INTO policy_rules (id, policy_id, name, description, enabled, action,
-      destinations, sources, bidirectional, protocol, ports)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(DEF_POLICY, DEF_POLICY, 'Default', 'This rule allows all traffic between peers (default rule)',
-      1, 'accept', JSON.stringify([ALL_GROUP]), JSON.stringify([ALL_GROUP]), 1, 'all', '[]');
-  db.prepare(`UPDATE accounts SET settings_ipv6_enabled_groups=? WHERE id=?`).run(JSON.stringify([ALL_GROUP]), ACCT);
-
   for (const p of SEED_PEERS) {
     // Every column the real store writes for a peer, with the values a real agent produced (the
     // shape was read off the server's own write, not invented). The dns_label is the real rule:
@@ -251,7 +206,7 @@ function seedStore() {
     // bare label, and the API appends ".<dns-domain>" when it answers.
     const o = p.ip.split('.').map(Number);
     const cols = {
-      id: p.id, account_id: ACCT, key: randomBytes(32).toString('base64'),
+      id: p.id, account_id: accountId, key: randomBytes(32).toString('base64'),
       ip: JSON.stringify(p.ip), ipv6: JSON.stringify('fd00:4e42:1234:5678::1'),
       meta_hostname: p.hostname, meta_go_os: 'linux', meta_kernel: 'Linux', meta_core: '',
       meta_platform: 'x86_64', meta_os: 'Debian GNU/Linux', meta_os_version: '12',
@@ -270,14 +225,57 @@ function seedStore() {
     const names = Object.keys(cols);
     db.prepare(`INSERT INTO peers (${names.map((c) => `"${c}"`).join(',')})
       VALUES (${names.map(() => '?').join(',')})`).run(...names.map((c) => cols[c]));
-    db.prepare(`INSERT INTO group_peers (group_id, peer_id) VALUES (?,?)`).run(ALL_GROUP, p.id);
+    if (groupId) db.prepare(`INSERT INTO group_peers (group_id, peer_id) VALUES (?,?)`).run(groupId, p.id);
   }
-  const pat = mintPat();
-  db.prepare(`INSERT INTO personal_access_tokens (id, user_id, name, hashed_token, expiration_date,
-      created_by, created_at) VALUES (?,?,?,?,?,?,?)`)
-    .run('e2elivepat00000000000000000000', USER, 'e2e', pat.hashed, '2030-01-01 00:00:00+00:00', USER, now);
   db.close();
-  return pat.token;
+  return { groupId };
+}
+
+// THE DOCKER SHAPE, EMULATED FAITHFULLY over the real service. The cage has no docker daemon, so
+// each verb does here what docker would do against a real container: inspect answers the image the
+// compose file pins, stop/start are the harness's own SIGTERM/spawn, cp is a file copy of the
+// sqlite store (chmod'ing to the source mode, as docker cp does). The ORCHESTRATION under test is
+// exactly production's — the order, the pin guard, the 0666 write-back, restart-on-failure — only
+// the transport is emulated.
+function meshDocker({ image = `netbirdio/management:${PINNED_NETBIRD_VERSION}` } = {}) {
+  const calls = [];
+  let child = null;
+  const stub = async (ctx, args) => {
+    calls.push(args.join(' '));
+    const [cmd] = args;
+    if (cmd === 'inspect') return { status: 0, stdout: `${image}\n`, stderr: '' };
+    if (cmd === 'stop') {
+      await stop(child);
+      child = null;
+      return { status: 0, stdout: `${boot.MESH_CONTROL_PLANE_CONTAINER}\n`, stderr: '' };
+    }
+    if (cmd === 'cp') {
+      const [src, dst] = args.slice(1);
+      const outOfContainer = src.startsWith(`${boot.MESH_CONTROL_PLANE_CONTAINER}:`);
+      const from = outOfContainer ? join(dataDir, 'store.db') : src;
+      const to = outOfContainer ? dst : join(dataDir, 'store.db');
+      mkdirSync(dirname(to), { recursive: true });
+      copyFileSync(from, to);
+      chmodSync(to, statSync(from).mode & 0o777); // docker cp preserves the source mode
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (cmd === 'start') {
+      child = startMgmt();
+      // The real `docker start` returns as soon as the container is started, and the performer's
+      // own bounded probe is what waits for the API. Waiting for the listener here is the same
+      // thing, and it keeps this emulation from spending the probe's six retries on spawn.
+      const up = await waitFor(async () => {
+        await (await fetch(`http://127.0.0.1:${apiPort}/api/instance`)).text();
+        return true;
+      }, { timeoutMs: 40000, everyMs: 200 });
+      return up ? { status: 0, stdout: `${boot.MESH_CONTROL_PLANE_CONTAINER}\n`, stderr: '' }
+                : { status: 1, stdout: '', stderr: 'management did not answer within 40s' };
+    }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  stub.calls = calls;
+  stub.liveChild = () => child;
+  return stub;
 }
 
 const cleanups = [];
@@ -288,9 +286,12 @@ try {
   apiPort = await freePort();
   metricsPort = await freePort();
   writeConfig();
+  // The bootstrap's own default probe (probeManagementApi) reads config.netbirdApiUrl, so point the
+  // seam at the loopback listener — exactly how a stand-up resolves the console/env URL.
+  config.netbirdApiUrl = `http://127.0.0.1:${apiPort}`;
 
   // ── phase 1: boot once to let the server create + migrate its sqlite store, then stop ───────
-  section('harness: boot the real server, seed the store, boot for real');
+  section('bootstrapFirstPat — the first account + PAT, against the real v-pinned plane');
   child1 = startMgmt();
   const schemaUp = await waitFor(() => {
     if (child1.exitCode !== null) return null;
@@ -306,12 +307,43 @@ try {
   await stop(child1);
   if (!schemaUp) throw new Error(`server never migrated its store — see ${logPath}`);
 
-  const token = seedStore();
-  ok(token.startsWith('nbp_') && token.length === 40, 'seeded a PAT in the real format (nbp_ + 30 + 6)');
+  // The production step, end to end: inspect the RUNNING image for the version pin, stop, copy the
+  // store out, seed the first account/user/PAT, copy it back 0666, restart, prove the API answers.
+  const docker = meshDocker();
+  const scratch = join(dir, 'pat-scratch');
+  const bootstrap = await boot.bootstrapFirstPat({
+    docker, ctx: 'default', dataKey, storeDir: scratch, keepScratch: true,
+  });
+  ok(bootstrap.ok === true,
+     `bootstrapFirstPat minted the first PAT on a real management server${bootstrap.ok ? '' : ` — ${bootstrap.reason}`}`);
+  if (!bootstrap.ok) throw new Error(`PAT bootstrap failed: ${bootstrap.reason} — see ${logPath}`);
+  const token = bootstrap.token;
+  ok(typeof token === 'string' && token.startsWith('nbp_') && token.length === 40,
+     'the minted token is the real format (nbp_ + 30 + 6)');
+  ok(bootstrap.version === PINNED_NETBIRD_VERSION, `and it read the pin off the running image (v${bootstrap.version})`);
+  const verbs = docker.calls.map((c) => c.split(' ')[0]);
+  ok(JSON.stringify(verbs) === JSON.stringify(['inspect', 'stop', 'cp', 'cp', 'start']),
+     `the plan ran in order — ${verbs.join(' → ')} (nothing is touched before the pin is read)`);
+  ok(docker.calls[2].includes(`${boot.MESH_CONTROL_PLANE_CONTAINER}:${boot.MESH_STORE_IN_CONTAINER}`)
+     && docker.calls[3].includes(`${boot.MESH_CONTROL_PLANE_CONTAINER}:${boot.MESH_STORE_IN_CONTAINER}`),
+     `and both copies name the real store path inside the container (${boot.MESH_STORE_IN_CONTAINER})`);
+  const backMode = statSync(join(scratch, 'store.db')).mode & 0o777;
+  ok(backMode === 0o666,
+     `the seeded store is written back world-writable (${backMode.toString(8)}) so the server can WRITE the store it owns`);
+  ok(bootstrap.health?.ok === true && bootstrap.health.verdict === 'ok',
+     `the restarted plane answered its own bounded probe (${bootstrap.health?.host}:${bootstrap.health?.port})`);
 
-  server = startMgmt();
+  // A plane that is not the pin is REFUSED before anything is stopped — legibly, naming the pin.
+  const offPin = meshDocker({ image: 'netbirdio/management:0.77.0' });
+  const refused = await boot.bootstrapFirstPat({ docker: offPin, ctx: 'default', dataKey, storeDir: join(dir, 'pin-scratch') });
+  ok(refused.ok === false && refused.refused === true && refused.reason.includes(PINNED_NETBIRD_VERSION),
+     `a plane that is not the pin is refused, naming the pin: ${refused.reason}`);
+  ok(offPin.calls.length === 1 && offPin.calls[0].startsWith('inspect'),
+     'and the refusal is the FIRST thing that happens — nothing was stopped or copied');
+
+  server = docker.liveChild();
   const ready = await waitFor(async () => {
-    if (server.exitCode !== null) return null;
+    if (!server || server.exitCode !== null) return null;
     try {
       // Consume the body: an unconsumed response leaves undici's pooled socket dirty, and the
       // next request on it can hang to its abort bound (seen once against a real server).
@@ -319,12 +351,27 @@ try {
       return true;
     } catch { return null; }
   }, { timeoutMs: 40000, everyMs: 200 });
-  ok(!!ready, 'the real management server answers HTTP on 127.0.0.1 (phase 2)');
+  ok(!!ready, 'the real management server answers HTTP on 127.0.0.1 after the bootstrap restart');
   if (!ready) throw new Error(`server never listened — see ${logPath}`);
+
+  // ── phase 2: stop, seed the PEER fixture (one writer), restart ────────────────────────────
+  section('the PEER fixture: rows a real agent writes, seeded while the server is stopped');
+  await stop(server);
+  const seeded = seedPeers({ accountId: bootstrap.account_id });
+  ok(!!seeded.groupId, 'the bootstrap\'s "All" group is in the store — the fixture peers are placed in it');
+  server = startMgmt();
+  const ready2 = await waitFor(async () => {
+    if (server.exitCode !== null) return null;
+    try {
+      await (await fetch(`http://127.0.0.1:${apiPort}/api/peers`)).text();
+      return true;
+    } catch { return null; }
+  }, { timeoutMs: 40000, everyMs: 200 });
+  ok(!!ready2, 'the server comes back up on the seeded peer rows');
+  if (!ready2) throw new Error(`server never listened after the peer seed — see ${logPath}`);
 
   // ── now drive the REAL client module at it ─────────────────────────────────────────────────
   const nb = await import('../server/src/lib/netbird.js');
-  config.netbirdApiUrl = `http://127.0.0.1:${apiPort}`;
   config.netbirdApiToken = token;
   ok(nb.meshEnabled(), 'meshEnabled() is true once the harness points config at the live server');
 
