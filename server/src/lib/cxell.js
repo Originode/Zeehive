@@ -1036,12 +1036,22 @@ export const zeeCliSourcePath = () => resolve(config.repoRoot, 'scripts', 'zee')
 // so the move cannot degrade into a copy) and `mv -f` it over `dest`: rename(2) is atomic, so a
 // racing invocation opens either the old script or the new one — never neither, never a half-written
 // one. A zee already mid-invocation is unaffected either way: node read the file at exec.
+//
+// NO LITTER. Staging is what makes the write atomic, but it also creates a second file in
+// /usr/local/bin, and if this exec dies between `install … ${staged}` and the `mv` — a timeout, a
+// wedged cage, a killed shell — nothing ever removes it: a root-owned `zee.new.<pid>` sits in the
+// bin dir forever, one per casualty. So the whole sequence runs under an EXIT trap (plus the
+// trappable signals) that removes the staged file and the temp copy. rename(2) is untouched: the
+// trap cleans the staging AREA, it never replaces the atomic move with an install(1) onto the live
+// path.
 export function cxellFileInstallCommands({ name, src, dest, tmp }) {
   const staged = `${dest}.new.$$`;
   return [
     ['cp', src, `${name}:${tmp}`],
     ['exec', '-u', '0', name, 'bash', '-lc',
-      `sed -i 's/\\r$//' ${tmp} && install -o root -g root -m 0755 ${tmp} ${staged} && mv -f ${staged} ${dest} && rm -f ${tmp}`],
+      `trap 'rm -f ${staged} ${tmp}' EXIT HUP INT TERM; `
+      + `sed -i 's/\\r$//' ${tmp} && install -o root -g root -m 0755 ${tmp} ${staged} `
+      + `&& mv -f ${staged} ${dest} && rm -f ${tmp}`],
   ];
 }
 export function zeeCliInstallCommands({ name, src = zeeCliSourcePath() }) {
@@ -1059,11 +1069,22 @@ export const zeeLiveSourcePath = () => resolve(config.repoRoot, 'docker', 'zeehi
 export const zeeLiveInstallCommands = ({ name, src = zeeLiveSourcePath() }) =>
   cxellFileInstallCommands({ name, src, dest: ZEE_LIVE_DEST, tmp: '/tmp/zee-live.mjs' });
 
-export async function installZeeLiveIntoCxell({ ctx = 'default', name }) {
+// The sweep's aggregate bound is enforced OP BY OP, not just between cages: each install checks the
+// passed deadline before it starts another docker op and reports `sweep-budget` instead of running.
+// That is what makes "the sweep stops at its bound" true even for a cage that turned slow halfway —
+// at most ONE already-started docker op (the per-op timeout) can still be finishing. `deadline` is
+// null everywhere except the fleet-wide sweep, so spawn keeps its unpressed behaviour.
+function pastDeadline(deadline) { return deadline != null && Date.now() >= deadline; }
+
+export async function installZeeLiveIntoCxell({ ctx = 'default', name, timeoutMs = 120000, deadline = null }) {
   const src = zeeLiveSourcePath();
   if (!existsSync(src)) return { installed: false, reason: 'source-missing', src };
+  if (pastDeadline(deadline)) return { installed: false, reason: 'sweep-budget', src };
   try {
-    for (const args of zeeLiveInstallCommands({ name, src })) await dk(ctx, args);
+    for (const args of zeeLiveInstallCommands({ name, src })) {
+      if (pastDeadline(deadline)) return { installed: false, reason: 'sweep-budget', src };
+      await dk(ctx, args, { timeoutMs });
+    }
     return { installed: true, src };
   } catch (e) {
     // Quieter than the CLI's !!!: a stale feed renderer costs a human a filter button, it does not
@@ -1085,11 +1106,15 @@ export const zeeAttachSourcePath = () => resolve(config.repoRoot, 'docker', 'zee
 export const zeeAttachInstallCommands = ({ name, src = zeeAttachSourcePath() }) =>
   cxellFileInstallCommands({ name, src, dest: ZEE_ATTACH_DEST, tmp: '/tmp/zee-attach.sh' });
 
-export async function installZeeAttachIntoCxell({ ctx = 'default', name }) {
+export async function installZeeAttachIntoCxell({ ctx = 'default', name, timeoutMs = 120000, deadline = null }) {
   const src = zeeAttachSourcePath();
   if (!existsSync(src)) return { installed: false, reason: 'source-missing', src };
+  if (pastDeadline(deadline)) return { installed: false, reason: 'sweep-budget', src };
   try {
-    for (const args of zeeAttachInstallCommands({ name, src })) await dk(ctx, args);
+    for (const args of zeeAttachInstallCommands({ name, src })) {
+      if (pastDeadline(deadline)) return { installed: false, reason: 'sweep-budget', src };
+      await dk(ctx, args, { timeoutMs });
+    }
     return { installed: true, src };
   } catch (e) {
     logline('cxell', `${name}: could not refresh the attach script from ${src} `
@@ -1127,15 +1152,38 @@ export async function installZeeAttachIntoCxell({ ctx = 'default', name }) {
 // a stale one: every OTHER baked file (cxell-sshd.sh, the agent CLIs, cxell-firewall.sh) is still
 // the old build and nothing here refreshes those. A repaired CLI is not a repaired image.
 //
+// IT IS BOUNDED. It used to be a serial `for … await` with no aggregate limit, each docker op on
+// dk's 120s default — so one wedged cage (a hung exec, a container that is half-gone) stalled every
+// cage behind it for minutes, on every boot, while a later boot's sweep could start on top of the
+// one still running. (Overlap is SAFE — the installs are idempotent overwrites — so this is about
+// latency and honesty, not correctness.) Three bounds, all small and all overridable:
+//   * every op carries SWEEP_OP_TIMEOUT_MS, not dk's 120s default;
+//   * the whole sweep stops STARTING work at its budget (SWEEP_BUDGET_MS) and reports the cages it
+//     did not reach, so those are visible rather than silently skipped;
+//   * a few cages run at once (SWEEP_CONCURRENCY) so none queues behind another's slow op.
+// The op-level deadline check (pastDeadline, above) means a cage that turns slow mid-install stops
+// at the next op too, so the bound holds even then. Still fire-and-forget: index.js does not await
+// it, and nothing here can throw into boot.
+//
 // AND IT OBEYS PROVISION_MODE, for the same reason the harness re-injection and the .zeehive.env
 // reconcile do: the caller (index.js) resolves these container names out of FLEET ROWS, and a
 // nested queenzee's fleet rows are the REAL fleet's — a xell's database is a clone of the meta-DB.
 // So in simulate this boot sweep would `docker cp` + `docker exec -u 0` into every OTHER zee's live
 // cage, installing whatever /usr/local/bin files happen to be in the running zee's own worktree.
 // Report-only there; unchanged in real mode.
-export async function refreshZeeToolingInLiveCxells(listLiveCxells, { mode = PROVISION_MODE } = {}) {
+export const SWEEP_OP_TIMEOUT_MS = 15000;   // per docker op (dk's default is 120000)
+export const SWEEP_BUDGET_MS = 45000;       // aggregate wall-clock bound for one sweep
+export const SWEEP_CONCURRENCY = 4;         // cages in flight at once
+
+export async function refreshZeeToolingInLiveCxells(listLiveCxells, {
+  mode = PROVISION_MODE,
+  perOpTimeoutMs = SWEEP_OP_TIMEOUT_MS,
+  budgetMs = SWEEP_BUDGET_MS,
+  concurrency = SWEEP_CONCURRENCY,
+} = {}) {
   let ok = 0;
   const failed = [];
+  const bounded = [];
   let cxells = [];
   try { cxells = await listLiveCxells(); } catch (e) {
     logline('cxell', `zee-tooling sweep skipped — could not list cxells (${String(e.message).slice(0, 120)})`);
@@ -1152,35 +1200,61 @@ export async function refreshZeeToolingInLiveCxells(listLiveCxells, { mode = PRO
     }
     return { swept: cxells.length, ok: 0, failed: [], dry_run: true };
   }
+  const deadline = Date.now() + Math.max(0, budgetMs);
+  const results = new Array(cxells.length);
+  let next = 0;
+  // A worker pool, not a `for … await`: one wedged cage must not hold the queue. `next++` is
+  // synchronous (single-threaded), so no two workers take the same index.
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= cxells.length) return;
+      const { ctx = 'default', name } = cxells[i];
+      // Past the bound, a worker stops: every cage after its index is never started, and the
+      // aggregation below reports each of those as bounded (not failed, and not silently skipped).
+      if (pastDeadline(deadline)) return;
+      // The CLI FIRST, and its failure counts against the cage: a zee that cannot run a shipped verb
+      // is the stranded-zee failure this sweep was extended for, and it is worse than a stale pane
+      // filter. `staleLog: false` — the verdict is aggregated into ONE line below, not repeated per
+      // cage per boot (the DETECTOR still runs per cage; only the logline is pooled).
+      const c = await installZeeCliIntoCxell({ ctx, name, staleLog: false, timeoutMs: perOpTimeoutMs, deadline });
+      // …then BOTH attend-path files, for one reason: they are two halves of the same pane. The
+      // renderer draws the feed; the attach script decides when the feed hands the pane over — and
+      // drains the talk queue at that exact moment. Refreshing only one would leave a cage that queues
+      // messages nothing ever types in.
+      const r = await installZeeLiveIntoCxell({ ctx, name, timeoutMs: perOpTimeoutMs, deadline });
+      const a = await installZeeAttachIntoCxell({ ctx, name, timeoutMs: perOpTimeoutMs, deadline });
+      results[i] = { name, cli: c, live: r, attach: a };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, cxells.length)) }, worker));
+  // Aggregate in CAGE ORDER (not completion order) so the example line a human reads is stable.
   let staleImages = 0;
   let staleExample = null;
-  for (const { ctx = 'default', name } of cxells) {
-    // The CLI FIRST, and its failure counts against the cage: a zee that cannot run a shipped verb
-    // is the stranded-zee failure this sweep was extended for, and it is worse than a stale pane
-    // filter. `staleLog: false` — the verdict is aggregated into ONE line below, not repeated per
-    // cage per boot (the DETECTOR still runs per cage; only the logline is pooled).
-    const c = await installZeeCliIntoCxell({ ctx, name, staleLog: false });
-    if (c.staleImage) { staleImages++; if (!staleExample) staleExample = { name, ...c }; }
-    // …then BOTH attend-path files, for one reason: they are two halves of the same pane. The
-    // renderer draws the feed; the attach script decides when the feed hands the pane over — and
-    // drains the talk queue at that exact moment. Refreshing only one would leave a cage that queues
-    // messages nothing ever types in.
-    const r = await installZeeLiveIntoCxell({ ctx, name });
-    const a = await installZeeAttachIntoCxell({ ctx, name });
-    if (c.installed && r.installed && a.installed) ok++; else failed.push(name);
+  for (let i = 0; i < cxells.length; i++) {
+    const res = results[i];
+    if (!res) { bounded.push(cxells[i].name); continue; }   // never started: the budget was spent
+    const parts = [res.cli, res.live, res.attach];
+    if (parts.some((p) => p && p.reason === 'sweep-budget')) { bounded.push(res.name); continue; }
+    if (parts.every((p) => p && p.installed)) ok++; else failed.push(res.name);
+    if (res.cli.staleImage) { staleImages++; if (!staleExample) staleExample = res; }
   }
   // ONCE for the sweep, not once per cage. On an un-rebuilt image this verdict is the same for every
   // cage, so a per-cage line would be the same paragraph repeated fleet-wide on every boot — signal
   // drowned by its own noise. NOT deleted: a silently stale image is how the CLI-drift bug's act two
   // hid for a whole ship, and this is the only place the fleet is told its image needs rebuilding.
+  // It now names the drifted files, because the sweep REPAIRS the CLI and the two attend-path files —
+  // so after one boot those compare clean while the files it does NOT repair still testify about the
+  // IMAGE. That is the point: a repaired CLI is not a repaired image.
   if (staleImages) {
     const ex = staleExample;
+    const driftedDests = (ex.cli.drifted || []).map((d) => d.dest);
     logline('cxell', `!!! STALE CXELL IMAGE in ${staleImages}/${cxells.length} swept cxell(s) — e.g. `
-      + `${ex.name}: the \`zee\` baked into its image (sha ${String(ex.bakedSha).slice(0, 12)}) is NOT `
-      + `this queenzee's scripts/zee (sha ${String(ex.sourceSha).slice(0, 12)}). This sweep refreshed `
-      + 'the CLI in those cages, and that papers over the image FOR THE CLI ONLY — every other baked '
-      + 'file (cxell-sshd.sh, the agent CLIs, cxell-firewall.sh) is still the old build and nothing '
-      + 'refreshes those. Rebuild the image: git archive <sha> | docker build -f '
+      + `${ex.name}: ${driftedDests.length} baked file(s) differ from this queenzee's repo copies `
+      + `(${driftedDests.slice(0, 4).join(', ')}). This sweep refreshed the CLI (and the attend path) `
+      + 'in those cages, and that papers over the image FOR THE CLI ONLY — the baked files it does NOT '
+      + 'refresh (cxell-sshd.sh, cxell-firewall.sh, cxell-claude-seed.mjs, the agent CLIs) are still '
+      + 'the old build. Rebuild the image: git archive <sha> | docker build -f '
       + 'docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -');
   }
   if (cxells.length) {
@@ -1189,7 +1263,12 @@ export async function refreshZeeToolingInLiveCxells(listLiveCxells, { mode = PRO
       + (failed.length ? ` — not reachable: ${failed.slice(0, 5).join(', ')}` : '')
       + ' (a mid-turn zee picks the CLI up on its NEXT invocation, the feed / attach on their next use)');
   }
-  return { swept: cxells.length, ok, failed, stale_image: staleImages };
+  if (bounded.length) {
+    logline('cxell', `zee-tooling sweep stopped at its ${budgetMs}ms bound — ${bounded.length}/`
+      + `${cxells.length} cxell(s) not swept this boot (${bounded.slice(0, 5).join(', ')}). The sweep is `
+      + 'idempotent, so the next boot retries them; nothing was skipped silently.');
+  }
+  return { swept: cxells.length, ok, failed, stale_image: staleImages, bounded: bounded.length };
 }
 
 // ── Is the IMAGE this cxell booted from actually built from the current code? ─────────────────
@@ -1200,17 +1279,72 @@ export async function refreshZeeToolingInLiveCxells(listLiveCxells, { mode = PRO
 // cache on every layer), and the only reason anyone found out was a zee comparing baked-file mtimes
 // by hand across two cages. Nothing in the system said a word.
 //
-// So ASK BEFORE OVERWRITING, while the baked file is still there: sha256 the image's `zee` and
-// compare it to the queenzee's own scripts/zee. A mismatch means the image predates this code —
-// the fleet image is stale, the spawn-time refresh is the only thing making the cage work, and the
-// next capability that is NOT the CLI (cxell-sshd.sh, zee-attach.sh, the agent CLIs, the firewall)
-// silently will not be there at all. Cheap: one exec, at spawn, best-effort.
-async function bakedZeeCliSha({ ctx, name }) {
+// So ASK BEFORE OVERWRITING, while the baked files are still there. The old probe sha256'd the baked
+// `zee` ONLY, which is the worst possible single witness: the sweep REPAIRS `zee`, so after one boot
+// this container's copy matches the queenzee's and the verdict goes quiet — while a clean CLI
+// implies a freshness that may be false. The files that keep testifying about the IMAGE are the ones
+// the sweep does NOT repair, and THOSE are what this now compares: cxell-sshd.sh, cxell-firewall.sh
+// and cxell-claude-seed.mjs (plus the CLI and attend-path files, whose drift a fresh cage reports).
+// A mismatch means the image predates this code: the fleet image is stale, the spawn-time refresh is
+// the only thing making the cage's CLI work, and the next capability that is NOT refreshed silently
+// will not be there at all. Cheap: ONE exec for the whole set, at spawn / once per cage per sweep,
+// best-effort — and it aggregates to ONE verdict, never a paragraph per cage.
+//
+// The agent CLIs (claude/codex/kimi/grok) are deliberately NOT in the set: they are npm-installed
+// binaries with no authoritative copy in this repo to compare against (kimi/grok are Dockerfile
+// pins, claude/codex track latest), so a version probe would need parsing the Dockerfile and running
+// four CLIs per cage. The image rebuild is what refreshes them, and the log says so.
+export const BAKED_CXELL_FILES = [
+  { dest: ZEE_CLI_DEST, src: zeeCliSourcePath, refreshed: true },
+  { dest: ZEE_LIVE_DEST, src: zeeLiveSourcePath, refreshed: true },
+  { dest: ZEE_ATTACH_DEST, src: zeeAttachSourcePath, refreshed: true },
+  { dest: '/usr/local/bin/cxell-sshd.sh', src: () => resolve(config.repoRoot, 'docker', 'zeehive', 'cxell-sshd.sh'), refreshed: false },
+  { dest: '/usr/local/bin/cxell-firewall.sh', src: () => resolve(config.repoRoot, 'docker', 'zeehive', 'cxell-firewall.sh'), refreshed: false },
+  { dest: '/usr/local/bin/cxell-claude-seed.mjs', src: () => resolve(config.repoRoot, 'docker', 'zeehive', 'cxell-claude-seed.mjs'), refreshed: false },
+];
+
+// The queenzee's own copy of every judged file, hashed once per process — the source files cannot
+// change under a running queenzee, and this probe runs per cage at boot.
+let bakedSourceShas = null;
+function queenzeeBakedShas() {
+  if (bakedSourceShas) return bakedSourceShas;
+  bakedSourceShas = BAKED_CXELL_FILES.map((f) => {
+    const src = f.src();
+    let sha = null;
+    try { if (existsSync(src)) sha = createHash('sha256').update(readFileSync(src)).digest('hex'); } catch { sha = null; }
+    return { ...f, src, sha };
+  });
+  return bakedSourceShas;
+}
+
+// Map dest → sha as reported by the container. ONE exec for every judged file; a file the image does
+// not carry is simply absent from the map (UNKNOWN for that path) and does not fail the probe.
+async function bakedCxellFileShas({ ctx, name, timeoutMs = 20000 }) {
+  const dests = BAKED_CXELL_FILES.map((f) => f.dest);
   try {
-    const r = await dk(ctx, ['exec', '-u', '0', name, 'sha256sum', ZEE_CLI_DEST], { timeoutMs: 20000 });
-    const sha = String(r.out || '').trim().split(/\s+/)[0];
-    return /^[0-9a-f]{64}$/.test(sha) ? sha : null;
-  } catch { return null; }   // no baked copy / no sha256sum — unknown, never fatal
+    const r = await dk(ctx, ['exec', '-u', '0', name, 'bash', '-c',
+      `for f in ${dests.join(' ')}; do [ -f "$f" ] && sha256sum "$f"; done; exit 0`], { timeoutMs });
+    const shas = {};
+    for (const line of String(r.out || '').split('\n')) {
+      const m = line.trim().match(/^([0-9a-f]{64})\s+(.+)$/);
+      if (m) shas[m[2]] = m[1];
+    }
+    return shas;
+  } catch { return null; }   // no baked files / no sha256sum — unknown, never fatal
+}
+
+// Which judged baked files disagree with the queenzee's copies, and how many were even comparable.
+// `compared === 0` must stay UNKNOWN (null), never "fresh": a probe that read nothing cannot acquit
+// the image — the same rule that keeps an unreadable review from meaning "all reviewed".
+function bakedFileDrift(shas) {
+  const drifted = [];
+  let compared = 0;
+  for (const f of queenzeeBakedShas()) {
+    if (!f.sha || !shas || !shas[f.dest]) continue;
+    compared++;
+    if (shas[f.dest] !== f.sha) drifted.push({ dest: f.dest, refreshed: f.refreshed, bakedSha: shas[f.dest], sourceSha: f.sha });
+  }
+  return { drifted, compared };
 }
 
 // Install (idempotently — it is an overwrite) the queenzee's current `zee` CLI into the cxell.
@@ -1222,28 +1356,37 @@ async function bakedZeeCliSha({ ctx, name }) {
 // stale-image DETECTOR still runs for every cage it visits, but the sweep prints the verdict ONCE
 // for the whole fleet instead of once per cage per boot. A single cage repaired at spawn keeps the
 // per-cage line, which is where "a spawn quietly booted from a stale image" belongs.
-export async function installZeeCliIntoCxell({ ctx = 'default', name, staleLog = true }) {
+//
+// `timeoutMs` / `deadline` exist for the sweep: its bound is enforced op by op, so a cage that turns
+// slow mid-install stops at the next op instead of running on. Both default to the spawn behaviour
+// (dk's own 120s, no deadline).
+export async function installZeeCliIntoCxell({ ctx = 'default', name, staleLog = true, timeoutMs = 120000, deadline = null }) {
   const src = zeeCliSourcePath();
   if (!existsSync(src)) {
     logline('cxell', `${name}: !!! could not refresh the zee CLI — ${src} is missing from the queenzee's `
       + 'repo; the cxell keeps the CLI baked into its image, which may be OLDER than this queenzee');
     return { installed: false, reason: 'source-missing', src };
   }
+  if (pastDeadline(deadline)) return { installed: false, reason: 'sweep-budget', src };
   // Read the image's verdict FIRST — the install below destroys the evidence.
-  const baked = await bakedZeeCliSha({ ctx, name });
-  const mine = createHash('sha256').update(readFileSync(src)).digest('hex');
-  const staleImage = baked ? baked !== mine : null;
+  const shas = await bakedCxellFileShas({ ctx, name, timeoutMs });
+  const { drifted, compared } = bakedFileDrift(shas);
+  const staleImage = compared ? drifted.length > 0 : null;
+  const zeeEntry = queenzeeBakedShas().find((f) => f.dest === ZEE_CLI_DEST) || {};
   if (staleImage && staleLog) {
-    logline('cxell', `${name}: !!! STALE CXELL IMAGE — the \`zee\` baked into this container's image `
-      + `(sha ${baked.slice(0, 12)}) is NOT this queenzee's scripts/zee (sha ${mine.slice(0, 12)}). The `
-      + 'zee-agent image was not rebuilt from the current code. The refresh below papers over it FOR '
-      + 'THE CLI ONLY (and the attend path) — every other baked file (cxell-sshd.sh, the agent CLIs, '
-      + 'cxell-firewall.sh) is still the old build and nothing refreshes those. Rebuild the image: '
+    logline('cxell', `${name}: !!! STALE CXELL IMAGE — ${drifted.length} baked file(s) differ from `
+      + `this queenzee's repo copies (${drifted.map((d) => d.dest).join(', ')}). The zee-agent image was `
+      + 'not rebuilt from the current code. The refresh below papers over it FOR THE CLI ONLY (and the '
+      + 'attend path) — the files it does NOT refresh (cxell-sshd.sh, cxell-firewall.sh, '
+      + 'cxell-claude-seed.mjs, the agent CLIs) are still the old build. Rebuild the image: '
       + 'git archive <sha> | docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -');
   }
   try {
-    for (const args of zeeCliInstallCommands({ name, src })) await dk(ctx, args);
-    return { installed: true, src, staleImage, bakedSha: baked, sourceSha: mine };
+    for (const args of zeeCliInstallCommands({ name, src })) {
+      if (pastDeadline(deadline)) return { installed: false, reason: 'sweep-budget', src };
+      await dk(ctx, args, { timeoutMs });
+    }
+    return { installed: true, src, staleImage, drifted, bakedSha: shas?.[ZEE_CLI_DEST] ?? null, sourceSha: zeeEntry.sha ?? null };
   } catch (e) {
     logline('cxell', `${name}: !!! could not refresh the zee CLI from ${src} (${String(e.message).slice(0, 200)}) — `
       + 'the cxell falls back to the CLI baked into its image, which may be OLDER than this queenzee '
