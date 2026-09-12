@@ -1282,8 +1282,11 @@ router.get('/projects/:id/build-readiness', async (req, res) => {
 router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res) => {
   try {
     const dryRun = req.body?.dry_run !== false;
+    // `kinds` scopes a perform to named step kinds (the Mesh panel's control-plane stand-up); the
+    // plan and its guards are still the whole picture — only the performed subset narrows.
+    const kinds = Array.isArray(req.body?.kinds) && req.body.kinds.length ? req.body.kinds : null;
     res.json(await performBuildBootstrap(req.params.id, req.params.machineId, {
-      dryRun, actor: req.body?.by || 'human@console',
+      dryRun, actor: req.body?.by || 'human@console', kinds,
     }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });

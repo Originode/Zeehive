@@ -601,6 +601,21 @@ try {
   ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
      'the stand-up is RECORDED in the audit steps');
 
+  // A SCOPED perform (the Mesh panel's stand-up) creates ONLY the named kinds: standing the control
+  // plane up must not create a project's networks/dev-db as a side effect of a mesh-only action.
+  const pScoped = await insProject(`bs-scoped-${tag}`,
+    { tiers: { spinoff: { requires: { networks: ['bs_scoped_net'] } } } });
+  await insDevDb(pScoped, 'default', `bs_${tag}_scoped_db`);
+  const dockerScoped = makeDocker({ reachable: true, networks: new Set() });
+  const scoped = await performBuildBootstrap(pScoped, mCp, { dryRun: false, docker: dockerScoped,
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeOk } });
+  ok(scoped.results.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
+     'a scoped perform runs the requested mesh stand-up');
+  ok(!scoped.results.some((s) => s.kind === 'network'),
+     'and does NOT perform the unrelated network step it was not asked for');
+  ok(!dockerScoped.calls.some((c) => c.includes('network') && c.includes('create')),
+     'no unrelated network was created as a side effect');
+
   // Idempotence: the container now answers 'running' → already-present, no second compose up.
   const dockerUp2 = makeDocker({ reachable: true, networks: new Set(),
     runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });

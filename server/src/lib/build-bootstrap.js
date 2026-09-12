@@ -597,9 +597,15 @@ async function loadProjectWithCoupling(projectId) {
 // THE ENTRY: dryRun returns the plan and performs nothing; otherwise performs each step, re-runs
 // the probe, and records the whole action. Never throws for a verdict outcome (a missing
 // machine/project row still throws — the row is gone).
+//
+// `kinds` SCOPES a perform to the named step kinds only (the Mesh panel's control-plane stand-up
+// must not create a project's networks/dev-db as a side effect of standing up the mesh). The plan
+// is still computed in full — the dev-only guard, the refusal and the prod disclosure all fire on
+// the whole picture — but only steps of the requested kinds are performed and recorded. null =
+// every performable step (the 🔧 card's behaviour).
 export async function performBuildBootstrap(projectId, machineId,
   { dryRun = false, docker = dockerAdapter, provisionDb = provisionDevDb,
-    actor = 'human@console', mesh = {} } = {}) {
+    actor = 'human@console', mesh = {}, kinds = null } = {}) {
   const project = await loadProjectWithCoupling(projectId);
   const machine = await one(`SELECT * FROM machine WHERE id=$1`, [machineId]);
   if (!machine) throw new Error('machine not found');
@@ -631,6 +637,7 @@ export async function performBuildBootstrap(projectId, machineId,
     // A disclosure is information for the human, not a step to perform — keep it in the results
     // so the audit records it, but never hand it to the performer.
     if (step.kind === 'disclosure' || step.status === 'cannot') { results.push(step); continue; }
+    if (kinds && !kinds.includes(step.kind)) continue;   // scoped action: leave unrelated steps alone
     results.push({ ...step, ...(await performStep(step, machine, project, { docker, provisionDb, mesh })) });
   }
 
