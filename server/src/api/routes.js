@@ -93,7 +93,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
-         selfProviderEnv, selfRoutes } from '../queenzee/self.js';
+         selfProviderEnv, selfRoutes, selfRouteTally } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
@@ -2328,6 +2328,16 @@ router.get('/xell/self/provider-env', async (req, res) => {
 // self-scoped, opens no gate — the live counterpart of the .zeehive.env snapshot.
 router.get('/xell/self/routes', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfRoutes(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// The tally HALF of the same router read (MANAGER only, `zee routes --tally`): the per-day count of
+// mesh-vs-legacy answers per target kind — the number phase 5 is gated on (migration 254,
+// lib/mesh-route-telemetry.js). A route of its own, deliberately: the routes answer above is a
+// settled contract about ONE xell's stack, and it must not grow (the TKT-42 lesson that kept
+// `zee ops` from absorbing delivery telemetry).
+router.get('/xell/self/routes/tally', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfRouteTally(x, { days: req.query.days ?? null })); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.get('/xell/self/env', async (req, res) => {

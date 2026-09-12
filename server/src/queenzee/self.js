@@ -45,6 +45,7 @@ import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migra
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv, resolveXellDsn } from '../lib/provision.js';
 import { deriveXellRoutes, probeTcp } from '../lib/mesh-routes.js';
+import { recordRouteSources, meshRouteTally } from '../lib/mesh-route-telemetry.js';
 import { meshEnabled, ensureProdBindMeshPolicy } from '../lib/netbird.js';
 import { providerRunEnv } from '../lib/provider-tokens.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
@@ -4116,5 +4117,33 @@ export async function selfRoutes(xell) {
       await probeTcp(payload.routes.db.ip || payload.routes.db.host || payload.routes.db.hostname,
                      payload.routes.db.port);
   }
+
+  // TELEMETRY, best-effort (never a gate, never a delay trap): count what this answer resolved,
+  // per target kind and source (lib/mesh-route-telemetry.js). Phase 5 — stop publishing per-xell
+  // ports and delete the allocator — is gated on this tally (§6), and THIS is the one place a route
+  // answer exists to be counted. recordRouteSources() swallows its own errors, so a telemetry row
+  // can never fail the answer it describes; it is awaited only so the counter is durable before
+  // the caller acts on a source it just read.
+  await recordRouteSources(payload);
   return payload;
+}
+
+// GET /api/xell/self/routes/tally — `zee routes --tally` (MANAGER only). The per-day count of which
+// world answered `zee routes`, by target kind and source: THE telemetry phase 5 (stop publishing
+// per-xell ports and delete the allocator, docs/netbird-mesh-plan.md §6) is gated on, and the reason
+// the recorder above exists (§3.4/§10 follow-up 3).
+//
+// MANAGER-only for the same reason `zee ops` is (docs/manager-zees.md): the tally is FLEET-WIDE, and
+// fleet visibility is precisely the manager trade. It is a route of its own rather than a field on
+// the routes answer because that answer's shape is a settled CONTRACT (§3.4) and it speaks about ONE
+// xell — while this speaks about the whole fleet over a window. Read-only and soft-failing: a
+// database behind the ledger answers an `error` beside empty buckets, never a 500.
+export async function selfRouteTally(xell, { days = null } = {}) {
+  const guard = requireManager(xell, 'routes --tally');
+  if (guard) return guard;
+  const tally = await meshRouteTally(days == null ? {} : { days });
+  logline('self', `${xell.slug} pulled the route-source tally (${tally.window_days}d window: `
+    + `${tally.by_source.mesh} mesh / ${tally.by_source['legacy-port']} legacy-port)`
+    + (tally.error ? ` — ${tally.error}` : ''));
+  return { ok: true, ...tally };
 }
