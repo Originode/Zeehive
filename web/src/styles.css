@@ -1144,7 +1144,7 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-meshconfigure:disabled { opacity: .5; cursor: default; }
 /* the NetBird control-plane SETUP WIZARD: a full-size modal (the dlg-overlay pattern), one page
    at a time, big inputs, the field hints as visible text — the anti-"compact dropdown". */
-.mx-wizoverlay { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center;
+.mx-wizoverlay { position: fixed; inset: 0; z-index: 85; display: flex; align-items: center;
   justify-content: center; padding: 6vh 16px; background: rgba(4,6,10,.6);
   backdrop-filter: blur(3px); animation: dlg-fade .14s ease-out; }
 .mx-wiz { width: min(640px, 96vw); max-height: 88vh; display: flex; flex-direction: column;
@@ -1184,6 +1184,19 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 7px; padding: 8px 14px; font-size: 12.5px; cursor: pointer; }
 .mx-wizgen:hover:not(:disabled) { border-color: var(--accent); }
 .mx-wizhint { display: block; color: var(--muted); font-size: 11.5px; line-height: 1.45; margin-top: 4px; }
+/* the PROVISION block on the management page: stand the plane up on the queenzee's own host */
+.mx-wizprov { margin-top: 14px; padding: 12px 14px; border: 1px dashed var(--line); border-radius: 9px;
+  background: var(--panel2); font-size: 12.5px; }
+.mx-wizprov .mx-wizblurb { margin-bottom: 10px; }
+.mx-wizprov .mx-meshstep { font-size: 12px; margin: 6px 0; }
+.mx-wizprov .mx-meshnote, .mx-wizprov .mx-mesherr { font-size: 11.5px; margin-top: 6px; }
+.mx-wizprovhead { font-size: 12.5px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.mx-wizprovplan, .mx-wizprovuse { background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  border-radius: 7px; padding: 7px 14px; font-size: 12.5px; cursor: pointer; }
+.mx-wizprovplan:hover:not(:disabled), .mx-wizprovuse:hover:not(:disabled) { border-color: var(--accent); }
+.mx-wizprovgo { background: rgba(229,85,78,.12); border: 1px solid rgba(229,85,78,.5); color: #ffb4a2;
+  border-radius: 7px; padding: 7px 16px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.mx-wizprovgo:hover:not(:disabled) { color: var(--text); border-color: var(--down); }
 .mx-wizreview { display: flex; flex-direction: column; gap: 6px; }
 .mx-wizrevrow { display: flex; gap: 10px; font-size: 12.5px; }
 .mx-wizrevrow .k { color: var(--muted); flex: none; width: 190px; }

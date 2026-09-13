@@ -183,6 +183,47 @@ const roHtml = renderToStaticMarkup(React.createElement(M.MeshConfigSummaryBody,
 ok(/disabled/.test(roHtml.match(/<button[^>]*data-testid="mesh-configure"[^>]*>/)?.[0] || ''),
    'a read-only host disables the configure button');
 
+// ── 2b. the PROVISION block: stand the plane up on the queenzee's own compose, from the wizard ──
+// The management page offers to PROVISION the control plane on the Zeehive host itself (the
+// queenzee's own production compose project) when there is no server to point the URL at. Same
+// seam as the panel's STAND UP — one perform path, one typed gate.
+console.log('\n── the wizard PROVISION block: stand up on the queenzee\'s own compose, one perform path ──');
+ok(/onProvision=\{\(\) => standUp\(plan\)\}/.test(src.mesh) && /onPlanProvision=\{loadPlan\}/.test(src.mesh),
+   'the wizard\'s provision is the panel\'s OWN standUp/loadPlan — one perform path, one typed gate');
+ok((src.mesh.match(/performBuildBootstrap\(/g) || []).length === 1,
+   'there is exactly ONE performBuildBootstrap call site (the gate cannot fork)');
+ok(/step\.key === 'management' && provision &&/.test(src.mesh),
+   'the provision block renders on the MANAGEMENT page only');
+const provPlanned = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { kind: 'mesh-control-plane', status: 'planned', why: 'not running',
+          action: 'docker compose --profile mesh up -d netbird-management' },
+  planned: true,
+}));
+ok(/data-testid="mesh-wizard-provision-go"/.test(provPlanned), 'a planned step offers the provision button');
+ok(/docker compose --profile mesh up -d/.test(provPlanned), 'and shows the exact action from the plan');
+ok(/production compose project/.test(provPlanned) && /Zeehive host itself/.test(provPlanned),
+   'the blurb says WHERE this provisions: the queenzee\'s own production compose, on the Zeehive host itself');
+const provRunning = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { kind: 'mesh-control-plane', status: 'already-present', detail: 'running' },
+  planned: true, resolvedUrl: 'https://netbird-management:443',
+}));
+ok(!/data-testid="mesh-wizard-provision-go"/.test(provRunning), 'an already-running plane offers NO provision button');
+ok(/data-testid="mesh-wizard-provision-use"/.test(provRunning) && /netbird-management:443/.test(provRunning),
+   'it offers "use this plane" instead, naming the resolved address');
+const provOffHost = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, { step: null, planned: true }));
+ok(/data-testid="mesh-wizard-provision-nostep"/.test(provOffHost) && /queenzee-host machine only/.test(provOffHost),
+   'a machine with no control-plane step says provisioning lives on the queenzee host only');
+// The URL a provision fills in: the row's value first, the resolved (default-rung) address second.
+ok(M.provisionedManagementUrl({ fields: { management_url: 'https://a' },
+                                resolved: { values: { api_url: 'https://b' } } }) === 'https://a',
+   'provisionedManagementUrl prefers the row\'s stored URL');
+ok(M.provisionedManagementUrl({ fields: {}, resolved: { values: { api_url: 'https://netbird-management:443' } } })
+     === 'https://netbird-management:443',
+   'and falls back to the queenzee\'s RESOLVED address (the compose-internal default rung)');
+ok(M.provisionedManagementUrl({ fields: {} }) === null, 'with neither it answers null, not an invented address');
+ok(M.normalizeMeshConfig({ resolved: { values: { api_url: 'https://x' } } }).resolved.values.api_url === 'https://x',
+   'normalizeMeshConfig carries the server\'s `resolved` through for the provision flow');
+
 console.log('\n── the pure helpers ──');
 ok(M.secretHint({ set: true, hint: 'x' }) === 'stored (x)' && M.secretHint({ set: false }) === 'not set'
    && M.secretHint(null) === 'not set', 'secretHint: stored(hint) / not set');

@@ -65,7 +65,9 @@ export function secretHint(s) {
 
 // Normalize the config read. The server half is built in parallel, so this tolerates the two
 // plausible spellings of each section (fields|config, secrets|secret_hints) and both a bare hint
-// string and a { set, hint } object — the join is then one sync, not a rewrite.
+// string and a { set, hint } object — the join is then one sync, not a rewrite. `resolved` rides
+// through untouched: it is what the queenzee would use RIGHT NOW (store→env→default), and the
+// wizard's provision flow reads the plane's address out of it after a stand-up.
 export function normalizeMeshConfig(r = {}) {
   const fields = r.fields || r.config || {};
   const raw = r.secrets || r.secret_hints || {};
@@ -76,7 +78,16 @@ export function normalizeMeshConfig(r = {}) {
       : s ? { set: s.set !== false, hint: s.hint ?? s.fingerprint ?? s.last4 ?? null }
       : { set: false, hint: null };
   }
-  return { fields, secrets, editable: r.editable !== false };
+  return { fields, secrets, editable: r.editable !== false, resolved: r.resolved || null };
+}
+
+// The management URL a just-provisioned (or already-running) plane answers at, read from a fresh
+// config: the ROW's value when the stand-up recorded one, else what the queenzee RESOLVES right
+// now (which includes the compose-internal default an enabled row falls back to). Null means the
+// queenzee reaches the plane without a stored URL — legal, and the wizard says so instead of
+// inventing an address.
+export function provisionedManagementUrl(cfg) {
+  return cfg?.fields?.management_url || cfg?.resolved?.values?.api_url || null;
 }
 
 // ── CONFIG: the wizard ───────────────────────────────────────────────────────
@@ -86,7 +97,8 @@ export function normalizeMeshConfig(r = {}) {
 export const MESH_WIZARD_STEPS = [
   { key: 'management', title: 'Management connection',
     blurb: 'Where the NetBird control plane answers. Leave the management URL empty and the mesh '
-      + 'stays a legible no-op: every route falls back to legacy host:port.',
+      + 'stays a legible no-op: every route falls back to legacy host:port. No server yet? '
+      + 'Provision one below, on this Zeehive host itself.',
     fields: ['management_url', 'mesh_domain'], secrets: [] },
   { key: 'coordination', title: 'Signal & relay',
     blurb: 'The coordination services peers are told about: the signal service brokers direct '
@@ -147,6 +159,65 @@ export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}
   );
 }
 
+// The PROVISION block on the management page: stand the NetBird control plane up on the queenzee's
+// OWN production compose project (Zeehive's own containers) without leaving the wizard. It is the
+// SAME plan/perform seam as the panel's STAND UP section — the plan is a dry run, the perform is
+// behind the typed STAND UP gate — surfaced where the human is actually stuck: staring at an empty
+// management-URL field with no server to point it at. Pure body; the handlers live in the wizard.
+export function MeshWizardProvisionBody({ step, planned = false, busy = false, err = null, note = null,
+                                          resolvedUrl = null, onPlan, onProvision, onAdopt }) {
+  return (
+    <div className="mx-wizprov" data-testid="mesh-wizard-provision">
+      <div className="mx-wizprovhead">no management server yet?</div>
+      <div className="mx-wizblurb">
+        Provision the NetBird control plane on this Zeehive host itself: the mesh-profile services
+        in the queenzee's own production compose project, next to the production containers. It is
+        human-gated (a typed STAND UP), creates ONLY the control plane, and a successful stand-up
+        fills the management URL above from the plane it stood up.
+      </div>
+      {!planned && (
+        <button type="button" className="mx-wizprovplan" disabled={busy} data-testid="mesh-wizard-provision-plan"
+                title="Read the bootstrap plan for this machine (dry run — creates nothing) and show the mesh-control-plane step."
+                onClick={onPlan}>
+          {busy ? '⏳…' : 'check this host…'}
+        </button>
+      )}
+      {planned && step && (
+        <>
+          <div className={`mx-meshstep ${step.status}`} data-testid="mesh-wizard-provision-step">
+            <b>{step.status}</b> — {step.detail || step.why}
+          </div>
+          {step.status === 'planned' && (
+            <div className="mx-wizinrow">
+              <button type="button" className="mx-wizprovgo" disabled={busy} data-testid="mesh-wizard-provision-go"
+                      title={step.action || ''} onClick={onProvision}>
+                {busy ? '⏳…' : '🏗 provision control plane on this host'}
+              </button>
+            </div>
+          )}
+          {step.status === 'planned' && step.action && <span className="mx-wizhint">{step.action}</span>}
+          {step.status === 'already-present' && (
+            <button type="button" className="mx-wizprovuse" disabled={busy} data-testid="mesh-wizard-provision-use"
+                    title="The control plane is already running on this host — fill the management URL above with the address the queenzee resolves for it."
+                    onClick={onAdopt}>
+              use this plane{resolvedUrl ? ` (${resolvedUrl})` : ''}
+            </button>
+          )}
+        </>
+      )}
+      {planned && !step && (
+        <div className="mx-meshnote" data-testid="mesh-wizard-provision-nostep">
+          No mesh-control-plane step for this machine — the control plane lives in the queenzee's
+          own compose project, so provisioning is offered on the queenzee-host machine only. Point
+          the management URL at a plane that already runs elsewhere.
+        </div>
+      )}
+      {err && <div className="mx-mesherr">{err}</div>}
+      {note && <div className="mx-meshnote" data-testid="mesh-wizard-provision-note">{note}</div>}
+    </div>
+  );
+}
+
 // Pure body for the last page: every non-secret value as it will be saved, every secret as
 // unchanged / will-be-set — NEVER the secret value itself.
 export function MeshWizardReviewBody({ fields = {}, secrets = {}, draft = {} }) {
@@ -178,12 +249,38 @@ export function MeshWizardReviewBody({ fields = {}, secrets = {}, draft = {} }) 
 // (fields seeded from the stored config, secrets always starting empty); nothing reaches the
 // server until Save, which hands the write-only-merged body to `onSave`. Escape / backdrop / ✕
 // close it and the draft is discarded — the stored config was never touched.
-export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSave, onClose, busy = false, err = null }) {
+//
+// `provision` + `onPlanProvision` + `onProvision` are the management page's stand-up seam:
+// onProvision performs the (typed-gate) mesh-control-plane stand-up and resolves to the FRESH
+// config read, from which the wizard fills the management URL — never clobbering one the human
+// already typed. The one act a provision performs on the wizard's draft is filling that field.
+export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSave, onClose, busy = false, err = null,
+                             provision = null, onPlanProvision = null, onProvision = null }) {
   const [i, setI] = useState(0);
   const [fields, setFields] = useState({ ...initialFields });
   const [draft, setDraft] = useState({});
+  const [provNote, setProvNote] = useState(null);
   const step = MESH_WIZARD_STEPS[i];
   const last = i === MESH_WIZARD_STEPS.length - 1;
+
+  // Fill the management URL from a plane address, unless the human already typed one — their
+  // draft outranks anything the wizard derives.
+  const adoptUrl = (url, how) => {
+    if (fields.management_url) {
+      setProvNote(`the plane answers at ${url || 'its compose-internal default'} — keeping the URL you typed.`);
+    } else if (url) {
+      setFields((f) => ({ ...f, management_url: url }));
+      setProvNote(`management URL filled from ${how}: ${url}`);
+    } else {
+      setProvNote(`${how} is up — leaving the URL empty is fine: the queenzee reaches its own plane at the compose-internal default.`);
+    }
+  };
+
+  const provisionNow = async () => {
+    setProvNote(null);
+    const fresh = await onProvision?.();          // null = typed gate declined, or the perform failed
+    if (fresh) adoptUrl(provisionedManagementUrl(fresh), 'the control plane that just stood up');
+  };
 
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); onClose?.(); } };
@@ -226,6 +323,13 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
             : <MeshWizardStepBody step={step} fields={fields} secrets={secrets} draft={draft} busy={busy}
                                   setField={(k, v) => setFields((f) => ({ ...f, [k]: v }))}
                                   setSecret={(k, v) => setDraft((d) => ({ ...d, [k]: v }))} />}
+          {step.key === 'management' && provision && (
+            <MeshWizardProvisionBody step={provision.step} planned={provision.planned}
+                                     busy={busy || provision.busy} err={provision.err} note={provNote}
+                                     resolvedUrl={provision.resolvedUrl}
+                                     onPlan={onPlanProvision} onProvision={provisionNow}
+                                     onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')} />
+          )}
           {err && <div className="mx-mesherr">{err}</div>}
         </div>
         <div className="mx-wizfoot">
@@ -425,7 +529,8 @@ function MeshSections({ m, projectId, onChanged }) {
     try {
       const r = normalizeMeshConfig(await getMeshConfig(m.id));
       setCfg(r); setFields(r.fields || {}); setStoredSecrets(r.secrets || {}); setCfgErr(null);
-    } catch (e) { setCfgErr(e.message || String(e)); }
+      return r;
+    } catch (e) { setCfgErr(e.message || String(e)); return null; }
   }, [m.id]);
 
   const loadStatus = useCallback(async () => {
@@ -463,6 +568,10 @@ function MeshSections({ m, projectId, onChanged }) {
     finally { setBusy(false); }
   };
 
+  // The ONE perform path for the mesh-control-plane stand-up — the panel's STAND UP section and
+  // the wizard's provision block both land here, so the typed gate and the kinds scope can never
+  // fork. Returns the FRESH config read on success (the perform records the first PAT and enables
+  // the row, so the read moves), null when the gate was declined or the perform failed.
   const standUp = async (step) => {
     const typed = await showPrompt(
       `Stand up the NetBird control plane on ${m.key}?\n\n`
@@ -471,14 +580,15 @@ function MeshSections({ m, projectId, onChanged }) {
       + 'It creates ONLY the control plane — no project network, volume or dev db. '
       + 'The API token and gateway setup key stay yours to set.\n\nType STAND UP to confirm.',
       { okLabel: 'Stand up', variant: 'danger', placeholder: 'STAND UP' });
-    if (String(typed || '').trim().toUpperCase() !== 'STAND UP') return;
+    if (String(typed || '').trim().toUpperCase() !== 'STAND UP') return null;
     setBusy(true); setPlanErr(null);
     try {
       await performBuildBootstrap(projectId, m.id, 'human@console', ['mesh-control-plane']);
       showAlert(`NetBird control plane stand-up requested on ${m.key}. Re-read below; any env a human must still set is in the receipt.`, { variant: 'info' });
-      await Promise.all([loadPlan(), loadStatus()]);
+      const [fresh] = await Promise.all([loadConfig(), loadPlan(), loadStatus()]);
       onChanged?.();
-    } catch (e) { setPlanErr(e.message || String(e)); }
+      return fresh;
+    } catch (e) { setPlanErr(e.message || String(e)); return null; }
     finally { setBusy(false); }
   };
 
@@ -489,7 +599,10 @@ function MeshSections({ m, projectId, onChanged }) {
                              err={cfgErr} note={cfgNote} />
       {wizardOpen && (
         <MeshWizard machineKey={m.key} initialFields={fields} secrets={storedSecrets} busy={saving}
-                    onSave={save} onClose={() => setWizardOpen(false)} err={cfgErr} />
+                    onSave={save} onClose={() => setWizardOpen(false)} err={cfgErr}
+                    provision={{ step: plan, planned, busy, err: planErr,
+                                 resolvedUrl: cfg?.resolved?.values?.api_url || null }}
+                    onPlanProvision={loadPlan} onProvision={() => standUp(plan)} />
       )}
       <MeshStandUpBody step={plan} planned={planned} busy={busy} err={planErr}
                        onPlan={loadPlan} onPerform={() => standUp(plan)} />
