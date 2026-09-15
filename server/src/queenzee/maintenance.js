@@ -1876,6 +1876,51 @@ export async function refreshStaleXellDbs(projectId) {
   return done;
 }
 
+// ── session_event retention: prune the bulky play-by-play mirror kinds ─────────────────────────
+// session_event doubles as (a) the append-only GATE/STATE log (tend-*, env-alert*, landhint-*/
+// shiphint-*, ship-refused-*, working-ping, turn-death, nudge-held*, interactive-turn-*, …) that
+// the fleet snapshot and the status derivations replay latest-event-wins with NO time bound, and
+// (b) a MIRROR of every stream-json feed event (turn-ledger recordFeedEvent, source 'cxell-feed').
+// Nothing pruned the mirror, so the table grew without bound (135k rows / 144 MB on the prod
+// meta-DB, 2026-09-15, ~94% of it the four mirror kinds) and every un-indexed scan got worse daily.
+//
+// ONLY the mirror kinds are swept, and only past the retention window. Every reader of those four
+// was grepped before choosing the list (2026-09-15): turn-ledger eventsForTurn (play-by-play by
+// turn_id) + conversationForXell (newest 100 'assistant'), and routes.js GET /zees/:id/events
+// (newest 200 by zee) — all recency-bounded DISPLAY reads; no state is derived from a mirror row.
+// The gate/state kinds are NEVER in the list — deleting one would silently flip a tend/hint/alert.
+//
+// Mode-gated like every other maintenance write: simulate reports what it WOULD delete, real
+// deletes. Exported (with the kind list) so a test can drive it against a sandbox db.
+export const SESSION_EVENT_SWEEP_KINDS = ['assistant', 'user', 'tool_progress', 'result'];
+
+export async function sweepSessionEvents({ olderThanDays = config.sessionEventRetentionDays,
+                                           now = Date.now(), mode = MODE } = {}) {
+  const days = Number(olderThanDays);
+  if (!Number.isFinite(days) || days <= 0) return 0;   // 0/negative = retention off, sweep nothing
+  const cutoff = new Date(now - days * 86400 * 1000).toISOString();
+  try {
+    if (mode !== 'real') {
+      const row = await one(
+        `SELECT count(*)::int AS n FROM session_event
+          WHERE hook_event_name = ANY($1::text[]) AND ts < $2::timestamptz`,
+        [SESSION_EVENT_SWEEP_KINDS, cutoff]);
+      if (row?.n) logline('maint', `session_event sweep (simulate): would remove ${row.n} mirror row(s) older than ${days}d`);
+      return 0;
+    }
+    const rows = await q(
+      `DELETE FROM session_event
+        WHERE hook_event_name = ANY($1::text[]) AND ts < $2::timestamptz
+        RETURNING id`,
+      [SESSION_EVENT_SWEEP_KINDS, cutoff]);
+    if (rows.length) logline('maint', `session_event sweep removed ${rows.length} mirror row(s) (older than ${days}d)`);
+    return rows.length;
+  } catch (e) {
+    logline('maint', `session_event sweep failed: ${String(e.message).slice(0, 120)}`);
+    return 0;
+  }
+}
+
 export function startMaintenance() {
   reconcileInterruptedJobs().catch((e) => console.error('[maintenance] reconcile', e.message));
   if (process.env.MAINTENANCE_ENABLED !== 'true') {
@@ -1937,6 +1982,9 @@ export function startMaintenance() {
       // The gateway BODY sweep is global (not per-project): delete bodies older than 14 days.
       // Never throws — a sweep failure logs and moves on.
       await sweepGatewayBodies();
+      // …and the session_event MIRROR sweep (same contract: global, never throws): prune the
+      // bulky cxell-feed play-by-play kinds past config.sessionEventRetentionDays.
+      await sweepSessionEvents();
     } catch (e) { console.error('[maintenance]', e.message); }
   };
   // Short tick; each project backs up only when its interval has elapsed (backupDue).

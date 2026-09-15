@@ -100,6 +100,13 @@ export const config = {
   // and how often the maintenance scheduler wakes to check whether a backup is due.
   backupDir: process.env.BACKUP_DIR || resolve(repoRoot, 'db_backups'),
   maintTickMs: int(process.env.MAINT_TICK_MS, 60000),
+  // How long the BULKY session_event mirror kinds (assistant/user/tool_progress/result — the
+  // cxell-feed play-by-play copies) are kept before the maintenance sweep prunes them. The
+  // gate/state kinds (tend-*, env-alert*, *hint-*, ship-refused-*, working-ping, turn-death, …)
+  // are NEVER swept — the fleet snapshot and the status derivations replay those latest-event-wins
+  // with no time bound. 30 days keeps recent turn drill-downs readable; nothing derives state
+  // from mirror rows that old.
+  sessionEventRetentionDays: int(process.env.SESSION_EVENT_RETENTION_DAYS, 30),
   // The PRODUCTION application database to dump (inside the modeled prod db container) — NOT
   // the zeehive meta DB above. db name defaults to the project name; role/tier resolve the
   // container from the inventory, so only user/name need overriding for an off-convention prod.
