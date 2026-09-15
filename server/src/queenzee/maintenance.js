@@ -21,6 +21,7 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { resolveSite } from '../lib/sites.js';
 import { listContainersDetailed } from '../lib/docker.js';
+import { transferWindowMs } from '../lib/transfer-window.js';
 import { pickDbContainer } from '../lib/xell-db.js';
 import { refreshProdDiffAfterRestore } from './proddiff.js';
 // The DATA half of a backup's guarantee — pure functions + the catalog SQL, kept out of here so both
@@ -574,10 +575,14 @@ const STREAM_TIMEOUT_CEILING_MS = 3 * 60 * 60 * 1000;  // but never more than 3 
 
 // The dump window for a source of `dbBytes` bytes. A null/unknown size (the probe failed) gets the
 // floor — the dump still runs, just within the old fixed window. Exported for the regression test.
+//
+// The arithmetic now lives in lib/transfer-window.js, because a bundle transfer into a cage needs
+// the same rule for the same reason (a fixed window is a guess about throughput, and this fleet's
+// measured throughput is what killed both transfers — see that module's header). The knobs and the
+// result are unchanged: BACKUP_* env overrides, the 30-min floor, the 3-hour ceiling.
 export function streamTimeoutFor(dbBytes) {
-  if (!Number.isFinite(dbBytes) || dbBytes <= 0) return STREAM_TIMEOUT_FLOOR_MS;
-  const secs = (dbBytes / STREAM_MIN_BYTES_PER_SEC) * STREAM_TIMEOUT_MARGIN;
-  return Math.min(STREAM_TIMEOUT_CEILING_MS, Math.max(STREAM_TIMEOUT_FLOOR_MS, Math.round(secs * 1000)));
+  return transferWindowMs(dbBytes, { floorMs: STREAM_TIMEOUT_FLOOR_MS, ceilingMs: STREAM_TIMEOUT_CEILING_MS,
+                                     minBytesPerSec: STREAM_MIN_BYTES_PER_SEC, margin: STREAM_TIMEOUT_MARGIN });
 }
 // The image used to run `pg_restore --list` on the WRITTEN dump for the content check. We prefer
 // the SOURCE db container's own image (guaranteed to read an archive it produced), falling back to
