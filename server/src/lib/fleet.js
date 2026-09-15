@@ -588,7 +588,30 @@ async function readSpendByProvider(projectId, xellIds) {
   return out;
 }
 
-export async function getFleet(projectId) {
+// COALESCE concurrent fleet reads (the /api/fleet hot path). The console re-fetches the snapshot
+// after every stream event while the queenzee loops broadcast constantly — production measured
+// ~108 /api/fleet requests per 10 min arriving every ~5 s against a read that took ~30 s, so the
+// queue never drained and every other meta-DB query waited behind 6-7 concurrent copies of the
+// SAME statement. Callers that arrive while a snapshot is already being computed for the same
+// project id await THAT promise instead of starting another identical query storm; the entry is
+// cleared when it settles (success OR failure — a failed read must not be cached), so the next
+// call always computes fresh. Keyed on the RAW argument: null/undefined (the default-project
+// call) coalesces under one key too. streamXells is deliberately NOT coalesced — it emits through
+// a per-caller callback, so two callers cannot share one run.
+const inflightFleet = new Map();
+
+export function getFleet(projectId) {
+  const key = projectId ?? '';
+  const hit = inflightFleet.get(key);
+  if (hit) return hit;
+  const p = fetchFleet(projectId).finally(() => {
+    if (inflightFleet.get(key) === p) inflightFleet.delete(key);
+  });
+  inflightFleet.set(key, p);
+  return p;
+}
+
+async function fetchFleet(projectId) {
   const project = projectId
     ? await one(`SELECT * FROM project WHERE id = $1`, [projectId])
     : await defaultProject();
