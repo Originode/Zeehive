@@ -1,7 +1,7 @@
 // Read model for the dashboard: project header, N-of-M status line, grouped container
 // inventory, and one entry per xell (container stack + its live zee + runtime badge).
 import { hostname } from 'node:os';
-import { q, one } from '../db/pool.js';
+import { q, one, pool } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
@@ -62,9 +62,30 @@ async function fleetGitContext(project) {
 // The xell rows (one per non-retired xell) BEFORE their container stacks are attached. Kept
 // separate from decoration so a caller can stream: fetch the cheap list first, then resolve each
 // xell's stack one at a time and emit it the moment it is ready.
+//
+// JIT IS OFF for this one query, per-transaction (SET LOCAL — it cannot leak past the COMMIT and
+// never touches the pooled connection's defaults). The planner estimates this statement at ~1.3M
+// cost — far over the stock jit_above_cost — so EVERY execution LLVM-compiled 221 functions:
+// ~15 s of the measured 28-33 s per production /api/fleet call was JIT compilation alone, on a
+// read that returns a few dozen rows. The fix travels with the code (not a docker-compose
+// postgres flag) so every deployment and every xell's clone db behaves the same.
 async function fetchXellRows(pid) {
-  return q(
-    `SELECT x.*, xo.ref AS xource_ref,
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL jit = off');
+    const res = await client.query(FETCH_XELL_ROWS_SQL, [pid, MEDIC_LIVE_STATUSES]);
+    await client.query('COMMIT');
+    return res.rows;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+const FETCH_XELL_ROWS_SQL = `SELECT x.*, xo.ref AS xource_ref,
             z.id AS zee_id, z.name AS zee_name, z.status AS zee_status, z.title AS zee_title,
             z.claude_session_id, z.session_name, z.viewer_url, z.viewer_kind,
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
@@ -260,8 +281,7 @@ async function fetchXellRows(pid) {
           LIMIT 1
        ) env ON true
       WHERE x.project_id = $1 AND x.status <> 'retired'
-      ORDER BY x.created_at`, [pid, MEDIC_LIVE_STATUSES]);
-}
+      ORDER BY x.created_at`;
 
 // Can a browser shell open into this container row? Mirrors terminal-bridge.resolveShellTarget:
 //   • a PER-XELL process role (runner:process, owner set) has no container of its own — its shell
