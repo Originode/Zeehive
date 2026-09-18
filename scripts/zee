@@ -13,6 +13,7 @@
 //   zee land [--wait]   |   zee land --withdraw [--reason "…"]   (un-ask a held landing)
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
+//   zee prod-logs [<role>] [--tail N] [--since 30m] [--grep "text"]   READ-ONLY tail of PRODUCTION's own log
 //   zee verify-webapp   (offer your built webapp to a human in the console — Open link / dismiss)
 //   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
 //
@@ -592,6 +593,7 @@ function usage() {
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
+  zee prod-logs [<role>] [--tail N] [--since 30m] [--grep "text"] [--container <name>] [--json]   READ what PRODUCTION's own app tier is saying: the tail of the live prod server/webapp container log. EVERY zee has it, read-only, opens NO gate and grants NO access to the container — no shell, no filesystem, no start/stop, no follow, and you name a ROLE (never a container id, host or docker context: the container is resolved from YOUR project). Credential-shaped values are MASKED (***) before the lines leave the queenzee. The prod DATABASE is deliberately not readable here — a postgres log carries production row data, which is the \`zee prod\` / \`zee seed\` gate. Bare (no role) lists what you may read. This is PRODUCTION's log; the QUEENZEE's own log is \`zee ops\`
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
   zee verify-webapp                    OFFER your built webapp to a human in the console (Open link / dismiss). For a VISUAL-VERIFICATION xell: build with \`zee build webapp --wait\`, then call this. NOT gated, nothing irreversible — never land/ship for this
   zee upload-conversation [--reason "…"]   UPLOAD this xell's conversation to the queenzee (archived; a manager can review it). NOT gated. Reads your own session transcript and stores it — the "upload conversations on done" harness setting does this automatically at \`zee done\`
@@ -1077,6 +1079,41 @@ switch (cmd) {
     const r = await req('POST', '/api/xell/self/seed-request', { files, reason });
     console.log(JSON.stringify(r.json, null, 2));
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'prod-logs': {
+    // READ-ONLY PRODUCTION LOGS — every zee's verb (see lib/prod-logs.js for the wall).
+    //
+    //   zee prod-logs                 → what you may read (the prod roles your project deploys)
+    //   zee prod-logs server           → the tail of production's server log
+    //   zee prod-logs webapp --tail 500 --since 30m --grep "500"
+    //
+    // You name a ROLE, never a container/host/context — the container is resolved server-side from
+    // YOUR project — and the answer is log text only: no shell, no filesystem, no container
+    // control, no follow. Credential-shaped values arrive already masked. The prod DATABASE is not
+    // readable here (its log is production row data: that is `zee prod` / `zee seed`).
+    //
+    // Printed as plain lines by default — a log is read by a human/agent eye, and JSON-wrapping it
+    // hides exactly the thing you asked for. `--json` gives the full answer (sources, counts,
+    // deployed sha, redaction count) for anything programmatic.
+    // positional(), not "the first argv without a leading --": that hunt reads a FLAG'S VALUE as
+    // the role the moment a flag comes first (`zee prod-logs --tail 50` would ask for role "50").
+    const role = positional();
+    const qs = new URLSearchParams();
+    if (role) qs.set('role', role);
+    for (const k of ['tail', 'since', 'grep', 'container']) if (flag(k)) qs.set(k, flag(k));
+    const r = await req('GET', `/api/xell/self/prod-logs${qs.size ? `?${qs}` : ''}`);
+    if (rest.includes('--json') || !role || r.json?.ok === false || !Array.isArray(r.json?.lines)) {
+      out(r);
+      break;
+    }
+    const s = r.json.source || {};
+    console.error(`── PRODUCTION ${s.role || role} log (${s.container || '?'}${s.state ? `, ${s.state}` : ''}`
+      + `${s.deployed_commit ? `, built ${s.deployed_commit}` : ''}) — ${r.json.lines.length} line(s)`
+      + `${r.json.redacted_lines ? `, ${r.json.redacted_lines} with credentials masked` : ''}`
+      + `${r.json.truncated ? ', TRUNCATED at the read cap' : ''} ──`);
+    for (const line of r.json.lines) console.log(line);
+    process.exit(r.code >= 400 ? 1 : 0);
     break;
   }
   case 'verify-webapp': {

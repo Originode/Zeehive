@@ -6,7 +6,7 @@
 // this stays out of its way).
 import http from 'node:http';
 import { one } from '../db/pool.js';
-import { resolveContext } from './docker.js';
+import { resolveContext, demuxDockerStream } from './docker.js';
 import { resolveShellTarget, dockerReq } from './terminal-bridge.js';
 import { buildListScript, parseListOutput, buildReadScript, parseReadResult } from './cxell-fs.js';
 
@@ -31,25 +31,11 @@ export function resolveContainerPath(p, root = CONTAINER_ROOT) {
   return '/' + parts.join('/');
 }
 
-// The docker raw-stream framing: a non-TTY exec's stdout/stderr come back multiplexed as
-// [8-byte header][payload] frames — header[0] is the stream (1=stdout, 2=stderr) and header[4:8]
-// is the big-endian payload size. With Tty:true (the shell) there is no multiplexing; a capture
-// must ask for Tty:false and demux here.
-export function demuxDockerStream(buf) {
-  const out = []; const err = [];
-  let off = 0;
-  while (off + 8 <= buf.length) {
-    const stream = buf[off];
-    const size = buf.readUInt32BE(off + 4);
-    off += 8;
-    if (off + size > buf.length) break; // truncated final frame — keep what is whole
-    const chunk = buf.subarray(off, off + size);
-    if (stream === 1) out.push(chunk);
-    else if (stream === 2) err.push(chunk);
-    off += size;
-  }
-  return { out: Buffer.concat(out), err: Buffer.concat(err) };
-}
+// The docker raw-stream framing (a non-TTY exec's stdout/stderr come back multiplexed) now lives
+// in docker.js, beside the other wire-format code, because the prod LOG tail needs the same demux
+// and a second copy of a framing parser is how two readers drift. Re-exported here so this
+// module's own contract (and test/container-fs.test.mjs) is unchanged.
+export { demuxDockerStream } from './docker.js';
 
 // Run a shell script inside the target and capture stdout/stderr, non-TTY. The script travels in
 // the exec Cmd verbatim (no shell interpolation on our side), and the same base64-pipe technique

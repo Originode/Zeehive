@@ -109,6 +109,35 @@ function dockerCliPs(ctx, timeout) {
   return list;
 }
 
+// The docker raw-stream framing: a non-TTY container's stdout/stderr come back multiplexed as
+// [8-byte header][payload] frames — header[0] is the stream (1=stdout, 2=stderr) and header[4:8]
+// is the big-endian payload size. Both consumers of a hijacked/streamed body need it: an exec
+// capture (container-fs.js, which re-exports this) and a log tail (containerLogTail below). With
+// Tty:true there is no multiplexing and the body is raw bytes — ask the daemon which it is
+// (Config.Tty) rather than guessing from the bytes.
+// ONE frame walker, two readings of it: an exec capture wants stdout and stderr SEPARATED, a log
+// tail wants them INTERLEAVED in arrival order. Both are the same parse, so it lives here once.
+export function walkDockerFrames(buf, onFrame) {
+  let off = 0;
+  while (off + 8 <= buf.length) {
+    const stream = buf[off];
+    const size = buf.readUInt32BE(off + 4);
+    off += 8;
+    if (off + size > buf.length) break; // truncated final frame — keep what is whole
+    onFrame(stream, buf.subarray(off, off + size));
+    off += size;
+  }
+}
+
+export function demuxDockerStream(buf) {
+  const out = []; const err = [];
+  walkDockerFrames(buf, (stream, chunk) => {
+    if (stream === 1) out.push(chunk);
+    else if (stream === 2) err.push(chunk);
+  });
+  return { out: Buffer.concat(out), err: Buffer.concat(err) };
+}
+
 function getJson(conn, path, timeout) {
   return new Promise((res, rej) => {
     const req = http.request({ ...conn, path, method: 'GET', timeout }, (r) => {
@@ -168,6 +197,83 @@ async function getContainerList(ctx, timeout) {
   const list = await getJson(conn, '/containers/json?all=1', timeout);
   if (!Array.isArray(list)) throw new Error('unexpected /containers/json payload');
   return list;
+}
+
+// Read a body that is NOT JSON (a log stream) as a Buffer, capped. The cap is applied while
+// reading and the request is destroyed once it is hit, so a container that logs a gigabyte an hour
+// can never fill this process's heap: the caller gets the first `maxBytes` and `truncated:true`.
+function getRaw(conn, path, timeout, maxBytes) {
+  return new Promise((res, rej) => {
+    const req = http.request({ ...conn, path, method: 'GET', timeout }, (r) => {
+      const chunks = []; let len = 0, truncated = false;
+      if (r.statusCode < 200 || r.statusCode >= 300) {
+        let body = '';
+        r.setEncoding('utf8');
+        r.on('data', (d) => (body += d));
+        r.on('end', () => rej(new Error(`HTTP ${r.statusCode}: ${body.slice(0, 200)}`)));
+        return;
+      }
+      r.on('data', (d) => {
+        const b = Buffer.from(d);
+        if (len >= maxBytes) { truncated = true; req.destroy(); return; }
+        chunks.push(b); len += b.length;
+      });
+      r.on('end', () => res({ buf: Buffer.concat(chunks), truncated }));
+      r.on('close', () => res({ buf: Buffer.concat(chunks), truncated }));
+      r.on('error', rej);
+    });
+    req.on('error', (e) => rej(e));
+    req.on('timeout', () => req.destroy(new Error(`timeout after ${timeout}ms`)));
+    req.end();
+  });
+}
+
+// Shell out to the `docker` CLI for a LOG READ against an SSH context — the same exception, and the
+// same contract, as dockerCliPs: the docker HTTP API cannot ride SSH, and `logs` is read-only.
+// Returns null when the CLI is missing or the daemon is unreachable, so the caller says so instead
+// of reporting an empty log.
+function dockerCliLogs(ctx, name, { tail, sinceTs, timeout, maxBytes }) {
+  const args = ['--context', ctx, 'logs', '--timestamps', '--tail', String(tail)];
+  if (sinceTs) args.push('--since', String(sinceTs));
+  args.push(name);
+  const r = spawnSync('docker', args, { encoding: 'utf8', timeout, maxBuffer: maxBytes, windowsHide: true });
+  if (r.error || r.status !== 0) return null;
+  // The CLI demuxes for us and prints stdout and stderr on the respective streams; a container's
+  // log is the two interleaved, which is what a reader wants.
+  return { text: `${r.stdout || ''}${r.stderr || ''}`, truncated: false };
+}
+
+// The TAIL of ONE container's log, as text. READ-ONLY by construction: the only calls it makes are
+// GET /containers/<name>/json (to learn whether the log is TTY-raw or multiplexed, and whether the
+// container is running) and GET /containers/<name>/logs with follow=0. There is no exec, no attach,
+// no start/stop, and nothing here takes a command from a caller — this is the whole door, and it
+// only ever opens onto a log.
+//
+// `tail` is a line count, `sinceTs` a unix timestamp (docker's own `since`), `maxBytes` the hard
+// ceiling on what is read off the daemon. Returns { text, truncated, state }. THROWS when the
+// daemon/container cannot be reached, so a caller never reports "no logs" for "could not ask".
+export async function containerLogTail(ctx, name, {
+  tail = 200, sinceTs = null, timeout = 20000, maxBytes = 1 << 20,
+} = {}) {
+  if (await isSshContext(ctx)) {
+    const out = dockerCliLogs(ctx, name, { tail, sinceTs, timeout, maxBytes });
+    if (!out) throw new Error(`daemon on context '${ctx}' is unreachable (ssh context, via the docker CLI)`);
+    return { ...out, state: null };
+  }
+  const conn = await resolveContext(ctx);
+  const enc = encodeURIComponent(name);
+  const info = await getJson(conn, `/containers/${enc}/json`, timeout);
+  const tty = !!info?.Config?.Tty;
+  const state = info?.State?.Status || null;
+  const qs = new URLSearchParams({ stdout: '1', stderr: '1', follow: '0', timestamps: '1', tail: String(tail) });
+  if (sinceTs) qs.set('since', String(sinceTs));
+  const { buf, truncated } = await getRaw(conn, `/containers/${enc}/logs?${qs}`, timeout, maxBytes);
+  // A TTY container's log is raw bytes; a non-TTY one is framed (and stderr is part of the log a
+  // reader wants, so the two are merged in the order the frames arrived).
+  if (tty) return { text: buf.toString('utf8'), truncated, state };
+  const parts = [];
+  walkDockerFrames(buf, (_stream, chunk) => parts.push(chunk));
+  return { text: Buffer.concat(parts).toString('utf8'), truncated, state };
 }
 
 // Stop then remove ONE container, by name (docker's HTTP API accepts a name as the id). Best-effort
