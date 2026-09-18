@@ -119,7 +119,10 @@ const secretDef = (k) => MESH_SECRETS.find((s) => s[0] === k);
 // Pure body for ONE wizard page: big labelled inputs, the hint under each field as readable text.
 // `fields` is the draft of the non-secret values, `secrets` the STORED state (hints only), `draft`
 // the pending secret values (always empty unless the human typed/generated one this session).
-export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}, setField, setSecret, busy = false }) {
+// `slots` hangs extra content DIRECTLY UNDER one named field (slots[fieldKey] → rendered right
+// after that field) — how the management page puts the install/provision block under the URL it
+// fills, instead of somewhere lower a human has to connect back up.
+export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}, setField, setSecret, busy = false, slots = {} }) {
   if (!step) return null;
   return (
     <div className="mx-wizstep" data-testid={`mesh-wizard-step-${step.key}`}>
@@ -127,12 +130,15 @@ export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}
       {step.fields.map((k) => {
         const [, label, hint] = fieldDef(k) || [k, k, ''];
         return (
-          <label className="mx-wizfield" key={k}>
-            <span className="k">{label}</span>
-            <input type="text" value={fields[k] ?? ''} disabled={busy} data-testid={`mesh-field-${k}`}
-                   placeholder="—" onChange={(e) => setField?.(k, e.target.value)} />
-            <span className="mx-wizhint">{hint}</span>
-          </label>
+          <React.Fragment key={k}>
+            <label className="mx-wizfield">
+              <span className="k">{label}</span>
+              <input type="text" value={fields[k] ?? ''} disabled={busy} data-testid={`mesh-field-${k}`}
+                     placeholder="—" onChange={(e) => setField?.(k, e.target.value)} />
+              <span className="mx-wizhint">{hint}</span>
+            </label>
+            {slots[k] || null}
+          </React.Fragment>
         );
       })}
       {step.secrets.map((k) => {
@@ -168,18 +174,21 @@ export function MeshWizardProvisionBody({ step, planned = false, busy = false, e
                                           resolvedUrl = null, onPlan, onProvision, onAdopt }) {
   return (
     <div className="mx-wizprov" data-testid="mesh-wizard-provision">
-      <div className="mx-wizprovhead">no management server yet?</div>
+      <div className="mx-wizprovhead">no management server yet? install one here</div>
       <div className="mx-wizblurb">
-        Provision the NetBird control plane on this Zeehive host itself: the mesh-profile services
-        in the queenzee's own production compose project, next to the production containers. It is
-        human-gated (a typed STAND UP), creates ONLY the control plane, and a successful stand-up
-        fills the management URL above from the plane it stood up.
+        Install/provision NetBird on this Zeehive host itself: the mesh-profile services in the
+        queenzee's own production compose project, next to the production containers. It is
+        human-gated (a typed STAND UP), creates ONLY the control plane, and a successful install
+        generates the management URL and fills the field for you.
       </div>
-      {!planned && (
-        <button type="button" className="mx-wizprovplan" disabled={busy} data-testid="mesh-wizard-provision-plan"
-                title="Read the bootstrap plan for this machine (dry run — creates nothing) and show the mesh-control-plane step."
+      {!planned && busy && (
+        <div className="mx-meshnote" data-testid="mesh-wizard-provision-checking">checking this host…</div>
+      )}
+      {!planned && !busy && (
+        <button type="button" className="mx-wizprovplan" data-testid="mesh-wizard-provision-plan"
+                title="Read the bootstrap plan for this machine (dry run — creates nothing) and show the mesh-control-plane step. The wizard runs this by itself when the page opens; the button re-checks."
                 onClick={onPlan}>
-          {busy ? '⏳…' : 'check this host…'}
+          check this host…
         </button>
       )}
       {planned && step && (
@@ -191,7 +200,7 @@ export function MeshWizardProvisionBody({ step, planned = false, busy = false, e
             <div className="mx-wizinrow">
               <button type="button" className="mx-wizprovgo" disabled={busy} data-testid="mesh-wizard-provision-go"
                       title={step.action || ''} onClick={onProvision}>
-                {busy ? '⏳…' : '🏗 provision control plane on this host'}
+                {busy ? '⏳…' : '🏗 install NetBird — provision the control plane on this host'}
               </button>
             </div>
           )}
@@ -282,6 +291,29 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
     if (fresh) adoptUrl(provisionedManagementUrl(fresh), 'the control plane that just stood up');
   };
 
+  // AUTO-CHECK the host the moment the management page is open: the plan is a dry run (creates
+  // nothing, no gate), and running it unprompted is what turns the block from "check, then
+  // install" into "install" — the one-click flow the field promises. Once per wizard open; the
+  // button in the block re-checks by hand after an error.
+  const autoPlanned = useRef(false);
+  useEffect(() => {
+    if (step.key !== 'management' || !provision || !onPlanProvision) return;
+    if (provision.planned || provision.busy || autoPlanned.current) return;
+    autoPlanned.current = true;
+    onPlanProvision();
+  }, [step.key, provision, onPlanProvision]);
+
+  // The install/provision block, hung DIRECTLY UNDER the management URL field it fills.
+  const provisionSlot = step.key === 'management' && provision
+    ? { management_url: (
+        <MeshWizardProvisionBody step={provision.step} planned={provision.planned}
+                                 busy={busy || provision.busy} err={provision.err} note={provNote}
+                                 resolvedUrl={provision.resolvedUrl}
+                                 onPlan={onPlanProvision} onProvision={provisionNow}
+                                 onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')} />
+      ) }
+    : {};
+
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); onClose?.(); } };
     window.addEventListener('keydown', onKey);
@@ -321,15 +353,9 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
                 <MeshWizardReviewBody fields={fields} secrets={secrets} draft={draft} />
               </>
             : <MeshWizardStepBody step={step} fields={fields} secrets={secrets} draft={draft} busy={busy}
+                                  slots={provisionSlot}
                                   setField={(k, v) => setFields((f) => ({ ...f, [k]: v }))}
                                   setSecret={(k, v) => setDraft((d) => ({ ...d, [k]: v }))} />}
-          {step.key === 'management' && provision && (
-            <MeshWizardProvisionBody step={provision.step} planned={provision.planned}
-                                     busy={busy || provision.busy} err={provision.err} note={provNote}
-                                     resolvedUrl={provision.resolvedUrl}
-                                     onPlan={onPlanProvision} onProvision={provisionNow}
-                                     onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')} />
-          )}
           {err && <div className="mx-mesherr">{err}</div>}
         </div>
         <div className="mx-wizfoot">

@@ -192,8 +192,13 @@ ok(/onProvision=\{\(\) => standUp\(plan\)\}/.test(src.mesh) && /onPlanProvision=
    'the wizard\'s provision is the panel\'s OWN standUp/loadPlan — one perform path, one typed gate');
 ok((src.mesh.match(/performBuildBootstrap\(/g) || []).length === 1,
    'there is exactly ONE performBuildBootstrap call site (the gate cannot fork)');
-ok(/step\.key === 'management' && provision &&/.test(src.mesh),
-   'the provision block renders on the MANAGEMENT page only');
+ok(/step\.key === 'management' && provision/.test(src.mesh) && /slots=\{provisionSlot\}/.test(src.mesh),
+   'the provision block renders on the MANAGEMENT page only, slotted under its field');
+// AUTO-CHECK: opening the management page runs the dry-run plan by itself (once), so the block
+// offers install immediately — no manual "check this host" step in the happy path.
+ok(/autoPlanned/.test(src.mesh) && /onPlanProvision\(\);/.test(src.mesh)
+   && /provision\.planned \|\| provision\.busy \|\| autoPlanned\.current/.test(src.mesh),
+   'the wizard AUTO-plans on the management page (once; skipped when already planned/busy)');
 const provPlanned = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
   step: { kind: 'mesh-control-plane', status: 'planned', why: 'not running',
           action: 'docker compose --profile mesh up -d netbird-management' },
@@ -223,6 +228,21 @@ ok(M.provisionedManagementUrl({ fields: {}, resolved: { values: { api_url: 'http
 ok(M.provisionedManagementUrl({ fields: {} }) === null, 'with neither it answers null, not an invented address');
 ok(M.normalizeMeshConfig({ resolved: { values: { api_url: 'https://x' } } }).resolved.values.api_url === 'https://x',
    'normalizeMeshConfig carries the server\'s `resolved` through for the provision flow');
+// PLACEMENT: the block hangs DIRECTLY UNDER the management URL field it fills (before mesh domain).
+// SSR runs no effects, so the auto-plan cannot fire here and the markup is deterministic.
+const wizHtml = renderToStaticMarkup(React.createElement(M.MeshWizard, {
+  machineKey: 'mardale', initialFields: {}, secrets: {}, onSave: () => {}, onClose: () => {},
+  provision: { step: { status: 'planned', why: 'not running', action: 'compose up' }, planned: true },
+  onPlanProvision: () => {}, onProvision: () => {},
+}));
+const at = (m) => wizHtml.indexOf(m);
+ok(at('data-testid="mesh-field-management_url"') !== -1
+   && at('data-testid="mesh-field-management_url"') < at('data-testid="mesh-wizard-provision"')
+   && at('data-testid="mesh-wizard-provision"') < at('data-testid="mesh-field-mesh_domain"'),
+   'the install block sits between the management URL field and the mesh domain field');
+const provChecking = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, { planned: false, busy: true }));
+ok(/mesh-wizard-provision-checking/.test(provChecking) && !/mesh-wizard-provision-plan/.test(provChecking),
+   'while the auto-check runs it says "checking this host…" instead of offering the button');
 
 console.log('\n── the pure helpers ──');
 ok(M.secretHint({ set: true, hint: 'x' }) === 'stored (x)' && M.secretHint({ set: false }) === 'not set'
