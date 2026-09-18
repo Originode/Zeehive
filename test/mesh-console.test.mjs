@@ -74,6 +74,13 @@ ok(/an empty field on save means unchanged|empty secret = unchanged|Empty secret
    'the source states the write-only rule: empty = unchanged');
 ok(/value=\{draft\[k\]/.test(src.mesh) && !/value=\{secrets\[k\]/.test(src.mesh),
    'a secret input is bound to the DRAFT only — the stored value is never bound back into it');
+// The WIZARD wiring (the compact inline form's replacement): the panel offers a full-size setup
+// wizard — a launch button, the modal mounted when open, and the save handed the merged body.
+ok(/data-testid="mesh-configure"/.test(src.mesh), 'the panel offers the wizard launch button');
+ok(/<MeshWizard\s/.test(src.mesh) && /wizardOpen && \(/.test(src.mesh),
+   'MeshSections MOUNTS <MeshWizard> when open (a wizard nothing renders is worthless)');
+ok(/onSave=\{save\}/.test(src.mesh) && /putMeshConfig\(m\.id, body\)/.test(src.mesh),
+   'the wizard save is the ONE write path to putMeshConfig');
 
 // ── 1b. wiring: the ALWAYS-VISIBLE mesh indicator in the console chrome ───────────────────────
 // The card ADDED after the panel: mesh status must be the most obvious thing in the console when
@@ -106,7 +113,7 @@ ok(/\.mesh-status\.loud/.test(css) && /background: var\(--down\)/.test(css),
    'MESH DOWN is styled as a filled danger pill (a red word among grey ones gets scanned past)');
 
 // ── 2. the pure bodies, rendered ──────────────────────────────────────────────────────────────
-console.log('\n── the CONFIG body: hints shown, values never; Generate on the key only ──');
+console.log('\n── the CONFIG wizard: hints shown, values never; Generate on the key only ──');
 let React, renderToStaticMarkup;
 const built = [];
 let M, S, API;
@@ -137,19 +144,105 @@ try {
   renderToStaticMarkup = require_('react-dom/server').renderToStaticMarkup;
 } finally { for (const f of built) rmSync(f, { force: true }); }
 
-const html = renderToStaticMarkup(React.createElement(M.MeshConfigBody, {
-  fields: { management_url: 'https://mgmt.example:443', mesh_domain: 'netbird.selfhosted' },
-  secrets: { api_token: { set: true, hint: 'abcd…wxyz' }, datastore_encryption_key: { set: false, hint: null } },
-  draft: {},
-}));
-ok(/https:\/\/mgmt\.example:443/.test(html), 'a non-secret field renders its stored value');
-ok(/abcd…wxyz/.test(html), 'a stored secret renders its HINT (in the placeholder)');
+// The WIZARD pages are the config editor now. Same fixtures, same rules: a non-secret value
+// renders, a secret VALUE never does — only its stored hint, in the field label.
+const FIELDS_FIX = { management_url: 'https://mgmt.example:443', mesh_domain: 'netbird.selfhosted' };
+const SECRETS_FIX = { api_token: { set: true, hint: 'abcd…wxyz' }, datastore_encryption_key: { set: false, hint: null } };
+const stepByKey = (k) => M.MESH_WIZARD_STEPS.find((s) => s.key === k);
+ok(Array.isArray(M.MESH_WIZARD_STEPS) && M.MESH_WIZARD_STEPS.length >= 4
+   && stepByKey('management') && stepByKey('secrets') && stepByKey('review'),
+   'the wizard has the management → … → secrets → review page plan');
+const mgmtHtml = renderToStaticMarkup(React.createElement(M.MeshWizardStepBody,
+  { step: stepByKey('management'), fields: FIELDS_FIX, secrets: SECRETS_FIX, draft: {} }));
+ok(/https:\/\/mgmt\.example:443/.test(mgmtHtml), 'a non-secret field renders its stored value');
+ok(/NETBIRD_API_URL/.test(mgmtHtml), 'the field hint is VISIBLE text on the page, not only a tooltip');
+const html = renderToStaticMarkup(React.createElement(M.MeshWizardStepBody,
+  { step: stepByKey('secrets'), fields: FIELDS_FIX, secrets: SECRETS_FIX, draft: {} }));
+ok(/abcd…wxyz/.test(html), 'a stored secret renders its HINT (in the field label)');
 ok(!/value="abcd…wxyz"/.test(html), 'the secret VALUE is never rendered — only the hint');
 const tokInput = html.match(/<input[^>]*data-testid="mesh-secret-api_token"[^>]*>/)?.[0] || '';
 ok(/value=""/.test(tokInput), 'the secret input starts EMPTY (an empty field on save means unchanged)');
-ok(/placeholder="stored \(abcd…wxyz\)"/.test(tokInput), 'and its placeholder is the stored hint');
+ok(/stored \(abcd…wxyz\)/.test(html), 'and the stored hint is shown beside the field');
 ok(/data-testid="mesh-generate-datastore_encryption_key"/.test(html), 'the datastore key has a Generate button');
 ok(!/data-testid="mesh-generate-api_token"/.test(html), 'the api token has NO Generate button (it is pasted, not invented)');
+// The REVIEW page: what will be saved, secrets as unchanged/set — never a value.
+const revHtml = renderToStaticMarkup(React.createElement(M.MeshWizardReviewBody,
+  { fields: FIELDS_FIX, secrets: SECRETS_FIX, draft: { api_token: 'SECRET-VALUE' } }));
+ok(/https:\/\/mgmt\.example:443/.test(revHtml), 'the review lists the non-secret values as they will be saved');
+ok(/will be REPLACED/.test(revHtml) && !/SECRET-VALUE/.test(revHtml),
+   'a drafted secret reads "will be REPLACED" — its value never reaches the markup');
+ok(/unchanged \(not set\)/.test(revHtml), 'an untouched unset secret reads unchanged (not set)');
+// The panel's read-only SUMMARY: current values + hints at a glance, editing only via the wizard.
+const sumHtml = renderToStaticMarkup(React.createElement(M.MeshConfigSummaryBody,
+  { fields: FIELDS_FIX, secrets: SECRETS_FIX, onConfigure: () => {} }));
+ok(/https:\/\/mgmt\.example:443/.test(sumHtml) && /stored \(abcd…wxyz\)/.test(sumHtml) && !/<input/.test(sumHtml),
+   'the summary shows values and secret hints with NO inputs (editing lives in the wizard)');
+ok(/data-testid="mesh-configure"/.test(sumHtml), 'and offers the configure button that opens the wizard');
+const roHtml = renderToStaticMarkup(React.createElement(M.MeshConfigSummaryBody,
+  { fields: FIELDS_FIX, secrets: SECRETS_FIX, editable: false, onConfigure: () => {} }));
+ok(/disabled/.test(roHtml.match(/<button[^>]*data-testid="mesh-configure"[^>]*>/)?.[0] || ''),
+   'a read-only host disables the configure button');
+
+// ── 2b. the PROVISION block: stand the plane up on the queenzee's own compose, from the wizard ──
+// The management page offers to PROVISION the control plane on the Zeehive host itself (the
+// queenzee's own production compose project) when there is no server to point the URL at. Same
+// seam as the panel's STAND UP — one perform path, one typed gate.
+console.log('\n── the wizard PROVISION block: stand up on the queenzee\'s own compose, one perform path ──');
+ok(/onProvision=\{\(\) => standUp\(plan\)\}/.test(src.mesh) && /onPlanProvision=\{loadPlan\}/.test(src.mesh),
+   'the wizard\'s provision is the panel\'s OWN standUp/loadPlan — one perform path, one typed gate');
+ok((src.mesh.match(/performBuildBootstrap\(/g) || []).length === 1,
+   'there is exactly ONE performBuildBootstrap call site (the gate cannot fork)');
+ok(/step\.key === 'management' && provision/.test(src.mesh) && /slots=\{provisionSlot\}/.test(src.mesh),
+   'the provision block renders on the MANAGEMENT page only, slotted under its field');
+// AUTO-CHECK: opening the management page runs the dry-run plan by itself (once), so the block
+// offers install immediately — no manual "check this host" step in the happy path.
+ok(/autoPlanned/.test(src.mesh) && /onPlanProvision\(\);/.test(src.mesh)
+   && /provision\.planned \|\| provision\.busy \|\| autoPlanned\.current/.test(src.mesh),
+   'the wizard AUTO-plans on the management page (once; skipped when already planned/busy)');
+const provPlanned = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { kind: 'mesh-control-plane', status: 'planned', why: 'not running',
+          action: 'docker compose --profile mesh up -d netbird-management' },
+  planned: true,
+}));
+ok(/data-testid="mesh-wizard-provision-go"/.test(provPlanned), 'a planned step offers the provision button');
+ok(/docker compose --profile mesh up -d/.test(provPlanned), 'and shows the exact action from the plan');
+ok(/production compose project/.test(provPlanned) && /Zeehive host itself/.test(provPlanned),
+   'the blurb says WHERE this provisions: the queenzee\'s own production compose, on the Zeehive host itself');
+const provRunning = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { kind: 'mesh-control-plane', status: 'already-present', detail: 'running' },
+  planned: true, resolvedUrl: 'https://netbird-management:443',
+}));
+ok(!/data-testid="mesh-wizard-provision-go"/.test(provRunning), 'an already-running plane offers NO provision button');
+ok(/data-testid="mesh-wizard-provision-use"/.test(provRunning) && /netbird-management:443/.test(provRunning),
+   'it offers "use this plane" instead, naming the resolved address');
+const provOffHost = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, { step: null, planned: true }));
+ok(/data-testid="mesh-wizard-provision-nostep"/.test(provOffHost) && /queenzee-host machine only/.test(provOffHost),
+   'a machine with no control-plane step says provisioning lives on the queenzee host only');
+// The URL a provision fills in: the row's value first, the resolved (default-rung) address second.
+ok(M.provisionedManagementUrl({ fields: { management_url: 'https://a' },
+                                resolved: { values: { api_url: 'https://b' } } }) === 'https://a',
+   'provisionedManagementUrl prefers the row\'s stored URL');
+ok(M.provisionedManagementUrl({ fields: {}, resolved: { values: { api_url: 'https://netbird-management:443' } } })
+     === 'https://netbird-management:443',
+   'and falls back to the queenzee\'s RESOLVED address (the compose-internal default rung)');
+ok(M.provisionedManagementUrl({ fields: {} }) === null, 'with neither it answers null, not an invented address');
+ok(M.normalizeMeshConfig({ resolved: { values: { api_url: 'https://x' } } }).resolved.values.api_url === 'https://x',
+   'normalizeMeshConfig carries the server\'s `resolved` through for the provision flow');
+// PLACEMENT: the block hangs DIRECTLY UNDER the management URL field it fills (before mesh domain).
+// SSR runs no effects, so the auto-plan cannot fire here and the markup is deterministic.
+const wizHtml = renderToStaticMarkup(React.createElement(M.MeshWizard, {
+  machineKey: 'mardale', initialFields: {}, secrets: {}, onSave: () => {}, onClose: () => {},
+  provision: { step: { status: 'planned', why: 'not running', action: 'compose up' }, planned: true },
+  onPlanProvision: () => {}, onProvision: () => {},
+}));
+const at = (m) => wizHtml.indexOf(m);
+ok(at('data-testid="mesh-field-management_url"') !== -1
+   && at('data-testid="mesh-field-management_url"') < at('data-testid="mesh-wizard-provision"')
+   && at('data-testid="mesh-wizard-provision"') < at('data-testid="mesh-field-mesh_domain"'),
+   'the install block sits between the management URL field and the mesh domain field');
+const provChecking = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, { planned: false, busy: true }));
+ok(/mesh-wizard-provision-checking/.test(provChecking) && !/mesh-wizard-provision-plan/.test(provChecking),
+   'while the auto-check runs it says "checking this host…" instead of offering the button');
 
 console.log('\n── the pure helpers ──');
 ok(M.secretHint({ set: true, hint: 'x' }) === 'stored (x)' && M.secretHint({ set: false }) === 'not set'

@@ -89,7 +89,9 @@ RUNS. Turning one off is a deliberate act nobody has taken for a xell.
 | `poller.js` | `POLLER_ENABLED` | GATED-ish (a switch) | drives the loops above | inherits theirs |
 | `worksync.js` | `WORKSYNC_ENABLED` | **INERT** (meta-DB only) | its own database | writes rows in its own (cloned) db |
 | `seedgate.js` | `SHIP_MODE` | **GATED** | prod db (approved seed files) | no in simulate |
-| `deploylock.js`, `tasks.js`, `landing.js`, `catchup-delta.js`, `ooney.js`, `self.js` | — | **INERT** (meta-DB / own xell only) | its own database, its own worktree | own db only |
+| `deploylock.js`, `tasks.js`, `landing.js`, `catchup-delta.js`, `ooney.js` | — | **INERT** (meta-DB / own xell only) | its own database, its own worktree | own db only |
+| `self.js` (every verb except the one below) | — | **INERT** (meta-DB / own xell only) | its own database, its own worktree | own db only |
+| `self.js` → `prod-logs` (`lib/prod-logs.js`) | `PRODLOGS_MODE`, inheriting `SHIP_MODE` | **GATED** — in simulate it refuses to dial and says why; the sources LIST is a meta-DB read and still answers | would reach prod `server`/`webapp` container LOGS over docker's HTTP API (inspect + `GET /containers/<name>/logs?follow=0`) | no — read-only by construction: no exec, no attach, no start/stop, no filesystem |
 
 ## The two findings that matter
 
@@ -126,6 +128,10 @@ risk being described. The remedy is a human's call.
   of the rest is stopped by the absence of docker and of host paths rather than by a flag.
 - The safety flags gate **actions**, not **reads**. Nothing in the flag family gates a read of
   production, and two paths (`proddiff`, `shipmigrate`'s ledger reads) use that latitude.
+  The exception, added after this audit: `zee prod-logs` READS a production container log and is
+  mode-gated anyway (`PRODLOGS_MODE`, inheriting `SHIP_MODE`), precisely because this document says
+  a nested queenzee's container rows name the REAL fleet. A new read path does not have to repeat
+  `proddiff`'s latitude.
 - The one path that is both **ungated and a write** is the ship's migration apply. Everything else
   that could write is inert because a tool or a path is missing in a cage — which is a property of
   the cage, not of the code, and it disappears the moment the same code runs on a host.

@@ -2943,6 +2943,28 @@ export async function selfOps(xell, { hours = 24, logs = 300 } = {}) {
   return digest;
 }
 
+// GET /api/xell/self/prod-logs — `zee prod-logs` (EVERY zee, read-only, opens no gate).
+//
+// The project is the TOKEN-resolved xell's own, never a parameter: a zee reads its OWN project's
+// production app-tier log and can name nothing else. The wall, the redaction and why the database
+// is excluded all live in lib/prod-logs.js — this is the thin verb over it, plus the one thing the
+// library must not decide: that a read of production is RECORDED where humans look (the queenzee
+// log), so "who read prod logs, and when" is a fact and not a trust exercise.
+export async function selfProdLogs(xell, { role = null, tail = null, since = null,
+                                           grep = null, container = null } = {}) {
+  const { prodLogTail } = await import('../lib/prod-logs.js');
+  const answer = await prodLogTail(xell.project_id, { role, tail, since, grep, container });
+  if (role) {
+    logline('self', `${xell.slug} read the PRODUCTION ${role} log`
+      + (answer.source?.container ? ` (${answer.source.container})` : '')
+      + (answer.ok ? `: ${answer.lines?.length ?? 0} line(s)`
+                   + (answer.redacted_lines ? `, ${answer.redacted_lines} redacted` : '')
+                   + (answer.grep ? `, matching "${answer.grep}"` : '')
+                 : ` — refused/failed: ${answer.error || 'unknown'}`));
+  }
+  return answer;
+}
+
 // POST /api/xell/self/ticket — `zee ticket` (MANAGER only). The project comes from the TOKEN-resolved
 // xell, never from the body — the same "which project? unaskable" rule as every other self verb.
 export async function selfTicketCreate(xell, { title = null, body = null, kind = null,

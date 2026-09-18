@@ -354,7 +354,9 @@ export async function bootstrapFirstPat({
     // 6. restart + prove healthy.
     const started = await startPlane();
     if (!started.ok) {
-      return { ok: false, reason: `the seeded store was written but '${container}' would not start: ${started.detail}` };
+      // The store WAS written back, so the minted token is real and its plaintext is gone unless the
+      // caller records the token we return here (the caller stores secrets write-only).
+      return { ok: false, token: seed.token, reason: `the seeded store was written but '${container}' would not start: ${started.detail}` };
     }
     const health = await probe({ attempts: probeAttempts });
     if (!health.ok) {

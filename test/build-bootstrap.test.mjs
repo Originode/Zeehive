@@ -750,6 +750,28 @@ try {
      && !dockerPat2.calls.some((c) => c.includes('--profile mesh')),
      'a second stand-up neither re-mints nor composes — the store is the source of truth');
 
+  // A bootstrap that seeds the store and writes it back but then fails to prove the plane is healthy
+  // still hands back the MINTED token. Its plaintext is unrecoverable — if the stand-up drops it, the
+  // next attempt finds an account (alreadyPresent) and tells a human to mint a PAT by hand, which is
+  // the very hand-edit §1 removes. It must be recorded write-only, with the failure still a warning.
+  await q(`UPDATE mesh_config SET api_token=NULL, api_token_hint=NULL WHERE machine_id=$1`, [mCp]);
+  config.netbirdApiToken = null;
+  const dockerPat3 = makeDocker({ reachable: true, networks: new Set() });
+  const bootFail = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerPat3,
+    provisionDb: makeProvision(), actor: 'tester@console', mesh: {
+      probeApi: probeOk,
+      bootstrapPat: async () => ({ ok: false, token: `nbp_${'D'.repeat(36)}`,
+        reason: 'the control plane restarted but the management API is not answering' }),
+      request: async () => ({ status: 500, json: { message: 'stub' } }),
+    } });
+  const patFailRes = bootFail.results.find((s) => s.kind === 'mesh-control-plane');
+  const rescued = await one(`SELECT api_token, api_token_hint FROM mesh_config WHERE machine_id=$1`, [mCp]);
+  ok(rescued.api_token === `nbp_${'D'.repeat(36)}` && rescued.api_token_hint === 'nbp_…DDDD',
+     'a token minted before the plane failed to answer is still recorded write-only, not dropped');
+  ok(/WAS minted and stored write-only/.test(patFailRes?.warning || '')
+     && !JSON.stringify(patFailRes || {}).includes(`nbp_${'D'.repeat(36)}`),
+     'and the warning names only the hint — the failure is not silent, and the token never rides the receipt');
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('TEST ERROR:', e);

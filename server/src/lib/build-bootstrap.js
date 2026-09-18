@@ -607,6 +607,17 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
         patNote = `The first API token was bootstrapped into the control plane (v${boot.version}) and `
           + `stored write-only in this machine's mesh config (hint ${cfg.secrets.api_token.hint}) — the `
           + `queenzee now reaches the plane without a hand-set env token.`;
+      } else if (boot.token) {
+        // The store WAS seeded and written back — only what came AFTER it failed. That token is in
+        // the control plane and its plaintext exists nowhere else, so record it rather than drop it:
+        // a retry would see an existing account (alreadyPresent) and ask a human to mint a PAT by
+        // hand, the exact hand-edit §1 removes, with the minted token unrecoverable. A WARNING, not
+        // a note — the plane did not answer, so the human must still read the service logs.
+        const cfg = await recordBootstrappedPat(machine.id, boot.token, { values: performer.values });
+        await applyMeshConfig({ machineId: machine.id });
+        warning = `the first API token WAS minted and stored write-only `
+          + `(hint ${cfg.secrets.api_token.hint}), but the control plane did not come up clean: `
+          + `${boot.reason}`;
       } else if (boot.alreadyPresent || boot.refused) {
         warning = `the first API token was NOT bootstrapped: ${boot.reason}`;
       } else {

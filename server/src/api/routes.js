@@ -95,7 +95,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
-         selfProviderEnv, selfRoutes, selfRouteTally } from '../queenzee/self.js';
+         selfProviderEnv, selfRoutes, selfRouteTally, selfProdLogs } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
@@ -2378,6 +2378,20 @@ router.get('/xell/self/routes/tally', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfRouteTally(x, { days: req.query.days ?? null })); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+// READ-ONLY PRODUCTION LOGS for EVERY zee (`zee prod-logs`) — the tail of the prod app tier's own
+// log, and nothing else that lives in that container. The project comes from the TOKEN-resolved
+// xell and the caller names a ROLE, never a container/context/id, so this can only ever open onto
+// its own project's production server/webapp log; the prod DATABASE is excluded (its log is row
+// data — that is the `zee prod` / `zee seed` gate), every line is credential-masked, and there is
+// no exec, no filesystem and no follow. Opens no gate; the read is recorded in the queenzee log.
+// The wall and the reasoning are lib/prod-logs.js.
+router.get('/xell/self/prod-logs', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfProdLogs(x, {
+      role: req.query.role || null, tail: req.query.tail || null, since: req.query.since || null,
+      grep: req.query.grep || null, container: req.query.container || null })); }
+  catch (err) { res.status(err.status || 500).json({ error: err.message }); }
 });
 router.get('/xell/self/env', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }

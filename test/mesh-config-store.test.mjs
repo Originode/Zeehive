@@ -133,6 +133,24 @@ try {
     ok(read.is_queenzee_host === false, 'a machine that is not the queenzee host is marked as such');
   }
 
+  section('editable is the panel\'s read-only note, and the same fact the stand-up plan uses');
+  {
+    const offHost = await mc.meshConfigFor(machineId);
+    ok(offHost.editable === false,
+       'a machine that is not the queenzee host cannot stand the plane up — the panel says read-only');
+    // The mesh-profile services live in the queenzee's OWN compose project, so the ctx IS the
+    // answer. Flip it and back rather than inserting a second `default` machine, which would be
+    // visible to every other resolver for the length of the test.
+    await q(`UPDATE machine SET docker_ctx='default' WHERE id=$1`, [machineId]);
+    try {
+      const onHost = await mc.meshConfigFor(machineId);
+      ok(onHost.editable === true && onHost.is_queenzee_host === true,
+         'the queenzee host itself is editable — configure and stand up');
+    } finally {
+      await q(`UPDATE machine SET docker_ctx=$1 WHERE id=$2`, [machine.docker_ctx, machineId]);
+    }
+  }
+
   section('the console\'s own field name (management_url) round-trips as api_url');
   {
     const put = await putJSON(`${BASE}/machines/${machineId}/mesh-config`, { management_url: 'https://mgmt.console:443' });
@@ -162,6 +180,22 @@ try {
     const stillOff = await putJSON(`${BASE}/machines/${second}/mesh-config`, { mesh_domain: 'mesh.again' });
     ok(off.data.enabled === false && stillOff.data.enabled === false,
        'disabling is sticky across later writes (an update does not re-enable)');
+  }
+
+  section('a write carrying NO configuration never enables the mesh by itself');
+  {
+    // The route strips `by`, so `{}` here is what an empty body (or the panel's save before its
+    // config read resolved, when `fields` is still {}) actually sends. It is not a decision: no row,
+    // no enabled default, nothing for the chrome to read as a configured-but-unreachable plane.
+    const third = (await one(
+      `INSERT INTO machine (key, docker_ctx, can_build, enabled) VALUES ($1,$2,true,true) RETURNING id`,
+      [`mc-${tag}-d`, `zt-mc-${tag}-d`])).id;
+    machineIds.push(third);
+    const empty = await putJSON(`${BASE}/machines/${third}/mesh-config`, {});
+    ok(empty.status === 200 && empty.data.enabled === false && empty.data.applied === false,
+       `an empty write enables nothing [enabled ${empty.data.enabled}]`);
+    const none = await one(`SELECT 1 AS x FROM mesh_config WHERE machine_id=$1`, [third]);
+    ok(!none, 'and it plants no row at all');
   }
 
   section('a disabled row is inert; the env rules again');

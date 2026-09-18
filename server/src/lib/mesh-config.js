@@ -346,8 +346,11 @@ export async function setMeshConfig(machineId, patch = {}, { actor = 'human@cons
   // A console write that CARRIES a configuration ENABLES this machine's mesh. The row a human fills
   // in is a decision, not a draft (the panel has no separate "on" switch), and a row left disabled
   // would make the stand-up's bootstrapped PAT inert — the one outcome §1 forbids. An explicit
-  // `enabled` in the patch always wins, and an UPDATE never flips it.
-  if (!row.machine_id && !('enabled' in (patch || {}))) cols.enabled = true;
+  // `enabled` in the patch always wins, and an UPDATE never flips it. A patch that carries NOTHING
+  // (an empty body, or the panel's own save on a config it never managed to read) is not a decision
+  // and must never enable the mesh by itself — it would plant an enabled default row and, on the
+  // chrome's read, a false "MESH DOWN" for a plane nobody configured.
+  if (!row.machine_id && Object.keys(cols).length && !('enabled' in (patch || {}))) cols.enabled = true;
   const fields = Object.keys(cols);
   if (!fields.length) return meshConfigFor(machineId);
   const sets = fields.map((f, i) => `"${f}" = $${i + 3}`).join(', ');
@@ -451,11 +454,19 @@ export async function meshConfigFor(machineId) {
   const row = (await one(`SELECT * FROM mesh_config WHERE machine_id=$1`, [machineId])) || {};
   const resolved = resolveMeshConfig(row, envSnapshot());
   const hintOf = (f) => secretHint(f, row[f]);
+  const isHost = machine.docker_ctx === queenzeeHostCtx();
   return {
     machine_id: machineId,
     machine_key: machine.key,
     docker_ctx: machine.docker_ctx,
-    is_queenzee_host: machine.docker_ctx === queenzeeHostCtx(),
+    is_queenzee_host: isHost,
+    // The console's read-only flag (web/src/Mesh.jsx): the mesh-profile services live in the
+    // queenzee's OWN compose project, so a machine that is not the queenzee host has nothing to
+    // stand up and the panel says so instead of offering a form that cannot act. The SAME
+    // condition the stand-up plan uses to decide whether the step exists at all
+    // (lib/build-bootstrap.js: `machine.docker_ctx === queenzeeHostCtx()`), so the button and the
+    // form can never disagree.
+    editable: isHost,
     configured: Boolean(row.machine_id),
     // The console's switch and the honest "is it live" answer. A row can exist, be enabled, and
     // still not be applied when no writer has run yet in this process (there is no such state:
