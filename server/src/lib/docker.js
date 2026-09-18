@@ -216,6 +216,13 @@ function getRaw(conn, path, timeout, maxBytes) {
       r.on('data', (d) => {
         const b = Buffer.from(d);
         if (len >= maxBytes) { truncated = true; req.destroy(); return; }
+        // The cap is a BYTE ceiling, not a chunk-boundary one: a single 64 KiB read must not carry
+        // the buffer past maxBytes (it did, until test/prod-logs.test.mjs asked for a 4 KiB cap and
+        // got 50 KB back). Keep only what fits, then stop reading.
+        const room = maxBytes - len;
+        if (b.length > room) {
+          chunks.push(b.subarray(0, room)); len = maxBytes; truncated = true; req.destroy(); return;
+        }
         chunks.push(b); len += b.length;
       });
       r.on('end', () => res({ buf: Buffer.concat(chunks), truncated }));
