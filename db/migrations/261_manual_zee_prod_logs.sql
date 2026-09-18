@@ -67,7 +67,8 @@ zee prod-logs server --json            # the full answer (sources, counts, deplo
   fact humans can see, not a trust exercise.
 
 **This is PRODUCTION's log. The QUEENZEE's own log is `zee ops`** (a manager's digest), and your own
-xell's containers are yours already — build them and read them with `zee build`.
+xell's containers are yours to build and drive (`zee build`, which prints a boot-log tail when one
+refuses to come up) — this verb is about PRODUCTION and nothing else.
 
 $hz$;
     IF position('### `zee prod-logs`' IN wtxt) = 0 THEN
