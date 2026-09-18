@@ -432,6 +432,15 @@ export default function App() {
   // Debounce handle for streamChange — one pending re-read at a time, cleared when the next event
   // (or an explicit refresh) supersedes it. Lives in a ref so the debounce survives re-renders.
   const refreshTimer = useRef(null);
+  // The IN-FLIGHT fleet fetch streamChange started ({ pid, promise }), plus whether another change
+  // arrived while it flew. The debounce alone was not enough: the queenzee loops broadcast every
+  // 4-30 s while a production snapshot took ~30 s, so every debounce window fired a NEW /api/fleet
+  // request into a queue that never drained (~108 requests per 10 min, 19 browser-aborted). While
+  // one fetch is in flight for the current project, later changes only mark fleetRefetchAgain and
+  // ONE follow-up runs when it settles — the follow-up reads the freshest state, so no change is
+  // lost. Refs, not state: this is plumbing, and a re-render must not reset it.
+  const fleetFetch = useRef(null);
+  const fleetRefetchAgain = useRef(false);
   // Which AI provider ACCOUNTS this project can dispatch on. Decides whether the single "+ prompt"
   // button is pressable (or the honest "add provider" fallback) — visibility IS the token store.
   // NB: read the fallback id off `fleet` (state), NOT the `project` const destructured from it
@@ -532,6 +541,32 @@ export default function App() {
   // the FLEET snapshot, so they re-read fleet alone. A `land`/`ship`/`project` event moved main or
   // production, so those re-read the git graph and diffs too. Bursts of same-type events collapse
   // into one re-read, and a burst that overlaps an explicit refresh skips the stale one entirely.
+  // ONE fleet fetch at a time for streamChange: if one is already in flight for this project,
+  // record that another change arrived and let the settle-handler run a single follow-up instead
+  // of stacking a new request per debounce window (the /api/fleet re-fetch storm). The follow-up
+  // re-reads the freshest snapshot, so a change that landed mid-flight is never lost — it is
+  // simply answered by the NEXT read instead of its own.
+  const fetchFleetCoalesced = useCallback((pid) => {
+    if (fleetFetch.current && fleetFetch.current.pid === pid) {
+      fleetRefetchAgain.current = true;
+      return fleetFetch.current.promise;
+    }
+    const promise = getFleet(pid).then((fl) => {
+      if (projectIdRef.current !== pid) return;
+      applyFleet(fl);
+      syncXells(fl?.xells || [], pid);
+    }).finally(() => {
+      if (fleetFetch.current?.promise === promise) fleetFetch.current = null;
+      if (fleetRefetchAgain.current) {
+        fleetRefetchAgain.current = false;
+        // same stale-guard as everywhere: a switch mid-flight drops the follow-up too
+        if (projectIdRef.current === pid) fetchFleetCoalesced(pid).catch(() => {});
+      }
+    });
+    fleetFetch.current = { pid, promise };
+    return promise;
+  }, [applyFleet, syncXells]);
+
   const streamChange = useCallback((type) => {
     const pid = projectIdRef.current;
     if (!pid) return;
@@ -542,11 +577,7 @@ export default function App() {
       // The honeycomb renders from streamedXells (not fleet.xells), so the fresh snapshot must
       // ALSO adopt its xells into the honeycomb — the same sync onSnapshot does — or the hexagons
       // would go stale the moment a live event lands.
-      const f = getFleet(pid).then((fl) => {
-        if (projectIdRef.current !== pid) return;
-        applyFleet(fl);
-        syncXells(fl?.xells || [], pid);
-      });
+      const f = fetchFleetCoalesced(pid);
       if (git) {
         getTimeline(pid).then((t) => { if (projectIdRef.current === pid && t) { setTimeline(t); setVersion((v) => v + 1); } });
         getDiffs(pid).then((d) => { if (projectIdRef.current === pid && d) setDiffs(d); });
@@ -557,7 +588,7 @@ export default function App() {
       loadProjects();
     };
     refreshTimer.current = setTimeout(work, git ? 120 : 400);
-  }, [applyFleet, syncXells, loadProjects, loadWorkItemsFor, loadMedics]);
+  }, [fetchFleetCoalesced, loadProjects, loadWorkItemsFor, loadMedics]);
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);

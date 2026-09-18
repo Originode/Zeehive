@@ -18,7 +18,8 @@
 // the same way, so a prompt that hands the zee an image path can actually Read it. Work products
 // stay in the container until collected (exportCxellDiff) — landing them is the human-gated step.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { transferWindowMs } from './transfer-window.js';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -383,7 +384,7 @@ export async function deliverXourceIntoCxell({ ctx = 'default', slug, worktree, 
     const buildThin = base && base !== tip;
     if (buildThin) await git(['bundle', 'create', bundle, ref, '--not', base]);
     else await git(['bundle', 'create', bundle, ref]);
-    await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+    await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`], { timeoutMs: bundleTransferWindowMs(statSync(bundle).size) });
     const fetch = async () => dk(ctx, ['exec', name, 'bash', '-lc',
       `cd /work/repo && git fetch -f /tmp/main.bundle '${ref.replace(/'/g, '')}:refs/remotes/origin/main'`], { timeoutMs: 60000 });
     try {
@@ -393,7 +394,9 @@ export async function deliverXourceIntoCxell({ ctx = 'default', slug, worktree, 
       // self-contained bundle so delivery still succeeds; a stranded cxell must always be recoverable.
       if (buildThin) {
         await git(['bundle', 'create', bundle, ref]).catch(() => {});
-        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+        // The FULL bundle that replaces the refused thin one (same sizing rule — the thin attempt
+        // may well have succeeded, and this one is strictly larger).
+        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`], { timeoutMs: bundleTransferWindowMs(statSync(bundle).size) });
         await fetch();
       } else { throw e; }
     }
@@ -452,7 +455,9 @@ export async function refreshCxellOriginMain({ ctx = 'default', slug, worktree, 
       // drifted) must still be able to fetch; a thin bundle would refuse on a missing prerequisite.
       await git(['bundle', 'create', bundle, 'refs/zeehive/refresh']);
       try {
-        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+        // FULL bundle, so sized to its bytes like the spawn one (this is a post-land refresh, and a
+        // repository too big to transfer must not quietly stop refreshing every cage's origin/main).
+        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`], { timeoutMs: bundleTransferWindowMs(statSync(bundle).size) });
         await dk(ctx, ['exec', name, 'bash', '-lc',
           "cd /work/repo && git fetch -f /tmp/main.bundle 'refs/zeehive/refresh:refs/remotes/origin/main'"],
           { timeoutMs: 60000 });
@@ -1573,7 +1578,50 @@ export async function installTurnHooksIntoCxell({ ctx = 'default', name, adapter
 
 // Bundle the worktree's HEAD (its spinoff branch) into the cxell as a private clone at
 // /work/repo, then copy in the gitignored .zeehive.env projection (ports + DATABASE_URL).
-export async function cloneIntoCxell({ ctx, name, worktree }) {
+// ── HOW LONG THE REPO BUNDLE MAY TAKE ───────────────────────────────────────────────────────────
+//
+// The cage is built around a PRIVATE CLONE of the xell's branch, handed to it as one git bundle
+// (header comment above, and cloneIntoCxell below). That single transfer is the only step of a cage
+// build whose cost scales with the REPOSITORY — everything else on the path is a few KB or a local
+// exec — and it used to run on dk()'s 120s default, which is a guess about throughput rather than a
+// measurement of the payload. On this fleet a big payload moves at ~1.5-3 MB/s, so a project with
+// enough history could not be dispatched at all; the human saw only `docker cp timed out after
+// 120000ms` and reasonably concluded a build was involved in a router deploy.
+//
+// So the window is sized from the bundle's bytes (lib/transfer-window.js — the same rule, and the
+// same reasoning, as the backup stream window in queenzee/maintenance.js). The FLOOR is dk's own
+// default, so no transfer gets a shorter window than it has today; the CEILING keeps a wedged
+// daemon bounded, and the rate is env-overridable for an operator with a bigger repository than the
+// estimate allows.
+const BUNDLE_MIN_BYTES_PER_SEC = (() => {
+  const v = Number(process.env.CXELL_BUNDLE_MIN_RATE);
+  return Number.isFinite(v) && v > 0 ? v : 1024 * 1024;
+})();
+export const BUNDLE_WINDOW_FLOOR_MS = 120000;            // dk's default — never shorter than today
+export const BUNDLE_WINDOW_CEILING_MS = (() => {
+  const v = Number(process.env.CXELL_BUNDLE_CEILING_MS);
+  return Number.isFinite(v) && v > 0 ? v : 30 * 60 * 1000;
+})();
+// The transfer window for a bundle of `bytes`. Exported (and used as cloneIntoCxell's default
+// `windowFor`) so a test can assert what a real bundle's size maps to without waiting it out.
+export function bundleTransferWindowMs(bytes) {
+  return transferWindowMs(bytes, { floorMs: BUNDLE_WINDOW_FLOOR_MS, ceilingMs: BUNDLE_WINDOW_CEILING_MS,
+                                   minBytesPerSec: BUNDLE_MIN_BYTES_PER_SEC });
+}
+// The in-cage clone/unpack of the SAME bytes has its own window, and it is a floor rather than a
+// number of its own: unpacking a local file is not a socket transfer, but it is still proportional
+// to the payload, so a bundle big enough to need a longer transfer must not then die on the clone.
+export const CLONE_EXEC_FLOOR_MS = 300000;               // the value this exec has always had
+// A payload and a window as a human reads them. Exported so the test can assert the log line and the
+// failure message against the SAME rule instead of a hand-copied guess. MiB alone would print an
+// ordinary small bundle as "0 MiB", which is precisely the ambiguity these figures exist to remove —
+// the sentence has to let a human tell "this repository is too big for the window" from "something
+// else went wrong".
+export const bundleSizeText = (bytes) => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MiB`
+  : bytes >= 1024 ? `${Math.round(bytes / 1024)} KiB` : `${bytes} B`);
+export const windowText = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1)}s` : `${ms}ms`);
+
+export async function cloneIntoCxell({ ctx, name, worktree, windowFor = bundleTransferWindowMs }) {
   let updated = false;   // did the checkout survive (fetch+reset) rather than being re-cloned?
   const tmp = mkdtempSync(join(tmpdir(), 'zee-cxell-'));
   const bundle = join(tmp, 'task.bundle');
@@ -1591,7 +1639,27 @@ export async function cloneIntoCxell({ ctx, name, worktree }) {
     const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
     if (branch === 'HEAD') throw new Error(`worktree ${worktree} is on a detached HEAD — nothing to cxell`);
     await git(['bundle', 'create', bundle, branch]);
-    await dk(ctx, ['cp', bundle, `${name}:/tmp/task.bundle`]);
+    // The payload is measured HERE, from the file we are about to send, and the window follows it
+    // (see bundleTransferWindowMs above). Both halves of the delivery are sized: the `docker cp`
+    // (a socket transfer) and the in-cage clone/fetch+reset that unpacks it.
+    const bundleBytes = statSync(bundle).size;
+    const transferMs = windowFor(bundleBytes);
+    const cloneMs = Math.max(CLONE_EXEC_FLOOR_MS, transferMs);
+    logline('cxell', `${name}: sending the repo bundle in (${bundleSizeText(bundleBytes)}, branch '${branch}', `
+      + `window ${windowText(transferMs)}) — the branch's whole history travels as one bundle`);
+    try {
+      await dk(ctx, ['cp', bundle, `${name}:/tmp/task.bundle`], { timeoutMs: transferMs });
+    } catch (e) {
+      // Name the payload and the stage. A bare "docker cp timed out after Nms" told a human nothing
+      // about WHICH transfer died, and the `cxell build failed: …` prefix intake puts on it reads as
+      // an app build — this exact confusion ("build should not be necessary for routers") is why the
+      // sentence says what the cage was actually doing.
+      throw new Error(`the repo bundle (${bundleSizeText(bundleBytes)}) did not reach ${name} within `
+        + `${windowText(transferMs)} — ${e.message}. This is the CAGE's code transfer, not an app `
+        + 'build: the xell\'s branch is sent into the cage as one git bundle and unpacked there, so it '
+        + 'scales with the repository\'s history. If this repository is genuinely this large, raise the '
+        + `window with CXELL_BUNDLE_MIN_RATE (currently ${BUNDLE_MIN_BYTES_PER_SEC} B/s) rather than retrying.`);
+    }
     // UPDATE IN PLACE when the cage already holds this branch, instead of `rm -rf` + clone.
     //
     // The wipe is right for a fresh cage and WRONG for a pre-warmed one: provisioning may have spent
@@ -1610,7 +1678,7 @@ export async function cloneIntoCxell({ ctx, name, worktree }) {
       + `git -C /work/repo fetch -q /tmp/task.bundle '${b}' && git -C /work/repo reset -q --hard FETCH_HEAD `
       + '&& git -C /work/repo clean -qfd -e node_modules && echo CLONE_UPDATED; '
       + `else rm -rf /work/repo && git clone -q -b '${b}' /tmp/task.bundle /work/repo && echo CLONE_FRESH; fi`],
-      { markers: CLONE_MARKERS, label: `${name}: clone`, timeoutMs: 300000 });
+      { markers: CLONE_MARKERS, label: `${name}: clone`, timeoutMs: cloneMs });
     if (!r.verdicts.length) {
       // Neither path reported success — the tree is in an unknown state and everything downstream
       // (the warm, the harness files, the zee itself) assumes /work/repo is a checkout. Fail here
