@@ -31,7 +31,10 @@ const tri = (v) => (v === true ? true : v === false ? false : null);
 // on mesh-status (the mesh is enabled for the fleet) instead of inferring it from stored config, and
 // a fleet with an explicit `enabled: false` is not "unreadable" — it is off on purpose.
 export function meshConfigured(cfg, status) {
-  const explicit = tri(cfg?.enabled) ?? tri(status?.enabled)
+  // `status.mesh.enabled` is the server's own spelling (lib/mesh-status.js nests the mesh's switch
+  // under `mesh`); the top level and the canonical `configured` are tolerated too, so the chip
+  // reads the same answer whichever of the two reads answered.
+  const explicit = tri(cfg?.enabled) ?? tri(status?.enabled) ?? tri(status?.mesh?.enabled)
     ?? tri(cfg?.configured) ?? tri(status?.configured);
   if (explicit !== null) return explicit;
   if (!cfg) return null;

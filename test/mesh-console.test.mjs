@@ -249,6 +249,17 @@ ok(meshConfigured({ fields: {}, secrets: { api_token: { set: true } } }, null) =
    'a stored secret alone means configured (someone intends this fleet to mesh)');
 ok(meshConfigured({ fields: {}, secrets: {} }, { management: { reachable: false } }) === false,
    'an empty config read cleanly → FALSE (deliberately not set up), not unknown');
+ok(meshConfigured(null, { mesh: { enabled: false }, management: { reachable: false } }) === false,
+   'the server\'s OWN spelling (status.mesh.enabled, lib/mesh-status.js) is read too');
+// The server's config read carries the switch; normalizeMeshConfig must not drop it on the way here
+// (it did — found live against the merged server half, where it left the intent unreadable).
+const normSwitch = M.normalizeMeshConfig({ enabled: false, configured: false, fields: {}, secrets: {} });
+ok(normSwitch.enabled === false && normSwitch.configured === false,
+   'normalizeMeshConfig carries enabled/configured through (the switch is not dropped)');
+ok(meshConfigured(normSwitch, null) === false,
+   'so a deliberately-disabled config alone says "not set up" — without needing the status read');
+ok(word({ configured: false, error: 'the status route 500s' }).kind === 'mesh_not_set_up',
+   'and an explicit OFF outranks a failed status read: a deliberately absent mesh is not an alarm');
 ok(meshConfigured(null, { management: { reachable: false } }) === null,
    'an UNREADABLE config with nothing said → null (cannot claim "not set up")');
 ok(word({ configured: null, status: { management: { reachable: false } } }).kind === 'mesh_down',
