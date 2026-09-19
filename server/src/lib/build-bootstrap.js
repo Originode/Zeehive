@@ -633,8 +633,16 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
       ? patNote
       : `No secret was minted or stored by this step — the datastore key and relay secret come from `
         + `the mesh config (console or env), and the first PAT is bootstrapped here when none exists.`;
+    // The address the queenzee now uses for this plane, RESOLVED after any PAT record above
+    // (store → env → the enabled row's compose-internal default), falling back to the URL the
+    // health probe just answered at. TYPED, so the console's wizard fills its management-URL
+    // field from the receipt instead of parsing the prose detail — or guessing from a config
+    // re-read that stays empty when an operator env token meant no row was recorded.
+    const after = await meshResolvedForPerformer(machine.id);
+    const managementUrl = after.values.api_url || hc.url || null;
     return { status: started ? 'created' : 'already-present',
              ...(warning ? { warning } : {}),
+             management_url: managementUrl,
              detail: `control plane ${started ? 'brought up' : 'already running'} on '${machine.docker_ctx}' `
                + `(${MESH_CONTROL_PLANE_SERVICES.join(', ')}) — the management API answered at `
                + `${hc.host}:${hc.port}. ${envLine} ${secretLine}`

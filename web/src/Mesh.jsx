@@ -287,8 +287,12 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
 
   const provisionNow = async () => {
     setProvNote(null);
-    const fresh = await onProvision?.();          // null = typed gate declined, or the perform failed
-    if (fresh) adoptUrl(provisionedManagementUrl(fresh), 'the control plane that just stood up');
+    // null = typed gate declined, the perform failed, or the receipt shows no success (the error
+    // then rides provision.err + an error alert — never a false "URL should be here" note).
+    const r = await onProvision?.();
+    if (!r) return;
+    const url = r.result?.management_url || provisionedManagementUrl(r.cfg);
+    adoptUrl(url, 'the control plane that just stood up');
   };
 
   // AUTO-CHECK the host the moment the management page is open: the plan is a dry run (creates
@@ -596,8 +600,12 @@ function MeshSections({ m, projectId, onChanged }) {
 
   // The ONE perform path for the mesh-control-plane stand-up — the panel's STAND UP section and
   // the wizard's provision block both land here, so the typed gate and the kinds scope can never
-  // fork. Returns the FRESH config read on success (the perform records the first PAT and enables
-  // the row, so the read moves), null when the gate was declined or the perform failed.
+  // fork. It READS THE RECEIPT and branches on what actually happened: a failed/cannot step is an
+  // ERROR alert carrying the step's own detail (the old flow showed one generic "requested" alert
+  // whatever the outcome, so a failed stand-up looked exactly like a good one and the URL "just
+  // did not fill"). On success it returns { cfg, result } — the fresh config read AND the step
+  // result, whose typed `management_url` is the address the plane answered at. Null = the typed
+  // gate was declined, the perform failed, or the receipt shows no success.
   const standUp = async (step) => {
     const typed = await showPrompt(
       `Stand up the NetBird control plane on ${m.key}?\n\n`
@@ -609,11 +617,33 @@ function MeshSections({ m, projectId, onChanged }) {
     if (String(typed || '').trim().toUpperCase() !== 'STAND UP') return null;
     setBusy(true); setPlanErr(null);
     try {
-      await performBuildBootstrap(projectId, m.id, 'human@console', ['mesh-control-plane']);
-      showAlert(`NetBird control plane stand-up requested on ${m.key}. Re-read below; any env a human must still set is in the receipt.`, { variant: 'info' });
+      const r = await performBuildBootstrap(projectId, m.id, 'human@console', ['mesh-control-plane']);
+      if (r?.status === 'refused') {
+        setPlanErr(r.reason || 'the bootstrap refused');
+        showAlert(`The stand-up on ${m.key} was REFUSED:\n\n${r.reason || '(no reason given)'}`, { variant: 'error' });
+        return null;
+      }
+      const result = (r?.results || r?.steps || []).find((s) => s.kind === 'mesh-control-plane') || null;
+      if (!result) {
+        setPlanErr('the perform returned no mesh-control-plane step — nothing was stood up');
+        showAlert(`No mesh-control-plane step ran on ${m.key} — the control plane lives on the queenzee-host machine only.`, { variant: 'error' });
+        await Promise.all([loadPlan(), loadStatus()]);
+        return null;
+      }
+      if (result.status !== 'created' && result.status !== 'already-present') {
+        // failed / cannot: the receipt's detail IS the fix ("set MESH_COMPOSE_FILE…", the compose
+        // stderr, the health-check verdict) — show it, do not pretend anything stood up.
+        setPlanErr(result.detail || result.why || `the stand-up ended '${result.status}'`);
+        showAlert(`The stand-up did NOT complete on ${m.key} (${result.status}):\n\n${result.detail || result.why || ''}`
+          + (result.stderr ? `\n\n${result.stderr}` : ''), { variant: 'error' });
+        await Promise.all([loadPlan(), loadStatus()]);
+        return null;
+      }
+      showAlert(`NetBird control plane ${result.status === 'created' ? 'is UP' : 'was already running'} on ${m.key}.\n\n`
+        + `${result.detail || ''}${result.warning ? `\n\n⚠ ${result.warning}` : ''}`, { variant: 'info' });
       const [fresh] = await Promise.all([loadConfig(), loadPlan(), loadStatus()]);
       onChanged?.();
-      return fresh;
+      return { cfg: fresh, result };
     } catch (e) { setPlanErr(e.message || String(e)); return null; }
     finally { setBusy(false); }
   };

@@ -199,6 +199,18 @@ ok(/step\.key === 'management' && provision/.test(src.mesh) && /slots=\{provisio
 ok(/autoPlanned/.test(src.mesh) && /onPlanProvision\(\);/.test(src.mesh)
    && /provision\.planned \|\| provision\.busy \|\| autoPlanned\.current/.test(src.mesh),
    'the wizard AUTO-plans on the management page (once; skipped when already planned/busy)');
+// THE RECEIPT IS READ. The first live use hit the old flow's blind spot: one generic "requested"
+// alert whatever the perform did, so a failed stand-up looked like a good one and the URL "just
+// did not fill". Now standUp branches on the step result and the wizard fills from its TYPED url.
+ok(/\.find\(\(s\) => s\.kind === 'mesh-control-plane'\)/.test(src.mesh),
+   'standUp READS THE RECEIPT: it finds the mesh-control-plane step result');
+ok(/r\?\.status === 'refused'/.test(src.mesh)
+   && /result\.status !== 'created' && result\.status !== 'already-present'/.test(src.mesh)
+   && /did NOT complete/.test(src.mesh) && /variant: 'error'/.test(src.mesh),
+   'a refused perform and a failed/cannot step are ERROR alerts carrying the receipt detail');
+ok(/return \{ cfg: fresh, result \};/.test(src.mesh)
+   && /r\.result\?\.management_url \|\| provisionedManagementUrl\(r\.cfg\)/.test(src.mesh),
+   'a good receipt returns {cfg,result}; the wizard fills the URL from the typed management_url first');
 const provPlanned = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
   step: { kind: 'mesh-control-plane', status: 'planned', why: 'not running',
           action: 'docker compose --profile mesh up -d netbird-management' },

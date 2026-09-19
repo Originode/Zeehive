@@ -592,7 +592,7 @@ try {
      'a DRY run issues no compose call for the control plane');
 
   const dockerGo = makeDocker({ reachable: true, networks: new Set() });
-  const probeOk = async () => ({ ok: true, host: 'netbird-management', port: 443, verdict: 'ok' });
+  const probeOk = async () => ({ ok: true, url: 'https://netbird-management:443', host: 'netbird-management', port: 443, verdict: 'ok' });
   const perfCp = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerGo,
     provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
   const cpRes = perfCp.results.find((s) => s.kind === 'mesh-control-plane');
@@ -603,6 +603,8 @@ try {
   ok(/NETBIRD_API_TOKEN/.test(cpRes?.detail || '') && /NETBIRD_GATEWAY_SETUP_KEY/.test(cpRes?.detail || '')
      && /No secret was minted or stored/.test(cpRes?.detail || ''),
      'the receipt names the env a human must still set, and that no secret was minted');
+  ok(/^https?:\/\//.test(cpRes?.management_url || ''),
+     `the receipt carries a TYPED management_url (resolved, else the probed URL) for the console to fill from [${cpRes?.management_url}]`);
   const cpRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCp.action_id]);
   ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
      'the stand-up is RECORDED in the audit steps');
