@@ -217,8 +217,9 @@ export function MeshWizardProvisionBody({ step, planned = false, busy = false, e
           {step.status === 'planned' && step.action && <span className="mx-wizhint">{step.action}</span>}
           {step.status === 'planned' && missing.length > 0 && (
             <div className="mx-wizprovmissing" data-testid="mesh-wizard-provision-missing">
-              ⚠ the stand-up will refuse until these are set: <b>{missing.join(', ')}</b> — generate
-              them on the Secrets page and SAVE, then install.
+              not set yet: <b>{missing.join(', ')}</b> — install will GENERATE and store them for
+              you (write-only random key material). Prefer your own? Set them on the Secrets page
+              first.
               {onGoSecrets && (
                 <button type="button" className="mx-wizprovuse" data-testid="mesh-wizard-provision-gosecrets"
                         onClick={onGoSecrets}>go to Secrets</button>
@@ -628,9 +629,23 @@ function MeshSections({ m, projectId, onChanged }) {
   // result, whose typed `management_url` is the address the plane answered at. Null = the typed
   // gate was declined, the perform failed, or the receipt shows no success.
   const standUp = async (step) => {
+    // A WIZARD must not fail its first step on keys a later page generates: the two required
+    // secrets the plane cannot start without are random key MATERIAL nobody needs to read, and
+    // the server mints them on request (the literal 'generate' — GENERATABLE_FIELDS, exactly
+    // these two). So when they are unset, this one gated click generates and stores them too —
+    // said in the prompt, so typing STAND UP consents to both. The Secrets page remains the
+    // place to paste or rotate your own.
+    const needGen = ['datastore_encryption_key', 'relay_auth_secret']
+      .filter((k) => cfg?.resolved?.secrets?.[k]?.set === false);
+    const genLine = needGen.length
+      ? `FIRST, the required secret${needGen.length > 1 ? 's' : ''} the plane cannot start without `
+        + `will be generated and stored write-only (server-minted random key material, never shown): `
+        + `${needGen.join(', ')}. Set your own on the Secrets page instead if you prefer.\n\n`
+      : '';
     const typed = await showPrompt(
       `Stand up the NetBird control plane on ${m.key}?\n\n`
       + `${step?.action || 'the mesh-profile services in the queenzee\'s own compose project'}\n\n`
+      + genLine
       + 'This runs docker compose on the queenzee\'s own host and health-checks the management API. '
       + 'It creates ONLY the control plane — no project network, volume or dev db. '
       + 'The API token and gateway setup key stay yours to set.\n\nType STAND UP to confirm.',
@@ -638,6 +653,12 @@ function MeshSections({ m, projectId, onChanged }) {
     if (String(typed || '').trim().toUpperCase() !== 'STAND UP') return null;
     setBusy(true); setPlanErr(null);
     try {
+      if (needGen.length) {
+        // The server mints and stores; only hints ever come back. A failure here is a config
+        // save failure — surfaced as such, and the stand-up is NOT attempted on missing keys.
+        await putMeshConfig(m.id, Object.fromEntries(needGen.map((k) => [k, 'generate'])));
+        await loadConfig();
+      }
       const r = await performBuildBootstrap(projectId, m.id, 'human@console', ['mesh-control-plane']);
       if (r?.status === 'refused') {
         setPlanErr(r.reason || 'the bootstrap refused');

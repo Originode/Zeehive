@@ -80,7 +80,19 @@ ok(/data-testid="mesh-configure"/.test(src.mesh), 'the panel offers the wizard l
 ok(/<MeshWizard\s/.test(src.mesh) && /wizardOpen && \(/.test(src.mesh),
    'MeshSections MOUNTS <MeshWizard> when open (a wizard nothing renders is worthless)');
 ok(/onSave=\{save\}/.test(src.mesh) && /putMeshConfig\(m\.id, body\)/.test(src.mesh),
-   'the wizard save is the ONE write path to putMeshConfig');
+   'the wizard save writes the merged body through putMeshConfig');
+// THE INSTALL IS SELF-SUFFICIENT (a wizard must not fail step 1 on keys a later page generates):
+// when the two required generatable secrets are unset, the SAME gated click generates and stores
+// them — the literal 'generate' the server mints on (GENERATABLE_FIELDS, exactly these two) —
+// disclosed in the typed-gate prompt, and the only other putMeshConfig call site.
+ok(/\['datastore_encryption_key', 'relay_auth_secret'\]\s*\n?\s*\.filter\(\(k\) => cfg\?\.resolved\?\.secrets\?\.\[k\]\?\.set === false\)/.test(src.mesh),
+   'standUp derives the unset required secrets from the SERVER\'s resolved read');
+ok(/putMeshConfig\(m\.id, Object\.fromEntries\(needGen\.map\(\(k\) => \[k, 'generate'\]\)\)\)/.test(src.mesh),
+   "…and mints them via the server's own 'generate' literal before the stand-up");
+ok(/generated and stored write-only/.test(src.mesh) && /Type STAND UP to confirm/.test(src.mesh),
+   'the typed-gate prompt DISCLOSES the generate-and-store, so one consent covers both');
+ok((src.mesh.match(/putMeshConfig\(/g) || []).length === 2,
+   'putMeshConfig has exactly TWO call sites: the wizard save, and the gated generate');
 
 // ── 1b. wiring: the ALWAYS-VISIBLE mesh indicator in the console chrome ───────────────────────
 // The card ADDED after the panel: mesh status must be the most obvious thing in the console when
