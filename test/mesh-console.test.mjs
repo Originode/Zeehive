@@ -164,7 +164,11 @@ const tokInput = html.match(/<input[^>]*data-testid="mesh-secret-api_token"[^>]*
 ok(/value=""/.test(tokInput), 'the secret input starts EMPTY (an empty field on save means unchanged)');
 ok(/stored \(abcd…wxyz\)/.test(html), 'and the stored hint is shown beside the field');
 ok(/data-testid="mesh-generate-datastore_encryption_key"/.test(html), 'the datastore key has a Generate button');
+ok(/data-testid="mesh-secret-relay_auth_secret"/.test(html)
+   && /data-testid="mesh-generate-relay_auth_secret"/.test(html),
+   'the RELAY AUTH SECRET is on the wizard with its own built-in generator (the stand-up refuses without it)');
 ok(!/data-testid="mesh-generate-api_token"/.test(html), 'the api token has NO Generate button (it is pasted, not invented)');
+ok(!/data-testid="mesh-generate-gateway_setup_key"/.test(html), 'the gateway setup key has NO Generate button (the plane issues it)');
 // The REVIEW page: what will be saved, secrets as unchanged/set — never a value.
 const revHtml = renderToStaticMarkup(React.createElement(M.MeshWizardReviewBody,
   { fields: FIELDS_FIX, secrets: SECRETS_FIX, draft: { api_token: 'SECRET-VALUE' } }));
@@ -255,6 +259,19 @@ ok(at('data-testid="mesh-field-management_url"') !== -1
 const provChecking = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, { planned: false, busy: true }));
 ok(/mesh-wizard-provision-checking/.test(provChecking) && !/mesh-wizard-provision-plan/.test(provChecking),
    'while the auto-check runs it says "checking this host…" instead of offering the button');
+// READINESS ON THE BLOCK: the stand-up refuses without the datastore key + relay secret, so the
+// install block SAYS so up front (the server's own resolved.readiness.missing) and offers the jump
+// to the Secrets page where the built-in generators are.
+const provMissing = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { status: 'planned', why: 'not running', action: 'compose up' }, planned: true,
+  missing: ['management.json DataStoreEncryptionKey', 'Relay.Secret'], onGoSecrets: () => {},
+}));
+ok(/mesh-wizard-provision-missing/.test(provMissing) && /Relay\.Secret/.test(provMissing)
+   && /mesh-wizard-provision-gosecrets/.test(provMissing),
+   'unset required secrets are named ON the install block, with the jump to the Secrets page');
+ok(!/mesh-wizard-provision-missing/.test(provPlanned), 'and the warning is absent when nothing is missing');
+ok(/missing: cfg\?\.resolved\?\.readiness\?\.missing \|\| \[\]/.test(src.mesh),
+   'the missing list is the SERVER\'s own resolved readiness, not a client guess');
 
 console.log('\n── the pure helpers ──');
 ok(M.secretHint({ set: true, hint: 'x' }) === 'stored (x)' && M.secretHint({ set: false }) === 'not set'

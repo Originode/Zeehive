@@ -41,9 +41,11 @@ export const MESH_FIELDS = [
 // value); `generate` marks the one that is key MATERIAL a human must create.
 export const MESH_SECRETS = [
   ['api_token', 'API token', false,
-   'The management API token the queenzee authenticates with (NETBIRD_API_TOKEN). Paste a freshly minted token to rotate.'],
+   'The management API token the queenzee authenticates with (NETBIRD_API_TOKEN). Paste a freshly minted token to rotate — or leave unset: the stand-up bootstraps the first one itself.'],
   ['datastore_encryption_key', 'Datastore encryption key', true,
    'management.json DataStoreEncryptionKey — 32 random bytes, base64. Generate one here, then SAVE; rotating it requires restarting the control plane with the new key.'],
+  ['relay_auth_secret', 'Relay auth secret', true,
+   'management.json Relay.Secret — the shared secret the relay and management agree on (NETBIRD_RELAY_AUTH_SECRET), at least 16 characters. Generate one here, then SAVE. The stand-up refuses to start the plane without it.'],
   ['gateway_setup_key', 'Gateway setup key', false,
    'The setup key the mesh-gateway agent joins with (NETBIRD_GATEWAY_SETUP_KEY). Paste a one-off key to rotate.'],
 ];
@@ -111,9 +113,11 @@ export const MESH_WIZARD_STEPS = [
       + 'connections, the relay is the fallback hop when a peer cannot connect directly.',
     fields: ['signal_uri', 'relay_endpoint'], secrets: [] },
   { key: 'secrets', title: 'Secrets',
-    blurb: 'All three are WRITE-ONLY: the stored value is never shown, only that it is set. '
-      + 'An empty field on save means unchanged — type or generate a value only to set or rotate it.',
-    fields: [], secrets: ['api_token', 'datastore_encryption_key', 'gateway_setup_key'] },
+    blurb: 'All WRITE-ONLY: the stored value is never shown, only that it is set. An empty field '
+      + 'on save means unchanged — type or generate a value only to set or rotate it. The two the '
+      + 'control plane cannot start without (the datastore key and the relay secret) have built-in '
+      + 'generators: generate, then SAVE.',
+    fields: [], secrets: ['api_token', 'datastore_encryption_key', 'relay_auth_secret', 'gateway_setup_key'] },
   { key: 'review', title: 'Review & save',
     blurb: 'Nothing has been stored yet. Check the values below, then save.',
     fields: [], secrets: [] },
@@ -177,7 +181,7 @@ export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}
 // behind the typed STAND UP gate — surfaced where the human is actually stuck: staring at an empty
 // management-URL field with no server to point it at. Pure body; the handlers live in the wizard.
 export function MeshWizardProvisionBody({ step, planned = false, busy = false, err = null, note = null,
-                                          resolvedUrl = null, onPlan, onProvision, onAdopt }) {
+                                          resolvedUrl = null, missing = [], onPlan, onProvision, onAdopt, onGoSecrets }) {
   return (
     <div className="mx-wizprov" data-testid="mesh-wizard-provision">
       <div className="mx-wizprovhead">no management server yet? install one here</div>
@@ -211,6 +215,16 @@ export function MeshWizardProvisionBody({ step, planned = false, busy = false, e
             </div>
           )}
           {step.status === 'planned' && step.action && <span className="mx-wizhint">{step.action}</span>}
+          {step.status === 'planned' && missing.length > 0 && (
+            <div className="mx-wizprovmissing" data-testid="mesh-wizard-provision-missing">
+              ⚠ the stand-up will refuse until these are set: <b>{missing.join(', ')}</b> — generate
+              them on the Secrets page and SAVE, then install.
+              {onGoSecrets && (
+                <button type="button" className="mx-wizprovuse" data-testid="mesh-wizard-provision-gosecrets"
+                        onClick={onGoSecrets}>go to Secrets</button>
+              )}
+            </div>
+          )}
           {step.status === 'already-present' && (
             <button type="button" className="mx-wizprovuse" disabled={busy} data-testid="mesh-wizard-provision-use"
                     title="The control plane is already running on this host — fill the management URL above with the address the queenzee resolves for it."
@@ -318,9 +332,10 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
     ? { management_url: (
         <MeshWizardProvisionBody step={provision.step} planned={provision.planned}
                                  busy={busy || provision.busy} err={provision.err} note={provNote}
-                                 resolvedUrl={provision.resolvedUrl}
+                                 resolvedUrl={provision.resolvedUrl} missing={provision.missing || []}
                                  onPlan={onPlanProvision} onProvision={provisionNow}
-                                 onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')} />
+                                 onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')}
+                                 onGoSecrets={() => setI(MESH_WIZARD_STEPS.findIndex((s) => s.key === 'secrets'))} />
       ) }
     : {};
 
@@ -663,7 +678,8 @@ function MeshSections({ m, projectId, onChanged }) {
         <MeshWizard machineKey={m.key} initialFields={fields} secrets={storedSecrets} busy={saving}
                     onSave={save} onClose={() => setWizardOpen(false)} err={cfgErr}
                     provision={{ step: plan, planned, busy, err: planErr,
-                                 resolvedUrl: cfg?.resolved?.values?.api_url || null }}
+                                 resolvedUrl: cfg?.resolved?.values?.api_url || null,
+                                 missing: cfg?.resolved?.readiness?.missing || [] }}
                     onPlanProvision={loadPlan} onProvision={() => standUp(plan)} />
       )}
       <MeshStandUpBody step={plan} planned={planned} busy={busy} err={planErr}
