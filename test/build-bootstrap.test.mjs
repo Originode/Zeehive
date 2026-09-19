@@ -658,6 +658,40 @@ try {
   const noFileRes = perfNoFile.results.find((s) => s.kind === 'mesh-control-plane');
   ok(noFileRes?.status === 'cannot' && /MESH_COMPOSE_FILE/.test(noFileRes?.detail || ''),
      `a missing queenzee compose file names MESH_COMPOSE_FILE [${noFileRes?.detail?.slice(0, 60)}…]`);
+  ok(/not-here\.yml/.test(noFileRes?.detail || ''), 'and the receipt NAMES the path that was tried');
+
+  // THE COMPOSE-FILE FALLBACK (first live stand-up, 2026-09-18): the containerized queenzee's /app
+  // carries no compose file, so the DEFAULT path cannot exist there — resolveMeshComposeFile then
+  // falls back to the SELF project's checkout (the self-ship precedent), while an EXPLICIT
+  // MESH_COMPOSE_FILE is never second-guessed.
+  const { resolveMeshComposeFile } = await import('../server/src/lib/build-bootstrap.js');
+  const defaultMcf = path.resolve(config.repoRoot, 'docker-compose.bootstrap.yml');
+  const selfRoot = fs.mkdtempSync(path.join(os.tmpdir(), `bs-self-${tag}-`));
+  fs.mkdirSync(path.join(selfRoot, 'docker', 'zeehive'), { recursive: true });
+  const prodCompose = path.join(selfRoot, 'docker', 'zeehive', 'docker-compose.prod.yml');
+  fs.writeFileSync(prodCompose, 'name: zeehive\n');
+  // The self project: selfProjectId falls back to the row named Zeehive when no prod db container
+  // IS the meta-DB. Point (or create) that row at the fake checkout; restore whatever was there.
+  const zp = await one(`SELECT id, repo_root FROM project WHERE lower(name)='zeehive' LIMIT 1`);
+  let restoreSelf;
+  if (zp) {
+    restoreSelf = () => q(`UPDATE project SET repo_root=$2 WHERE id=$1`, [zp.id, zp.repo_root]);
+    await q(`UPDATE project SET repo_root=$2 WHERE id=$1`, [zp.id, selfRoot]);
+  } else {
+    const zrow = await one(`INSERT INTO project (name, repo_root, main_branch, db_user, db_name)
+                              VALUES ('Zeehive', $1, 'main', 'postgres', 'postgres') RETURNING id`, [selfRoot]);
+    restoreSelf = () => q(`DELETE FROM project WHERE id=$1`, [zrow.id]);
+  }
+  try {
+    config.meshComposeFile = defaultMcf;
+    const fb = await resolveMeshComposeFile({ exists: (p) => p !== defaultMcf && fs.existsSync(p) });
+    ok(fb.file === prodCompose && fb.tried.includes(defaultMcf),
+       `the DEFAULT path absent → falls back to the self checkout's docker-compose.prod.yml [${fb.file}]`);
+    config.meshComposeFile = path.join(cpDir, 'explicitly-set-but-gone.yml');
+    const ex = await resolveMeshComposeFile({ exists: () => false });
+    ok(ex.file === null && ex.tried.length === 1 && /explicitly-set-but-gone/.test(ex.tried[0]),
+       'an EXPLICIT MESH_COMPOSE_FILE that is missing fails loudly — the fallback never second-guesses it');
+  } finally { await restoreSelf(); }
 
   // a CAGE has no docker: the whole action refuses legibly, and nothing is composed. That refusal
   // is correct — the stand-up runs on a machine with docker, never inside a cxell.

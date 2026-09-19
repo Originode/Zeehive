@@ -25,7 +25,7 @@
 //     host, so refusing there would switch the bootstrap off on the most common installation.
 //   • Every action is RECORDED: who asked, what ran, what came back (build_bootstrap_action).
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { one } from '../db/pool.js';
 import { config } from '../config.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
@@ -151,6 +151,43 @@ export function managementJsonMissingSecrets(doc) {
     missing.push('Relay.Secret (set it in the console\'s mesh config, or NETBIRD_RELAY_AUTH_SECRET)');
   }
   return missing;
+}
+
+// Where the queenzee's OWN compose file actually is. `config.meshComposeFile` (default
+// <repoRoot>/docker-compose.bootstrap.yml) answers on a host-era queenzee running from a checkout.
+// The CONTAINERIZED queenzee's /app carries no compose file at all — Dockerfile.server ships
+// server/, scripts/, db/, deliberately not the install's compose — so the default path cannot
+// exist there, and the first live stand-up died on exactly that. The fallback is the SELF-SHIP
+// precedent (scripts/self-ship-container.sh): the queenzee's own stack is driven from its own
+// project's CHECKOUT under /repos (repo_root of the project whose prod db IS the meta-DB), where
+// docker/zeehive/docker-compose.prod.yml — the lockstep twin defining the same mesh profile —
+// resolves identically for the compose CLI in this container and the sibling it detaches.
+//
+// An EXPLICIT MESH_COMPOSE_FILE that does not exist fails loudly with no fallback: an operator's
+// setting is never second-guessed. Only the built-in default falls through. Returns
+// { file, tried } — file null when nothing answered, tried naming every path that was looked at
+// (the receipt's material). `exists` is injectable for tests.
+export async function resolveMeshComposeFile({ exists = existsSync } = {}) {
+  const configured = config.meshComposeFile;
+  const tried = [];
+  if (configured && exists(configured)) return { file: configured, tried };
+  if (configured) tried.push(configured);
+  const isDefault = configured === resolve(config.repoRoot, 'docker-compose.bootstrap.yml');
+  if (!isDefault) return { file: null, tried };
+  try {
+    // Dynamic import: infra-medic statically imports this module, and the self-project lookup
+    // belongs in one place (it is the same "which project is the queenzee itself" question).
+    const { selfProjectId } = await import('./infra-medic.js');
+    const p = await one(`SELECT repo_root FROM project WHERE id=$1`, [await selfProjectId()]);
+    for (const cand of p?.repo_root
+      ? [join(p.repo_root, 'docker', 'zeehive', 'docker-compose.prod.yml'),
+         join(p.repo_root, 'docker-compose.bootstrap.yml')]
+      : []) {
+      if (exists(cand)) return { file: cand, tried };
+      tried.push(cand);
+    }
+  } catch { /* no self project resolvable — the tried list is the whole receipt */ }
+  return { file: null, tried };
 }
 
 // PURE: the overrides that may REPLACE a placeholder in an existing file — and only a placeholder.
@@ -531,12 +568,14 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
     // compose, an existing management.json has only its placeholders filled (never an operator's own
     // value), and a second perform after a successful one reports already-present. A refused secret,
     // a missing compose file or an unreachable daemon is a NAMED cannot — never a half-started plane.
-    const file = config.meshComposeFile;
-    if (!file || !existsSync(file)) {
+    const resolvedCompose = await resolveMeshComposeFile();
+    const file = resolvedCompose.file;
+    if (!file) {
       return { status: 'cannot',
-               detail: `the queenzee's compose file was not found at '${file}' — set MESH_COMPOSE_FILE to the `
-                 + `install's compose file (the one defining the mesh profile) and re-run. The control plane `
-                 + `lives in the queenzee's own compose project, on the queenzee's own docker context.`,
+               detail: `the queenzee's compose file was not found — tried ${resolvedCompose.tried.map((p) => `'${p}'`).join(', ')
+                 || '(nothing configured)'}. Set MESH_COMPOSE_FILE to the install's compose file (the one `
+                 + `defining the mesh profile) and re-run. The control plane lives in the queenzee's own `
+                 + `compose project, on the queenzee's own docker context.`,
                stderr: null };
     }
     // THE CONSOLE'S VALUES for THIS machine, with the secrets (the one reader that must have them —
