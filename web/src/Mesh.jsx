@@ -78,7 +78,13 @@ export function normalizeMeshConfig(r = {}) {
       : s ? { set: s.set !== false, hint: s.hint ?? s.fingerprint ?? s.last4 ?? null }
       : { set: false, hint: null };
   }
-  return { fields, secrets, editable: r.editable !== false, resolved: r.resolved || null };
+  // `enabled`/`configured` are the server's own answer to "is this fleet meant to have a mesh?"
+  // (lib/mesh-config.js: a row exists / the console's switch). Carried through UNCOERCED — the mesh
+  // status chip's tri-state reads them (meshStatus.js meshConfigured), and dropping them here left
+  // the chip unable to tell "deliberately off" from "cannot tell" whenever only the config read
+  // answered.
+  return { fields, secrets, editable: r.editable !== false, resolved: r.resolved || null,
+           enabled: r.enabled ?? null, configured: r.configured ?? null };
 }
 
 // The management URL a just-provisioned (or already-running) plane answers at, read from a fresh
