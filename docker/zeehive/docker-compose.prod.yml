@@ -229,10 +229,17 @@ services:
       - "${NETBIRD_MGMT_API_PORT:-33074}:443"
     volumes:
       - netbird_management_data:/var/lib/netbird
-      # management.json is read from ./netbird/ relative to THIS compose file, so in a checkout it
-      # is docker/zeehive/netbird/management.json — copy it from the shipped .example and fill in
-      # the endpoints before `up --profile mesh` (README). `config -q` does not stat host paths.
-      - ./netbird/management.json:/etc/netbird/management.json:ro
+      # /etc/netbird is a NAMED VOLUME here, not a host bind — deliberately DIFFERENT from the
+      # bootstrap twin. The containerized queenzee runs the stand-up from its checkout under
+      # /repos, a path inside the zeehive_repos volume that the HOST daemon cannot bind: live on
+      # 2026-09-20 the daemon auto-created an empty host dir for it, management crash-looped on a
+      # directory where its config should be, while signal (configless) ran fine. The stand-up
+      # (lib/build-bootstrap.js) docker-cp's the rendered management.json INTO this volume and
+      # restarts the service — config reaches the container daemon-side, survives recreates, and
+      # never crosses the host boundary. docker-compose.bootstrap.yml keeps the ./netbird file
+      # bind: a host-checkout install's daemon CAN see that path, and the stand-up skips the cp
+      # when the compose it runs declares the bind.
+      - netbird_mgmt_config:/etc/netbird
     command:
       - "--port"
       - "443"
@@ -330,6 +337,9 @@ volumes:
   # sibling and the mesh README steps mount these by bare name.
   netbird_management_data: { name: netbird_management_data }
   netbird_signal_data: { name: netbird_signal_data }
+  # management.json's home on the containerized install (see the netbird-management service) —
+  # written by the stand-up via docker cp, never by a host bind.
+  netbird_mgmt_config: { name: netbird_mgmt_config }
 
 networks:
   default: {}

@@ -612,6 +612,27 @@ try {
      'the receipt names the env a human must still set, and that no secret was minted');
   ok(/^https?:\/\//.test(cpRes?.management_url || ''),
      `the receipt carries a TYPED management_url (resolved, else the probed URL) for the console to fill from [${cpRes?.management_url}]`);
+  // CONFIG DELIVERY, per world (live 2026-09-20: the containerized install's host daemon cannot
+  // bind the /repos checkout path — management crash-looped on an auto-created empty dir while
+  // configless signal ran fine). A compose WITHOUT the ./netbird bind (this one) gets the file
+  // docker-cp'd in daemon-side, then a restart so a configless first start comes back reading it.
+  ok(dockerGo.calls.some((c) => /^cp .*zeehive_netbird_management:\/etc\/netbird\/management\.json$/.test(c)),
+     'a bind-less compose gets management.json docker-cp\'d INTO the container (daemon-side, no host path)');
+  ok(dockerGo.calls.some((c) => c === 'restart zeehive_netbird_management'),
+     '…and the management service is restarted to read it');
+  // A compose that DOES declare the host bind (a host-checkout install) needs neither.
+  const bindCompose = path.join(cpDir, 'docker-compose.bind.yml');
+  fs.writeFileSync(bindCompose,
+    'name: zeehive\nservices:\n  netbird-management:\n    image: example\n'
+    + '    volumes:\n      - ./netbird/management.json:/etc/netbird/management.json:ro\n');
+  config.meshComposeFile = bindCompose;
+  const dockerBind = makeDocker({ reachable: true, networks: new Set() });
+  const perfBindCp = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerBind,
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeOk } });
+  const bindRes = perfBindCp.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(bindRes?.status === 'created' && !dockerBind.calls.some((c) => c.startsWith('cp ')),
+     'a compose WITH the ./netbird bind skips the cp — the daemon already sees the file');
+  config.meshComposeFile = composeFile;
   const cpRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCp.action_id]);
   ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
      'the stand-up is RECORDED in the audit steps');

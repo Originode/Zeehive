@@ -620,20 +620,56 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
                  detail: `docker compose --profile mesh up failed on '${machine.docker_ctx}' from '${file}'`,
                  stderr: (up.stderr || up.stdout || '').trim() };
       }
+      // HOW THE CONFIG REACHES THE CONTAINER depends on which world's compose ran. A host-checkout
+      // compose (the bootstrap twin) declares the ./netbird/management.json bind — the daemon can
+      // see that path, the file is already in place, nothing to do. The containerized install's
+      // compose mounts /etc/netbird as a NAMED volume instead, because the queenzee's checkout
+      // lives inside the zeehive_repos volume where the HOST daemon cannot bind it (proven live
+      // 2026-09-20: docker auto-created an empty host dir, management crash-looped on a directory
+      // where its config should be, while configless signal ran fine). There the rendered file is
+      // docker-cp'd in — daemon-side, persisted in the volume — and the service restarted so a
+      // first start that came up without config reads it.
+      const bindsConfig = /\.\/netbird\/management\.json/.test(readFileSync(file, 'utf8'));
+      if (!bindsConfig) {
+        const cp = await docker(machine.docker_ctx,
+          ['cp', mj.file, `${MESH_CONTROL_PLANE_CONTAINER}:/etc/netbird/management.json`],
+          { timeout: 60_000 });
+        if (cp.unknown || cp.status !== 0) {
+          return { status: 'failed',
+                   detail: `management.json could not be copied into '${MESH_CONTROL_PLANE_CONTAINER}' `
+                     + `(${cp.unknown ? cp.reason : (cp.stderr || cp.stdout || '').trim() || cp.status})`,
+                   stderr: null };
+        }
+        const rs = await docker(machine.docker_ctx, ['restart', MESH_CONTROL_PLANE_CONTAINER], { timeout: 60_000 });
+        if (rs.unknown || rs.status !== 0) {
+          return { status: 'failed',
+                   detail: `'${MESH_CONTROL_PLANE_CONTAINER}' did not restart after its config was copied in `
+                     + `(${rs.unknown ? rs.reason : (rs.stderr || rs.stdout || '').trim() || rs.status})`,
+                   stderr: null };
+        }
+      }
       started = true;
     }
     // Health-check the management API (bounded dial + retry; injected for tests, same seam as the
     // netbird request adapter the machine-peer step takes).
     const hc = await (mesh.probeApi || probeManagementApi)({});
     if (!hc.ok) {
+      // "check the service logs" was the whole receipt once — so FETCH them: the management
+      // container's state and last log lines ride the receipt, bounded, best-effort (a failure
+      // to read them must not mask the health verdict itself).
+      const st = await docker(machine.docker_ctx,
+        ['inspect', MESH_CONTROL_PLANE_CONTAINER, '--format', '{{.State.Status}} restarts={{.RestartCount}}']);
+      const lg = await docker(machine.docker_ctx, ['logs', '--tail', '20', MESH_CONTROL_PLANE_CONTAINER]);
+      const stateLine = !st.unknown && st.status === 0 ? ` Container state: ${(st.stdout || '').trim()}.` : '';
+      const logTail = !lg.unknown ? ((lg.stderr || '') + (lg.stdout || '')).trim().slice(-2000) : '';
       const { missing, already } = meshOperatorEnv();
       const envLine = `by hand on the queenzee: ${missing.join(', ')}`
         + (already.length ? ` (already set: ${already.join(', ')})` : '');
       return { status: 'failed',
                detail: `the control plane containers ${started ? 'started' : 'are running'} from '${file}' but `
                  + `the management API at ${hc.host}:${hc.port} is not answering `
-                 + `(${hc.verdict || hc.reason}) — check the service logs; then set ${envLine}.`,
-               stderr: null };
+                 + `(${hc.verdict || hc.reason}).${stateLine} Then set ${envLine}.`,
+               stderr: logTail || null };
     }
     // THE FIRST PAT (§3.1 / §11): a ManagerType-none plane has no supported way to create its first
     // account, so with no token anywhere this bootstraps it into the pinned store and records it in
