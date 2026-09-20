@@ -153,6 +153,10 @@ export function managementJsonMissingSecrets(doc) {
   return missing;
 }
 
+// The stand-up's `compose up` budget. Pulling the pinned NetBird images on a first install takes
+// minutes; the adapter's default 8s ceiling is sized for probes and killed the first live stand-up.
+export const MESH_COMPOSE_UP_TIMEOUT_MS = 10 * 60 * 1000;
+
 // Where the queenzee's OWN compose file actually is. `config.meshComposeFile` (default
 // <repoRoot>/docker-compose.bootstrap.yml) answers on a host-era queenzee running from a checkout.
 // The CONTAINERIZED queenzee's /app carries no compose file at all — Dockerfile.server ships
@@ -601,9 +605,12 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
       if (mj.error) return { status: 'cannot', detail: mj.error, stderr: null };
       // The ports/domain/secrets ride as ENV on the compose child, never as argv: they are what the
       // containers are created with, and the install's .env stops being the only place they live.
+      // Its OWN timeout: the first `up` PULLS the three NetBird images — minutes, not the adapter's
+      // 8s probe ceiling (the first live stand-up died on exactly that, "did not answer within
+      // 8000ms"). A hard ceiling remains so a wedged daemon cannot hang the perform forever.
       const up = await docker(machine.docker_ctx,
         ['compose', '-f', file, '--profile', 'mesh', 'up', '-d', ...MESH_CONTROL_PLANE_SERVICES],
-        { env: composeEnvFor(values) });
+        { env: composeEnvFor(values), timeout: MESH_COMPOSE_UP_TIMEOUT_MS });
       if (up.unknown) {
         return { status: 'failed',
                  detail: `could not run compose on '${machine.docker_ctx}': ${up.reason}`, stderr: null };

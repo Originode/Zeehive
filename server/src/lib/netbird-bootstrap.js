@@ -295,10 +295,14 @@ export async function bootstrapFirstPat({
   const storeOut = join(dir, 'store.db');
   const plan = patBootstrapPlan({ ctx, container, storeOut });
   const argvOf = (op) => plan.find((s) => s.op === op).argv;
+  // The plane operations carry their own timeout: docker stop waits out the container's grace
+  // period (10s default) before SIGKILL, and cp of a store takes a moment — both overrun the
+  // adapter's 8s probe ceiling (the same class that killed the first live compose up).
+  const PLANE_OP_TIMEOUT_MS = 60_000;
   let stopped = false;
   const startPlane = async () => {
     if (!stopped) return { ok: true, skipped: true };
-    const r = await docker(ctx, argvOf('start'));
+    const r = await docker(ctx, argvOf('start'), { timeout: PLANE_OP_TIMEOUT_MS });
     stopped = false;
     return { ok: !r.unknown && r.status === 0, detail: r.unknown ? r.reason : (r.stderr || r.stdout || '').trim() };
   };
@@ -315,7 +319,7 @@ export async function bootstrapFirstPat({
     if (refusal) return { ok: false, refused: true, reason: refusal, refused_version: runningVersion };
 
     // 2. stop — one writer only.
-    const stop = await docker(ctx, argvOf('stop'));
+    const stop = await docker(ctx, argvOf('stop'), { timeout: PLANE_OP_TIMEOUT_MS });
     if (stop.unknown || stop.status !== 0) {
       return { ok: false, restarted: true,
                reason: `could not stop '${container}' on '${ctx}' (${stop.unknown ? stop.reason : (stop.stderr || stop.stdout || '').trim() || stop.status}) `
@@ -324,7 +328,7 @@ export async function bootstrapFirstPat({
     stopped = true;
 
     // 3. the store OUT.
-    const cpOut = await docker(ctx, argvOf('read-store'));
+    const cpOut = await docker(ctx, argvOf('read-store'), { timeout: PLANE_OP_TIMEOUT_MS });
     if (cpOut.unknown || cpOut.status !== 0) {
       const r = await startPlane();
       return { ok: false, restarted: r.ok,
@@ -343,7 +347,7 @@ export async function bootstrapFirstPat({
 
     // 5. the store BACK. 0666 first — see the header's step 5.
     chmodSync(storeOut, 0o666);
-    const cpIn = await docker(ctx, argvOf('write-store'));
+    const cpIn = await docker(ctx, argvOf('write-store'), { timeout: PLANE_OP_TIMEOUT_MS });
     if (cpIn.unknown || cpIn.status !== 0) {
       const r = await startPlane();
       return { ok: false, restarted: r.ok,

@@ -89,8 +89,14 @@ ok(/\['datastore_encryption_key', 'relay_auth_secret'\]\s*\n?\s*\.filter\(\(k\) 
    'standUp derives the unset required secrets from the SERVER\'s resolved read');
 ok(/putMeshConfig\(m\.id, Object\.fromEntries\(needGen\.map\(\(k\) => \[k, 'generate'\]\)\)\)/.test(src.mesh),
    "…and mints them via the server's own 'generate' literal before the stand-up");
-ok(/generated and stored write-only/.test(src.mesh) && /Type STAND UP to confirm/.test(src.mesh),
-   'the typed-gate prompt DISCLOSES the generate-and-store, so one consent covers both');
+// The ask is a MODAL, not navigation: "Generate secrets?" with its own confirm — no jumping to
+// the Secrets page and back. Cancel aborts the install (a stand-up on missing keys is a refusal).
+ok(/showConfirm\(/.test(src.mesh) && /title: 'Generate secrets\?'/.test(src.mesh)
+   && /okLabel: 'Generate & store'/.test(src.mesh),
+   'unset keys raise the dedicated "Generate secrets?" confirm modal on install');
+ok(/if \(!okGen\) return null;/.test(src.mesh), 'declining the generate aborts the install cleanly');
+ok(!/mesh-wizard-provision-gosecrets/.test(src.mesh),
+   'the forward-then-backward "go to Secrets" jump is GONE — the modal replaced it');
 ok((src.mesh.match(/putMeshConfig\(/g) || []).length === 2,
    'putMeshConfig has exactly TWO call sites: the wizard save, and the gated generate');
 
@@ -276,11 +282,11 @@ ok(/mesh-wizard-provision-checking/.test(provChecking) && !/mesh-wizard-provisio
 // to the Secrets page where the built-in generators are.
 const provMissing = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
   step: { status: 'planned', why: 'not running', action: 'compose up' }, planned: true,
-  missing: ['management.json DataStoreEncryptionKey', 'Relay.Secret'], onGoSecrets: () => {},
+  missing: ['management.json DataStoreEncryptionKey', 'Relay.Secret'],
 }));
 ok(/mesh-wizard-provision-missing/.test(provMissing) && /Relay\.Secret/.test(provMissing)
-   && /mesh-wizard-provision-gosecrets/.test(provMissing),
-   'unset required secrets are named ON the install block, with the jump to the Secrets page');
+   && /install will ASK/.test(provMissing),
+   'unset required secrets are named ON the install block, saying install will ASK to generate them');
 ok(!/mesh-wizard-provision-missing/.test(provPlanned), 'and the warning is absent when nothing is missing');
 ok(/missing: cfg\?\.resolved\?\.readiness\?\.missing \|\| \[\]/.test(src.mesh),
    'the missing list is the SERVER\'s own resolved readiness, not a client guess');

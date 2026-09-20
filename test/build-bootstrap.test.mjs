@@ -51,9 +51,11 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
                       createVolumes = new Set(), failVolumeCreate = null } = {}) => {
   const calls = [];
   const envCalls = [];
+  const timeoutCalls = [];
   const stub = async (ctx, args, opts) => {
     calls.push(args.join(' '));
     if (opts?.env) envCalls.push({ args: args.join(' '), env: opts.env });
+    if (opts?.timeout) timeoutCalls.push({ args: args.join(' '), timeout: opts.timeout });
     const [cmd] = args;
     if (cmd === 'info') {
       if (!reachable) return { unknown: true, reason: `connection refused (stub) to ${ctx}` };
@@ -106,6 +108,7 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
   };
   stub.calls = calls;
   stub.envCalls = envCalls;
+  stub.timeoutCalls = timeoutCalls;
   return stub;
 };
 
@@ -600,6 +603,10 @@ try {
   const upCall = dockerGo.calls.find((c) => c.includes('--profile mesh'));
   ok(upCall === `compose -f ${composeFile} --profile mesh up -d ${MESH_CONTROL_PLANE_SERVICES.join(' ')}`,
      `compose is invoked with the three mesh services ONLY (never the queenzee's own) [${upCall}]`);
+  // The first `up` PULLS images — minutes. The adapter's default 8s probe ceiling killed the first
+  // live stand-up ("did not answer within 8000ms"), so the up call must carry its own long budget.
+  const upTimeout = dockerGo.timeoutCalls.find((c) => c.args.includes('--profile mesh'))?.timeout || 0;
+  ok(upTimeout >= 60_000, `the compose up rides a LONG timeout, not the 8s probe ceiling [${upTimeout}ms]`);
   ok(/NETBIRD_API_TOKEN/.test(cpRes?.detail || '') && /NETBIRD_GATEWAY_SETUP_KEY/.test(cpRes?.detail || '')
      && /No secret was minted or stored/.test(cpRes?.detail || ''),
      'the receipt names the env a human must still set, and that no secret was minted');

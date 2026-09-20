@@ -25,7 +25,7 @@
 // the fetches live in MeshSections, so a test can render each body with a fixture through
 // react-dom/server and read the markup back.
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { showAlert, showPrompt } from './Dialog.jsx';
+import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import { getMeshConfig, putMeshConfig, getMeshStatus, planBuildBootstrap, performBuildBootstrap } from './api.js';
 
 // The non-secret fields the card edits, in render order. Each names where the value is READ from,
@@ -181,7 +181,7 @@ export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}
 // behind the typed STAND UP gate — surfaced where the human is actually stuck: staring at an empty
 // management-URL field with no server to point it at. Pure body; the handlers live in the wizard.
 export function MeshWizardProvisionBody({ step, planned = false, busy = false, err = null, note = null,
-                                          resolvedUrl = null, missing = [], onPlan, onProvision, onAdopt, onGoSecrets }) {
+                                          resolvedUrl = null, missing = [], onPlan, onProvision, onAdopt }) {
   return (
     <div className="mx-wizprov" data-testid="mesh-wizard-provision">
       <div className="mx-wizprovhead">no management server yet? install one here</div>
@@ -217,13 +217,8 @@ export function MeshWizardProvisionBody({ step, planned = false, busy = false, e
           {step.status === 'planned' && step.action && <span className="mx-wizhint">{step.action}</span>}
           {step.status === 'planned' && missing.length > 0 && (
             <div className="mx-wizprovmissing" data-testid="mesh-wizard-provision-missing">
-              not set yet: <b>{missing.join(', ')}</b> — install will GENERATE and store them for
-              you (write-only random key material). Prefer your own? Set them on the Secrets page
-              first.
-              {onGoSecrets && (
-                <button type="button" className="mx-wizprovuse" data-testid="mesh-wizard-provision-gosecrets"
-                        onClick={onGoSecrets}>go to Secrets</button>
-              )}
+              not set yet: <b>{missing.join(', ')}</b> — install will ASK to generate and store
+              them (write-only random key material), so there is nothing to fill in first.
             </div>
           )}
           {step.status === 'already-present' && (
@@ -335,8 +330,7 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
                                  busy={busy || provision.busy} err={provision.err} note={provNote}
                                  resolvedUrl={provision.resolvedUrl} missing={provision.missing || []}
                                  onPlan={onPlanProvision} onProvision={provisionNow}
-                                 onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')}
-                                 onGoSecrets={() => setI(MESH_WIZARD_STEPS.findIndex((s) => s.key === 'secrets'))} />
+                                 onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')} />
       ) }
     : {};
 
@@ -632,20 +626,24 @@ function MeshSections({ m, projectId, onChanged }) {
     // A WIZARD must not fail its first step on keys a later page generates: the two required
     // secrets the plane cannot start without are random key MATERIAL nobody needs to read, and
     // the server mints them on request (the literal 'generate' — GENERATABLE_FIELDS, exactly
-    // these two). So when they are unset, this one gated click generates and stores them too —
-    // said in the prompt, so typing STAND UP consents to both. The Secrets page remains the
+    // these two). When they are unset, install ASKS with its own modal — "Generate secrets?" —
+    // instead of sending the human forward to the Secrets page and back. Cancel aborts the
+    // install (a stand-up on missing keys would only be refused); the Secrets page remains the
     // place to paste or rotate your own.
     const needGen = ['datastore_encryption_key', 'relay_auth_secret']
       .filter((k) => cfg?.resolved?.secrets?.[k]?.set === false);
-    const genLine = needGen.length
-      ? `FIRST, the required secret${needGen.length > 1 ? 's' : ''} the plane cannot start without `
-        + `will be generated and stored write-only (server-minted random key material, never shown): `
-        + `${needGen.join(', ')}. Set your own on the Secrets page instead if you prefer.\n\n`
-      : '';
+    if (needGen.length) {
+      const okGen = await showConfirm(
+        `The control plane cannot start without: ${needGen.join(', ')}.\n\n`
+        + 'Generate and store now? Server-minted random key material, saved write-only — never '
+        + 'shown, only its fingerprint. Prefer your own values? Cancel, and set them on the '
+        + 'Secrets page first.',
+        { title: 'Generate secrets?', okLabel: 'Generate & store', variant: 'info' });
+      if (!okGen) return null;
+    }
     const typed = await showPrompt(
       `Stand up the NetBird control plane on ${m.key}?\n\n`
       + `${step?.action || 'the mesh-profile services in the queenzee\'s own compose project'}\n\n`
-      + genLine
       + 'This runs docker compose on the queenzee\'s own host and health-checks the management API. '
       + 'It creates ONLY the control plane — no project network, volume or dev db. '
       + 'The API token and gateway setup key stay yours to set.\n\nType STAND UP to confirm.',
