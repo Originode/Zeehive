@@ -652,7 +652,12 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
     }
     // Health-check the management API (bounded dial + retry; injected for tests, same seam as the
     // netbird request adapter the machine-peer step takes).
-    const hc = await (mesh.probeApi || probeManagementApi)({});
+    // A PATIENT health check: a first boot runs management's own migrations and then DOWNLOADS
+    // the GeoLite2 database before binding the API at all — live 2026-09-21 the container sat
+    // 'running restarts=0', log tail at "will be downloaded", port refused, and the default ~20s
+    // probe window called a healthy start a failure. Minutes of budget; a plane that is already
+    // answering returns on the first attempt, so patience costs a healthy path nothing.
+    const hc = await (mesh.probeApi || probeManagementApi)({ attempts: 90, intervalMs: 2000 });
     if (!hc.ok) {
       // "check the service logs" was the whole receipt once — so FETCH them: the management
       // container's state and last log lines ride the receipt, bounded, best-effort (a failure

@@ -627,11 +627,17 @@ try {
     + '    volumes:\n      - ./netbird/management.json:/etc/netbird/management.json:ro\n');
   config.meshComposeFile = bindCompose;
   const dockerBind = makeDocker({ reachable: true, networks: new Set() });
+  let probeOpts = null;
+  const probeRecOk = async (o) => { probeOpts = o; return probeOk(); };
   const perfBindCp = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerBind,
-    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeOk } });
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeRecOk } });
   const bindRes = perfBindCp.results.find((s) => s.kind === 'mesh-control-plane');
   ok(bindRes?.status === 'created' && !dockerBind.calls.some((c) => c.startsWith('cp ')),
      'a compose WITH the ./netbird bind skips the cp — the daemon already sees the file');
+  // First boot downloads GeoLite2 BEFORE binding the API (live 2026-09-21: running restarts=0,
+  // port refused, default ~20s window called it failed) — the stand-up's check must be PATIENT.
+  ok(probeOpts && (probeOpts.attempts || 0) * (probeOpts.intervalMs || 0) >= 60_000,
+     `the health check rides a MINUTES budget, not the probe default [attempts=${probeOpts?.attempts} interval=${probeOpts?.intervalMs}ms]`);
   config.meshComposeFile = composeFile;
   const cpRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCp.action_id]);
   ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
