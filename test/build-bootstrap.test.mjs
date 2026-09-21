@@ -639,6 +639,38 @@ try {
   ok(probeOpts && (probeOpts.attempts || 0) * (probeOpts.intervalMs || 0) >= 60_000,
      `the health check rides a MINUTES budget, not the probe default [attempts=${probeOpts?.attempts} interval=${probeOpts?.intervalMs}ms]`);
   config.meshComposeFile = composeFile;
+
+  // ── THE OPTIONAL DASHBOARD (mesh-dashboard): reported in the plan, OPT-IN to perform ─────────
+  // No plane → 'cannot'; plane running → 'planned'; and an UNSCOPED perform must never start it.
+  const planNoMgmt = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp),
+    { docker: makeDocker({ networks: new Set() }) });
+  const dashNoMgmt = planNoMgmt.steps.find((s) => s.kind === 'mesh-dashboard');
+  ok(dashNoMgmt?.status === 'cannot' && /stand the control plane up first/.test(dashNoMgmt?.detail || ''),
+     'no running management → the dashboard step is a named cannot');
+  const dockerMgmtUp = makeDocker({ networks: new Set(), runningContainers: new Set(['zeehive_netbird_management']) });
+  const planMgmtUp = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp), { docker: dockerMgmtUp });
+  const dashPlanned2 = planMgmtUp.steps.find((s) => s.kind === 'mesh-dashboard');
+  ok(dashPlanned2?.status === 'planned' && /netbird-dashboard/.test(dashPlanned2?.action || ''),
+     'a running plane + no dashboard → a planned mesh-dashboard step');
+  // UNSCOPED perform: the dashboard must NOT ride along.
+  const dockerUnscoped = makeDocker({ networks: new Set(), runningContainers: new Set(['zeehive_netbird_management']) });
+  await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerUnscoped,
+    provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
+  ok(!dockerUnscoped.calls.some((c) => /up -d netbird-dashboard/.test(c)),
+     'an UNSCOPED bootstrap never starts the dashboard (opt-in only)');
+  // SCOPED perform: composes exactly the dashboard, carries the browser-reachable endpoints, and
+  // the receipt names the OIDC env sign-in still needs.
+  const dockerDash = makeDocker({ networks: new Set(), runningContainers: new Set(['zeehive_netbird_management']) });
+  const perfDash = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerDash,
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-dashboard'],
+    mesh: { probeApi: probeOk, probeDash: async () => 'ok' } });
+  const dashRes = perfDash.results.find((s) => s.kind === 'mesh-dashboard');
+  ok(dashRes?.status === 'created' && dockerDash.calls.some((c) => /--profile mesh up -d netbird-dashboard$/.test(c)),
+     `the scoped perform composes exactly the dashboard service [${dashRes?.status}]`);
+  ok(!dockerDash.calls.some((c) => /up -d netbird-management/.test(c)),
+     '…and touches none of the control-plane services');
+  ok(/NETBIRD_AUTH_AUTHORITY/.test(dashRes?.detail || ''),
+     'the receipt names the OIDC env sign-in still needs');
   const cpRow = await one(`SELECT * FROM build_bootstrap_action WHERE id=$1`, [perfCp.action_id]);
   ok(cpRow?.steps?.some((s) => s.kind === 'mesh-control-plane' && s.status === 'created'),
      'the stand-up is RECORDED in the audit steps');

@@ -99,6 +99,17 @@ ok(!/mesh-wizard-provision-gosecrets/.test(src.mesh),
    'the forward-then-backward "go to Secrets" jump is GONE — the modal replaced it');
 ok((src.mesh.match(/putMeshConfig\(/g) || []).length === 2,
    'putMeshConfig has exactly TWO call sites: the wizard save, and the gated generate');
+// SUGGESTED DEFAULTS: the server computes the machine's own addresses (meshConfigFor.suggested);
+// the console only offers them — placeholder + a one-click "use default" — never inventing shapes.
+ok(/suggest=\{cfg\?\.suggested \|\| \{\}\}/.test(src.mesh),
+   'the wizard is handed the SERVER\'s suggested defaults');
+// THE DASHBOARD: an OPT-IN extra — its own button, its own confirm modal, its own kinds scope.
+ok(/performBuildBootstrap\(projectId, m\.id, [^,)]+, \['mesh-dashboard'\]\)/.test(src.mesh),
+   'enabling the dashboard performs ONLY the mesh-dashboard step (kinds-scoped)');
+ok(/title: 'Enable dashboard\?'/.test(src.mesh) && /okLabel: 'Enable dashboard'/.test(src.mesh),
+   'behind its own confirm modal');
+ok((src.mesh.match(/performBuildBootstrap\(/g) || []).length === 2,
+   'performBuildBootstrap has exactly TWO call sites, each kinds-scoped (stand-up + dashboard)');
 
 // ── 1b. wiring: the ALWAYS-VISIBLE mesh indicator in the console chrome ───────────────────────
 // The card ADDED after the panel: mesh status must be the most obvious thing in the console when
@@ -212,8 +223,8 @@ ok(/disabled/.test(roHtml.match(/<button[^>]*data-testid="mesh-configure"[^>]*>/
 console.log('\n── the wizard PROVISION block: stand up on the queenzee\'s own compose, one perform path ──');
 ok(/onProvision=\{\(\) => standUp\(plan\)\}/.test(src.mesh) && /onPlanProvision=\{loadPlan\}/.test(src.mesh),
    'the wizard\'s provision is the panel\'s OWN standUp/loadPlan — one perform path, one typed gate');
-ok((src.mesh.match(/performBuildBootstrap\(/g) || []).length === 1,
-   'there is exactly ONE performBuildBootstrap call site (the gate cannot fork)');
+ok(![...src.mesh.matchAll(/performBuildBootstrap\(([^)]*)\)/g)].some((c) => !/\['mesh-/.test(c[1])),
+   'every performBuildBootstrap call site is kinds-scoped to a mesh step (no unscoped bootstrap from here)');
 ok(/step\.key === 'management' && provision/.test(src.mesh) && /slots=\{provisionSlot\}/.test(src.mesh),
    'the provision block renders on the MANAGEMENT page only, slotted under its field');
 // AUTO-CHECK: opening the management page runs the dry-run plan by itself (once), so the block
@@ -290,6 +301,35 @@ ok(/mesh-wizard-provision-missing/.test(provMissing) && /Relay\.Secret/.test(pro
 ok(!/mesh-wizard-provision-missing/.test(provPlanned), 'and the warning is absent when nothing is missing');
 ok(/missing: cfg\?\.resolved\?\.readiness\?\.missing \|\| \[\]/.test(src.mesh),
    'the missing list is the SERVER\'s own resolved readiness, not a client guess');
+// SUGGESTED DEFAULTS rendered: placeholder + one-click fill on the empty field, gone once filled.
+const suggHtml = renderToStaticMarkup(React.createElement(M.MeshWizardStepBody, {
+  step: M.MESH_WIZARD_STEPS.find((s) => s.key === 'coordination'), fields: {},
+  suggest: { relay_endpoint: 'relay://10.0.0.5:33080', signal_uri: '10.0.0.5:10000' },
+}));
+ok(/default: relay:\/\/10\.0\.0\.5:33080/.test(suggHtml) && /data-testid="mesh-default-relay_endpoint"/.test(suggHtml),
+   'an empty relay field shows the default as placeholder + a "use default" button');
+ok(/data-testid="mesh-default-signal_uri"/.test(suggHtml), 'and the signal URI gets the same treatment');
+const suggFilled = renderToStaticMarkup(React.createElement(M.MeshWizardStepBody, {
+  step: M.MESH_WIZARD_STEPS.find((s) => s.key === 'coordination'),
+  fields: { relay_endpoint: 'relay://mine:1' }, suggest: { relay_endpoint: 'relay://10.0.0.5:33080' },
+}));
+ok(!/data-testid="mesh-default-relay_endpoint"/.test(suggFilled),
+   'a filled field offers no "use default" — the human\'s value stands');
+// THE DASHBOARD rendered: enable button on a running plane, running note instead once up.
+const dashPlanned = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { status: 'already-present', detail: 'running' }, planned: true,
+  dash: { status: 'planned', action: 'docker compose --profile mesh up -d netbird-dashboard' },
+  onDashboard: () => {},
+}));
+ok(/data-testid="mesh-wizard-dashboard-go"/.test(dashPlanned), 'a running plane + no dashboard offers "enable web dashboard"');
+const dashRunning = renderToStaticMarkup(React.createElement(M.MeshWizardProvisionBody, {
+  step: { status: 'already-present', detail: 'running' }, planned: true,
+  dash: { status: 'already-present', detail: "container 'zeehive_netbird_dashboard' is running" },
+}));
+ok(/data-testid="mesh-wizard-dashboard-running"/.test(dashRunning) && !/mesh-wizard-dashboard-go/.test(dashRunning),
+   'a running dashboard reads as running, with no second enable button');
+ok(M.normalizeMeshConfig({ suggested: { relay_endpoint: 'relay://x:1' } }).suggested.relay_endpoint === 'relay://x:1',
+   'normalizeMeshConfig carries the server\'s suggested defaults through');
 
 console.log('\n── the pure helpers ──');
 ok(M.secretHint({ set: true, hint: 'x' }) === 'stored (x)' && M.secretHint({ set: false }) === 'not set'

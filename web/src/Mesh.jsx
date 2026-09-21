@@ -86,6 +86,7 @@ export function normalizeMeshConfig(r = {}) {
   // the chip unable to tell "deliberately off" from "cannot tell" whenever only the config read
   // answered.
   return { fields, secrets, editable: r.editable !== false, resolved: r.resolved || null,
+           suggested: r.suggested || {},
            enabled: r.enabled ?? null, configured: r.configured ?? null };
 }
 
@@ -132,7 +133,10 @@ const secretDef = (k) => MESH_SECRETS.find((s) => s[0] === k);
 // `slots` hangs extra content DIRECTLY UNDER one named field (slots[fieldKey] → rendered right
 // after that field) — how the management page puts the install/provision block under the URL it
 // fills, instead of somewhere lower a human has to connect back up.
-export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}, setField, setSecret, busy = false, slots = {} }) {
+// `suggest` is the SERVER's per-field default (meshConfigFor.suggested — the machine's own
+// address in the shipped example's shapes): it rides the empty field's placeholder and a
+// one-click "use default" button. The console never invents an address format.
+export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}, setField, setSecret, busy = false, slots = {}, suggest = {} }) {
   if (!step) return null;
   return (
     <div className="mx-wizstep" data-testid={`mesh-wizard-step-${step.key}`}>
@@ -143,8 +147,16 @@ export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}
           <React.Fragment key={k}>
             <label className="mx-wizfield">
               <span className="k">{label}</span>
-              <input type="text" value={fields[k] ?? ''} disabled={busy} data-testid={`mesh-field-${k}`}
-                     placeholder="—" onChange={(e) => setField?.(k, e.target.value)} />
+              <span className="mx-wizinrow">
+                <input type="text" value={fields[k] ?? ''} disabled={busy} data-testid={`mesh-field-${k}`}
+                       placeholder={suggest[k] ? `default: ${suggest[k]}` : '—'}
+                       onChange={(e) => setField?.(k, e.target.value)} />
+                {suggest[k] && !fields[k] && (
+                  <button type="button" className="mx-wizgen" disabled={busy} data-testid={`mesh-default-${k}`}
+                          title={`Fill the field with this machine's own address: ${suggest[k]}`}
+                          onClick={() => setField?.(k, suggest[k])}>use default</button>
+                )}
+              </span>
               <span className="mx-wizhint">{hint}</span>
             </label>
             {slots[k] || null}
@@ -181,7 +193,8 @@ export function MeshWizardStepBody({ step, fields = {}, secrets = {}, draft = {}
 // behind the typed STAND UP gate — surfaced where the human is actually stuck: staring at an empty
 // management-URL field with no server to point it at. Pure body; the handlers live in the wizard.
 export function MeshWizardProvisionBody({ step, planned = false, busy = false, err = null, note = null,
-                                          resolvedUrl = null, missing = [], onPlan, onProvision, onAdopt }) {
+                                          resolvedUrl = null, missing = [], dash = null,
+                                          onPlan, onProvision, onAdopt, onDashboard }) {
   return (
     <div className="mx-wizprov" data-testid="mesh-wizard-provision">
       <div className="mx-wizprovhead">no management server yet? install one here</div>
@@ -227,6 +240,22 @@ export function MeshWizardProvisionBody({ step, planned = false, busy = false, e
                     onClick={onAdopt}>
               use this plane{resolvedUrl ? ` (${resolvedUrl})` : ''}
             </button>
+          )}
+          {/* The OPTIONAL web dashboard, offered once the plane exists. 'cannot' (no plane yet) is
+              deliberately silent here — the install button above IS the fix for that. */}
+          {dash && dash.status === 'already-present' && (
+            <div className="mx-meshnote" data-testid="mesh-wizard-dashboard-running">
+              web dashboard: running — {dash.detail}
+            </div>
+          )}
+          {dash && dash.status === 'planned' && (
+            <div className="mx-wizinrow">
+              <button type="button" className="mx-wizprovuse" disabled={busy} data-testid="mesh-wizard-dashboard-go"
+                      title={`${dash.action || ''} — the optional web UI. Starts one extra container; sign-in needs an OIDC provider (the receipt names the env).`}
+                      onClick={onDashboard}>
+                🖥 enable web dashboard
+              </button>
+            </div>
           )}
         </>
       )}
@@ -279,8 +308,8 @@ export function MeshWizardReviewBody({ fields = {}, secrets = {}, draft = {} }) 
 // onProvision performs the (typed-gate) mesh-control-plane stand-up and resolves to the FRESH
 // config read, from which the wizard fills the management URL — never clobbering one the human
 // already typed. The one act a provision performs on the wizard's draft is filling that field.
-export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSave, onClose, busy = false, err = null,
-                             provision = null, onPlanProvision = null, onProvision = null }) {
+export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, suggest = {}, onSave, onClose, busy = false, err = null,
+                             provision = null, onPlanProvision = null, onProvision = null, onDashboard = null }) {
   const [i, setI] = useState(0);
   const [fields, setFields] = useState({ ...initialFields });
   const [draft, setDraft] = useState({});
@@ -329,6 +358,7 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
         <MeshWizardProvisionBody step={provision.step} planned={provision.planned}
                                  busy={busy || provision.busy} err={provision.err} note={provNote}
                                  resolvedUrl={provision.resolvedUrl} missing={provision.missing || []}
+                                 dash={provision.dash || null} onDashboard={onDashboard}
                                  onPlan={onPlanProvision} onProvision={provisionNow}
                                  onAdopt={() => adoptUrl(provision.resolvedUrl, 'the plane already running on this host')} />
       ) }
@@ -373,7 +403,7 @@ export function MeshWizard({ machineKey, initialFields = {}, secrets = {}, onSav
                 <MeshWizardReviewBody fields={fields} secrets={secrets} draft={draft} />
               </>
             : <MeshWizardStepBody step={step} fields={fields} secrets={secrets} draft={draft} busy={busy}
-                                  slots={provisionSlot}
+                                  slots={provisionSlot} suggest={suggest}
                                   setField={(k, v) => setFields((f) => ({ ...f, [k]: v }))}
                                   setSecret={(k, v) => setDraft((d) => ({ ...d, [k]: v }))} />}
           {err && <div className="mx-mesherr">{err}</div>}
@@ -565,6 +595,7 @@ function MeshSections({ m, projectId, onChanged }) {
   const [cfgErr, setCfgErr] = useState(null);
   const [cfgNote, setCfgNote] = useState(null);
   const [plan, setPlan] = useState(null);          // undefined = not planned; null = no step
+  const [dashStep, setDashStep] = useState(null);  // the OPTIONAL mesh-dashboard step, same plan
   const [planned, setPlanned] = useState(false);
   const [planErr, setPlanErr] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -606,9 +637,10 @@ function MeshSections({ m, projectId, onChanged }) {
       const r = await planBuildBootstrap(projectId, m.id);
       // A refused plan (an unreachable daemon) is not "this machine has no control-plane step" —
       // say why, rather than letting the host-only note take the blame.
-      if (r?.refused || r?.status === 'refused') { setPlan(null); setPlanErr(r.refused || r.reason || 'the bootstrap refused'); setPlanned(true); return; }
+      if (r?.refused || r?.status === 'refused') { setPlan(null); setDashStep(null); setPlanErr(r.refused || r.reason || 'the bootstrap refused'); setPlanned(true); return; }
       const steps = r?.plan || r?.steps || [];
       setPlan(steps.find((s) => s.kind === 'mesh-control-plane') || null);
+      setDashStep(steps.find((s) => s.kind === 'mesh-dashboard') || null);
       setPlanned(true);
     } catch (e) { setPlanErr(e.message || String(e)); setPlanned(true); }
     finally { setBusy(false); }
@@ -688,6 +720,32 @@ function MeshSections({ m, projectId, onChanged }) {
     finally { setBusy(false); }
   };
 
+  // The OPTIONAL dashboard: its own confirm modal (per the house preference for modals over
+  // navigation), its own kinds-scoped perform, and the receipt read the same way standUp reads
+  // its own — a failed enable is an error carrying the step's detail, never a silent nothing.
+  const enableDashboard = async () => {
+    const okd = await showConfirm(
+      `Enable the NetBird web dashboard on ${m.key}?\n\n`
+      + 'Starts ONE extra container (compose service netbird-dashboard) publishing the web UI on '
+      + 'this host. Sign-in needs an OIDC provider — without one the page loads but nobody can '
+      + 'log in; the receipt names the env to set.',
+      { title: 'Enable dashboard?', okLabel: 'Enable dashboard', variant: 'info' });
+    if (!okd) return;
+    setBusy(true); setPlanErr(null);
+    try {
+      const r = await performBuildBootstrap(projectId, m.id, 'human@console', ['mesh-dashboard']);
+      const res = (r?.results || []).find((s) => s.kind === 'mesh-dashboard') || null;
+      if (!res || (res.status !== 'created' && res.status !== 'already-present')) {
+        setPlanErr(res?.detail || r?.reason || 'the dashboard step did not run');
+        showAlert(`The dashboard was NOT enabled on ${m.key}${res ? ` (${res.status})` : ''}:\n\n${res?.detail || r?.reason || ''}`, { variant: 'error' });
+      } else {
+        showAlert(res.detail, { variant: 'info' });
+      }
+      await loadPlan();
+    } catch (e) { setPlanErr(e.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="mx-meshsections">
       <MeshConfigSummaryBody fields={fields} secrets={storedSecrets} editable={cfg?.editable !== false}
@@ -695,11 +753,13 @@ function MeshSections({ m, projectId, onChanged }) {
                              err={cfgErr} note={cfgNote} />
       {wizardOpen && (
         <MeshWizard machineKey={m.key} initialFields={fields} secrets={storedSecrets} busy={saving}
+                    suggest={cfg?.suggested || {}}
                     onSave={save} onClose={() => setWizardOpen(false)} err={cfgErr}
-                    provision={{ step: plan, planned, busy, err: planErr,
+                    provision={{ step: plan, planned, busy, err: planErr, dash: dashStep,
                                  resolvedUrl: cfg?.resolved?.values?.api_url || null,
                                  missing: cfg?.resolved?.readiness?.missing || [] }}
-                    onPlanProvision={loadPlan} onProvision={() => standUp(plan)} />
+                    onPlanProvision={loadPlan} onProvision={() => standUp(plan)}
+                    onDashboard={enableDashboard} />
       )}
       <MeshStandUpBody step={plan} planned={planned} busy={busy} err={planErr}
                        onPlan={loadPlan} onPerform={() => standUp(plan)} />

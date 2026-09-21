@@ -449,10 +449,20 @@ async function activeMeshRow() {
 // `values` is what the ROW holds. They differ exactly when the env is doing the work — which is
 // the question a human looking at an empty form is asking.
 export async function meshConfigFor(machineId) {
-  const machine = await one(`SELECT id, key, docker_ctx FROM machine WHERE id=$1`, [machineId]);
+  const machine = await one(`SELECT id, key, docker_ctx, host_ip FROM machine WHERE id=$1`, [machineId]);
   if (!machine) throw new Error('machine not found');
   const row = (await one(`SELECT * FROM mesh_config WHERE machine_id=$1`, [machineId])) || {};
   const resolved = resolveMeshConfig(row, envSnapshot());
+  // SUGGESTED values for the endpoint fields the console can offer as one-click defaults: the
+  // machine's own address on the resolved published ports, in the SHAPES the shipped example
+  // uses (management.json.example: Relay.Addresses "relay://host:port", Signal.URI bare
+  // "host:port"). Computed HERE so the console never invents an address format — and null when
+  // the machine has no recorded host_ip, because a wrong suggestion is worse than none.
+  const suggested = machine.host_ip
+    ? { relay_endpoint: `relay://${machine.host_ip}:${resolved.values.relay_port}`,
+        signal_uri: `${machine.host_ip}:${resolved.values.signal_port}`,
+        management_url: `https://${machine.host_ip}:${resolved.values.mgmt_api_port}` }
+    : { relay_endpoint: null, signal_uri: null, management_url: null };
   const hintOf = (f) => secretHint(f, row[f]);
   const isHost = machine.docker_ctx === queenzeeHostCtx();
   return {
@@ -490,6 +500,7 @@ export async function meshConfigFor(machineId) {
     },
     // Write-only: nothing here is the secret. `set` is what a form needs to say "leave as is".
     secrets: Object.fromEntries(SECRET_FIELDS.map((f) => [f, { set: Boolean(row[f]), hint: hintOf(f) }])),
+    suggested,
     resolved: publicResolved(resolved),
     updated_at: row.updated_at ?? null,
     updated_by: row.updated_by ?? null,

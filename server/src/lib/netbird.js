@@ -107,6 +107,11 @@ export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
 // (needs an OIDC provider). Both would crash-loop with an empty key/OIDC and make a good stand-up
 // look failed; the operator brings them up once the env below exists.
 export const MESH_CONTROL_PLANE_SERVICES = ['netbird-management', 'netbird-signal', 'netbird-relay'];
+// The OPTIONAL web UI — deliberately NOT in MESH_CONTROL_PLANE_SERVICES: the mesh works without
+// it, and it is enabled by its own opt-in step (build-bootstrap `mesh-dashboard`), never as a
+// side effect of the stand-up or of an unscoped bootstrap.
+export const MESH_DASHBOARD_SERVICE = 'netbird-dashboard';
+export const MESH_DASHBOARD_CONTAINER = 'zeehive_netbird_dashboard';
 
 // ── the stand-up health check (docs/netbird-mesh-plan.md §3.1 / §11 NOT-done #1) ────────────────
 // The control plane is stood up BEFORE the operator can set NETBIRD_API_URL (that env points the

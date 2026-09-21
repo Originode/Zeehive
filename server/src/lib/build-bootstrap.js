@@ -31,7 +31,9 @@ import { config } from '../config.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
 import { sharedDevDb, provisionDevDb, queenzeeHostCtx } from './machines.js';
 import { meshEnabled, mintPeer, netbirdRequest, probeManagementApi,
-         MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } from './netbird.js';
+         MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES,
+         MESH_DASHBOARD_CONTAINER, MESH_DASHBOARD_SERVICE } from './netbird.js';
+import { probeTcp } from './mesh-routes.js';
 // The production first-PAT bootstrap (the store seed under the version pin) and the console's mesh
 // config it is read from. Imported, not re-implemented: this step stands the plane up, the config
 // tells it WHAT to stand up, and netbird-bootstrap.js mints the account the ManagerType-none plane
@@ -432,6 +434,38 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
         status: 'planned', detail: null, stderr: null,
       });
     }
+
+    // MESH DASHBOARD — the OPTIONAL web UI, reported so the console can offer it, and OPT-IN to
+    // perform: the perform loop skips this kind unless `kinds` names it explicitly, so an
+    // unscoped bootstrap can never enable a UI nobody asked for. Without a running management
+    // it is a 'cannot' (a dashboard pointing at nothing is a login page to nowhere).
+    if (!insp.unknown) {
+      const mgmtRunning = insp.status === 0 && /running/i.test((insp.stdout || '').trim());
+      const dins = await docker(machine.docker_ctx,
+        ['inspect', MESH_DASHBOARD_CONTAINER, '--format', '{{.State.Status}}']);
+      if (!dins.unknown && dins.status === 0 && /running/i.test((dins.stdout || '').trim())) {
+        steps.push({
+          kind: 'mesh-dashboard', target: machine.docker_ctx,
+          why: 'the NetBird dashboard is running', action: null, status: 'already-present',
+          detail: `container '${MESH_DASHBOARD_CONTAINER}' is running`, stderr: null,
+        });
+      } else if (mgmtRunning) {
+        steps.push({
+          kind: 'mesh-dashboard', target: machine.docker_ctx,
+          why: 'the optional NetBird web dashboard is not running',
+          action: `docker compose --profile mesh up -d ${MESH_DASHBOARD_SERVICE}`,
+          status: 'planned', detail: null, stderr: null,
+        });
+      } else {
+        steps.push({
+          kind: 'mesh-dashboard', target: machine.docker_ctx,
+          why: 'the dashboard needs a running control plane', action: null, status: 'cannot',
+          detail: 'the management service is not running — stand the control plane up first; '
+            + 'a dashboard pointing at nothing is a login page to nowhere.',
+          stderr: null,
+        });
+      }
+    }
   }
 
   // MESH MACHINE PEER (docs/netbird-mesh-plan.md §3.2 phase 2): the bootstrap CARD is the
@@ -464,7 +498,8 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
   // mesh control plane are the queenzee's own control-plane objects, not this project's DEV
   // prerequisites, so neither triggers the docker disclosure.
   const createNames = steps
-    .filter((s) => s.status === 'planned' && s.kind !== 'mesh-machine-peer' && s.kind !== 'mesh-control-plane')
+    .filter((s) => s.status === 'planned' && s.kind !== 'mesh-machine-peer' && s.kind !== 'mesh-control-plane'
+                   && s.kind !== 'mesh-dashboard')
     .map((s) => s.target);
   let disclosure = null;
   if (createNames.length) {
@@ -737,6 +772,72 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
              stderr: null };
   }
 
+  if (step.kind === 'mesh-dashboard') {
+    // The optional web UI: one compose service, same compose-file resolution and image-pull
+    // budget as the stand-up. The management endpoints ride as env so the dashboard talks to the
+    // SAME plane a browser can reach (the machine's published ports, never the compose-internal
+    // name a browser cannot resolve). OIDC is the operator's: without AUTH_* env the container
+    // still serves, and the receipt says exactly what login needs.
+    const insp = await docker(machine.docker_ctx,
+      ['inspect', MESH_DASHBOARD_CONTAINER, '--format', '{{.State.Status}}']);
+    if (!insp.unknown && insp.status === 0 && /running/i.test((insp.stdout || '').trim())) {
+      return { status: 'already-present',
+               detail: `container '${MESH_DASHBOARD_CONTAINER}' is already running`, stderr: null };
+    }
+    const resolvedCompose = await resolveMeshComposeFile();
+    if (!resolvedCompose.file) {
+      return { status: 'cannot',
+               detail: `the queenzee's compose file was not found — tried ${resolvedCompose.tried.map((p) => `'${p}'`).join(', ')
+                 || '(nothing configured)'}. Set MESH_COMPOSE_FILE and re-run.`,
+               stderr: null };
+    }
+    const performer = await meshResolvedForPerformer(machine.id);
+    const v = performer.values;
+    const env = { ...composeEnvFor(v) };
+    if (machine.host_ip) {
+      env.NETBIRD_MGMT_API_ENDPOINT = env.NETBIRD_MGMT_API_ENDPOINT || `https://${machine.host_ip}:${v.mgmt_api_port}`;
+      env.NETBIRD_MGMT_GRPC_API_ENDPOINT = env.NETBIRD_MGMT_GRPC_API_ENDPOINT || `https://${machine.host_ip}:${v.mgmt_grpc_port}`;
+    }
+    const up = await docker(machine.docker_ctx,
+      ['compose', '-f', resolvedCompose.file, '--profile', 'mesh', 'up', '-d', MESH_DASHBOARD_SERVICE],
+      { env, timeout: MESH_COMPOSE_UP_TIMEOUT_MS });
+    if (up.unknown) {
+      return { status: 'failed', detail: `could not run compose on '${machine.docker_ctx}': ${up.reason}`, stderr: null };
+    }
+    if (up.status !== 0) {
+      return { status: 'failed',
+               detail: `docker compose --profile mesh up ${MESH_DASHBOARD_SERVICE} failed from '${resolvedCompose.file}'`,
+               stderr: (up.stderr || up.stdout || '').trim() };
+    }
+    // A bounded dial on the published port (nginx + static files — quick once the image is there).
+    const dial = mesh.probeDash || probeTcp;
+    let served = 'unprobed (no recorded host_ip to dial)';
+    if (machine.host_ip) {
+      let verdict = 'unknown';
+      for (let i = 0; i < 10; i++) {
+        verdict = await dial(machine.host_ip, v.dashboard_port, 2000);
+        if (verdict === 'ok') break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (verdict !== 'ok') {
+        return { status: 'failed',
+                 detail: `the dashboard container started but http://${machine.host_ip}:${v.dashboard_port} `
+                   + `is not answering (${verdict}) — check its logs.`,
+                 stderr: null };
+      }
+      served = `http://${machine.host_ip}:${v.dashboard_port}`;
+    }
+    const authMissing = ['NETBIRD_AUTH_AUTHORITY', 'NETBIRD_AUTH_CLIENT_ID', 'NETBIRD_AUTH_AUDIENCE']
+      .filter((k) => !process.env[k]);
+    return { status: 'created',
+             detail: `dashboard up — ${served}. `
+               + (authMissing.length
+                 ? `Sign-in needs an OIDC provider: set ${authMissing.join(', ')} (and its redirect URI) on the `
+                   + `queenzee, then re-run this step to recreate the container with them.`
+                 : 'OIDC env present — sign-in is the provider\'s.'),
+             stderr: null };
+  }
+
   if (step.kind === 'mesh-machine-peer') {
     // The bootstrap CARD's mesh half (§3.2): mint the machine's peer + one-time setup key. The key
     // is returned ONCE — it rides the step result (the human-approved action's receipt) and is
@@ -841,6 +942,9 @@ export async function performBuildBootstrap(projectId, machineId,
     // so the audit records it, but never hand it to the performer.
     if (step.kind === 'disclosure' || step.status === 'cannot') { results.push(step); continue; }
     if (kinds && !kinds.includes(step.kind)) continue;   // scoped action: leave unrelated steps alone
+    // The dashboard is OPT-IN ONLY: an unscoped bootstrap (the machine 🔧 card) must never enable
+    // an optional UI as a side effect — it performs only when `kinds` names it explicitly.
+    if (step.kind === 'mesh-dashboard' && !(kinds || []).includes('mesh-dashboard')) continue;
     results.push({ ...step, ...(await performStep(step, machine, project, { docker, provisionDb, mesh })) });
   }
 
