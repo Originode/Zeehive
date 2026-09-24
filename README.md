@@ -231,7 +231,28 @@ npm run dev            # API (queenzee + routes) + web console together
 ```
 
 Tests are standalone Node scripts in `test/` — run one directly:
-`node test/<name>.test.mjs`. There is no `npm test`.
+`node test/<name>.test.mjs`. `npm test` sweeps all of them through
+**[scripts/run-tests.mjs](scripts/run-tests.mjs)**, which measures each one by its **process exit
+code** (the terminal summary rides along for the human) and exits nonzero if any test did not exit
+0 — so a failing test is a red build, not a line somebody has to notice.
+
+```sh
+npm test                          # the whole suite, exit code = the verdict
+npm test -- provision zee         # only files whose name contains a term
+npm test -- --list                # what would run
+npm test -- --json                # machine-readable verdicts
+npm test -- --strict              # also fail a test that printed a failure but exited 0
+```
+
+A test that prints its assertion marker and still exits 0 is *reported* (`⚠ advisory`) rather than
+silently read as green — but it does not change the verdict, because the exit code is the instrument
+that cannot be produced by the other case. `--strict` is how you make that advisory fatal.
+
+**Never measure a test by grepping its output for a word.** The suite's printed lines are full of
+descriptions of healthy scenarios (`app-build FAILS, classed INFRA` is a section header printed on
+every green run), so `grep -i fail` reads a passing suite as a bloodbath — and a test whose exit
+code is wrong hides behind a passing word the same way. The rule, the sweep and the instruments in
+order of authority: [docs/test-suite-measurement-decision-record.md](docs/test-suite-measurement-decision-record.md).
 
 ZEEHIVE is its own first project: work on it happens in xells like any other project. A Zeehive
 xell gets its own per-xell meta-DB container, and the nested queenzee inside it runs with
