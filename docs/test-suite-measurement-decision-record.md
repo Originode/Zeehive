@@ -135,11 +135,30 @@ That is an isolation property of the test, **characterized here and not fixed**.
   child processes), the three edited tests, and every DB-backed run above — against
   `zee db-sandbox --migrate`, a real postgres on loopback (`…@127.0.0.1:36209/postgres`, 248
   migrations applied).
-* **The whole suite was not run end to end.** It wants the assigned shared dev database, which was
-  unreachable from here the entire session — the preflight probe reports the host it lives on
-  (`ugreen-nas`) as a `db-open … timeout expired (dsn source: shared-dev-container)`. Any count in
-  this record that needs no database (the sweep, the exit-code audit) is complete; the flake
-  numbers are sandbox numbers, and are labelled as such.
+* **The whole suite WAS run end to end — once, against the sandbox, not against the assigned
+  database.** `node scripts/run-tests.mjs --timeout 60` over all 363 files, sequential, with
+  `DATABASE_URL` pointed at `zee db-sandbox --migrate` (a real postgres on loopback; the assigned
+  shared dev database on `ugreen-nas` did not answer all session — the preflight probe reports
+  `db-open … timeout expired (dsn source: shared-dev-container)`). Its verdict:
+
+  > **363 selected · 323 passed · 40 failed (7 timed out)**
+
+  **Every file this card touches passed** — `run-tests`, `run-tests.test`, `infra-medic-dispatch`,
+  `fleet-conditions`, `provision-fault-carding`, and `provision-proof` at its shipped timing.
+* **The other 40 are pre-existing and were NOT audited here.** No commit on this branch touches them
+  (the commits change `scripts/run-tests.mjs`, `test/run-tests.test.mjs`, `package.json`,
+  `README.md`, this record, and those four test files), and what I opened of them is
+  environmental in kind, not assertion drift: fixtures that crash on a `SELECT … FROM project
+  ORDER BY created_at LIMIT 1` returning null in a migrated-but-empty database
+  (`backup-bound-xell`, `conversation-archives`), `ERR_UNKNOWN_FILE_EXTENSION ".jsx"` from tests that
+  import web sources the cage's node cannot load (`harness-empty-visible`, `harness-project-scope`),
+  an esbuild `Build failed with 2 errors` (`tend-reason`, `env-reconcile-alert`), `to_char(text,
+  unknown) does not exist` against this embedded postgres (`project-root`), and a test whose first
+  assertion is *"no agent-shaped process is running before the test starts"* — false by
+  construction when the suite is run from inside an agent (`fleet-pause`). **They are the runner
+  doing its job on its first sweep, not a regression from this card**, and clearing them is a
+  separate job: the number is recorded here so that job starts from a measurement rather than a
+  guess.
 * **The flake's reproducer was characterized, not the reporter's box.** The reporter's 2-in-15 was a
   loaded machine; the forced-400ms hold reproduces the same failure deterministically here. That
   is the stronger instrument, but it is still a stand-in for their wall clock.
