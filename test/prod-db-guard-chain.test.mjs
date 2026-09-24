@@ -159,5 +159,25 @@ console.log('nothing running at all → the logical name is inspected and fails 
     'no candidates → fallback → the guard cannot inspect it → REFUSED');
 }
 
+// ── 6. WHAT THIS DOES NOT CLOSE — stated, so nobody over-trusts it ───────────────────────────────
+// A container that BOTH extends the row's name AND publishes the recorded port IS accepted, and the
+// registry then holds no further fact that could refuse it. What stands between that shape and a
+// wrong write is the registry's OWN rows: a dev clone is a registered container (its own tier=dev
+// row), so the exclusion set removes it even when it publishes the prod port.
+console.log('the registered clone is removed by the REGISTRY, not by the address');
+{
+  const clone = 'omnibiz_db_prod_dev_local_mardale_prod';
+  const d = daemon([{ name: clone, publishes: [5432] }]);      // it even binds the prod port
+  const reg = resolveThenGuard(d, PROD_ROW, new Set([clone]));
+  ok(reg.pick.name !== clone && reg.verdict.ok === false,
+    'a REGISTERED sibling — even publishing 5432 — is never accepted as prod');
+
+  // With NO row of its own, nothing left in the registry distinguishes it from the real container.
+  const un = resolveThenGuard(d, PROD_ROW, new Set());
+  ok(un.pick.name === clone && un.verdict.ok === true,
+    'RESIDUAL: an UNREGISTERED name-extension publishing the recorded port is still accepted — the '
+    + 'guard has no further registry fact to refuse it. This is why a clone must have its own row.');
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : '\nall checks passed');
 process.exitCode = failures ? 1 : 0;
