@@ -107,6 +107,15 @@ export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
 // (needs an OIDC provider). Both would crash-loop with an empty key/OIDC and make a good stand-up
 // look failed; the operator brings them up once the env below exists.
 export const MESH_CONTROL_PLANE_SERVICES = ['netbird-management', 'netbird-signal', 'netbird-relay'];
+// Service → container, so the stand-up can ask after EACH service rather than treating management
+// as the whole plane. It is not: live 2026-09-24 management was healthy while the relay had never
+// started (empty NB_EXPOSED_ADDRESS until an endpoint was configured), and a management-only
+// liveness read reported "nothing to stand up" — leaving no way to bring the relay up at all.
+export const MESH_CONTROL_PLANE_CONTAINERS = {
+  'netbird-management': MESH_CONTROL_PLANE_CONTAINER,
+  'netbird-signal': 'zeehive_netbird_signal',
+  'netbird-relay': 'zeehive_netbird_relay',
+};
 // The OPTIONAL web UI — deliberately NOT in MESH_CONTROL_PLANE_SERVICES: the mesh works without
 // it, and it is enabled by its own opt-in step (build-bootstrap `mesh-dashboard`), never as a
 // side effect of the stand-up or of an unscoped bootstrap.

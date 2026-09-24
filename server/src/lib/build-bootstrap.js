@@ -31,7 +31,7 @@ import { config } from '../config.js';
 import { probeBuildReadiness, dockerAdapter } from './build-readiness.js';
 import { sharedDevDb, provisionDevDb, queenzeeHostCtx } from './machines.js';
 import { meshEnabled, mintPeer, netbirdRequest, probeManagementApi,
-         MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES,
+         MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES, MESH_CONTROL_PLANE_CONTAINERS,
          MESH_DASHBOARD_CONTAINER, MESH_DASHBOARD_SERVICE } from './netbird.js';
 import { probeTcp } from './mesh-routes.js';
 // The production first-PAT bootstrap (the store seed under the version pin) and the console's mesh
@@ -416,11 +416,32 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
         stderr: null,
       });
     } else if (insp.status === 0 && /running/i.test((insp.stdout || '').trim())) {
-      steps.push({
+      // Management is up — but it is NOT the whole plane. Ask after the siblings too: a relay that
+      // never started (no NB_EXPOSED_ADDRESS until an endpoint was configured) left this step
+      // reading 'already-present', which offered no action and so no way to bring it up.
+      const down = [];
+      for (const svc of MESH_CONTROL_PLANE_SERVICES) {
+        if (svc === 'netbird-management') continue;
+        const si = await docker(machine.docker_ctx,
+          ['inspect', MESH_CONTROL_PLANE_CONTAINERS[svc], '--format', '{{.State.Status}}']);
+        if (si.unknown) continue;   // cannot tell → never invent a fault
+        if (!(si.status === 0 && /running/i.test((si.stdout || '').trim()))) down.push(svc);
+      }
+      steps.push(down.length ? {
+        kind: 'mesh-control-plane', target: machine.docker_ctx,
+        why: `the NetBird control plane is INCOMPLETE on '${machine.docker_ctx}': ${down.join(', ')} not running`,
+        action: `docker compose --profile mesh up -d ${MESH_CONTROL_PLANE_SERVICES.join(' ')} `
+          + `(reconciles ${down.join(', ')}; management keeps running)`,
+        status: 'planned',
+        detail: `management is up; ${down.join(', ')} ${down.length > 1 ? 'are' : 'is'} not. `
+          + `A service that exits on startup is usually missing its config — the relay needs a relay `
+          + `endpoint set (Signal & relay in the wizard).`,
+        stderr: null,
+      } : {
         kind: 'mesh-control-plane', target: machine.docker_ctx,
         why: `the NetBird control plane runs on the queenzee's own context '${machine.docker_ctx}'`,
         action: null, status: 'already-present',
-        detail: `container '${MESH_CONTROL_PLANE_CONTAINER}' is running — nothing to stand up`,
+        detail: `${MESH_CONTROL_PLANE_SERVICES.join(', ')} are running — nothing to stand up`,
         stderr: null,
       });
     } else {
@@ -634,6 +655,58 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
                stderr: null };
     }
     const running = insp.status === 0 && /running/i.test((insp.stdout || '').trim());
+    // The plane is the THREE services, not management alone. When management is up but a sibling
+    // is down (the live relay case: no NB_EXPOSED_ADDRESS until an endpoint was configured), the
+    // compose up still has to run — it is idempotent, and it is the only thing that can start or
+    // recreate the stopped one. `compose up -d` leaves an unchanged, running container alone.
+    let siblingsDown = [];
+    if (running) {
+      for (const svc of MESH_CONTROL_PLANE_SERVICES) {
+        if (svc === 'netbird-management') continue;
+        const si = await docker(machine.docker_ctx,
+          ['inspect', MESH_CONTROL_PLANE_CONTAINERS[svc], '--format', '{{.State.Status}}']);
+        if (si.unknown) continue;
+        if (!(si.status === 0 && /running/i.test((si.stdout || '').trim()))) siblingsDown.push(svc);
+      }
+    }
+    let reconciled = false;
+    if (running && siblingsDown.length) {
+      const performer2 = await meshResolvedForPerformer(machine.id);
+      const rc = await resolveMeshComposeFile();
+      if (!rc.file) {
+        return { status: 'cannot',
+                 detail: `${siblingsDown.join(', ')} not running and the queenzee's compose file was not found — `
+                   + `tried ${rc.tried.map((p) => `'${p}'`).join(', ') || '(nothing configured)'}.`,
+                 stderr: null };
+      }
+      const rup = await docker(machine.docker_ctx,
+        ['compose', '-f', rc.file, '--profile', 'mesh', 'up', '-d', ...MESH_CONTROL_PLANE_SERVICES],
+        { env: composeEnvFor(performer2.values), timeout: MESH_COMPOSE_UP_TIMEOUT_MS });
+      if (rup.unknown || rup.status !== 0) {
+        return { status: 'failed',
+                 detail: `could not reconcile ${siblingsDown.join(', ')} on '${machine.docker_ctx}'`
+                   + (rup.unknown ? `: ${rup.reason}` : ''),
+                 stderr: rup.unknown ? null : (rup.stderr || rup.stdout || '').trim() };
+      }
+      // Report what is STILL down: a service that exits on startup (a relay with no exposed
+      // address) comes back down immediately, and saying "reconciled" then would be a lie.
+      const stillDown = [];
+      for (const svc of siblingsDown) {
+        const si = await docker(machine.docker_ctx,
+          ['inspect', MESH_CONTROL_PLANE_CONTAINERS[svc], '--format', '{{.State.Status}}']);
+        if (!si.unknown && !(si.status === 0 && /running/i.test((si.stdout || '').trim()))) stillDown.push(svc);
+      }
+      if (stillDown.length) {
+        const lg = await docker(machine.docker_ctx,
+          ['logs', '--tail', '15', MESH_CONTROL_PLANE_CONTAINERS[stillDown[0]]]);
+        return { status: 'failed',
+                 detail: `${stillDown.join(', ')} still not running after compose up. A control-plane `
+                   + `service that exits on startup is usually missing its config: the relay needs a `
+                   + `relay endpoint (Signal & relay in the wizard, then save and run this again).`,
+                 stderr: !lg.unknown ? ((lg.stderr || '') + (lg.stdout || '')).trim().slice(-2000) || null : null };
+      }
+      reconciled = true;
+    }
     let started = false;
     if (!running) {
       const mj = ensureManagementJson(file, { overrides: mjOverrides });
@@ -762,10 +835,10 @@ async function performStep(step, machine, project, { docker, provisionDb, mesh =
     // re-read that stays empty when an operator env token meant no row was recorded.
     const after = await meshResolvedForPerformer(machine.id);
     const managementUrl = after.values.api_url || hc.url || null;
-    return { status: started ? 'created' : 'already-present',
+    return { status: started || reconciled ? 'created' : 'already-present',
              ...(warning ? { warning } : {}),
              management_url: managementUrl,
-             detail: `control plane ${started ? 'brought up' : 'already running'} on '${machine.docker_ctx}' `
+             detail: `control plane ${started ? 'brought up' : reconciled ? `reconciled (started ${siblingsDown.join(', ')})` : 'already running'} on '${machine.docker_ctx}' `
                + `(${MESH_CONTROL_PLANE_SERVICES.join(', ')}) — the management API answered at `
                + `${hc.host}:${hc.port}. ${envLine} ${secretLine}`
                + (warning ? ` ${warning}` : ''),

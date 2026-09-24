@@ -520,7 +520,7 @@ try {
   // The control plane's container/service names live in lib/netbird.js — ONE authority the probe
   // (build-readiness.js) and this performer both read, so a button cannot check one container while
   // the step starts another.
-  const { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } =
+  const { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES, MESH_CONTROL_PLANE_CONTAINERS } =
     await import('../server/src/lib/netbird.js');
   const EXAMPLE = path.join(REPO, 'docker/zeehive/netbird/management.json.example');
   const exampleText = fs.readFileSync(EXAMPLE, 'utf8');
@@ -583,7 +583,7 @@ try {
      `the action names the three control-plane services [${cpStep?.action}]`);
 
   const dockerRunning = makeDocker({ reachable: true, networks: new Set(),
-    runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });
+    runningContainers: new Set(Object.values(MESH_CONTROL_PLANE_CONTAINERS)) });
   const planUp = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp), { docker: dockerRunning });
   const upStep = planUp.steps.find((s) => s.kind === 'mesh-control-plane');
   ok(upStep?.status === 'already-present' && /running/.test(upStep?.detail || ''),
@@ -640,6 +640,48 @@ try {
      `the health check rides a MINUTES budget, not the probe default [attempts=${probeOpts?.attempts} interval=${probeOpts?.intervalMs}ms]`);
   config.meshComposeFile = composeFile;
 
+  // ── THE PLANE IS THREE SERVICES, NOT ONE (live 2026-09-24) ───────────────────────────────────
+  // Management healthy + relay never started (no NB_EXPOSED_ADDRESS until an endpoint is set) read
+  // as 'already-present' — which offers NO action, so the relay could never be brought up.
+  const ALL_CP = new Set(['zeehive_netbird_management', 'zeehive_netbird_signal', 'zeehive_netbird_relay']);
+  const planAllUp = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp),
+    { docker: makeDocker({ networks: new Set(), runningContainers: ALL_CP }) });
+  const allUpStep = planAllUp.steps.find((s) => s.kind === 'mesh-control-plane');
+  ok(allUpStep?.status === 'already-present' && /netbird-relay/.test(allUpStep?.detail || ''),
+     'all three services running → already-present, naming what is up');
+  const partial = new Set(['zeehive_netbird_management', 'zeehive_netbird_signal']);   // relay DOWN
+  const planPartial = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp),
+    { docker: makeDocker({ networks: new Set(), runningContainers: partial }) });
+  const partialStep = planPartial.steps.find((s) => s.kind === 'mesh-control-plane');
+  ok(partialStep?.status === 'planned' && /netbird-relay/.test(partialStep?.why || ''),
+     `management up + relay down → a PLANNED step (an action exists), not already-present [${partialStep?.status}]`);
+  ok(/relay endpoint/.test(partialStep?.detail || ''), 'and the detail names the usual cause (no relay endpoint set)');
+  // Performing it reconciles via compose up — and reports honestly when the service exits again.
+  const dockerRecon = makeDocker({ networks: new Set(), runningContainers: partial });
+  const perfRecon = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerRecon,
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeOk } });
+  const reconRes = perfRecon.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(dockerRecon.calls.some((c) => /--profile mesh up -d netbird-management netbird-signal netbird-relay$/.test(c)),
+     'a down sibling makes the perform run compose up (idempotent) instead of skipping it');
+  ok(reconRes?.status === 'failed' && /still not running/.test(reconRes?.detail || '')
+     && /relay endpoint/.test(reconRes?.detail || ''),
+     'a service that stays down after compose up is reported FAILED with the likely cause, never "reconciled"');
+  // …and when it comes back up, the receipt says what it started.
+  const dockerRecon2 = makeDocker({ networks: new Set(), runningContainers: partial });
+  const origStub = dockerRecon2;
+  const dockerHeals = async (ctx, args, opts) => {
+    const r = await origStub(ctx, args, opts);
+    // ONLY the real `up -d` heals it — the readiness probe also runs `compose config -q`.
+    if (args[0] === 'compose' && args.includes('up')) partial.add('zeehive_netbird_relay');
+    return r;
+  };
+  dockerHeals.calls = origStub.calls;
+  const perfHeal = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerHeals,
+    provisionDb: makeProvision(), actor: 'tester@xell', kinds: ['mesh-control-plane'], mesh: { probeApi: probeOk } });
+  const healRes = perfHeal.results.find((s) => s.kind === 'mesh-control-plane');
+  ok(healRes?.status === 'created' && /reconciled \(started netbird-relay\)/.test(healRes?.detail || ''),
+     `a healed sibling reports created + what it started [${healRes?.detail?.slice(0, 60)}…]`);
+
   // ── THE OPTIONAL DASHBOARD (mesh-dashboard): reported in the plan, OPT-IN to perform ─────────
   // No plane → 'cannot'; plane running → 'planned'; and an UNSCOPED perform must never start it.
   const planNoMgmt = await planBuildBootstrap(await row('machine', mCp), await row('project', pCp),
@@ -692,7 +734,7 @@ try {
 
   // Idempotence: the container now answers 'running' → already-present, no second compose up.
   const dockerUp2 = makeDocker({ reachable: true, networks: new Set(),
-    runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });
+    runningContainers: new Set(Object.values(MESH_CONTROL_PLANE_CONTAINERS)) });
   const perfCp2 = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerUp2,
     provisionDb: makeProvision(), actor: 'tester@xell', mesh: { probeApi: probeOk } });
   const cpRes2 = perfCp2.results.find((s) => s.kind === 'mesh-control-plane');
@@ -840,7 +882,7 @@ try {
   // A second stand-up must NOT re-mint: the token resolves from the store now.
   let bootCalls = 0;
   const dockerPat2 = makeDocker({ reachable: true, networks: new Set(),
-    runningContainers: new Set([MESH_CONTROL_PLANE_CONTAINER]) });
+    runningContainers: new Set(Object.values(MESH_CONTROL_PLANE_CONTAINERS)) });
   const perfPat2 = await performBuildBootstrap(pCp, mCp, { dryRun: false, docker: dockerPat2,
     provisionDb: makeProvision(), actor: 'tester@console', mesh: {
       probeApi: probeOk,
