@@ -94,6 +94,16 @@ if (!hasGrok) {
     ok((after.stderr + after.stdout).trim().length > 0 && after.status !== null,
        'and the CLI itself ran — it exits on its own diagnostics (no Grok account here), not on a '
        + 'bash exec failure');
+
+    // The empty prompt is the one case a file-based door could regress into something worse than an
+    // argv one: an empty PROMPT ARGUMENT is rejected, but an empty prompt FILE could be read as "no
+    // prompt given" and drop the CLI into an interactive session that never returns. It does not —
+    // grok refuses it, exactly as `-p ""` did, and it exits rather than hanging.
+    const empty = spawnSync('bash', ['-lc', `cd ${dir} && ${fresh}`],
+      { input: '', env: bare, encoding: 'utf8', timeout: 30000 });
+    ok(empty.status !== null && empty.status !== 0 && !empty.signal,
+       `an EMPTY prompt still fails fast and loudly (exit ${empty.status}, signal ${empty.signal}) `
+       + '— it does not fall through to an interactive session that hangs the turn');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
