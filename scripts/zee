@@ -584,7 +584,7 @@ function usage() {
   zee infra bootstrap --plan --machine <id> [--project <name|id>]   the DRY-RUN plan performBuildBootstrap already computes for the target (NOT gated, performs nothing)
   zee infra bootstrap --perform --machine <id> [--project <name|id>] [--reason "..."]   HUMAN-GATED CARD on the TARGET → the queenzee performs on approval (the console 🔧 as a verb: creates only manifest-declared DEV infra, never invents/removes, dev-only guard intact)
   zee infra settings [--project <name|id>]   NON-SECRET projection of a TARGET project's settings (manifest cache, pool_config, machines + machine_pool, containers, deploy sites) — never a token or password
-  zee infra propose --change '<json>' --reason "..." [--project <name|id>]   HUMAN-GATED settings card on the TARGET (pool knobs, registry, machine priority, manifest-cache refresh) → the queenzee applies on approval; who asked, what changed, recorded
+  zee infra propose --change '<json>' --reason "..." [--project <name|id>]   HUMAN-GATED settings card on the TARGET → the queenzee applies on approval; who asked, what changed, recorded. Sections: pool_config {target_ready, readiness_proof, default_db_coupling, default_build_ctx, backup_ctx, refresh_interval_sec}, project {registry}, manifest_refresh:true, plus the two MACHINE-KEYED ones — machine_pool {'<machine-key>': {pool_size, dev_priority}} (this project's spawn preference: the highest dev_priority with room gets its next dev xell) and machines {'<machine-key>': {can_build, max_xells}}. machines.<key>.dev_priority is REFUSED: that column is deprecated since 038 and no picker reads it — the priority is machine_pool.<machine-key>.dev_priority
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
@@ -830,7 +830,7 @@ switch (cmd) {
     if (sub === 'propose') {
       const change = flag('change');
       const reason = flag('reason');
-      if (!change) { console.error('infra propose needs --change "<json>" — the settings patch (pool knobs, registry, machine priority, manifest refresh)'); process.exit(1); }
+      if (!change) { console.error('infra propose needs --change "<json>" — the settings patch (pool_config knobs, registry, manifest refresh, and the MACHINE-KEYED machine_pool {pool_size, dev_priority} / machines {can_build, max_xells})'); process.exit(1); }
       if (!reason) { console.error('infra propose needs --reason "…" — it is what the human reads on the card'); process.exit(1); }
       out(await req('POST', '/api/xell/self/infra/propose', { change, reason, project: proj }));
       break;
