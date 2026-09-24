@@ -45,6 +45,7 @@ const { dbContentVerdict, DB_CONTENT_SQL } = await import('../server/src/lib/row
 const { runPreflight, preflightXell, checkDbContent, contentRemedy } = await import('../server/src/lib/preflight.js');
 const { proofConditionLine } = await import('../server/src/lib/proof-policy.js');
 const { hiveStatus } = await import('../server/src/lib/hive-status.js');
+const { briefing } = await import('../server/src/queenzee/intake.js');
 
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
 const dsnFor = (db) => String(new URL(url.replace(/^postgres(ql)?:/, 'http:')))
@@ -176,6 +177,13 @@ try {
     ok(/db-data:/.test(line || '') && /zee db-catchup --restore/.test(line || ''),
        'and the ZEE\'s briefing carries it, with the remedy');
     ok(!/FAILING/.test(line || ''), '…worded as a warning, never as a preflight FAILURE');
+    // …through the REAL briefing composer, not just the pure renderer: the row → the SELECT → the
+    // block → the text a dispatched zee actually wakes up to.
+    const b = await briefing(x.id, { id: null, name: 'test-zee', viewer_url: null }, 'do the thing');
+    ok(b.includes('Your own proof state') && b.includes('zee db-catchup --restore'),
+       'the dispatched zee\'s BRIEFING carries the empty-db warning and the remedy');
+    ok(b.indexOf('Your own proof state') < b.indexOf('## Your task'),
+       '…positioned above the task, like the conditions block');
   }
 
   if (dsnRows) {
