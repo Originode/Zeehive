@@ -10,7 +10,8 @@ import { showAlert, showPrompt } from './Dialog.jsx';
 // One control, two states, and the state it is IN is the thing it must communicate: an operator who
 // cannot tell at a glance whether the fleet is stopped will assume it is running (that is the safer-
 // feeling assumption and it is the wrong one), dispatch into it, and be told no. So the button changes
-// word, colour and pulse, and while paused the whole statusline carries a banner beside it.
+// GLYPH, colour and pulse — it went icon-only in 449603a, so the word it used to carry is now the
+// tooltip's job — and while paused the whole statusline carries a banner beside it.
 //
 // A pause is NOT confirmed, deliberately. It is the one control on this page whose entire value is
 // being fast: it interrupts turns, destroys nothing, moves no gate and is undone by pressing it again,

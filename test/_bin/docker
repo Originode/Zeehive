@@ -89,10 +89,19 @@ if [ -n "${DOCKER_FAKE_EXEC_EXIT:-}" ]; then
   echo "fake docker: refusing (DOCKER_FAKE_EXEC_EXIT=${DOCKER_FAKE_EXEC_EXIT})" >&2
   exit "$DOCKER_FAKE_EXEC_EXIT"
 fi
+# CAGE-ENV simulation: the read the resume makes to recover the env the cage was SPAWNED with. The
+# default is the two lines every earlier test depended on, byte for byte, so nothing already passing
+# changes. DOCKER_FAKE_CAGE_ENV_FILE states a DIFFERENT cage (a fuller /etc/environment — the
+# every-provider set, the git author, a stale api address — or one with no identity line at all), and
+# DOCKER_FAKE_CAGE_ENV_EXIT makes the read FAIL (a torn-down cage), which is precisely the case the
+# resume used to swallow silently. The exit is reported even when a file is given, so a test can prove
+# the caller surfaces a read that could not be made.
 for a in "$@"; do
   if [ "$a" = "/etc/environment" ]; then
-    printf 'ANTHROPIC_AUTH_TOKEN=sk-ant-fake-tok\nZEEHIVE_XELL_TOKEN=fake-ident-tok\n'
-    exit 0
+    if [ -n "${DOCKER_FAKE_CAGE_ENV_FILE:-}" ]; then cat "$DOCKER_FAKE_CAGE_ENV_FILE"; else
+      printf 'ANTHROPIC_AUTH_TOKEN=sk-ant-fake-tok\nZEEHIVE_XELL_TOKEN=fake-ident-tok\n'
+    fi
+    exit "${DOCKER_FAKE_CAGE_ENV_EXIT:-0}"
   fi
 done
 exit 0
