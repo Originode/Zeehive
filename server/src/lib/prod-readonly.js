@@ -34,6 +34,29 @@ export function roRoleName(slug) {
   return `zee_ro_${String(slug || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40)}`;
 }
 
+// The META-DB reader's role name — deliberately NOT roRoleName, and the reason is a measured fault.
+//
+// Both readers used to mint the SAME role name. On a project that orchestrates ITSELF (Zeehive: the
+// meta-DB IS production) one cluster therefore held ONE role that two mints wrote: the manager bind
+// ran `CREATE/ALTER ROLE zee_ro_<slug> PASSWORD <A>` and stored that DSN as xell.prod_ro_dsn (→
+// DATABASE_URL), and the infra-medic bind that follows ran `ALTER ROLE zee_ro_<slug> PASSWORD <B>`
+// on the same cluster and stored THAT as xell.meta_ro_dsn (→ ZEEHIVE_META_RO_DSN). The second mint
+// rotated the password out from under the first: the file named the same role, on the same host,
+// twice, with two different passwords — and the one it calls DATABASE_URL was refused (28P01) while
+// the next line worked. Nothing was mis-emitted; the TWO MINTS collided, so the fix belongs here.
+//
+// A distinct name per door is what makes the collision impossible: each mint owns its own role,
+// rotates only its own password, and neither can invalidate the other's credential. The two readers
+// stay separate privileges on purpose (the manager's prod reader and the medic's meta reader are
+// granted by different code paths against different databases).
+//
+// NOTE for the next reader: xells minted BEFORE this split hold their meta-RO role under the OLD
+// shared name, so dropMetaReader (which now drops only the new name) will not reclaim those — a
+// SELECT-only role left on the meta-DB when such a xell is reaped. See the report on this change.
+export function metaRoRoleName(slug) {
+  return `zee_meta_ro_${String(slug || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40)}`;
+}
+
 // Columns that hold STORED CREDENTIALS, per table — the reason a read-only role must not see them.
 // The rule (ticket TKT-96): if a column has a `*_hint` sibling, the raw column is a secret (the hint
 // is what a reader may see); plus the measured columns that carry credentials but have no hint —
@@ -410,7 +433,7 @@ export async function dropProdReader(xell) {
 // reads the ORCHESTRATOR's own meta-DB — the database THIS server itself connects to
 // (config.databaseUrl) — because the provisioning evidence (machines, containers, pool, readiness
 // records, proof verdicts) lives there and nowhere else. Same guarantee as prod-RO, aimed at a
-// different database: a per-xell `zee_ro_<slug>` role, LOGIN+CONNECT+SELECT, read-only transaction,
+// different database: a per-xell `zee_meta_ro_<slug>` role, LOGIN+CONNECT+SELECT, read-only transaction,
 // secret columns revoked, injected into the cxell as ZEEHIVE_META_RO_DSN, dropped by the reaper
 // with the xell. PRODRO_MODE=simulate mints nothing real and a DSN that cannot authenticate — the
 // same simulate contract the manager bind has.
@@ -449,7 +472,7 @@ export function metaDbHostPort() {
 // role cannot be provisioned the bind FAILS — there is no fallback to the owner credential, because
 // "read-only, except when provisioning hiccups" is not read-only (the same rule as the manager bind).
 export async function mintMetaReader(xell) {
-  const role = roRoleName(xell.slug);
+  const role = metaRoRoleName(xell.slug);
   const password = randomBytes(24).toString('base64url');
   const db = metaDbHandle();
   const sql = readonlyRoleSql(role, password, db.name, db.user);
@@ -476,7 +499,7 @@ export async function mintMetaReader(xell) {
 // an unreachable database; the role is inert without its DSN either way). Same shape as dropProdReader.
 export async function dropMetaReader(xell) {
   try {
-    const role = roRoleName(xell.slug);
+    const role = metaRoRoleName(xell.slug);
     const db = metaDbHandle();
     if (PRODRO_MODE === 'simulate') {
       logline('prod-ro', `SIMULATE: would drop read-only meta role ${role}`);
@@ -496,7 +519,7 @@ export async function dropMetaReader(xell) {
     return { dropped: true, role };
   } catch (e) {
     const msg = e?.message || String(e);
-    logline('prod-ro', `could not drop read-only meta role ${roRoleName(xell.slug)}: ${msg}`);
+    logline('prod-ro', `could not drop read-only meta role ${metaRoRoleName(xell.slug)}: ${msg}`);
     return { dropped: false, error: msg };
   }
 }
