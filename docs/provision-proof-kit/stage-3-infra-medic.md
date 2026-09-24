@@ -84,7 +84,9 @@ one.
 
 5. **Meta-RO bind at dispatch** when the worn effective harness carries the capability: reuse
    `lib/prod-readonly.js` machinery pointed at the orchestrator's own meta-DB — per-xell
-   `zee_ro_<slug>` role, LOGIN+CONNECT+SELECT, `default_transaction_read_only=on`, SECRET
+   `zee_meta_ro_<slug>` role (its own name, never the manager prod-reader's `zee_ro_<slug>`:
+   two mints on one cluster must not share a role), LOGIN+CONNECT+SELECT,
+   `default_transaction_read_only=on`, SECRET
    COLUMNS REVOKED (provider_token.token, environment_var.value, xell.prod_ro_dsn — and audit
    the list against the live schema, per the `*_hint` sibling rule), injected as
    `ZEEHIVE_META_RO_DSN`, firewall-opened at seal time, dropped by the reaper with the xell.

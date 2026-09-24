@@ -19,8 +19,10 @@
 //      the propose whitelist refuses an unknown field at file time;
 //   4. the settings projection leaks NO secret column — asserted against the LIVE sandbox schema
 //      (the *_hint sibling rule + the code's explicit secret list), never a hardcoded list;
-//   5. PRODRO_MODE=simulate mints NOTHING real: mintMetaReader creates no zee_ro_* role on the
-//      cluster, stores a DSN that CANNOT authenticate, and dropMetaReader clears it;
+//   5. PRODRO_MODE=simulate mints NOTHING real: mintMetaReader creates no zee_meta_ro_* role on the
+//      cluster (its OWN name — never the prod reader's zee_ro_<slug>, see
+//      test/prod-ro-reader-collision), stores a DSN that CANNOT authenticate, and dropMetaReader
+//      clears it;
 //   6. cross-project targeting — an explicit `project` (id or case-insensitive name) makes reads
 //      resolve and the gated cards file ON the target; a name that resolves to nothing is refused;
 //      no `project` → the calling xell's own project (the behaviour every pre-existing call uses).
@@ -42,7 +44,7 @@ const { xellCapabilities, hasInfraTroubleshoot, requireInfra, INFRA_CAPABILITY }
   await import('../server/src/lib/harness-capabilities.js');
 const { infraBootstrap, infraPropose, infraSettings, decideInfraRequest } =
   await import('../server/src/lib/infra-medic.js');
-const { mintMetaReader, dropMetaReader } = await import('../server/src/lib/prod-readonly.js');
+const { mintMetaReader, dropMetaReader, metaRoRoleName } = await import('../server/src/lib/prod-readonly.js');
 const { randomUUID } = await import('node:crypto');
 
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
@@ -254,13 +256,17 @@ try {
   console.log('\n── PRODRO_MODE=simulate: the meta-RO bind mints NOTHING and a DSN that cannot authenticate ──');
   const p5 = await insProject(`im-ro-${tag}`);
   const roX = await insXell(p5, `im-rox-${tag}`, medC);
-  const role = `zee_ro_${roX.slug.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40)}`;
+  // The meta reader's OWN role name — zee_meta_ro_<slug>, deliberately not the prod reader's
+  // (zee_ro_<slug>): the two mints must not share a role, or the second rotates the first's
+  // password out from under the DSN the manager was handed (test/prod-ro-reader-collision).
+  const role = metaRoRoleName(roX.slug);
 
   const minted = await mintMetaReader(roX);
   ok(minted.mode === 'simulate' && minted.dsn && minted.dsn.startsWith('postgresql://'),
      'simulate returns a DSN-shaped value and says SIMULATE');
+  ok(minted.role === role, `the minted role is the meta reader's own name (${minted.role})`);
   const roles = await q(`SELECT count(*)::int AS n FROM pg_roles WHERE rolname=$1`, [role]);
-  ok(roles[0].n === 0, `no zee_ro_* role was created on the cluster (pg_roles count = ${roles[0].n})`);
+  ok(roles[0].n === 0, `no zee_meta_ro_* role was created on the cluster (pg_roles count = ${roles[0].n})`);
 
   const stored = await one(`SELECT meta_ro_dsn FROM xell WHERE id=$1`, [roX.id]);
   ok(stored?.meta_ro_dsn === minted.dsn, 'the (simulate) DSN is stored on the xell row');

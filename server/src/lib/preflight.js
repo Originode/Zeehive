@@ -15,9 +15,14 @@
 // WHAT IT DELIBERATELY DOES NOT DO:
 //   • It never WRITES to a database it is checking. `SELECT 1` and nothing else — a preflight that
 //     created a temp table to prove writability would be a preflight that can damage what it checks.
-//   • It never opens PRODUCTION. A xell coupled db-shared-prod / db-prod-readonly is reported as
-//     SKIPPED, with the reason, rather than probed. A skipped check that says so is information; a
-//     silently absent one is not.
+//   • It never opens a WRITE bind to PRODUCTION. A xell coupled db-shared-prod holds the prod
+//     owner's credential and is reported as SKIPPED, with the reason, rather than probed. A skipped
+//     check that says so is information; a silently absent one is not. The READ-ONLY bind
+//     (db-prod-readonly) is a different thing and IS probed: its DSN is the SELECT-only role
+//     lib/prod-readonly.js minted for this xell, so `SELECT 1` through it cannot damage anything —
+//     and it is the only proof there is that the binding the zee was handed actually opens. Not
+//     opening it is what left a manager's binding unproven while its recorded verdict described the
+//     shared dev db it no longer names.
 //   • It never tries to FIX a credential (that is ticket #47 and a human's). Its whole job is to
 //     make the fault impossible to miss.
 //   • It never throws. A preflight that can fail the caller would be a new way to fail provisioning,
@@ -30,11 +35,15 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import { resolveXellDsn } from './provision.js';
+import { PRODRO_MODE } from './prod-readonly.js';
 
 export const PREFLIGHT_TIMEOUT_MS = 5000;
 
-const pass = (check, detail) => ({ check, ok: true, skipped: false, detail });
-const fail = (check, detail) => ({ check, ok: false, skipped: false, detail });
+// `extra` is additive: a caller that must CLASSIFY a failure rather than print it (the
+// build-readiness probe, which turns "this db does not open" into a machine verdict) gets the
+// structured half of the same fact on the row. The preflight path itself reads ok/detail only.
+const pass = (check, detail, extra = {}) => ({ check, ok: true, skipped: false, detail, ...extra });
+const fail = (check, detail, extra = {}) => ({ check, ok: false, skipped: false, detail, ...extra });
 // A skipped check is `ok` — it asserts nothing, so it must not flip a xell to unusable — but it
 // carries WHY, because "production is never opened by a preflight" is an answer, not an absence.
 const skip = (check, detail) => ({ check, ok: true, skipped: true, detail });
@@ -72,7 +81,16 @@ export async function checkDsnOpens(dsn, { timeout = PREFLIGHT_TIMEOUT_MS } = {}
   } catch (e) {
     // The driver's own message, with the pg SQLSTATE when there is one (28P01 = the ticket #47
     // credential fault) — a human triaging wants the code, not our paraphrase of it.
-    return fail('db-open', `${who}: ${e.code ? `[${e.code}] ` : ''}${e.message}`);
+    //
+    // `code` is the structured half of that same sentence, for a caller that must decide what the
+    // failure MEANS rather than show it (build-readiness.js):
+    //   • a code → the attempt reached a verdict — 28P01 rejected us, ECONNREFUSED nothing is
+    //     listening, ENOTFOUND the name does not resolve. Definitive.
+    //   • no code → OUR OWN bound ended it. pg's connectionTimeoutMillis destroys the socket with
+    //     a bare `Error('timeout expired')`, and a query_timeout gives no SQLSTATE either: nobody
+    //     told us anything, so it is a cannot-tell, never a refusal.
+    return fail('db-open', `${who}: ${e.code ? `[${e.code}] ` : ''}${e.message}`,
+                { code: e.code || null });
   } finally {
     // end() on a client that never connected rejects; the check's verdict is already decided.
     try { await client.end(); } catch { /* nothing left to close */ }
@@ -112,9 +130,18 @@ export async function preflightXell(xellId, { timeout = PREFLIGHT_TIMEOUT_MS } =
 
 // The db-open check, plus the two states where opening is the WRONG thing to do.
 async function dsnCheck(xell, { dsn, source, binding_is_prod: bindingIsProd }, { timeout }) {
-  if (bindingIsProd) {
+  const roReader = xell.db_coupling === 'db-prod-readonly';
+  if (bindingIsProd && !roReader) {
     return skip('db-open', `binding is production (${xell.db_coupling}) — a preflight never opens `
       + 'the live database; a human granted this bind and only they may exercise it');
+  }
+  if (roReader && PRODRO_MODE === 'simulate') {
+    // The read-only DSN IS probed (below) because it is a minted SELECT-only role, not the owner's
+    // credential. In PRODRO_MODE=simulate that role was never created and the DSN it stored here is
+    // a deliberate fake — so probing it would report a credential fault the binding does not have.
+    // It is the SAME concession every other prod-touching path makes in simulate, and it says so.
+    return skip('db-open', 'the read-only production reader is SIMULATED (PRODRO_MODE=simulate): no '
+      + 'role was minted on the cluster, so there is nothing to open — the binding is unproven, not failed');
   }
   if (!dsn) {
     // Not a fault by itself: a pooled xell may have no db row yet, and a db-shared-dev xell with
