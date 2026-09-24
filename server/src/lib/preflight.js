@@ -117,6 +117,12 @@ export async function checkDsnOpens(dsn, { timeout = PREFLIGHT_TIMEOUT_MS } = {}
 //     job that needs rows, and never pretends the two cases are one.
 // A probe that cannot run (unreachable, timeout, a role with no rights to read the catalog) returns
 // null: an unprobeable database asserts nothing and must never be reported as empty.
+//
+// THIN-BUT-NOT-EMPTY IS DELIBERATELY NOT JUDGED HERE. "This copy is short of what its source had" is a
+// comparison, and this check has one side only — no reference, no per-table counts, and counting rows
+// across a whole database is exactly the cost queenzee/datadiff.js exists to spend deliberately (and
+// only against a snapshot whose counts were recorded). So this says what it can prove cheaply and
+// exactly — holds nothing / holds something — and never guesses at a shortfall it cannot measure.
 export async function checkDbContent(dsn, { coupling = null, timeout = PREFLIGHT_TIMEOUT_MS } = {}) {
   const client = new pg.Client({
     connectionString: dsn,
