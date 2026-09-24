@@ -62,18 +62,30 @@ export async function rePreflightAfterBindingChange(xellId) {
 // nothing to say (§4.5: under 'advisory' a FAILED re-preflight is what must be visible to the zee —
 // a healthy xell gets a briefing byte-identical to before this feature existed). The render matches
 // the project conditions block (a dated ⚠ line), so a zee reading one reads the other. Deliberately
-// only FAILURES: "never proven yet" is the normal state of a freshly provisioned xell until the
-// backfill proves it, so it is not an impediment worth a line. Pure, so the verify suite can drive
-// it without a database.
+// only FAILURES and WARNINGS: "never proven yet" is the normal state of a freshly provisioned xell
+// until the backfill proves it, so it is not an impediment worth a line. Pure, so the verify suite
+// can drive it without a database.
+//
+// A WARNING is a check the preflight passed with a finding attached (preflight.js › db-data: the
+// database opened and holds no data). It gets its own bullet, worded apart from a failure, because
+// the zee is the one who has to know and the one who can run the remedy — and because a warning
+// that came dressed as a refusal, or a refusal that hid behind a warning, is worse than neither.
 export function proofConditionLine(row) {
   if (!row) return null;
   const bits = [];
   if (row.preflight_error) bits.push(`database preflight FAILING: ${row.preflight_error}`);
   if (row.proof_error) bits.push(`provision proof FAILED: ${row.proof_error}`);
-  if (!bits.length) return null;
+  const warnings = (Array.isArray(row.preflight_checks) ? row.preflight_checks : [])
+    .filter((c) => c && c.warning && c.detail)
+    .map((c) => `${c.check || 'preflight'}: ${c.detail}`);
+  if (!bits.length && !warnings.length) return null;
   const when = conditionDate(row.preflight_at || row.proof_at) || '?';
-  return '## ⚠ Your own proof state (this xell — advisory)\n\n'
-    + `- [${when}] ${bits.join(' · ')}. The pool still dispatched you (this project runs `
-    + 'readiness_proof=advisory, which refuses nothing and only reports), but your db binding is not '
-    + 'proven until the fault is fixed — treat what it tells you as untrusted.';
+  const lines = [];
+  if (bits.length) {
+    lines.push(`- [${when}] ${bits.join(' · ')}. The pool still dispatched you (this project runs `
+      + 'readiness_proof=advisory, which refuses nothing and only reports), but your db binding is not '
+      + 'proven until the fault is fixed — treat what it tells you as untrusted.');
+  }
+  for (const w of warnings) lines.push(`- [${when}] ⚠ ${w}`);
+  return '## ⚠ Your own proof state (this xell — advisory)\n\n' + lines.join('\n');
 }
