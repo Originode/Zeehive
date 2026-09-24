@@ -33,8 +33,11 @@ import { resolveXellDsn } from './provision.js';
 
 export const PREFLIGHT_TIMEOUT_MS = 5000;
 
-const pass = (check, detail) => ({ check, ok: true, skipped: false, detail });
-const fail = (check, detail) => ({ check, ok: false, skipped: false, detail });
+// `extra` is additive: a caller that must CLASSIFY a failure rather than print it (the
+// build-readiness probe, which turns "this db does not open" into a machine verdict) gets the
+// structured half of the same fact on the row. The preflight path itself reads ok/detail only.
+const pass = (check, detail, extra = {}) => ({ check, ok: true, skipped: false, detail, ...extra });
+const fail = (check, detail, extra = {}) => ({ check, ok: false, skipped: false, detail, ...extra });
 // A skipped check is `ok` — it asserts nothing, so it must not flip a xell to unusable — but it
 // carries WHY, because "production is never opened by a preflight" is an answer, not an absence.
 const skip = (check, detail) => ({ check, ok: true, skipped: true, detail });
@@ -72,7 +75,16 @@ export async function checkDsnOpens(dsn, { timeout = PREFLIGHT_TIMEOUT_MS } = {}
   } catch (e) {
     // The driver's own message, with the pg SQLSTATE when there is one (28P01 = the ticket #47
     // credential fault) — a human triaging wants the code, not our paraphrase of it.
-    return fail('db-open', `${who}: ${e.code ? `[${e.code}] ` : ''}${e.message}`);
+    //
+    // `code` is the structured half of that same sentence, for a caller that must decide what the
+    // failure MEANS rather than show it (build-readiness.js):
+    //   • a code → the attempt reached a verdict — 28P01 rejected us, ECONNREFUSED nothing is
+    //     listening, ENOTFOUND the name does not resolve. Definitive.
+    //   • no code → OUR OWN bound ended it. pg's connectionTimeoutMillis destroys the socket with
+    //     a bare `Error('timeout expired')`, and a query_timeout gives no SQLSTATE either: nobody
+    //     told us anything, so it is a cannot-tell, never a refusal.
+    return fail('db-open', `${who}: ${e.code ? `[${e.code}] ` : ''}${e.message}`,
+                { code: e.code || null });
   } finally {
     // end() on a client that never connected rejects; the check's verdict is already decided.
     try { await client.end(); } catch { /* nothing left to close */ }
