@@ -162,12 +162,13 @@ try {
     headers: { authorization: `Bearer ${workerToken}` },
   });
   ok(r.status === 403, `the worker refusal fires before the condition lookup too [got ${r.status}]`);
-
-  console.log('\nall good');
 } finally {
   // Reverse order: the HTTP server first, then the rows it might reference.
   for (const fn of clean.reverse()) { try { await fn(); } catch { /* best effort */ } }
   await pool.end();
 }
 
+// The terminal summary is CONDITIONAL on the counter: an unconditional `all good` here would be a
+// passing word a real failure could hide behind (see docs/test-suite-measurement-decision-record.md).
+console.log(fail ? `\n${fail} FAILED` : '\nall good');
 process.exit(fail ? 1 : 0);

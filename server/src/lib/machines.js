@@ -333,17 +333,77 @@ export async function liveXellCount(ctx) {
   return r?.n || 0;
 }
 
+// The RECORDED build-readiness verdict for ONE (machine, project) pair — 'ok' | 'missing' |
+// 'unknown' | null (never probed). This is the SAME row the pool's fill-stopper already reads
+// (queenzee/pool.js fillStopReasonFor; written by build-readiness.js upsertBuildReadinessRecord),
+// kept as a bare read here because build-readiness.js imports THIS module — a module cycle is not
+// worth a shared helper for one two-column lookup, and the pool reads the same row the same way.
+export async function pairBuildReadinessStatus(machineId, projectId) {
+  const rec = await one(
+    `SELECT status FROM build_readiness_record WHERE machine_id=$1 AND project_id=$2`,
+    [machineId, projectId]).catch(() => null);
+  return rec?.status || null;
+}
+
 // WHERE does the next dev xell for THIS PROJECT spawn? The highest-priority enabled machine (in
-// this project's priorities, 038) that still has room under its machine-wide cap. Returns null
-// when no machines are configured for the project (legacy placement) and THROWS when they exist
-// but every one is at its cap — "the hive is full" is an answer, not a fallback to the NAS.
+// this project's priorities, 038) that (a) still has room under its machine-wide cap AND (b) is
+// not already RECORDED as unable to host this project's build. Returns null when no machines are
+// configured for the project (legacy placement) and THROWS when they exist but none can take the
+// spawn — "the hive is full" and "the fleet already knows this cannot work here" are both
+// answers, not a fallback onto a machine known to be broken.
+//
+// (b) is the DISPATCH-path half of a fact the POOL has honoured from the start (pool.js
+// fillStopReasonFor stops filling a pair recorded 'missing'). The dispatch path was blind to it:
+// on 2026-09-24 ugreen-nas read 'missing' for this project — dead daemon
+// (10.1.0.18:2375 i/o timeout), dead shared dev db — and was still picked for fresh work, so one
+// worker was handed the dead db and another's `zee build` died on the daemon the fleet had
+// already recorded as unusable. One fact, two readers; this is the second reader.
+//
+// The gate is PER PAIR, exactly like the record it reads and the pool reader beside it: a machine
+// can be unable to host project A's build (no shared dev db for A, an A-specific requires
+// network) while hosting B's fine, and keying this per machine would refuse work on a host that
+// was never broken for the project asking.
+//
+// Only a DEFINITE 'missing' skips. 'unknown' (nothing answered within the probe's bound) and a
+// pair with no record yet (never probed) are NOT skips: the readiness taxonomy keeps "refused"
+// distinct from "could not tell", and refusing dispatch on a merely-slow machine — or on a fresh
+// install nobody has probed — would be a new fault of this gate's own making.
+//
+// No staleness window, deliberately: the record is the fleet's kept-fresh verdict (the pool's
+// hourly re-record re-probes every pair, each proof and each live probe writes it), the pool
+// trusts it with no window, and a second rule for one fact is the bug this closes. Clearing it is
+// a re-probe: the console's recheck (GET /projects/:id/build-readiness?refresh=1) or the next
+// hourly cycle writes 'ok' and dispatch resumes with no code change.
 export async function pickDevMachine(projectId) {
   const ms = await devMachines(projectId);
   if (!ms.length) return null;
+  const unroutable = [];   // recorded 'missing' for this project — cannot host the build
+  const atCap = [];        // healthy pair, no room under the machine-wide cap
   for (const m of ms) {
+    if ((await pairBuildReadinessStatus(m.id, projectId)) === 'missing') { unroutable.push(m.key); continue; }
     if ((await liveXellCount(m.docker_ctx)) < m.max_xells) return m;
+    atCap.push(m.key);
   }
-  throw new Error(`every dev machine is at its max_xells cap (${ms.map((m) => m.key).join(', ')}) — raise a cap or mark xells done`);
+  throw new Error(devDispatchRefusal({ unroutable, atCap }));
+}
+
+// The refusal a caller renders when no dev machine can take the spawn. The two facts are named
+// separately because the human's fix differs: a pair recorded 'missing' is an INFRA fault (the
+// console's machine-matrix card names the failing check and its recheck clears the record), while
+// a full machine is a cap. Neither clause is invented when its scope is empty, and the cap clause
+// keeps its long-standing wording for anyone matching on it.
+function devDispatchRefusal({ unroutable = [], atCap = [] }) {
+  const why = [];
+  if (unroutable.length) {
+    why.push(`build_readiness_record is 'missing' for this project on ${unroutable.join(', ')} — `
+      + 'that machine cannot host the project\'s build (an INFRA fault for a human: the console '
+      + 'card names the failing check, and its recheck clears the record)');
+  }
+  if (atCap.length) {
+    why.push(`every dev machine is at its max_xells cap (${atCap.join(', ')}) — raise a cap or mark xells done`);
+  }
+  if (!why.length) why.push('no dev machine is configured to accept the spawn for this project');
+  return `no dev machine can host this project right now — ${why.join('; and ')}`;
 }
 
 // This project's shared dev db ON a given machine. A dev xell's app tier must never reach across

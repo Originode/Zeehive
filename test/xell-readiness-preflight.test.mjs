@@ -20,6 +20,10 @@
 //     conn_ref for every runner type — so this state is the genuinely db-less one only.)
 //   • the probe is READ-ONLY: nothing in the database changes across a preflight
 //   • the probe is BOUNDED: an unroutable address returns a verdict instead of hanging
+//
+// The content profile (db-data — the check that says a database OPENED AND HOLDS NOTHING) is covered
+// by test/preflight-db-content.test.mjs against databases that are genuinely empty/schema-only; here
+// only the DSN that opens is asserted to carry it, beside db-open, on the row.
 import { randomUUID } from 'node:crypto';
 
 const url = process.env.DATABASE_URL;
@@ -95,8 +99,10 @@ try {
      `…and it says WHICH rule produced the string it opened (${goodCheck?.detail})`);
   const goodRow = await one(`SELECT preflight_at, preflight_error, preflight_checks FROM xell WHERE id=$1`, [good.id]);
   ok(goodRow.preflight_at && goodRow.preflight_error === null, 'the xell row records a clean, timestamped verdict');
-  ok(Array.isArray(goodRow.preflight_checks) && goodRow.preflight_checks.length === 1,
-     'and keeps every check, not just the failures');
+  ok(Array.isArray(goodRow.preflight_checks)
+     && goodRow.preflight_checks.some((c) => c.check === 'db-open')
+     && goodRow.preflight_checks.some((c) => c.check === 'db-data'),
+     'and keeps every check, not just the failures (db-open + the content profile beside it)');
   ok(hiveStatus(await one(`SELECT * FROM xell WHERE id=$1`, [good.id]),
                 { preflightFailed: !!goodRow.preflight_error }) === 'vac-ready',
      'a xell that passed still reads ready');

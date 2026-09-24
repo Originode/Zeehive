@@ -3470,6 +3470,10 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .xenv-empty { margin-top: 5px; font-size: 12px; line-height: 1.5; color: var(--text);
   border: 1px solid rgba(224,165,59,.45); background: rgba(224,165,59,.10); border-radius: 8px; padding: 8px 10px; }
 .xenv-vars { margin: 4px 0 0; padding-left: 18px; font-size: 12px; columns: 2; }
+/* a READ-ONLY binding's withheld database credentials — a fourth sentence, same rule as the
+   three above it: a var a zee expected must never read like one that was never configured. */
+.xenv-withheld { margin-top: 6px; font-size: 12px; line-height: 1.5; color: var(--text);
+  border: 1px solid rgba(224,165,59,.45); background: rgba(224,165,59,.10); border-radius: 8px; padding: 8px 10px; }
 .xenv-secret { opacity: .8; }
 .xenv-owned { color: var(--warn, #e0a53b); font-size: 11px; }
 .xenv-pick { display: flex; flex-direction: column; gap: 5px; }

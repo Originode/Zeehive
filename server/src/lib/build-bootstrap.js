@@ -295,7 +295,7 @@ function meshOperatorEnv() {
 // file that does not resolve (a repo/manifest defect), or an alias a running container lost (never
 // touched). It is 'planned' for a declared network, a `create: empty` volume, the shared dev db,
 // and (on the queenzee's own host) the mesh control plane.
-export async function planBuildBootstrap(machine, project, { docker = dockerAdapter } = {}) {
+export async function planBuildBootstrap(machine, project, { docker = dockerAdapter, dbDial } = {}) {
   // The probe reads project.db_coupling to decide whether a shared dev db is expected at all
   // (buildReadinessForProject attaches it from pool_config before probing). Attach it here too so
   // a direct planBuildBootstrap caller gets the same answer — never assume the caller did.
@@ -306,7 +306,9 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
   // The precise DEV-only guard — throws when the spinoff tier declares a network/volume the PROD
   // tier also declares. Host-level prod is a DISCLOSURE (below), not a refusal.
   guardDevOnly(machine, project);
-  const probe = await probeBuildReadiness(machine, project, { docker });
+  // dbDial rides through untouched: undefined means probeBuildReadiness's own default (the real,
+  // bounded dial), and a test injects a verdict without a live host.
+  const probe = await probeBuildReadiness(machine, project, { docker, dbDial });
 
   const check = (name) => probe.checks.find((c) => c.check === name);
   const ctxCheck = check('context-reachable');
@@ -376,12 +378,30 @@ export async function planBuildBootstrap(machine, project, { docker = dockerAdap
 
   const sdb = check('shared-dev-db');
   if (sdb && !sdb.ok) {
-    steps.push({
-      kind: 'shared-dev-db', target: 'shared dev db',
-      why: sdb.detail,
-      action: `provision the shared dev db for ${project.name} on ${machine.key} (provisionDevDb)`,
-      status: 'planned', detail: null, stderr: null,
-    });
+    if (sdb.db_row_present) {
+      // The row EXISTS and does not open — the probe DIALLED it and it refused (or did not answer).
+      // provisionDevDb is the planner's only act here and it creates a db the machine does NOT
+      // have (it refuses one that already does), so there is nothing for the bootstrap to perform.
+      // The real fix — get the db opening again — is a human-timed RECREATE: it interrupts every
+      // live dev xell on the machine, the same class as the lost-alias row. Named, never clicked;
+      // bootstrappableFrom reads the same `db_row_present` fact so the button agrees with the plan.
+      cannot(sdb, 'shared dev db', null, sdb.detail
+        + ' The row exists, so provisionDevDb cannot act (it only creates a db the machine does not '
+        + 'have). It is a human-timed fix: recreate this shared dev db with the credential its '
+        + 'container was actually minted with — container.conn_pw is a MODEL of that credential, not '
+        + 'the credential itself — or re-check once it answers again.');
+    } else if (sdb.unknown) {
+      // Could not tell. Never perform against a prerequisite that was not verified — the same rule
+      // the requires-present rows get when their structure is missing.
+      cannot(sdb, 'shared dev db', null, sdb.detail);
+    } else {
+      steps.push({
+        kind: 'shared-dev-db', target: 'shared dev db',
+        why: sdb.detail,
+        action: `provision the shared dev db for ${project.name} on ${machine.key} (provisionDevDb)`,
+        status: 'planned', detail: null, stderr: null,
+      });
+    }
   }
 
   const reg = check('registry-for-handoff');
@@ -981,7 +1001,7 @@ async function loadProjectWithCoupling(projectId) {
 // the whole picture — but only steps of the requested kinds are performed and recorded. null =
 // every performable step (the 🔧 card's behaviour).
 export async function performBuildBootstrap(projectId, machineId,
-  { dryRun = false, docker = dockerAdapter, provisionDb = provisionDevDb,
+  { dryRun = false, docker = dockerAdapter, provisionDb = provisionDevDb, dbDial,
     actor = 'human@console', mesh = {}, kinds = null } = {}) {
   const project = await loadProjectWithCoupling(projectId);
   const machine = await one(`SELECT * FROM machine WHERE id=$1`, [machineId]);
@@ -997,7 +1017,7 @@ export async function performBuildBootstrap(projectId, machineId,
     return { status: 'refused', reason: e.message, steps: [], probe: null, action_id: row.id };
   }
 
-  const { probe, steps, refused, disclosure } = await planBuildBootstrap(machine, project, { docker });
+  const { probe, steps, refused, disclosure } = await planBuildBootstrap(machine, project, { docker, dbDial });
   if (refused) {
     const row = await record(projectId, machineId, actor, dryRun, 'refused', refused, []);
     logline('machine', `bootstrap REFUSED on ${machine.key} for ${project.name} by ${actor}: ${refused}`);
@@ -1022,7 +1042,7 @@ export async function performBuildBootstrap(projectId, machineId,
   }
 
   // Re-run the probe so the returned verdict is what is now TRUE, not what the action hoped.
-  const freshProbe = await probeBuildReadiness(machine, project, { docker });
+  const freshProbe = await probeBuildReadiness(machine, project, { docker, dbDial });
   const status = overallStatus(results);
   const row = await record(projectId, machineId, actor, false, status, null, results);
   logline('machine', `bootstrap ${status} on ${machine.key} for ${project.name} by ${actor}: `

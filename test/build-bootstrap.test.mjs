@@ -174,6 +174,14 @@ const insDevDb = async (projectId, ctx, name) => {
        VALUES ($1,'db','dev','shared',$2,$3,'up')`,
     [projectId, name, ctx]);
 };
+// …and one that records an ADDRESS + credential the way machines.js provisionDevDb writes a real
+// row — the shape the shared-dev-db check can dial, and the shape that produced the false green.
+const insAddressedDevDb = async (projectId, ctx, name, { host, port, pw = 'zeehive' }) => {
+  await q(
+    `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, host, host_port, conn_ref, conn_pw, health)
+       VALUES ($1,'db','dev','shared',$2,$3,$4,$5,$6,$7,'up')`,
+    [projectId, name, ctx, host, port, `postgresql://zeehive@${host}:${port}/zeehive`, pw]);
+};
 const insProdSite = async (projectId, ctx) => {
   await q(
     `INSERT INTO deploy_site (project_id, key, tier, docker_ctx) VALUES ($1,$2,'prod',$3)`,
@@ -195,6 +203,25 @@ try {
      `missing shared dev db → shared-dev-db step [${plan1.steps.map((s) => s.kind).join(', ')}]`);
   const netStep = plan1.steps.find((s) => s.kind === 'network');
   ok(/docker network create/.test(netStep?.action || ''), `the network step names its action [${netStep?.action}]`);
+
+  // ── a shared dev db that EXISTS but does not open → cannot, never a planned provision ─────────
+  // The readiness check now DIALS the row's own address, so a pair can fail this check while the
+  // row is present. provisionDevDb only creates a db a machine does NOT have (it refuses one that
+  // already does), so the planner must name the human fix instead of planning an action that
+  // cannot act — the same classification bootstrappableFrom reads, so the button and the plan agree.
+  console.log('\n── a shared dev db that EXISTS and refuses the dial → cannot, no provision planned ──');
+  const pDial = await insProject(`bs-dial-${tag}`, {});
+  const mDial = await insMachine(`bs-dial-${tag}`, `zt-bs-dial-${tag}`, true);
+  await insAddressedDevDb(pDial, `zt-bs-dial-${tag}`, `bs_${tag}_dial_db`, { host: '10.0.0.9', port: 5432 });
+  const refusingDial = async (dsn) => ({ ok: false, code: '28P01', detail: `${dsn}: [28P01] password authentication failed for user "zeehive"` });
+  const planDial = await planBuildBootstrap(await row('machine', mDial), await row('project', pDial),
+    { docker: makeDocker({ networks: new Set() }), dbDial: refusingDial });
+  const dialStep = planDial.steps.find((s) => /shared dev db/.test(s.target || ''));
+  ok(dialStep?.status === 'cannot', `a present-but-refusing dev db is 'cannot', not planned [${dialStep?.status}]`);
+  ok(!planDial.steps.some((s) => s.kind === 'shared-dev-db' && s.status === 'planned'),
+     'and NO planned provisionDevDb step was emitted for it');
+  ok(/recreate/.test(dialStep?.detail || '') && /MODEL of that credential/.test(dialStep?.detail || ''),
+     `the cannot reason names the human recreate and why the row cannot be trusted [${dialStep?.detail}]`);
 
   // ── volume → cannot, never created ─────────────────────────────────────────
   console.log('\n── a missing external VOLUME → cannot, with the DATA reason ──');
