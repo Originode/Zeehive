@@ -301,6 +301,19 @@ export function isOnProduction(xell) {
       || xell?.is_production === true;
 }
 
+// The couplings whose xell CANNOT WRITE the database it is bound to. Exactly one today:
+// db-prod-readonly — the SELECT-only role lib/prod-readonly.js mints for a manager zee (ticket #15
+// made that binding resolve the PROD environment; it must keep resolving it, for the API bases and
+// service accounts its reads need). The distinction matters to the PROJECTION, because the
+// environment's own vars may carry database credentials: a write-bound xell owns its database and
+// wants them, a reader must never be handed one (writeXellEnv withholds them by name shape, and
+// says so in the file). Deliberately NOT a generic "not is_production" test — db-shared-dev,
+// db-clone and db-isolated all write their OWN database and are not narrowed by this.
+export const READ_ONLY_COUPLINGS = ['db-prod-readonly'];
+export function isReadOnlyBinding(xell) {
+  return READ_ONLY_COUPLINGS.includes(xell?.db_coupling);
+}
+
 // Returns the environment row a xell should get, or null if none is configured. The precedence is
 // the task's rule, in order: explicit pin → on-production → dev.
 export async function resolveEnvironmentFor(xell) {
