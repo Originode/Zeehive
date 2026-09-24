@@ -54,11 +54,19 @@ export const DB_MODES = {
 // name cannot lie about:
 //   • a container that IS another registry row is never the answer for THIS row (the clone has its
 //     OWN row at tier=dev — excluding registered names alone kills this whole bug class), and
-//   • the published HOST PORT the registry records for the row (5432 → real prod; 32768 → clone),
-//     which docker reports independently of how the container is named.
-// Prefix matching survives only as a last resort for a freshly-modeled row with NO recorded port,
-// and even then only among names that are not themselves registered. Ambiguity is REFUSED, never
-// coin-flipped: for a prod migration a wrong guess is worse than a failed resolve.
+//   • the NAME the row records, versioned (`<logical>_<suffix>`) — the fleet mints every db container
+//     that way (machines.js: `<project>_db_dev_<machine>`), while the published HOST PORT the
+//     registry records for the row (5432 → real prod; 32768 → clone) only DISAMBIGUATES among the
+//     containers that name already claims.
+// A published port is NOT an identity, and trusting it as one re-created the same class of bug from
+// the other side: `pickDbContainer` selected a container BECAUSE `docker ps` reported it publishing
+// the row's recorded host_port, and the prod-migration guard (shipmigrate.js assertProdDbTarget)
+// then inspected that same container and required it to publish that same host_port — the same fact
+// from the same daemon, so on that path the guard could only confirm its own premise. A stranger
+// publishing 5432 (on the mardale-prod host, 5432 is the HOST's own postgres port) was accepted as
+// prod and a prod migration ran in it. Identity is therefore the row's NAME, and the port filters
+// within it. Ambiguity is REFUSED, never coin-flipped: for a prod migration a wrong guess is worse
+// than a failed resolve.
 
 // Parse `docker ps --format '{{.Names}}\t{{.Ports}}'` into [{name, hostPorts:Set<number>}].
 // A ports cell looks like "0.0.0.0:5432->5432/tcp, :::5432->5432/tcp" or "32768->5432/tcp"; the
@@ -75,6 +83,11 @@ function parsePsPorts(stdout) {
 // Pure decision (no I/O, exported for tests). `running` = [{name, hostPorts}] from docker ps on
 // this context; `target` = { name (logical), host_port }; `registeredElsewhere` = the names that
 // belong to a DIFFERENT registry row. Returns { name, via } or { ambiguous, candidates }.
+//
+// IDENTITY IS THE NAME THE ROW CLAIMS; THE RECORDED ADDRESS ONLY DISAMBIGUATES. A published host
+// port cannot be an identity — any container on the host may bind it, and on the mardale-prod host
+// 5432 is the HOST's own postgres port. So a container whose name this row cannot claim is never
+// returned, whatever it publishes.
 export function pickDbContainer(running, target, registeredElsewhere = new Set()) {
   const logical = target.name;
   const wantPort = target.host_port != null ? Number(target.host_port) : null;
@@ -87,23 +100,31 @@ export function pickDbContainer(running, target, registeredElsewhere = new Set()
   const exact = cand.find((c) => c.name === logical);
   if (exact) return { name: exact.name, via: 'exact' };
 
-  // 2. Durable identity: the published host port the registry recorded for this row.
-  if (wantPort != null) {
-    const byPort = cand.filter((c) => c.hostPorts.has(wantPort));
-    if (byPort.length === 1) return { name: byPort[0].name, via: 'port' };
-    if (byPort.length > 1) return { ambiguous: true, candidates: byPort.map((c) => c.name) };
+  // 2. The row's own NAME, versioned: the fleet mints a db container as `<logical>_<suffix>`
+  //    (omnibiz_db_prod → omnibiz_db_prod_v184; machines.js mints every dev db as
+  //    `<project>_db_dev_<machine>`). A name the row cannot claim is not this row's container, no
+  //    matter what it publishes — which is why the resolver stops here rather than at the port.
+  const versioned = cand.filter((c) => c.name.startsWith(`${logical}_`));
+  if (!versioned.length) {
+    // Nothing carries the row's name. Fall back to the logical name (as the old resolver did on any
+    // miss) rather than hand over an unidentifiable container as if it were this row's. Callers that
+    // need certainty (a prod migration) assert the target independently before writing and refuse.
+    return { name: logical, via: 'fallback', unresolved: true };
   }
 
-  // 3. Last resort only for a row with NO recorded port: a versioned extension of the logical
-  //    name, among names not themselves registered. Never reached when a host_port is on file.
-  const versioned = cand.filter((c) => c.name !== logical && c.name.startsWith(`${logical}_`));
-  if (versioned.length === 1) return { name: versioned[0].name, via: 'prefix' };
-  if (versioned.length > 1) return { ambiguous: true, candidates: versioned.map((c) => c.name) };
+  // 3. Among the containers the row's NAME claims, the recorded host_port disambiguates.
+  if (wantPort != null) {
+    const byPort = versioned.filter((c) => c.hostPorts.has(wantPort));
+    if (byPort.length === 1) return { name: byPort[0].name, via: 'port' };
+    if (byPort.length > 1) return { ambiguous: true, candidates: byPort.map((c) => c.name) };
+    // Exactly one claimable name that does NOT publish the recorded port: hand it over so the
+    // caller's guard refuses on the ADDRESS — a registry fact this resolver did not use to pick it.
+    if (versioned.length === 1) return { name: versioned[0].name, via: 'prefix' };
+    return { ambiguous: true, candidates: versioned.map((c) => c.name) };
+  }
 
-  // 4. Nothing matched. Fall back to the logical name (as the old resolver did on any miss). The
-  //    guard's substring match tolerates it; callers that need certainty (a prod migration) assert
-  //    the target independently before writing.
-  return { name: logical, via: 'fallback', unresolved: true };
+  if (versioned.length === 1) return { name: versioned[0].name, via: 'prefix' };
+  return { ambiguous: true, candidates: versioned.map((c) => c.name) };
 }
 
 // The names of every OTHER db container in the registry — the exclusion set for pickDbContainer.
