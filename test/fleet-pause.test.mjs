@@ -432,8 +432,9 @@ try {
      'there is NO pause verb for a ZEE, in the API or the CLI — a zee that can stop the fleet can stop '
      + 'the zee that would land its rival\'s work; everything a zee does here is ASK, never act');
   const app = read('web/src/App.jsx');
-  ok(/<FleetPause\s/.test(app) && /pause=\{fleet\.pause\}/.test(app),
-     'the console renders the button from the fleet snapshot');
+  ok(/<FleetPause\s/.test(app) && /pause=\{fleet\.project_pause \|\| fleet\.pause\}/.test(app),
+     'the console renders the button from the fleet snapshot — the PROJECT\'s pause when a project is '
+     + 'selected, the fleet\'s otherwise (the per-project scope, migration 101)');
   // The control is its OWN component file (like CrewChip), not another few hundred lines of
   // App.jsx — which is also what lets §8 below render it.
   const ctl = read('web/src/FleetPause.jsx');
@@ -473,19 +474,25 @@ try {
       React.createElement(FleetPause, { pause, onChanged: () => {}, pushToast: () => {}, dismissToast: () => {} }));
 
     const running = render({ paused: false });
-    ok(/⏸ pause/.test(running), 'running: the button offers PAUSE');
+    ok(/⏸/.test(running) && !/▶/.test(running),
+       'running: the button offers the PAUSE glyph, and not the PLAY one — the state it is in is the '
+       + 'thing it must communicate');
+    ok(/PAUSE EVERY ZEE/.test(running),
+       'with the word in the TOOLTIP: the button is icon-only by design (449603a made "⏸"/"▶" the '
+       + 'button and kept the title as the tooltip), so the word is asserted where it now lives');
     ok(!/fleet-paused-banner/.test(running), 'and there is no banner (nothing to warn about)');
     ok(/every zee/i.test(running) && /managers included/i.test(running),
        'its tooltip says what it will actually do — every zee, managers included');
 
     const paused = render({ paused: true, by: 'mark@console', reason: 'rate limit', interrupted: 7 });
-    ok(/▶ play/.test(paused), 'paused: the same button offers PLAY');
+    ok(/▶/.test(paused) && !/⏸/.test(paused), 'paused: the same button flips to the PLAY glyph');
+    ok(/resume the fleet/.test(paused), 'and its tooltip flips with it, so the word is never lost');
     ok(/class="fleetpause paused"/.test(paused), 'and carries the paused class the loud styling hangs off');
     ok(/FLEET PAUSED by mark@console/.test(paused) && /7 zee\(s\) stopped/.test(paused) && /rate limit/.test(paused),
        'the banner says who stopped it, how many zees, and why');
 
     // A snapshot from a server too old to carry fleet.pause must not blank the console.
-    ok(/⏸ pause/.test(renderToStaticMarkup(React.createElement(FleetPause,
+    ok(/⏸/.test(renderToStaticMarkup(React.createElement(FleetPause,
         { pause: undefined, onChanged: () => {}, pushToast: () => {}, dismissToast: () => {} }))),
        'and with no pause in the snapshot at all it renders as running rather than throwing');
   } finally {
