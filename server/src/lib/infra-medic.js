@@ -251,6 +251,26 @@ export async function infraBootstrap(xell, { machineId = null, reason = null, pr
 // ── propose — the settings patch the queenzee may apply, and the validation ──
 // The whitelist is the QUEENZEE-APPLIED surface: a field not listed here is refused, a machine key
 // not on the estate is refused, and the patch is validated BOTH when filed and when applied.
+//
+// TWO SHAPES, and mixing them up is not cosmetic. Most sections are FLAT field maps
+// ({ pool_config: { target_ready: 4 } }); the two MACHINE sections are keyed by the machine's KEY,
+// each value being that machine's field map — { machine_pool: { 'mardale-prod': { dev_priority: 6 } } }
+// — which is the shape the applier below implements. The validator used to walk every section as if
+// it were flat, so `machines.<key>.max_xells` was refused for EVERY field ("'machines.local' is not
+// on the whitelist"), while a flat `machines: { max_xells: 3 }` was accepted at file time and could
+// then only fail at approval time ("no machine 'max_xells' on the estate"). Both machine sections
+// were therefore unreachable in every shape: a card touching one was either refused or doomed.
+const MACHINE_KEYED = new Set(['machines', 'machine_pool']);
+
+// The knob that decides WHERE a project's next dev xell spawns lives in machine_pool.dev_priority,
+// NOT on the machine row. `machine.dev_priority` is DEPRECATED since 038 (its own column COMMENT
+// reads "Unread by current code") and every picker orders the per-(machine, project) column instead:
+// machines.js listMachines/poolMachines/devMachines, provision.js's placement through
+// pickDevMachine, intake.js's claim order, build-readiness. Offering machines.<key>.dev_priority
+// here turned a "raise this machine's priority" card into `UPDATE machine SET dev_priority` and
+// reported it as applied while the spawn preference did not move one inch — the trap this section
+// exists to close. can_build and max_xells STAY: both are read (defaultBuildCtxFor and the
+// registry-handoff readiness check; liveXellCount, which pickDevMachine consults for room).
 const PROPOSE_WHITELIST = {
   project: { registry: 'string' },
   pool_config: {
@@ -258,9 +278,38 @@ const PROPOSE_WHITELIST = {
     default_db_coupling: 'db_coupling', default_build_ctx: 'string', backup_ctx: 'string',
     refresh_interval_sec: 'int',
   },
-  machines: { dev_priority: 'int', can_build: 'boolean', max_xells: 'int' },
-  machine_pool: { pool_size: 'int' },
+  machines: { can_build: 'boolean', max_xells: 'nonneg_int' },
+  machine_pool: { pool_size: 'nonneg_int', dev_priority: 'nonneg_int' },
 };
+
+// One field against its declared kind; `path` is the full dotted path, so the refusal names what the
+// asker actually wrote. `nonneg_int` covers the columns carrying CHECK >= 0 (machine_pool.dev_priority
+// /pool_size, machine.max_xells): refused when FILED, so the medic learns before a human is asked.
+function validateProposeField(path, kind, v) {
+  if (kind === 'int' || kind === 'nonneg_int') {
+    if (!Number.isInteger(v)) throw new Error(`propose: '${path}' must be an integer`);
+    if (kind === 'nonneg_int' && v < 0) throw new Error(`propose: '${path}' must be a non-negative integer`);
+  }
+  if (kind === 'boolean' && typeof v !== 'boolean') throw new Error(`propose: '${path}' must be a boolean`);
+  if (kind === 'string' && typeof v !== 'string') throw new Error(`propose: '${path}' must be a string`);
+  if (kind === 'db_coupling' && !/^db-[a-z-]+$/.test(v)) throw new Error(`propose: '${path}' must be a db_coupling like 'db-shared-dev'`);
+  if (kind === 'readiness_proof' && !['off', 'advisory', 'required'].includes(v)) {
+    throw new Error(`propose: '${path}' must be one of off|advisory|required`);
+  }
+}
+
+// A machine-keyed field that is not on the whitelist. dev_priority gets its own sentence: it is not
+// a typo, it is the knob that MOVED to machine_pool in 038, and the asker is one edit away from the
+// write that works. Nothing downstream sees a patch refused here, so this is the only place the
+// correction can be said.
+function unknownMachineField(top, key, field, section) {
+  const hint = (top === 'machines' && field === 'dev_priority')
+    ? ` — dev_priority is a (machine, project) fact since 038 and every picker orders `
+      + `machine_pool.dev_priority: file { machine_pool: { "${key}": { dev_priority: N } } } instead`
+    : '';
+  return new Error(`propose: '${top}.${key}.${field}' is not on the whitelist — the queenzee applies `
+    + `only ${Object.keys(section).join(', ')}${hint}`);
+}
 
 function validateProposePatch(patch) {
   const topKeys = new Set(['project', 'pool_config', 'machines', 'machine_pool', 'manifest_refresh']);
@@ -273,16 +322,23 @@ function validateProposePatch(patch) {
       + `${[...topKeys].join(', ')}`);
     const section = PROPOSE_WHITELIST[top];
     for (const [k, v] of Object.entries(patch[top] || {})) {
+      if (MACHINE_KEYED.has(top)) {
+        // keyed by MACHINE KEY: the value is that machine's field map, never a bare setting.
+        if (!v || typeof v !== 'object' || Array.isArray(v)) {
+          throw new Error(`propose: '${top}.${k}' must be an object of ${Object.keys(section).join(', ')}`
+            + ` — '${top}' is keyed by MACHINE key (e.g. { "${top}": { "mardale-prod": { `
+            + `${Object.keys(section)[0]}: … } } }), not by setting`);
+        }
+        for (const [field, fv] of Object.entries(v)) {
+          if (!section[field]) throw unknownMachineField(top, k, field, section);
+          validateProposeField(`${top}.${k}.${field}`, section[field], fv);
+        }
+        continue;
+      }
       const kind = section[k];
       if (!kind) throw new Error(`propose: '${top}.${k}' is not on the whitelist — the queenzee applies `
         + `only ${Object.keys(section).join(', ')}`);
-      if (kind === 'int' && !Number.isInteger(v)) throw new Error(`propose: '${top}.${k}' must be an integer`);
-      if (kind === 'boolean' && typeof v !== 'boolean') throw new Error(`propose: '${top}.${k}' must be a boolean`);
-      if (kind === 'string' && typeof v !== 'string') throw new Error(`propose: '${top}.${k}' must be a string`);
-      if (kind === 'db_coupling' && !/^db-[a-z-]+$/.test(v)) throw new Error(`propose: '${top}.${k}' must be a db_coupling like 'db-shared-dev'`);
-      if (kind === 'readiness_proof' && !['off', 'advisory', 'required'].includes(v)) {
-        throw new Error(`propose: '${top}.${k}' must be one of off|advisory|required`);
-      }
+      validateProposeField(`${top}.${k}`, kind, v);
     }
   }
 }
@@ -350,14 +406,20 @@ export async function applySettingsPatch(projectId, patch, actor) {
       if (!m) throw new Error(`no machine '${key}' on the estate`);
       const beforeRow = await one(
         `SELECT * FROM machine_pool WHERE machine_id=$1 AND project_id=$2`, [m.id, projectId]);
-      const sets = [];
-      const vals = [m.id, projectId];
-      for (const [k, v] of Object.entries(mf)) {
-        sets.push(`${k} = $${vals.length + 2}`);
-        vals.push(v);
-        rec(`machine_pool.${key}.${k}`, beforeRow?.[k], v);
-      }
-      await q(`UPDATE machine_pool SET ${sets.join(', ')} WHERE machine_id=$1 AND project_id=$2`, vals);
+      const fields = Object.keys(mf || {});
+      if (!fields.length) continue;
+      // UPSERT, never a bare UPDATE. A (machine, project) pair this project has never pooled on or
+      // aimed work at has NO machine_pool row, and `UPDATE … WHERE machine_id AND project_id`
+      // matching zero rows reports success all the same — the same silent no-op the whitelist half
+      // of this defect was made of, one layer down. The columns are whitelisted keys (validation runs
+      // above and again at apply), so they carry no injection.
+      await q(
+        `INSERT INTO machine_pool (machine_id, project_id, ${fields.join(', ')})
+         VALUES ($1, $2, ${fields.map((_, i) => `$${i + 3}`).join(', ')})
+         ON CONFLICT (machine_id, project_id)
+         DO UPDATE SET ${fields.map((f) => `${f} = EXCLUDED.${f}`).join(', ')}`,
+        [m.id, projectId, ...fields.map((f) => mf[f])]);
+      for (const f of fields) rec(`machine_pool.${key}.${f}`, beforeRow?.[f], mf[f]);
     }
   }
   broadcast('project', { id: projectId });

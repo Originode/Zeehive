@@ -43,6 +43,50 @@ export const ROW_COUNT_SQL = `SELECT n.nspname||'.'||c.relname||'\x1e'||c.reltup
                     WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
  ORDER BY 1`;
 
+// THE CONTENT PROFILE — "does this database hold ANY data at all?", asked of a database a xell has
+// just been handed (a clone that came out thin, a shared dev db nobody ever loaded). One catalog row;
+// not a single table is read.
+//
+// WHY SIZE, NOT reltuples. An estimate is -1 on a database restored from a dump or populated by a
+// migration — pg_dump carries no statistics and pg_restore does not ANALYZE — so a count-only probe
+// reads "0 rows" (or "unknown") on a database that is perfectly full. Measured on a migrated
+// throwaway: 85 tables, 0 estimated rows, 84 of them never analyzed, and 2.7 MB of heap. The
+// relation's own SIZE comes from the catalog's file bookkeeping, so it is right on a fresh restore,
+// costs a stat() per relation instead of a heap scan, and cannot be fooled by missing statistics.
+// "Every application table's file is empty" is therefore an EXACT reading of "holds no data".
+//
+// Same exclusions as ROW_COUNT_SQL above (ordinary tables, no extension-owned relations, no system
+// schemas) and for the same reasons — one definition of "an application table", not two.
+export const DB_CONTENT_SQL = `SELECT count(*)::int AS tables,
+       coalesce(sum(pg_table_size(c.oid)), 0)::bigint AS bytes,
+       coalesce(sum(c.reltuples) FILTER (WHERE c.reltuples > 0), 0)::bigint AS est_rows,
+       count(*) FILTER (WHERE c.reltuples < 0)::int AS unanalyzed
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind = 'r'
+   AND n.nspname NOT IN ('pg_catalog','information_schema')
+   AND n.nspname NOT LIKE 'pg_toast%'
+   AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')`;
+
+// The reading of that one row. PURE, so the levels and the numbers can be pinned by a test and every
+// surface that shows them says the same thing.
+//   empty       — no application tables at all: an empty or never-initialized database, not a copy
+//                 of anything.
+//   schema-only — the tables exist and not one of them holds a byte. The shape arrived; the data did
+//                 not. (A schema-work xell may want exactly this; a job that needs rows does not.)
+//   data        — at least one application table holds something. `rows` is the planner's estimate
+//                 when anything has been analyzed, and null when nothing has (a fresh restore) —
+//                 null means "not counted", never "none", which is why it is never reported as 0.
+export function dbContentVerdict(row) {
+  const tables = Number(row?.tables) || 0;
+  const bytes = Number(row?.bytes) || 0;
+  const est = Number(row?.est_rows) || 0;
+  const unanalyzed = Number(row?.unanalyzed) || 0;
+  const level = tables === 0 ? 'empty' : bytes === 0 ? 'schema-only' : 'data';
+  return { level, tables, bytes, rows: level === 'data' && est > 0 ? est : null,
+           unanalyzed, estimated: level === 'data' && est > 0 };
+}
+
 // Exact counts, for a RESTORED (dev) database only — the one side where exactness is affordable and
 // where it matters, because a fresh restore has no statistics at all (pg_restore does not ANALYZE, so
 // every reltuples in it reads -1 and an estimate-vs-estimate comparison would compare nothing).

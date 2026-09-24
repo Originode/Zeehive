@@ -1332,12 +1332,16 @@ export async function briefing(xellId, zee, task, { headless = true, cxell = fal
   // Resolved live at briefing time so a line a manager added a minute ago is already in the very
   // next briefing — there is no rebuild, no re-spawn, no cache to go stale.
   const xellRow = await one(
-    `SELECT project_id, proof_at, proof_error, preflight_at, preflight_error FROM xell WHERE id=$1`, [xellId]);
+    `SELECT project_id, proof_at, proof_error, preflight_at, preflight_error, preflight_checks
+       FROM xell WHERE id=$1`, [xellId]);
   const conditions = await currentConditionsMarkdownForProject(xellRow?.project_id);
   // …plus THIS xell's own failing proof/preflight state, when there is one (§4.5): under 'advisory'
   // a FAILED binding re-preflight must be visible in the very briefing that follows it, not only on
   // the row. proofConditionLine returns null for a healthy xell, so a healthy briefing is
   // byte-identical to before this feature existed. Both blocks render the same dated ⚠ line shape.
+  // preflight_checks rides along for the same reason at one remove: a check the preflight PASSED with
+  // a finding attached (§ db-data — "the DSN opened and the database holds no data") is a fact only
+  // this block can hand the zee, and the zee is the party that can run the remedy.
   const ownProof = proofConditionLine(xellRow);
   const conditionsBlock = [conditions, ownProof].filter(Boolean).join('\n\n') || null;
   // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +

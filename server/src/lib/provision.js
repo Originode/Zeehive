@@ -23,7 +23,8 @@ import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenze
          implicitPoolMachine, liveXellCount, siteHostForMachine, ensureDbContainerConnPw } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
-import { resolveEnvironmentFor, fullVarsFor, isOnProduction, isReadOnlyBinding } from './environments.js';
+import { resolveEnvironmentFor, fullVarsFor, isOnProduction, isReadOnlyBinding,
+         isDatabaseCredentialName, splitSpinEnv } from './environments.js';
 import { warmWorktree } from './npm-cache.js';
 import { normalizeSpawnPrep, prewarmsCage, templateHash } from './spawn-prep.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, preppedImageIfPresent, ensurePreppedImage, cxellName } from './cxell.js';
@@ -636,35 +637,12 @@ export function meshBuildEnv(worktreePath, project) {
 
 // ── IS THIS ENV VAR NAME A DATABASE CREDENTIAL? ─────────────────────────────────────────────────
 //
-// The question writeXellEnv asks of every name an environment proposes to merge, so a binding that
-// cannot WRITE is never handed a credential that can. It has to be a SHAPE and not a list: an
-// environment is each project's own namespace, and the next one names its owner password something
-// else — POSTGRES_PASSWORD today, PROD_DB_PASSWORD or a bare MONGO_URI tomorrow. A name qualifies
-// when it names a DATABASE **and** names a way IN; either half alone is not enough, which is what
-// keeps DB_POOL_MAX, POSTGRES_HOST and API_BASE flowing to a reader while the credential does not.
-//
-//   • NAMES_A_DB     the database's own namespace: POSTGRES*, PGPASSWORD-style libpq names
-//                    (LIBPQ_CRED below — concatenated, the one shape with no separator to read),
-//                    MYSQL_*/MARIADB_*, MONGO*, REDIS_*, CLICKHOUSE_*, and the generic DB_*/DATABASE_*.
-//   • NAMES_A_CRED   a password, a login, or a connection string — the things that let you IN.
-//
-// DELIBERATELY NOT CAUGHT: SENTRY_DSN, GOOGLE_APPLICATION_CREDENTIALS, AWS_SECRET_ACCESS_KEY and
-// every other credential that is not a DATABASE one. A read-only zee still needs the live system's
-// service accounts and endpoints for its reads to mean what they say (ticket #15), and a rule that
-// swallowed those would trade a credential leak for a broken projection. The trade is only ever
-// made for the database the binding says this xell may not write.
-//
-// It also cannot tell a read-only DATABASE user from the owner — a name is all it has. So it errs
-// one way on purpose: on a read-only binding EVERY database credential is withheld, and the file
-// NAMES what was withheld (writeXellEnv) so a zee is never silently missing a var.
-const NAMES_A_DB = /(^|_)(POSTGRES|POSTGRESQL|PG|MYSQL|MARIADB|MARIA|MONGO|MONGODB|REDIS|CLICKHOUSE|DB|DATABASE)(_|$)/i;
-const NAMES_A_CRED = /(^|_)(PASSWORD|PASSWD|PWD|PASS|CREDENTIAL|CREDS|USER|USERNAME|LOGIN|ROLE|DSN|URL|URI|CONN|CONNECTION)(_|$)/i;
-const LIBPQ_CRED = /^PG(PASSWORD|USER|USERNAME|DATABASE|HOST|PORT|CONNINFO|PASSFILE)$/i;
-export function isDatabaseCredentialName(name) {
-  const n = String(name ?? '').trim();
-  if (!n) return false;
-  return LIBPQ_CRED.test(n) || (NAMES_A_DB.test(n) && NAMES_A_CRED.test(n));
-}
+// The predicate lives in lib/environments.js, beside isReadOnlyBinding, because the same rule now
+// guards BOTH project-authored channels — the environment_var merge and the manifest's
+// tiers.spinoff.env block (which writeXellEnv writes to this file AND compose-gen bakes into the
+// generated compose). One definition, so the two cannot drift. Re-exported here because this is
+// where it was first asked, and callers (and tests) name it here.
+export { isDatabaseCredentialName };
 
 // Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
 // The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
@@ -694,6 +672,16 @@ async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}
   const spin = project?.manifest?.tiers?.spinoff || {};
   const serverEnv = spin.ports?.server?.env || 'SPINOFF_SERVER_PORT';
   const webEnv = spin.ports?.webapp?.env || 'SPINOFF_WEB_PORT';
+  // The manifest's OWN env block (tiers.spinoff.env) is the second project-authored channel into
+  // this file — it is appended verbatim at the bottom, and dotenv is LAST-WINS. Same guard, same
+  // predicate as the environment merge below: a RESERVED name is never the manifest's to declare,
+  // and a database credential is not projected into a binding that cannot write. splitSpinEnv
+  // returns both dropped sets NAMED, and both are reported in the file (below) — a var the project
+  // declared and did not get must be distinguishable from one that was never declared.
+  const spinSplit = splitSpinEnv(spin.env, {
+    keepCredentials: !isReadOnlyBinding(xell),
+    reserved: [serverEnv, webEnv],
+  });
   const lines = [
     '# .zeehive.env — GENERATED by ZEEHIVE from the meta-DB. Do not edit; regenerate via the console.',
     `SPINOFF_SLUG=${xell.slug}`,
@@ -842,7 +830,12 @@ async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}
         serverEnv, webEnv,
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);
-      for (const k of Object.keys(spin.env || {})) reserved.add(k);
+      // A manifest key still outranks the environment (that is the §6.2 safety set's whole job) —
+      // but only the keys that are actually EMITTED, plus the manifest's reserved ones. A manifest
+      // key this xell will not receive (a withheld credential) must not silence the environment's
+      // same-named var as if it had been projected; that one is withheld and NAMED on its own path.
+      for (const [k] of spinSplit.kept) reserved.add(k);
+      for (const k of spinSplit.reserved) reserved.add(k);
       // ── AND THE OTHER HALF: A CREDENTIAL THAT CAN WRITE MUST NOT REACH A BINDING THAT CANNOT ──
       //
       // The reserve above is STRUCTURAL — names per-xell wiring owns. This one is about CAPABILITY.
@@ -886,7 +879,20 @@ async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}
 
   // Manifest-declared extra env for spinoffs — for Zeehive itself these are the §6.2 safety
   // defaults (BUILD_MODE=simulate, POOL_TARGET_READY=0, …) that keep a nested queenzee inert.
-  for (const [k, v] of Object.entries(spin.env || {})) lines.push(`${k}=${v}`);
+  // The two sets splitSpinEnv dropped are stated BEFORE the block, for the same reason the
+  // environment merge names what it withheld: absent-on-purpose must never read as never-declared.
+  if (spinSplit.withheld.length) {
+    lines.push(`# —— WITHHELD (manifest tiers.spinoff.env): ${spinSplit.withheld.join(', ')} — this `
+      + `xell's binding is READ-ONLY (${xell.db_coupling}), so a database credential the manifest `
+      + 'declares is not projected either. The generated spinoff compose drops it for the same '
+      + 'reason, so the file and the container agree. ——');
+  }
+  if (spinSplit.reserved.length) {
+    lines.push(`# —— IGNORED (manifest tiers.spinoff.env): ${spinSplit.reserved.join(', ')} — this `
+      + 'name is RESERVED by per-xell wiring, so the queenzee\'s own line above stands and the '
+      + `manifest's is not emitted (dotenv is last-wins: a second line would be an override). ——`);
+  }
+  for (const [k, v] of spinSplit.kept) lines.push(`${k}=${v}`);
   lines.push('');
 
   const wt = xell.worktree_path.replace(/\\/g, '/');

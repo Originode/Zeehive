@@ -210,6 +210,12 @@ try {
        'and says a running process does not pick it up until it restarts');
     ok(/not injected \(queenzee-owned\)/.test(src) && /OWNED_BY_QUEENZEE/.test(src),
        'a reserved name in the environment is LABELLED as not-injected, rather than silently dropped');
+    // …and the OTHER reason a name the environment holds does not reach the xell: a READ-ONLY
+    // binding withholds database credentials (environments.withheldEnvVars drops them from `vars`),
+    // so the panel must name them too — a dropped var may never read as a var that is not there.
+    ok(/data-testid="xenv-withheld"/.test(src) && /var\(s\) WITHHELD\./.test(src)
+       && /READ-ONLY/.test(src),
+       'a READ-ONLY binding gets a fourth sentence naming what was withheld, and why');
     const app = readFileSync(join(ROOT, 'web/src/App.jsx'), 'utf8');
 
     // The env chip that used to render here lived on the DELETED XellCard (TKT-29-3AB6) — its

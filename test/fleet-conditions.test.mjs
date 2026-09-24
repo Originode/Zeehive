@@ -65,8 +65,6 @@ try {
      'a project with no conditions arrives with conditions: [] (the bar checks .length)');
   const onlyMine = fleet.conditions.every((c) => c.project_id === projId);
   ok(onlyMine, 'the fixture project\'s snapshot carries only its own conditions');
-
-  console.log('\nall good');
 } finally {
   for (const fn of clean) { try { await fn(); } catch { /* best effort */ } }
   await pool.end();
