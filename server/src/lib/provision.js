@@ -23,7 +23,7 @@ import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenze
          implicitPoolMachine, liveXellCount, siteHostForMachine, ensureDbContainerConnPw } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
-import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
+import { resolveEnvironmentFor, fullVarsFor, isOnProduction, isReadOnlyBinding } from './environments.js';
 import { warmWorktree } from './npm-cache.js';
 import { normalizeSpawnPrep, prewarmsCage, templateHash } from './spawn-prep.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, preppedImageIfPresent, ensurePreppedImage, cxellName } from './cxell.js';
@@ -634,6 +634,38 @@ export function meshBuildEnv(worktreePath, project) {
   return out;
 }
 
+// ── IS THIS ENV VAR NAME A DATABASE CREDENTIAL? ─────────────────────────────────────────────────
+//
+// The question writeXellEnv asks of every name an environment proposes to merge, so a binding that
+// cannot WRITE is never handed a credential that can. It has to be a SHAPE and not a list: an
+// environment is each project's own namespace, and the next one names its owner password something
+// else — POSTGRES_PASSWORD today, PROD_DB_PASSWORD or a bare MONGO_URI tomorrow. A name qualifies
+// when it names a DATABASE **and** names a way IN; either half alone is not enough, which is what
+// keeps DB_POOL_MAX, POSTGRES_HOST and API_BASE flowing to a reader while the credential does not.
+//
+//   • NAMES_A_DB     the database's own namespace: POSTGRES*, PGPASSWORD-style libpq names
+//                    (LIBPQ_CRED below — concatenated, the one shape with no separator to read),
+//                    MYSQL_*/MARIADB_*, MONGO*, REDIS_*, CLICKHOUSE_*, and the generic DB_*/DATABASE_*.
+//   • NAMES_A_CRED   a password, a login, or a connection string — the things that let you IN.
+//
+// DELIBERATELY NOT CAUGHT: SENTRY_DSN, GOOGLE_APPLICATION_CREDENTIALS, AWS_SECRET_ACCESS_KEY and
+// every other credential that is not a DATABASE one. A read-only zee still needs the live system's
+// service accounts and endpoints for its reads to mean what they say (ticket #15), and a rule that
+// swallowed those would trade a credential leak for a broken projection. The trade is only ever
+// made for the database the binding says this xell may not write.
+//
+// It also cannot tell a read-only DATABASE user from the owner — a name is all it has. So it errs
+// one way on purpose: on a read-only binding EVERY database credential is withheld, and the file
+// NAMES what was withheld (writeXellEnv) so a zee is never silently missing a var.
+const NAMES_A_DB = /(^|_)(POSTGRES|POSTGRESQL|PG|MYSQL|MARIADB|MARIA|MONGO|MONGODB|REDIS|CLICKHOUSE|DB|DATABASE)(_|$)/i;
+const NAMES_A_CRED = /(^|_)(PASSWORD|PASSWD|PWD|PASS|CREDENTIAL|CREDS|USER|USERNAME|LOGIN|ROLE|DSN|URL|URI|CONN|CONNECTION)(_|$)/i;
+const LIBPQ_CRED = /^PG(PASSWORD|USER|USERNAME|DATABASE|HOST|PORT|CONNINFO|PASSFILE)$/i;
+export function isDatabaseCredentialName(name) {
+  const n = String(name ?? '').trim();
+  if (!n) return false;
+  return LIBPQ_CRED.test(n) || (NAMES_A_DB.test(n) && NAMES_A_CRED.test(n));
+}
+
 // Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
 // The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
 // ordinary state of a pooled xell, not a projection failure worth flagging to a human.
@@ -811,9 +843,40 @@ async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);
       for (const k of Object.keys(spin.env || {})) reserved.add(k);
+      // ── AND THE OTHER HALF: A CREDENTIAL THAT CAN WRITE MUST NOT REACH A BINDING THAT CANNOT ──
+      //
+      // The reserve above is STRUCTURAL — names per-xell wiring owns. This one is about CAPABILITY.
+      // A binding that cannot write (isReadOnlyBinding — db-prod-readonly, the SELECT-only role
+      // every manager zee holds) used to get its project's environment merged VERBATIM, so a file
+      // whose every other line promised read-only carried POSTGRES_USERNAME=postgres,
+      // POSTGRES_PASSWORD and POSTGRES_PROD_PASSWORD — the production database's OWNER credential —
+      // and the read-only guarantee was only as good as a zee choosing DATABASE_URL over the file it
+      // was handed, which is not a guarantee. A crew measured that pair as a live postgres SUPERUSER
+      // on the production cluster (same system_identifier as the read-only DSN).
+      //
+      // The withheld names are NAMED in the file, never silently dropped: a var a zee expected and
+      // did not find has to be distinguishable from a var that was never configured — that failure
+      // is how the empty-environment case got its own comment line above.
+      //
+      // Ticket #15 is intact: the read-only xell still RESOLVES the prod environment and still gets
+      // every non-credential var, and its one database credential stays the SELECT-only DATABASE_URL
+      // emitted above (per-xell wiring, never the environment's).
+      const withheld = new Set();
+      if (isReadOnlyBinding(xell)) {
+        for (const { name } of envVars) {
+          if (reserved.has(name)) continue;             // reserved already claims the name's story
+          if (isDatabaseCredentialName(name)) withheld.add(name);
+        }
+      }
       lines.push(`# —— environment: ${env.key} (${env.tier}) — ${envVars.length} var(s) from the meta-DB ——`);
+      if (withheld.size) {
+        lines.push(`# —— WITHHELD: ${[...withheld].join(', ')} — this xell's binding is READ-ONLY `
+          + `(${xell.db_coupling}), so a database credential that can WRITE is never projected into `
+          + 'it. Whatever database access this xell has, it is the per-xell DATABASE_URL line above '
+          + '— never the environment\'s. ——');
+      }
       for (const { name, value } of envVars) {
-        if (reserved.has(name)) continue;   // never fight per-xell wiring or the manifest defaults
+        if (reserved.has(name) || withheld.has(name)) continue;   // never fight per-xell wiring or the manifest defaults
         lines.push(`${name}=${value}`);
       }
     }

@@ -15,6 +15,9 @@
 // What this covers, per db_coupling, against real fixture rows:
 //   • which environment resolves (dev vs prod) — resolveEnvironmentFor, resolvedEnvView, streamXells;
 //   • what DATABASE_URL emitXellEnv actually writes;
+//   • which DB credentials are withheld from a READ-ONLY binding — by NAME SHAPE, not a list — and
+//     what a write-bound xell still gets. Ticket #15 is not undone by this: a reader still resolves
+//     the prod environment, it just no longer receives the owner's POSTGRES_* credential with it;
 //   • the rules that must NOT move: the reserved-name rule (an environment can never redirect
 //     DATABASE_URL), db-clone staying dev, and the §6.2 meta-DB refusal — which now has exactly one
 //     exemption, the minted SELECT-only reader, because when ZEEHIVE orchestrates ITSELF production
@@ -36,12 +39,15 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { config } = await import('../server/src/config.js');
 const { resolveEnvironmentFor, resolvedEnvView } = await import('../server/src/lib/environments.js');
-const { emitXellEnv } = await import('../server/src/lib/provision.js');
+const { emitXellEnv, isDatabaseCredentialName } = await import('../server/src/lib/provision.js');
 const { streamXells } = await import('../server/src/lib/fleet.js');
 
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
 const root = mkdtempSync(join(tmpdir(), `env15-${tag}-`));
 const RO_DSN = `postgresql://zee_ro_${tag}:pw@prod-host:5432/proddb`;
+// The prod environment's OWNER credentials — planted to prove they reach a writer and NOT a reader.
+const PROD_OWNER_PW = `owner-${tag}-SUPERUSER`;
+const PROD_PW = `prod-${tag}-SUPERUSER`;
 let pid = null; let barePid = null;
 
 // read back the projection emitXellEnv wrote, as a plain KEY=value map (+ the raw lines)
@@ -81,6 +87,13 @@ try {
     WHICH_ENV: 'prod', API_BASE: 'https://prod.example',
     // an environment must NEVER be able to redirect the db (reserved-name rule)
     DATABASE_URL: 'postgresql://hijack@elsewhere:5432/hijack',
+    // …and the production database's OWNER credential, the shape the work item is about: a manager
+    // zee bound READ-ONLY was handed all three verbatim, and the reporting crew measured the pair as
+    // a live postgres SUPERUSER. PROD_OWNER_PW / PROD_PW are distinctive so "did the VALUE leak" is
+    // checkable, not just "is the NAME gone".
+    POSTGRES_USERNAME: 'postgres',
+    POSTGRES_PASSWORD: PROD_OWNER_PW,
+    POSTGRES_PROD_PASSWORD: PROD_PW,
   });
 
   const mkXell = async (name, { coupling, isProd = false, roDsn = null, ownedDb = null }) => {
@@ -210,6 +223,62 @@ try {
   ok((readEmitted(rotcp.wt).vars.DATABASE_URL ?? null) === null,
      `db-prod-readonly with no minted reader stays DSN-less — the published address never widens a `
      + `reader into a writer [${readEmitted(rotcp.wt).vars.DATABASE_URL ?? '(none)'}]`);
+
+  // ── 2c. A READ-ONLY BINDING IS NEVER HANDED A WRITE-CAPABLE DB CREDENTIAL ────────────────────
+  // Ticket #15's rule — a db-prod-readonly xell RESOLVES the prod environment — is right and stays.
+  // What was wrong is what the merge DID with it: it wrote the environment VERBATIM, so a manager
+  // zee whose entire binding is a SELECT-only role got POSTGRES_USERNAME=postgres,
+  // POSTGRES_PASSWORD and POSTGRES_PROD_PASSWORD — the production database's OWNER credential —
+  // into the one file it is guaranteed to read. The read-only guarantee was then only as good as a
+  // zee choosing DATABASE_URL over the file it was handed.
+  console.log('a READ-ONLY binding: the write credential is withheld, and the file SAYS so');
+  const DB_CREDS = ['POSTGRES_USERNAME', 'POSTGRES_PASSWORD', 'POSTGRES_PROD_PASSWORD'];
+  const READERS = ['ro', 'romgr', 'rondsn'];
+  const WRITERS = ['rw', 'isprod'];
+  // DATABASE_URL is a database credential BY SHAPE and is deliberately left out of the sweep: it is
+  // the ONE the reader is supposed to have, per-xell wiring emitted by the queenzee, and section 2
+  // above already pins it to the minted SELECT-only reader. What must not survive is any OTHER one,
+  // and the environment is the only other source.
+  const PER_XELL = ['DATABASE_URL', 'ZEEHIVE_META_RO_DSN'];
+  for (const name of READERS) {
+    const f = readEmitted(xells[name].wt);
+    const leaked = DB_CREDS.filter((k) => k in f.vars);
+    ok(!leaked.length,
+       `${name} (${xells[name].db_coupling}): no POSTGRES_* owner credential in the file `
+       + `[${leaked.join(', ') || 'none'}]`);
+    const byShape = Object.keys(f.vars).filter((n) => !PER_XELL.includes(n) && isDatabaseCredentialName(n));
+    ok(!byShape.length,
+       `${name}: …nor any var that is a database credential BY SHAPE `
+       + `[${byShape.join(', ') || 'none'}]`);
+    ok(!f.text.includes(PROD_OWNER_PW) && !f.text.includes(PROD_PW),
+       `${name}: the withheld VALUES appear nowhere in the file (not even in a comment)`);
+    ok(/WITHHELD:/.test(f.text) && DB_CREDS.every((k) => f.text.includes(k)),
+       `${name}: the file NAMES what it withheld — a var a zee expected is never silently missing`);
+    ok(/binding is READ-ONLY \(db-prod-readonly\)/.test(f.text),
+       `${name}: …and says WHY (the binding cannot write)`);
+    ok(f.vars.API_BASE === 'https://prod.example' && f.vars.WHICH_ENV === 'prod',
+       `${name}: ticket #15 is intact — the prod environment still resolves, minus the credentials`);
+  }
+  // …and a WRITE-bound prod xell is NOT narrowed: it owns that database, so its credential stays.
+  for (const name of WRITERS) {
+    const f = readEmitted(xells[name].wt);
+    ok(DB_CREDS.every((k) => k in f.vars) && f.vars.POSTGRES_PASSWORD === PROD_OWNER_PW,
+       `${name} (${xells[name].db_coupling}${xells[name].is_production ? ' + is_production' : ''}): `
+       + 'the owner credential still lands, unchanged');
+    ok(!/WITHHELD:/.test(f.text), `${name}: …and nothing is claimed as withheld`);
+  }
+  // THE RULE IS A SHAPE, not the trio this fixture happens to use — the next project names its
+  // password something else, and the same binding must refuse to hand that over too.
+  for (const [nm, withheld] of [
+    ['POSTGRES_PASSWORD', true], ['PGPASSWORD', true], ['MYSQL_PASSWORD', true], ['MONGO_URI', true],
+    ['PROD_DB_PASSWORD', true], ['DATABASE_CONN_STR', true], ['MYAPP_REDIS_URL', true],
+    ['DB_PASSWORD', true], ['postgres_prod_password', true],
+    ['API_BASE', false], ['SENTRY_DSN', false], ['BUCKET_NAME', false], ['WHICH_ENV', false],
+    ['DB_POOL_MAX', false], ['POSTGRES_HOST', false], ['GOOGLE_APPLICATION_CREDENTIALS', false],
+  ]) {
+    ok(isDatabaseCredentialName(nm) === withheld,
+       `shape: ${nm} → ${withheld ? 'withheld from a reader' : 'left for the zee'}`);
+  }
 
   // ── 3. §6.2 — the refusal, and its ONE exemption ────────────────────────────────────────────
   // The guard exists so a nested queenzee never OPERATES on the managing instance's meta-DB (two
