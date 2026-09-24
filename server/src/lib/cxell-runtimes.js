@@ -332,9 +332,14 @@ const ADAPTERS = {
 
   // ── Kimi Code — the literal `kimi` CLI (@moonshot-ai/kimi-code), prompt mode ────────────
   // Headless (measured on 0.28.1, the pinned version): `-p <prompt> --output-format stream-json`.
-  // -p takes the prompt as an ARGUMENT, so the prompt rides in on stdin and `"$(cat)"` splices
-  // it in-container — model text still never touches the queenzee-side command line. Prompt mode
-  // runs tool calls under the auto policy (no approval prompts by design; -p is documented as
+  // -p takes the prompt as an ARGUMENT; `"$(cat)"` splices it in-container, so model text still never
+  // touches the queenzee-side command line. ⚠ That splice still puts the WHOLE prompt into one argv
+  // element, so kimi carries the SAME MAX_ARG_STRLEN (128 KiB) overflow grok just moved off its
+  // command line — and, unlike grok, kimi has NO door out of argv: measured 2026-09-24 on the pinned
+  // 0.28.1, `-p -` does not read stdin (it sends the literal "-") and there is no --prompt-file or
+  // --prompt-json. Left as it is deliberately — there is no measured door to move to, and inventing
+  // one would silently send "-" as the prompt. See the grok adapter for the door kimi lacks.
+  // Prompt mode runs tool calls under the auto policy (no approval prompts by design; -p is documented as
   // mutually exclusive with --yolo/--auto). Output lines are OpenAI-chat-shaped messages with no
   // final "result" event, so the parser synthesizes one from the exit code + last assistant text
   // (measured: a bad key prints `error: failed to run prompt: provider.auth_error: 401 …` on
@@ -422,8 +427,17 @@ const ADAPTERS = {
   //     is the vendor's to differ from an API account's, so if a seat cage ever ends a turn on
   //     "unknown model id", the answer is `grok models` in that cage and the model spec row in the
   //     meta-DB — not a change here.
-  // -p takes the prompt as an ARGUMENT (kimi's situation), so it rides in on stdin and `"$(cat)"`
-  // splices it in-container — model text never touches the queenzee-side command line.
+  // THE PROMPT RIDES ON STDIN *AS A FILE*, NEVER IN ARGV. `-p "$(cat)"` spliced the whole prompt
+  // into ONE argv element, and Linux caps a single argv/environ string at MAX_ARG_STRLEN (128 KiB):
+  // past it execve returns E2BIG and bash prints exactly "Argument list too long" — the turn never
+  // starts (measured in this cage: 200 KiB on the old shape → exit 126, that line). A resumed grok
+  // turn also puts the session id FIRST, so the failing element was the prompt either way.
+  // MEASURED on grok 0.2.118 (2026-09-24): headless grok does NOT read piped stdin into the prompt
+  // — its own diagnostics say so, and `-p -` really does send the literal one-character prompt "-"
+  // (a silent, worse bug than the crash). Its documented door is `--prompt-file <PATH>`; named as
+  // /dev/stdin that path IS this process's stdin, and 300 KiB of pipe drains through it with no read
+  // error (and a bad one fails loudly: "Failed to read '/dev/stdin': …"). So `-p` leaves the command
+  // line entirely — see HEADLESS_PROC_PATTERN below, which tracks the new shape.
   'grok-cxell': {
     key: 'grok-cxell',
     provider: 'grok',
@@ -435,7 +449,7 @@ const ADAPTERS = {
       `grok${safeSid(resumeSid) ? ` -r ${safeSid(resumeSid)}` : ''}`
       // --always-approve: the cxell is the permission system (the init event then reports
       // permissionMode bypassPermissions), same stance as every other runtime here
-      + ` -p "$(cat)" -m ${safeModel(grokModel(model))}`
+      + ` --prompt-file /dev/stdin -m ${safeModel(grokModel(model))}`
       + ' --output-format streaming-messages-json --always-approve',
     // TWO credential shapes, one adapter (grokSessionCredential above says which): an `xai-…` API
     // key rides in as XAI_API_KEY exactly as before, while a device-auth SESSION rides in as
@@ -731,9 +745,12 @@ export const AGENT_PROC_PATTERN = `(^|/| )(${[...new Set(Object.values(ADAPTERS)
 // look mid-turn and queue, in a cage with no turn running at all. `[-]p` matches "-p" while the
 // literal text "[-]p" does not, so the probe cannot see itself. (Same trick, same reason, as
 // `zee-live[.]mjs` in terminal-bridge.js.)
-// grok spells its alternative out (`grok( -r <sid>)? -p`) rather than as `grok [-]p`, because a
-// RESUMED grok turn puts the session id FIRST (`grok -r <sid> -p …`) and the headless flag is what
-// identifies the turn. A plain `grok .*[-]p` would have done it and must not be used: the `.*` hops
-// straight over the brackets to a `-p` further along the wrapper's own command line, which is the
-// self-match this whole comment is about.
-export const HEADLESS_PROC_PATTERN = 'claude --bare [-]p|codex [e]xec|kimi [-]p|grok( -r [^ ]*)? [-]p';
+// grok spells its alternative out (`grok( -r <sid>)? --prompt-file`) rather than as `grok [-]p`,
+// because a RESUMED grok turn puts the session id FIRST (`grok -r <sid> --prompt-file …`) and it is
+// the headless flag that identifies the turn. A plain `grok .*[-]-prompt-file` would have done it and
+// must not be used: the `.*` hops straight over the brackets to the flag further along the wrapper's
+// own command line, which is the self-match this whole comment is about. (The flag changed from `-p`
+// to `--prompt-file` when grok's prompt moved out of argv — see that adapter. `[-]-prompt-file`
+// matches "--prompt-file" while the literal text "[-]-prompt-file" does not contain it, so the probe
+// still cannot see itself.)
+export const HEADLESS_PROC_PATTERN = 'claude --bare [-]p|codex [e]xec|kimi [-]p|grok( -r [^ ]*)? [-]-prompt-file';
