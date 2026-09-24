@@ -249,11 +249,16 @@ try {
   console.error('TEST ERROR:', e);
   fail++;
 } finally {
-  // drop every role this test minted, with the repo's own inverse SQL, and SHOW any residue
+  // Drop every role this test minted, with the repo's own inverse SQL, and SHOW any residue. The
+  // check must FAIL LOUD on an unreadable answer too: `left?.n` alone treats "the count query
+  // itself failed" exactly like "the role is gone", which is how a leaked credential hides.
   for (const role of [ROLE, META_ROLE]) {
-    try { await q(dropProdReaderSql(role, dbName, dbOwner)); } catch { /* reported below */ }
-    const left = await one(`SELECT count(*)::int AS n FROM pg_roles WHERE rolname=$1`, [role]).catch(() => null);
-    if (left?.n) console.log(`  ⚠ cleanup: role ${role} survived teardown`);
+    let dropErr = null;
+    try { await q(dropProdReaderSql(role, dbName, dbOwner)); } catch (e) { dropErr = e; }
+    let left = null;
+    try { left = await one(`SELECT count(*)::int AS n FROM pg_roles WHERE rolname=$1`, [role]); }
+    catch (e) { console.log(`  ⚠ cleanup: could not confirm ${role} is gone — ${e.message}`); continue; }
+    if (left?.n) console.log(`  ⚠ cleanup: role ${role} survived teardown${dropErr ? ` — ${dropErr.message}` : ''}`);
   }
   if (pid) {
     await q(`DELETE FROM xell_uses_container WHERE xell_id IN (SELECT id FROM xell WHERE project_id=$1)`, [pid]).catch(() => {});
@@ -261,6 +266,11 @@ try {
     await q(`DELETE FROM xell WHERE project_id=$1`, [pid]).catch(() => {});
     await q(`DELETE FROM xource WHERE project_id=$1`, [pid]).catch(() => {});
     await q(`DELETE FROM project WHERE id=$1`, [pid]).catch(() => {});
+    // A fixture row left behind is not inert: these rows are status='working', and any test that
+    // reads "the working xell" from a shared sandbox (prod-readonly-secrets-migration does) will
+    // pick the wrong one. Say so rather than leak it quietly.
+    const rowsLeft = await one(`SELECT count(*)::int AS n FROM xell WHERE project_id=$1`, [pid]).catch(() => null);
+    if (rowsLeft?.n) console.log(`  ⚠ cleanup: ${rowsLeft.n} fixture xell row(s) survived teardown`);
   }
   await pool.end().catch(() => {});
   try { rmSync(root, { recursive: true, force: true }); } catch { /* tmp */ }
