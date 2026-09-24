@@ -118,8 +118,6 @@ try {
   const noMach = await noteProvisionFailure(projId, null, err);
   ok(noMach.recorded === false && noMach.carded === false,
      'a machine-less legacy fill is counted but never recorded/carded — nothing to key on');
-
-  console.log('\nall good');
 } finally {
   for (const fn of clean) { try { await fn(); } catch { /* best effort */ } }
   await pool.end();
