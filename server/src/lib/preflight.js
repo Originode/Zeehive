@@ -15,9 +15,14 @@
 // WHAT IT DELIBERATELY DOES NOT DO:
 //   • It never WRITES to a database it is checking. `SELECT 1` and nothing else — a preflight that
 //     created a temp table to prove writability would be a preflight that can damage what it checks.
-//   • It never opens PRODUCTION. A xell coupled db-shared-prod / db-prod-readonly is reported as
-//     SKIPPED, with the reason, rather than probed. A skipped check that says so is information; a
-//     silently absent one is not.
+//   • It never opens a WRITE bind to PRODUCTION. A xell coupled db-shared-prod holds the prod
+//     owner's credential and is reported as SKIPPED, with the reason, rather than probed. A skipped
+//     check that says so is information; a silently absent one is not. The READ-ONLY bind
+//     (db-prod-readonly) is a different thing and IS probed: its DSN is the SELECT-only role
+//     lib/prod-readonly.js minted for this xell, so `SELECT 1` through it cannot damage anything —
+//     and it is the only proof there is that the binding the zee was handed actually opens. Not
+//     opening it is what left a manager's binding unproven while its recorded verdict described the
+//     shared dev db it no longer names.
 //   • It never tries to FIX a credential (that is ticket #47 and a human's). Its whole job is to
 //     make the fault impossible to miss.
 //   • It never throws. A preflight that can fail the caller would be a new way to fail provisioning,
@@ -30,6 +35,7 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import { resolveXellDsn } from './provision.js';
+import { PRODRO_MODE } from './prod-readonly.js';
 
 export const PREFLIGHT_TIMEOUT_MS = 5000;
 
@@ -112,9 +118,18 @@ export async function preflightXell(xellId, { timeout = PREFLIGHT_TIMEOUT_MS } =
 
 // The db-open check, plus the two states where opening is the WRONG thing to do.
 async function dsnCheck(xell, { dsn, source, binding_is_prod: bindingIsProd }, { timeout }) {
-  if (bindingIsProd) {
+  const roReader = xell.db_coupling === 'db-prod-readonly';
+  if (bindingIsProd && !roReader) {
     return skip('db-open', `binding is production (${xell.db_coupling}) — a preflight never opens `
       + 'the live database; a human granted this bind and only they may exercise it');
+  }
+  if (roReader && PRODRO_MODE === 'simulate') {
+    // The read-only DSN IS probed (below) because it is a minted SELECT-only role, not the owner's
+    // credential. In PRODRO_MODE=simulate that role was never created and the DSN it stored here is
+    // a deliberate fake — so probing it would report a credential fault the binding does not have.
+    // It is the SAME concession every other prod-touching path makes in simulate, and it says so.
+    return skip('db-open', 'the read-only production reader is SIMULATED (PRODRO_MODE=simulate): no '
+      + 'role was minted on the cluster, so there is nothing to open — the binding is unproven, not failed');
   }
   if (!dsn) {
     // Not a fault by itself: a pooled xell may have no db row yet, and a db-shared-dev xell with
