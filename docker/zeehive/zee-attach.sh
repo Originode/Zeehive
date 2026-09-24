@@ -52,7 +52,7 @@ TALK_TARGET="${TMUX_PANE:-zee}"
 # ⚠ This pattern is HEADLESS_PROC_PATTERN in server/src/lib/cxell-runtimes.js — the queenzee decides
 # "type or queue" with the same test, and the two disagreeing loses messages. The brackets match the
 # same processes while keeping the probe from matching its OWN command line (see that constant).
-live_run() { pgrep -f 'claude --bare [-]p|codex [e]xec|kimi [-]p|grok( -r [^ ]*)? [-]p' >/dev/null 2>&1; }
+live_run() { pgrep -f 'claude --bare [-]p|codex [e]xec|kimi [-]p|grok( -r [^ ]*)? [-]-prompt-file' >/dev/null 2>&1; }
 
 # Deliver queued operator messages into whatever holds the pane now, oldest first, one Enter each.
 # Runs in the BACKGROUND for as long as the interactive session owns this pane, so a message that
