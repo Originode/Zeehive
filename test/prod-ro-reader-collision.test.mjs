@@ -26,7 +26,12 @@
 //   C. the emitted file names both doors, each with its own role, and the DATABASE_URL it
 //      advertises is a credential that actually OPENS;
 //   D. db-open PROBES a db-prod-readonly binding's DSN (labelled 'prod-readonly-dsn'), still SKIPS
-//      a db-shared-prod WRITE bind, and does not report a false credential fault in simulate mode.
+//      a db-shared-prod WRITE bind, and does not report a false credential fault in simulate mode;
+//   E. §4.5 on the MANAGER bind: a dead read-only binding REFUSES the dispatch under
+//      readiness_proof='required' and the compensation leaves the xell on the shared dev db holding
+//      no production DSN or container link — while the same binding under 'advisory' refuses
+//      nothing and only stamps the verdict (what the dispatch loop does with that is not covered
+//      here; it needs a live spawn — see the note in section E).
 //
 // PRODRO_MODE=real is set deliberately: mintMetaReader's SQL runs through the pool, which here is
 // the throwaway `zee db-sandbox` postgres — so the mint is exercised for real, on a real cluster,
@@ -57,6 +62,8 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { emitXellEnv } = await import('../server/src/lib/provision.js');
 const { preflightXell, PREFLIGHT_TIMEOUT_MS } = await import('../server/src/lib/preflight.js');
+const { rePreflightAfterBindingChange } = await import('../server/src/lib/proof-policy.js');
+const { unbindManagerFromProdReadonly } = await import('../server/src/lib/manager-spawn.js');
 const { roRoleName, metaRoRoleName, readonlyRoleSql, readonlyDsn, dropProdReaderSql, mintMetaReader } =
   await import('../server/src/lib/prod-readonly.js');
 const pg = (await import('pg')).default;
@@ -244,6 +251,54 @@ try {
      'the simulated reader is SKIPPED — a fake DSN must not read as a credential fault');
   ok(/SIMULATED/.test(sc?.detail || ''), `…and it says why (${sc?.detail})`);
 
+  // ── E. §4.5 on the MANAGER bind: a refusal runs the compensation BEFORE it throws ──────────────
+  //
+  // intake.js's manager path now re-preflights the binding it just minted and, under
+  // readiness_proof='required', refuses the dispatch. The three moving parts of that branch need no
+  // docker — the policy (a pool_config row), the verdict (a preflight against the binding's own
+  // DSN) and the compensation (drop the minted reader, put the xell back on the shared dev db) — so
+  // they are DRIVEN here rather than described, with a reader the cluster will refuse (the one
+  // shape a refusal can be provoked with off production).
+  //
+  // WHAT THIS DOES NOT COVER, so the next reader is not misled: the dispatch loop that CALLS these
+  // two — dispatching a real manager, seeing the throw, and the pool routing the released xell
+  // (§4.6) — is not executed here; that needs a live spawn. What is proven is that the pair
+  // intake.js runs does what the branch assumes: refuses under 'required', does not under
+  // 'advisory', and leaves no production credential or link behind when it compensates.
+  console.log('\nE. §4.5 on the manager bind: a refusal compensates before it throws');
+  await q(`INSERT INTO pool_config (project_id, readiness_proof) VALUES ($1,'required')
+             ON CONFLICT (project_id) DO UPDATE SET readiness_proof='required'`, [pid]);
+  const deadDsn = dsnFor(`nosuchrole_${tag}`, 'pw');
+  const badBind = await mkXell('badbind', { coupling: 'db-prod-readonly', roDsn: deadDsn });
+  const refused = await rePreflightAfterBindingChange(badBind.id);
+  ok(refused.refused === true && refused.policy === 'required',
+     'under readiness_proof=required a dead read-only binding REFUSES the dispatch');
+  ok(/db-open/.test(refused.reason || '') && new RegExp(`nosuchrole_${tag}`).test(refused.reason || ''),
+     `…naming the check that failed and the role it dialled (${(refused.reason || '').slice(0, 120)}…)`);
+
+  // The compensating action intake.js performs BEFORE it throws.
+  await unbindManagerFromProdReadonly(badBind.id,
+    'its read-only bind failed the §4.5 re-preflight under readiness_proof=required');
+  const back = await one(`SELECT db_coupling, prod_ro_dsn FROM xell WHERE id=$1`, [badBind.id]);
+  ok(back?.db_coupling === 'db-shared-dev' && back?.prod_ro_dsn === null,
+     `the compensation runs first: the xell is back on the shared dev db holding no production DSN `
+     + `(${back?.db_coupling}, prod_ro_dsn ${back?.prod_ro_dsn})`);
+  const links = await one(
+    `SELECT count(*)::int AS n FROM xell_uses_container uc JOIN container c ON c.id=uc.container_id
+      WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod'`, [badBind.id]);
+  ok(links?.n === 0, '…and no LINK to a production container is left on it either');
+
+  // The other half of the policy × verdict table: the SAME dead binding under advisory refuses
+  // NOTHING — the verdict is stamped on the row and the spawn proceeds (that is what #47 wants: a
+  // failed check that is visible, not a dispatch that silently stops).
+  await q(`UPDATE pool_config SET readiness_proof='advisory' WHERE project_id=$1`, [pid]);
+  const advBind = await mkXell('advbind', { coupling: 'db-prod-readonly', roDsn: deadDsn });
+  const advised = await rePreflightAfterBindingChange(advBind.id);
+  ok(advised.refused === false && advised.verdict.ok === false,
+     'the same dead binding under advisory refuses nothing — the failure is stamped, not fatal');
+  ok(/db-open/.test(advised.verdict.error || ''),
+     `…and the stamped verdict still names the check (${advised.verdict.error})`);
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('TEST ERROR:', e);
@@ -261,6 +316,10 @@ try {
     if (left?.n) console.log(`  ⚠ cleanup: role ${role} survived teardown${dropErr ? ` — ${dropErr.message}` : ''}`);
   }
   if (pid) {
+    // pool_config is deleted EXPLICITLY rather than left to the project cascade: its FK does cascade
+    // today (pool_config_project_id_fkey, ON DELETE CASCADE), but this teardown should not depend on
+    // a schema detail it does not own — a dropped cascade would turn a green run into a silent leak.
+    await q(`DELETE FROM pool_config WHERE project_id=$1`, [pid]).catch(() => {});
     await q(`DELETE FROM xell_uses_container WHERE xell_id IN (SELECT id FROM xell WHERE project_id=$1)`, [pid]).catch(() => {});
     await q(`DELETE FROM container WHERE project_id=$1`, [pid]).catch(() => {});
     await q(`DELETE FROM xell WHERE project_id=$1`, [pid]).catch(() => {});
