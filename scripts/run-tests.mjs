@@ -6,9 +6,9 @@
 // output. That instrument is wrong here, and it fails quietly: the suite's printed lines are full
 // of DESCRIPTIONS of healthy scenarios. test/provision-proof.test.mjs:159 prints
 //   `── 2. proveXell: address-pool exhaustion → app-build FAILS, classed INFRA ──`
-// on EVERY run, green or not — so a greped green run reads like a bloodbath (99 printed lines
-// across test/ carry fail/failed/FAILS outside the assertion marker and the terminal summary; the
-// sweep and the rule are in docs/test-suite-measurement-decision-record.md).
+// on EVERY run, green or not — so a greped green run reads like a bloodbath (~100 printed lines
+// across test/ describe a healthy scenario that carries the word; the sweep, its classifier and the
+// rule are in docs/test-suite-measurement-decision-record.md).
 //
 // THE INSTRUMENTS, in order of authority:
 //   1. the process EXIT CODE — the verdict. A section header cannot produce it.
