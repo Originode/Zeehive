@@ -741,7 +741,8 @@ async function writeXellEnv(xellId, { dryRun = false, meshSetupKey = null } = {}
   // apply: this is a minted SELECT-only reader (default_transaction_read_only=on), the exact class
   // the exemption is about — a medic could no more reap a live xell than a manager could.
   if (xell.meta_ro_dsn) {
-    lines.push(`# ZEEHIVE_META_RO_DSN — the meta-DB, READ-ONLY (SELECT-only zee_ro_ role minted for this xell)`);
+    lines.push('# ZEEHIVE_META_RO_DSN — the meta-DB, READ-ONLY (SELECT-only zee_meta_ro_ role minted '
+      + 'for this xell; its OWN role, never the prod reader\'s — the two mints must not share a name)');
     lines.push(`ZEEHIVE_META_RO_DSN=${xell.meta_ro_dsn}`);
   }
 
