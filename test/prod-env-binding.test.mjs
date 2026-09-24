@@ -280,6 +280,99 @@ try {
        `shape: ${nm} → ${withheld ? 'withheld from a reader' : 'left for the zee'}`);
   }
 
+  // ── 2d. THE MANIFEST DOOR — the SECOND project-authored channel ──────────────────────────────
+  // The guard above filters the environment_var rows. The manifest's `tiers.spinoff.env` block is
+  // a second channel into the SAME two carriers: writeXellEnv appends it to .zeehive.env VERBATIM
+  // (and dotenv is LAST-WINS), and compose-gen bakes it into the generated spinoff compose — i.e.
+  // into the CONTAINER of every xell of this project, read-only bindings included. A manifest that
+  // declared POSTGRES_PASSWORD handed a db-prod-readonly xell a write credential by both paths,
+  // and a manifest DATABASE_URL emitted a SECOND line that wins over the queenzee's own.
+  console.log('the MANIFEST (tiers.spinoff.env) channel: same guard, both carriers');
+  const MANIFEST_PW = `manifest-${tag}-SUPERUSER`;
+  const manifestSpinEnv = {
+    BUILD_MODE: 'simulate',                        // structural — must keep flowing
+    POSTGRES_PASSWORD: MANIFEST_PW,                // the credential the door was opened for
+    PROD_DB_URL: 'postgresql://owner:pw@prod-host:5432/proddb',   // credential by shape too
+    DATABASE_URL: 'postgresql://manifest@elsewhere:5432/hijack',  // RESERVED — no second line
+    SPINOFF_SLUG: 'declared-slug',                 // RESERVED
+  };
+  await q(`UPDATE project SET manifest=$2::jsonb WHERE id=$1`,
+    [pid, JSON.stringify({ tiers: { spinoff: { env: manifestSpinEnv } } })]);
+  const mro = await mkXell('msro', { coupling: 'db-prod-readonly', roDsn: RO_DSN });
+  const mrw = await mkXell('msrw', { coupling: 'db-isolated', ownedDb: OWNED('msrw') });
+  await emitXellEnv(mro.id);
+  await emitXellEnv(mrw.id);
+  const mroFile = readEmitted(mro.wt);
+  const mrwFile = readEmitted(mrw.wt);
+
+  // (a) the manifest credential is absent from a READ-ONLY xell's env, by NAME and by VALUE.
+  ok(!('POSTGRES_PASSWORD' in mroFile.vars) && !('PROD_DB_URL' in mroFile.vars),
+     `the manifest's database credentials are absent from a read-only xell's env `
+     + `[${['POSTGRES_PASSWORD', 'PROD_DB_URL'].filter((k) => k in mroFile.vars).join(', ') || 'none'}]`);
+  ok(!mroFile.text.includes(MANIFEST_PW),
+     '…and the declared VALUE appears nowhere in the file (not even in a comment)');
+  // (b) the file NAMES what it withheld — absent-on-purpose never reads as never-declared.
+  ok(/WITHHELD \(manifest tiers\.spinoff\.env\):/.test(mroFile.text)
+     && mroFile.text.includes('POSTGRES_PASSWORD') && mroFile.text.includes('PROD_DB_URL'),
+     `the file NAMES the manifest credentials it withheld — "${(mroFile.text.match(/^# —— WITHHELD \(manifest.*/m) || [''])[0].slice(0, 90)}…"`);
+  // (c) exactly ONE DATABASE_URL line, and it is the PER-XELL one (the manifest's is ignored).
+  const dbUrlLines = mroFile.text.split('\n').filter((l) => /^DATABASE_URL=/.test(l));
+  ok(dbUrlLines.length === 1 && dbUrlLines[0] === `DATABASE_URL=${RO_DSN}`,
+     `exactly one DATABASE_URL line, the per-xell SELECT-only one [${dbUrlLines.join(' | ') || 'none'}]`);
+  ok(!/hijack|declared-slug/.test(mroFile.text),
+     'a RESERVED name declared by the manifest is ignored, not emitted as an override');
+  ok(/^# —— IGNORED \(manifest tiers\.spinoff\.env\): .*DATABASE_URL/m.test(mroFile.text),
+     '…and the ignored reserved names are named too, so the manifest author is not left guessing');
+  // ticket #15 intact: the manifest's STRUCTURAL keys still flow to a reader.
+  ok(mroFile.vars.BUILD_MODE === 'simulate',
+     'a structural manifest key still lands — the read-only narrowing is about credentials, nothing else');
+  // …and a WRITE-bound xell is NOT narrowed by any of it: it owns its database, so the manifest
+  // credential is untouched there. Only the RESERVED name is dropped (that rule is channel-wide).
+  ok(mrwFile.vars.POSTGRES_PASSWORD === MANIFEST_PW && mrwFile.vars.PROD_DB_URL.startsWith('postgresql://owner:'),
+     'a write-bound xell still receives the manifest credentials, unchanged');
+  ok(!/WITHHELD/.test(mrwFile.text), '…and nothing is claimed as withheld for it');
+  ok(mrwFile.text.split('\n').filter((l) => /^DATABASE_URL=/.test(l)).length === 1
+     && mrwFile.vars.DATABASE_URL === OWNED('msrw'),
+     '…with still exactly one DATABASE_URL line — its own');
+  // the READ MODEL agrees with the file: no withheld name is listed as a var of the environment.
+  {
+    const roView = await resolvedEnvView(await one(`SELECT * FROM xell WHERE id=$1`, [xells.romgr.id]));
+    ok(!roView.vars.some((v) => ['POSTGRES_PASSWORD', 'POSTGRES_PROD_PASSWORD'].includes(v.name))
+       && roView.vars.some((v) => v.name === 'API_BASE'),
+       'resolvedEnvView does not list a withheld credential as a var — and still lists the rest '
+       + `[${roView.vars.map((v) => v.name).join(', ')}]`);
+    ok(Array.isArray(roView.withheld) && roView.withheld.includes('POSTGRES_PASSWORD')
+       && roView.withheld.includes('POSTGRES_PROD_PASSWORD') && /READ-ONLY/.test(roView.withheld_reason || ''),
+       `…it NAMES them instead, with the reason [${(roView.withheld || []).join(', ')}]`);
+    ok(!JSON.stringify(roView).includes(PROD_OWNER_PW) && !JSON.stringify(roView).includes(PROD_PW),
+       'and no withheld VALUE rides along with the names');
+    const rwView = await resolvedEnvView(await one(`SELECT * FROM xell WHERE id=$1`, [xells.rw.id]));
+    ok(!('withheld' in rwView) && rwView.vars.some((v) => v.name === 'POSTGRES_PASSWORD'),
+       'a write-bound xell\'s read model is unchanged — it still lists the credential it receives');
+  }
+  // (d) THE COMPOSE CARRIER — the env file being clean is worthless if the container still holds
+  // the credential. The generated compose is PROJECT-scoped (one file serves every xell container,
+  // the read-only-bound one included), so a credential there can never be scoped to writers.
+  {
+    const { generateSpinoffCompose } = await import('../server/src/lib/compose-gen.js');
+    const { services, yaml } = generateSpinoffCompose({ name: 'EnvFixture', manifest: {
+      db: { name: 'app', user: 'u', password: 'p' },
+      roles: { server: { service: 'server', buildable: true, dockerfile: 'Dockerfile' }, db: { service: 'db' } },
+      tiers: { spinoff: { env: manifestSpinEnv } },
+    } });
+    const senv = services.server.environment;
+    ok(!('POSTGRES_PASSWORD' in senv) && !('PROD_DB_URL' in senv),
+       `the generated compose server env carries no manifest credential `
+       + `[${['POSTGRES_PASSWORD', 'PROD_DB_URL'].filter((k) => k in senv).join(', ') || 'none'}]`);
+    ok(senv.DATABASE_URL === 'postgresql://u:p@db:5432/app',
+       `its DATABASE_URL stays the one built from the db block [${senv.DATABASE_URL}]`);
+    ok(senv.BUILD_MODE === 'simulate' && senv.PORT === '3000',
+       'the structural keys and the service\'s own PORT still bake — only the guard\'s names are dropped');
+    ok(/NOT BAKED from tiers\.spinoff\.env/.test(yaml) && yaml.includes('POSTGRES_PASSWORD'),
+       'the generated file SAYS what it did not take from the manifest, rather than dropping it silently');
+  }
+  await q(`UPDATE project SET manifest=NULL WHERE id=$1`, [pid]);   // the rest of the suite is manifest-less
+
   // ── 3. §6.2 — the refusal, and its ONE exemption ────────────────────────────────────────────
   // The guard exists so a nested queenzee never OPERATES on the managing instance's meta-DB (two
   // reconcilers reap each other's xells). That needs writes. A minted read-only reader has none —

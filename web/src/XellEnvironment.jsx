@@ -72,6 +72,11 @@ export default function XellEnvironment({ xell, onClose, onChanged }) {
 
   const env = view?.environment || null;
   const vars = view?.vars || [];
+  // A READ-ONLY binding receives no database credential from this environment (writeXellEnv
+  // withholds it by name shape, and the server no longer lists it among `vars` — see
+  // environments.js withheldEnvVars). The names still arrive, so the panel can say WHAT is missing
+  // and WHY: a var a zee expected must never read like a var that was never configured.
+  const withheld = view?.withheld || [];
 
   return (
     <div className="disp-overlay" onClick={onClose}>
@@ -106,7 +111,7 @@ export default function XellEnvironment({ xell, onClose, onChanged }) {
                       ? <span className="xenv-why" data-testid="xenv-why">📌 pinned to this xell</span>
                       : <span className="xenv-why" data-testid="xenv-why">resolved by tier — {view.reason}</span>}
                   </div>
-                  {vars.length === 0
+                  {vars.length === 0 && withheld.length === 0
                     ? (
                       <div className="xenv-empty" data-testid="xenv-empty">
                         <b>0 vars configured.</b> This environment resolved correctly and carries nothing, so a
@@ -132,6 +137,15 @@ export default function XellEnvironment({ xell, onClose, onChanged }) {
                             </li>
                           ))}
                         </ul>
+                        {withheld.length > 0 && (
+                          <div className="xenv-withheld" data-testid="xenv-withheld">
+                            <b>{withheld.length} var(s) WITHHELD.</b> This xell's binding is <b>READ-ONLY</b>, so a
+                            database credential is not projected into it — not into its <code>.zeehive.env</code>, and not
+                            into the generated spinoff compose either. Named here rather than silently missing:{' '}
+                            <code>{withheld.join(', ')}</code>. Its database access is the per-xell{' '}
+                            <code>DATABASE_URL</code> the queenzee mints for the binding.
+                          </div>
+                        )}
                       </>
                     )}
                 </>
