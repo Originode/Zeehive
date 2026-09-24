@@ -14,7 +14,12 @@
 //
 //     { status: 'ok'|'unknown'|'missing', error: string|null,
 //       bootstrappable: boolean,
-//       checks: [{ check, ok, skipped, unknown, blocking?, missing?, detail }] }
+//       checks: [{ check, ok, skipped, unknown, blocking?, missing?, db_row_present?, detail }] }
+//
+//   db_row_present → set on a failing `shared-dev-db` row whose db ROW EXISTS (the check dialled it
+//             and it did not open). It is what tells the bootstrap apart from a db the machine does
+//             not have at all: provisionDevDb can only create the absent one, so a row present caps
+//             `bootstrappable` at false (see checkSharedDevDb).
 //
 //   ok      → every BLOCKING check passed; a build can work here.
 //   missing → at least one blocking check FAILED (a definite missing prerequisite is named).
@@ -49,8 +54,20 @@ import { config } from '../config.js';
 import { sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx } from './machines.js';
 import { serverRoleIsProcess } from './manifest.js';
 import { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } from './netbird.js';
+// The DIAL half of the shared-dev-db check (below). Reused, not rewritten: the preflight already
+// opens a DSN, runs SELECT 1 and answers with the pg SQLSTATE — this probe needs the same act and
+// the same bound, on a container ROW's address rather than on a xell's. (provision.js and
+// preflight.js already import each other's half of this graph — see xell-db.js ↔ provision.js —
+// so the import cycle is the shape the module graph already has, and every binding here is read
+// inside a function, at a point where all three modules have finished evaluating.)
+import { checkDsnOpens } from './preflight.js';
+import { dsnWithPassword } from './provision.js';
 
 export const BUILD_READINESS_TIMEOUT_MS = 8000;
+// The shared-dev-db dial's own ceiling: one connect + SELECT 1, shorter than the docker ceiling
+// because it answers a page render. It bounds the DIAL, never the machine's docker context — the
+// check stays docker-free on purpose (see the comment above probeBuildReadiness).
+export const SHARED_DEV_DB_DIAL_TIMEOUT_MS = 4000;
 
 const pass = (check, detail) => ({ check, ok: true, skipped: false, unknown: false, detail });
 const skip = (check, detail) => ({ check, ok: true, skipped: true, unknown: false, detail });
@@ -288,7 +305,7 @@ async function checkMeshControlPlane(machine, docker) {
 // console's 🔧 button renders on this boolean, and the decision record's contract is that a shown
 // button always acts (docs/build-bootstrap-button-contract-decision-record.md). True means the
 // planner's classification will find at least one PERFORMABLE step:
-//   • a failing shared-dev-db                          → provisionDevDb
+//   • a shared-dev-db fail whose db ROW IS ABSENT      → provisionDevDb
 //   • a missing declared NETWORK                       → `docker network create`
 //   • a missing volume the manifest marks create:'empty' → `docker volume create`
 //   • the mesh control plane down on the queenzee host  → `compose --profile mesh up -d`
@@ -296,10 +313,17 @@ async function checkMeshControlPlane(machine, docker) {
 // performable — the planner names those as human steps — so this stays false and the button does
 // not render. A recorded check from before the structured `missing` field carries only free text:
 // fail SAFE there (false) rather than render a button into a plan with nothing to perform.
+//
+// A shared-dev-db fail is performable ONLY while NO row exists: provisionDevDb creates the db this
+// machine does not have, and refuses a machine that already has one. A row that is PRESENT and does
+// not open (`db_row_present`, set by checkSharedDevDb above) needs a human-timed recreate, so the
+// button must not render for it — and a legacy recorded row carries no flag at all, which keeps
+// exactly the behaviour it had (the row was the only fact the old check could see).
 export function bootstrappableFrom(checks = []) {
   const byName = (n) => checks.find((c) => c.check === n);
   const definiteFail = (c) => !!c && c.ok === false && c.unknown !== true;
-  if (definiteFail(byName('shared-dev-db'))) return true;
+  const sdb = byName('shared-dev-db');
+  if (definiteFail(sdb) && sdb.db_row_present !== true) return true;
   if (definiteFail(byName('mesh-control-plane'))) return true;
   const req = byName('requires-present');
   if (definiteFail(req)) {
@@ -311,13 +335,43 @@ export function bootstrappableFrom(checks = []) {
   return false;
 }
 
-// CHECK 4 — this machine has the project's shared dev db ON it. A dev xell's app tier must
-// never cross docker contexts for its database (spec), so no shared dev db here means this
-// machine cannot host the project's dev xells. Pure meta-DB read — no docker call.
-// A project whose default coupling is db-isolated shapes a per-xell dev db (each xell's db comes
-// up with its own compose stack) — for it, "no shared dev db on the machine" is the CORRECT
-// state, not a missing prerequisite, so the check is SKIPPED with the reason, never a red X.
-async function checkSharedDevDb(project, machine) {
+// CHECK 4 — this machine has the project's shared dev db ON it, AND that db answers.
+// A dev xell's app tier must never cross docker contexts for its database (spec), so no shared
+// dev db here means this machine cannot host the project's dev xells.
+//
+// The first half is still a pure meta-DB read — deliberately docker-free, so the check can answer
+// while the machine's docker context is down. The second half is a BOUNDED DIAL of the row's own
+// recorded address, and it exists because row-presence ALONE was a check that could not fail:
+// 'local' read ✓ GREEN for Zeehive while every db-open on it answered [28P01] — the row carries
+// conn_pw 'zeehive', the container was minted with a different password, and NO meta-DB value can
+// tell you that (the row is a MODEL of the password, not the password). Readiness then said "this
+// machine can host dev xells here" while every pooled provision that followed landed on a db
+// nothing could open. A check that cannot fail converts "I could not tell" into "fine".
+//
+// The verdicts, each one deliberate:
+//   no row                                   → fail    (a missing prerequisite; KEEP)
+//   per-xell coupling (db-isolated)          → skip    (the correct state; KEEP)
+//   row present, records no address          → pass    (there is nothing to DIAL: container.conn_ref
+//                                                       is derived from the same host address
+//                                                       machines.js provisionDevDb records, so a
+//                                                       row without one has no door to try. The
+//                                                       check keeps its presence-only meaning here
+//                                                       rather than inventing an address — an
+//                                                       addressless row is a different, named fault.)
+//   row present AND the dial answers         → pass
+//   row present AND the dial is REFUSED      → fail    (28P01 / ECONNREFUSED / ENOTFOUND — the peer
+//                                                       or the resolver told us something definite)
+//   row present AND only our OWN bound ended → unknown (nobody answered: cannot tell. Never a pass,
+//     it (no code from the driver)                      and never a definite fail either)
+//
+// A failing row carries `db_row_present: true`. That one structured fact is read by BOTH consumers
+// of "is there something to bootstrap here" — bootstrappableFrom() (the console's 🔧 render
+// condition) and the planner — because the bootstrap's only action on this check is provisionDevDb,
+// which creates a db that is NOT there and REFUSES a machine that already has one. A row that
+// exists and does not answer needs a human-timed RECREATE (it interrupts every live dev xell on the
+// machine) — the same class as the lost-alias row — so a shown button must not promise it
+// (docs/build-bootstrap-button-contract-decision-record.md: a shown button always acts).
+async function checkSharedDevDb(project, machine, dial = checkDsnOpens) {
   const coupling = project?.db_coupling || 'db-shared-dev';
   if (coupling !== 'db-shared-dev' && coupling !== 'db-clone') {
     return skip('shared-dev-db',
@@ -328,7 +382,27 @@ async function checkSharedDevDb(project, machine) {
     return fail('shared-dev-db',
       `no shared dev db for this project on '${machine.docker_ctx}' — dev xells cannot spawn here (their db must never live on another machine)`);
   }
-  return pass('shared-dev-db', `shared dev db '${row.name}' present on '${machine.docker_ctx}'`);
+  // The address the projection hands a zee for this db: the row's passwordless conn_ref (source
+  // 'shared-dev-container' in resolveXellDsn) with the row's OWN credential injected — never the
+  // manifest's, which is not what provisioned the container (TKT-181-9EDA).
+  const dsn = dsnWithPassword(row.conn_ref, row.conn_pw);
+  if (!dsn) {
+    return pass('shared-dev-db', `shared dev db '${row.name}' present on '${machine.docker_ctx}'`
+      + ' — the row records no dialable address, so the check asserts presence (there is no door to try)');
+  }
+  const r = await dial(dsn, { timeout: SHARED_DEV_DB_DIAL_TIMEOUT_MS });
+  if (r.ok) {
+    return pass('shared-dev-db', `shared dev db '${row.name}' present on '${machine.docker_ctx}' and it opens (${r.detail})`);
+  }
+  // `code` present ⇒ someone answered (auth rejection, nothing listening, a name that does not
+  // resolve). Absent ⇒ our own bound ended the attempt and nobody said anything: unknown, which
+  // the verdict ladder already refuses to call green.
+  const but = r.code
+    ? `but it does NOT open — ${r.detail}`
+    : `and CANNOT be confirmed to open — it did not answer within ${SHARED_DEV_DB_DIAL_TIMEOUT_MS}ms (${r.detail})`;
+  const detail = `shared dev db '${row.name}' present on '${machine.docker_ctx}' ${but}`;
+  return r.code ? { ...fail('shared-dev-db', detail), db_row_present: true }
+                : { ...unk('shared-dev-db', detail), db_row_present: true };
 }
 
 // CHECK 5 — when this machine cannot build, can a split build actually hand the image over?
@@ -360,17 +434,21 @@ async function checkRegistryForHandoff(machine, project) {
 }
 
 // The resolver — one (machine, project) → a verdict. Never throws for a verdict outcome.
-export async function probeBuildReadiness(machine, project, { docker = dockerAdapter } = {}) {
+// `dbDial` is the second injection seam, next to `docker`: the shared-dev-db check DIALS a real
+// postgres, and a test must be able to drive that verdict without a live host (the same reason
+// `docker` exists). Default is the preflight's own bound-and-report dial.
+export async function probeBuildReadiness(machine, project, { docker = dockerAdapter, dbDial = checkDsnOpens } = {}) {
   const checks = [];
   checks.push(await checkContextReachable(machine.docker_ctx, docker));
 
   // The remaining checks still run even when the context is down: compose-resolves and
-  // requires-present will answer 'unknown' (they need the daemon), while shared-dev-db and
-  // registry-for-handoff are pure meta-DB reads that do not. A definite missing fact beats
-  // "could not tell" in the overall verdict — we know it cannot build here.
+  // requires-present will answer 'unknown' (they need the daemon); shared-dev-db reads the meta-DB
+  // and dials only the row's OWN address (never the daemon) and registry-for-handoff reads the
+  // meta-DB alone. A definite missing fact beats "could not tell" in the overall verdict — we know
+  // it cannot build here.
   checks.push(await checkComposeResolves(machine, project, docker));
   checks.push(await checkRequiresPresent(machine, project, docker));
-  checks.push(await checkSharedDevDb(project, machine));
+  checks.push(await checkSharedDevDb(project, machine, dbDial));
   checks.push(await checkRegistryForHandoff(machine, project));
   // Recorded, never user-entered, and never a reason a build fails: the mesh control plane.
   checks.push(await checkMeshControlPlane(machine, docker));
@@ -393,7 +471,7 @@ export async function probeBuildReadiness(machine, project, { docker = dockerAda
 // for a project, probed in parallel. Read-only; each probe is bounded; a single unreachable
 // machine cannot stall the rest. Returns one entry per machine with the machine facts the UI
 // renders, plus the probe verdict.
-export async function buildReadinessForProject(projectId, { docker = dockerAdapter } = {}) {
+export async function buildReadinessForProject(projectId, { docker = dockerAdapter, dbDial = checkDsnOpens } = {}) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
   if (!project) throw new Error('project not found');
   // The project's DEFAULT db coupling decides whether a shared dev db is expected at all:
@@ -406,7 +484,7 @@ export async function buildReadinessForProject(projectId, { docker = dockerAdapt
        FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
       ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]);
   const rows = await Promise.all(machines.map(async (m) => {
-    const probe = await probeBuildReadiness(m, project, { docker });
+    const probe = await probeBuildReadiness(m, project, { docker, dbDial });
     return {
       machine_id: m.id,
       machine_key: m.key,
