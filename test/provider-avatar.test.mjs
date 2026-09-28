@@ -320,17 +320,28 @@ ok(renderToStaticMarkup(React.createElement(ZeeAvatar, { xell: { slug: 'ready-ce
 
 section('the console actually wears it');
 const app = read('web/src/App.jsx');
-ok(/<ZeeAvatar xell=\{x\} size=\{\d+\} \/>/.test(app), 'the xell card leads with the badge');
+// THE XELL CARD IS GONE (6bf7580, TKT-29-3AB6 — "delete XellCard and everything that existed only to
+// serve it"). This line used to read `<ZeeAvatar xell={x} size={N} />` out of App.jsx — the pre-canvas
+// fleet card that led with the badge. That card was deleted; the honeycomb is the fleet view now and
+// paints the badge there (asserted for real in §"the hexagon asks for it"), so the live fact to pin is
+// that App renders the honeycomb, which is what draws the badge. The deleted card's other tests were
+// retargeted in the same commit (crew-facet-and-cards, tend-reason); this one was missed.
+ok(/<HiveCanvas/.test(app) && /drawZeeAvatar\(/.test(read('web/src/hive/HiveCanvas.jsx')),
+   'the fleet view (the honeycomb) is what leads a xell with the badge now — the DOM xell card that '
+   + 'used to was deleted (6bf7580) and its badge import went with it');
 // The per-persona prompt buttons were collapsed into ONE "+ prompt" (fd43282): the button no
 // longer wears the persona it dispatches — the persona is chosen inside the composer. The vendor
 // coin lives where the vendor is actually picked (the composer's provider/account pickers, asserted
-// below), and the badge that survives is the xell card's, asserted above. Pin that the old
+// below), and the badge that survives is the honeycomb's, asserted above. Pin that the old
 // per-persona avatar row did NOT come back.
 ok(!/<ZeeAvatar harness=\{\{ key: b\.key/.test(app), 'no per-persona prompt-button avatar row in App');
 const dispSrc = read('web/src/Dispatch.jsx');
-ok(/<ZeeAvatar provider=\{p\.provider\} size=\{18\} \/>/.test(dispSrc),
+// The coin is the assertion; the tag's TAIL is not. 9aa4c14 added a usage ring to the coin
+// (`availablePct=…`), which is a second fact ABOUT the same coin, so the pin keeps requiring the
+// exact component + provider expression + size and stops requiring the tag to end right there.
+ok(/<ZeeAvatar provider=\{p\.provider\} size=\{18\}/.test(dispSrc),
    'and the composer carries the coin on the provider it will run on');
-ok(/<ZeeAvatar provider=\{active\?\.provider\} size=\{18\} \/>/.test(dispSrc),
+ok(/<ZeeAvatar provider=\{active\?\.provider\} size=\{18\}/.test(dispSrc),
    '…and on each account of that provider');
 ok(/WornPreview/.test(read('web/src/HarnessManager.jsx')),
    'the harness editor shows how its gear will be WORN — on more than one vendor');

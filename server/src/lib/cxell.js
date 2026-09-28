@@ -1419,10 +1419,15 @@ export async function configureCxellGitIdentity({ ctx = 'default', slug, timeout
   const safeSlug = String(slug || '').replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 120);
   const email = `${safeSlug}@xell.zeehive.local`;
   try {
-    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
+    // Through dkVerdict, like every other exec whose script states its own outcome. This one decides
+    // from the marker (the script echoes IDENTITY_OK only when both config writes succeeded), so the
+    // exit code must NOT decide — reading it through plain dk meant a non-zero exit rejected before
+    // the marker was read, and a cage that DID configure its identity was reported as having failed.
+    const r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc',
       `git config --global user.name 'xell' && git config --global user.email '${email}'`
-      + ` && echo IDENTITY_OK`], { timeoutMs });
-    return { ok: /IDENTITY_OK/.test(r.out || ''), slug: safeSlug, email };
+      + ` && echo IDENTITY_OK`],
+      { markers: ['IDENTITY_OK'], label: `${name}: git identity`, timeoutMs });
+    return { ok: r.verdict === 'IDENTITY_OK', slug: safeSlug, email };
   } catch (e) {
     logline('cxell', `${name}: could not configure per-xell git identity (${String(e.message).slice(0, 200)}) — `
       + 'in-cxell commits keep the baked shared identity until a rebuild fixes it');
