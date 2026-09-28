@@ -686,7 +686,10 @@ switch (cmd) {
     console.log(JSON.stringify(r.json, null, 2));
     const w = waitFlag();
     const status = r.json?.status;
-    if (r.code >= 400 || status === 'needs-resolution' || status === 'error') process.exit(1);
+    // 'not-landed' is the gate-recorded-it-but-the-ref-did-not-move case (a dirty xource refused the
+    // update after the hook answered): a REAL failure, so exit 1 rather than falling through to the
+    // clean-exit path a genuine success takes.
+    if (r.code >= 400 || status === 'needs-resolution' || status === 'error' || status === 'not-landed') process.exit(1);
     if (status === 'landed') process.exit(0);
     // HOLDING: queued behind another xell's landing on this ref. Print the position and exit cleanly
     // even under --wait — waiting would burn the whole timeout on a card no human will ever see, and

@@ -19,7 +19,7 @@ import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxe
          refreshCxellOriginMain } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { metaDbHostPort } from '../lib/prod-readonly.js';
-import { pushToXource, catchUpToXource } from './xellgit.js';
+import { pushToXource, catchUpToXource, xourceContainsSha } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
 // about the branch it just walked into (see branchHandover).
 import { cleanGitEnv, gitLog, worktreeDiff } from '../lib/git.js';
@@ -565,6 +565,47 @@ export async function selfLand(xell) {
             + 'tell which one you still mean. Do not stack them up: `zee land --withdraw --reason "…"` un-asks your '
             + 'open landings, so the order is WITHDRAW first, then `zee land` again for one fresh card.'
           : '')),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
+    };
+  }
+
+  // THE GATE RECORDED THIS EXACT SHA AS LANDED, BUT THE PUSH EXITED NON-ZERO.
+  //
+  // This is the self-heal-retry shape: the push is re-issued after main moved under the zee, the
+  // gate lets it through (auto-approve, or an approval it had already spent) and records `landed` —
+  // and the push can still exit non-zero for a reason that has nothing to do with the landing (a
+  // client-side failure AFTER the ref update; see xourceContainsSha). Branching on the exit code
+  // alone fell through to the failure wording, which printed "Push did not land ... the latest
+  // land_request is 'landed'" — CONTRADICTING the very record it quotes. CLAUDE.md §1: a zee that
+  // reads that re-lands, escalates a phantom, or reports a false failure to a human.
+  //
+  // So ask the REF, which is the only thing that can settle it, and keep the two honest answers
+  // distinct — a landed row is never answered with "Push did not land":
+  //   • the ref CONTAINS this sha → the landing landed; say so (and name the self-heal, if any).
+  //   • it does NOT → the landing did NOT happen (the push was refused AFTER the hook answered, as a
+  //     dirty xource checkout does under receive.denyCurrentBranch=updateInstead). Say THAT — do not
+  //     pretend it landed, and do not hide it behind the "not a fresh pending hold" wording either.
+  if (request && request.status === 'landed' && request.new_sha === push.head) {
+    const onRef = await xourceContainsSha(xell.id, push.head).catch(() => false);
+    if (onRef) {
+      return {
+        ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request,
+        message: withNote(`LANDED on ${ref} @ ${String(push.head).slice(0, 8)}${caughtNote} — the push's own `
+          + `non-zero exit was a retry artifact: the gate had ALREADY recorded this exact sha as landed `
+          + `(land_request ${String(request.id).slice(0, 8)}) and ${ref} contains it. Your work is on main.`),
+        ...(sibling ? { sibling_overlap: sibling } : {}),
+      };
+    }
+    return {
+      ok: false, status: 'not-landed', landed: false, collected, catch_up: caughtUp, healed, request,
+      push_output: push.output ? String(push.output).slice(-800) : null,
+      message: withNote(`The gate RECORDED this landing as 'landed' (land_request ${String(request.id).slice(0, 8)}, `
+        + `sha ${String(push.head).slice(0, 8)}) but ${ref} does NOT contain it — the push was refused AFTER the gate `
+        + 'let it through, so NOTHING is on main yet. This is the dirty-xource case: '
+        + '`receive.denyCurrentBranch=updateInstead` refuses the ref update over an unclean checkout once the hook '
+        + 'has already answered. Do not amend and do not re-push blindly — a human should clean the xource '
+        + '(console → Project → "Clean up xource"), then `zee land` again. Nothing is lost: your commits are safe on '
+        + 'your branch.'),
       ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
