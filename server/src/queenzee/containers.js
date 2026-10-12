@@ -68,25 +68,32 @@ const STATE_RANK = { running: 5, restarting: 4, created: 3, paused: 2, exited: 1
 // of its name — exact, no heuristics. Fallback for the pre-label fleet: modeled name exact OR a
 // versioned suffix (omnibiz_db_dev → omnibiz_db_dev_gis, omnibiz_db_prod → omnibiz_db_prod_v184),
 // preferring the healthiest match so a leftover stopped copy never masks the live one.
-function matchState(psMap, c) {
+// Returns the matched { name, info } (the dockerPs entry), or null if no candidate on that daemon.
+export function matchContainer(psMap, c) {
   let best = null, bestRank = -1;
-  const consider = (state) => {
-    const rank = STATE_RANK[state] ?? 0;
-    if (rank > bestRank) { best = state; bestRank = rank; }
+  const consider = (name, info) => {
+    const rank = STATE_RANK[info.state] ?? 0;
+    if (rank > bestRank) { best = { name, info }; bestRank = rank; }
   };
   if (c.project_token) {
-    for (const info of psMap.values()) {
+    for (const [name, info] of psMap) {
       if (info.project !== c.project_token || info.role !== c.role) continue;
       if ((info.xell || null) !== (c.xell_slug || null)) continue;
-      consider(info.state);
+      consider(name, info);
     }
     if (best != null) return best;
   }
   for (const [real, info] of psMap) {
     if (real !== c.name && !real.startsWith(c.name + '_')) continue;
-    consider(info.state);
+    consider(real, info);
   }
-  return best; // null if no candidate on that daemon
+  return best;
+}
+
+// The docker STATE of the container matching a modeled row (null if none) — the health tick's
+// reading of matchContainer.
+function matchState(psMap, c) {
+  return matchContainer(psMap, c)?.info.state ?? null;
 }
 
 // WHERE A PROCESS ROLE ACTUALLY IS — ticket #8 + TKT-136 defect #2.
