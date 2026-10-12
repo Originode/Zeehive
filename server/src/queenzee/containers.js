@@ -12,6 +12,10 @@ import { derivedTcpDsn } from '../lib/xell-db.js';
 import { config } from '../config.js';
 import { probeGatewayHealth } from './gateway-health.js';
 import { markJoinedMeshPeers } from '../lib/netbird.js';
+// The pair re-probe the db-port heal fires (see healStaleDbPortRows). build-readiness.js reaches
+// this module through provision.js already; every binding is read inside a function, after all
+// three have evaluated — the shape the module graph already has.
+import { reprobeBuildReadinessPair } from '../lib/build-readiness.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
 // role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
@@ -298,6 +302,14 @@ export async function healStaleSiteHostRows() {
 // Idempotent: a healed row no longer matches. Mirror of healHostlessDbRows /
 // healStaleSiteHostRows — same discipline, third broken shape (wrong port vs wrong host vs no
 // address). It runs on the ps map the tick already fetched: no second daemon call.
+//
+// A HEALED SHARED DEV DB RE-PROBES ITS PAIR. The (machine, project) build-readiness record was
+// dialled from the old address and reads 'missing' — the pool fill-stop and dispatch's
+// pickDevMachine both honour it, so a healed row alone resumes nothing until the hourly re-record.
+// On a restart that is worse: the boot-time re-record runs before the first health tick, so it
+// writes 'missing' from the rows this heal is about to fix (2026-10-12: omnibiz sat unprovisioned
+// after the heal had shipped, until a human clicked recheck). So each healed shared row re-probes
+// its pair at once through the ONE writer (reprobeBuildReadinessPair). Injectable for the test.
 
 // The host port the matched RUNNING container publishes the row's internal port on, when that
 // is one unambiguous port and it differs from the recorded host_port; null otherwise. PURE.
@@ -324,7 +336,7 @@ export function withPort(ref, port) {
   }
 }
 
-export async function healStaleDbPortRows(rows, psByCtx) {
+export async function healStaleDbPortRows(rows, psByCtx, { reprobe = reprobeBuildReadinessPair } = {}) {
   let healed = 0;
   for (const c of rows) {
     if (c.role !== 'db' || !c.host_port || !['dev', 'spinoff'].includes(c.tier)) continue;
@@ -350,9 +362,15 @@ export async function healStaleDbPortRows(rows, psByCtx) {
     healed++;
     logline('containers', `healed db row ${c.name}@${c.docker_ctx}: ${entry.name} publishes `
       + `${c.internal_port || 5432} on host port ${port} but the row recorded ${c.host_port} — host_port`
-      + `${c.conn_ref ? ' and conn_ref' : ''} re-stamped (a restart gives a -p 0:5432 container a new `
-      + 'port). The build-readiness record for its machine still says what the OLD address answered '
-      + 'until the hourly re-probe or the console recheck rewrites it.');
+      + `${c.conn_ref ? ' and conn_ref' : ''} re-stamped (a restart gives a -p 0:5432 container a new port).`);
+    if (c.isolation === 'shared' && c.project_id) {
+      const rec = await reprobe(c.docker_ctx, c.project_id);
+      if (rec) {
+        logline('containers', `re-probed build-readiness for (${c.docker_ctx}, project `
+          + `${String(c.project_id).slice(0, 8)}) off the healed address: ${rec.status}`
+          + `${rec.error ? ` — ${String(rec.error).slice(0, 160)}` : ''}`);
+      }
+    }
   }
   return healed;
 }
@@ -379,7 +397,7 @@ export async function checkContainers() {
   // project/xell identity rides along so labeled containers match exactly (sanitized project
   // token = what the compose labels carry, mirroring lib/manifest.js sanitizeName).
   const containers = await q(
-    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation, c.tier,
+    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation, c.tier, c.project_id,
             c.host_port, c.internal_port, c.conn_ref, c.url,
             lower(regexp_replace(p.name, '[^a-zA-Z0-9]', '', 'g')) AS project_token,
             x.slug AS xell_slug

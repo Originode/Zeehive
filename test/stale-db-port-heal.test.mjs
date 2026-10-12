@@ -18,6 +18,10 @@
 // • prod tier                             → untouched (dev/spinoff shapes only, like its siblings)
 // • daemon unreachable (null map)         → untouched
 // • dockerPs's CLI payload (Ports STRING) → read the same as the API array (publishedPortsOf)
+// • the healed SHARED row re-probes its (machine, project) build-readiness pair at once — and
+//   only it (the untouched rows re-probe nothing): the pair's 'missing' was dialled from the old
+//   address and is what stops the pool fill and dispatch. Waiting for the hourly re-record left
+//   omnibiz unprovisioned after the heal had shipped (2026-10-12).
 //
 // The ps map is a fake (the monitor's own dockerPs shape); the rows are real. Requires a migrated
 // postgres at DATABASE_URL (like hostless-db-heal.test.mjs).
@@ -60,7 +64,7 @@ try {
 
   // The monitor's own SELECT shape (project_token / xell_slug drive matchContainer).
   const rows = (await q(
-    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation, c.tier,
+    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation, c.tier, c.project_id,
             c.host_port, c.internal_port, c.conn_ref, c.url,
             lower(regexp_replace(p.name, '[^a-zA-Z0-9]', '', 'g')) AS project_token, NULL AS xell_slug
        FROM container c JOIN project p ON p.id = c.project_id WHERE c.project_id=$1`, [proj]));
@@ -78,13 +82,17 @@ try {
   };
 
   console.log('\n── a running db whose published port moved is re-stamped ──');
-  const n = await healStaleDbPortRows(rows, psByCtx);
+  const reprobed = [];
+  const reprobe = async (ctxRef, projectId) => { reprobed.push([ctxRef, projectId]); return { status: 'ok', error: null }; };
+  const n = await healStaleDbPortRows(rows, psByCtx, { reprobe });
   const m = await one(`SELECT host_port, conn_ref, conn_pw, host FROM container WHERE id=$1`, [moved.id]);
   ok(m.host_port === 32769, `host_port rewritten to the live port (got ${m.host_port}; the defect is 32768)`);
   ok(m.conn_ref === 'postgresql://postgres@10.1.0.15:32769/omnibiz',
      `conn_ref carries the live port, user/host/db as recorded (got ${m.conn_ref})`);
   ok(m.conn_pw === 'secret' && m.host === '10.1.0.15', 'conn_pw and host untouched');
   ok(n === 1, `exactly one row healed (got ${n})`);
+  ok(reprobed.length === 1 && reprobed[0][0] === ctx && reprobed[0][1] === proj,
+     `the healed shared row re-probed its own (machine, project) pair, once (got ${JSON.stringify(reprobed)})`);
 
   console.log('\n── every other shape is left exactly as recorded ──');
   for (const [label, r] of [['exited', exited], ['publishes nothing', unpub], ['ambiguous (two mappings)', ambig],
@@ -95,8 +103,8 @@ try {
 
   console.log('\n── idempotent: a second tick over the healed fleet changes nothing ──');
   const n2 = await healStaleDbPortRows(
-    (await q(`SELECT c.*, 'x' AS project_token, NULL AS xell_slug FROM container c WHERE c.project_id=$1`, [proj])), psByCtx);
-  ok(n2 === 0, `second pass heals nothing (got ${n2})`);
+    (await q(`SELECT c.*, 'x' AS project_token, NULL AS xell_slug FROM container c WHERE c.project_id=$1`, [proj])), psByCtx, { reprobe });
+  ok(n2 === 0 && reprobed.length === 1, `second pass heals nothing and re-probes nothing (got ${n2}, ${reprobed.length})`);
 
   console.log('\n── the pure halves ──');
   ok(liveDbPortFor({ host_port: 32768, internal_port: 5432 }, { name: 'x', info: entry('running', [tcp(32769)]) }) === 32769, 'liveDbPortFor: moved → the live port');

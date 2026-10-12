@@ -524,6 +524,30 @@ export async function upsertBuildReadinessRecord(machineId, projectId, { status,
 // `bootstrappable` is DERIVED from the stored checks on read (one authority, bootstrappableFrom)
 // rather than stored as a column: the record predates it, the checks are what the classification
 // actually needs, and a stored boolean could disagree with the rows it was derived from.
+// RE-PROBE ONE (machine, project) PAIR and record it — the narrow re-record a reader calls when
+// it has just CHANGED the fact the pair's verdict was read from. The health monitor's db-port heal
+// (queenzee/containers.js healStaleDbPortRows) is that caller: it rewrites a shared dev db row's
+// address, and the pair's recorded 'missing' (which the pool fill-stop and dispatch both honour)
+// was dialled from the OLD address. Without this the fix waits for the hourly re-record — and on a
+// restart the boot-time re-record runs BEFORE the first health tick heals the rows, so a pair sat
+// 'missing' for an hour over a db that answered (2026-10-12, omnibiz, after the heal itself had
+// shipped). Resolves the machine by key or docker_ctx; returns the record, or null when there is
+// nothing to probe (no such machine/project). Never throws — a caller's heal must not fail on it.
+export async function reprobeBuildReadinessPair(machineRef, projectId,
+                                                { docker = dockerAdapter, dbDial = checkDsnOpens } = {}) {
+  try {
+    const machine = await one(`SELECT * FROM machine WHERE key=$1 OR docker_ctx=$1`, [machineRef]);
+    const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+    if (!machine || !project) return null;
+    const pc = await one(`SELECT default_db_coupling FROM pool_config WHERE project_id=$1`, [projectId]);
+    if (pc?.default_db_coupling) project.db_coupling = pc.default_db_coupling;
+    const probe = await probeBuildReadiness(machine, project, { docker, dbDial });
+    return upsertBuildReadinessRecord(machine.id, projectId, probe);
+  } catch {
+    return null;
+  }
+}
+
 export async function recordedBuildReadinessForProject(projectId) {
   const project = await one(`SELECT id FROM project WHERE id=$1`, [projectId]);
   if (!project) throw new Error('project not found');
