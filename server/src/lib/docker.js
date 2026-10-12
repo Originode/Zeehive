@@ -339,8 +339,41 @@ export async function removeImage(ctx, tag, { timeout = 60000 } = {}) {
   return { removed: false, reason: `HTTP ${r.status}` };
 }
 
+// The PUBLISHED ports of one container-list entry: [{ ip, public, private, type }], one per
+// mapping (a PublicPort means it is reachable from the host; the duplicate IPv4/IPv6 rows docker
+// emits per mapping are collapsed). PURE, and shared by both readers below so the monitor and the
+// discovery read the same fact. Two payload shapes are accepted, because the module has two
+// sources: the HTTP API's `Ports` ARRAY (`{IP, PrivatePort, PublicPort, Type}`), and the CLI's
+// `{{json .}}` STRING ("0.0.0.0:32769->5432/tcp, :::32769->5432/tcp") on an SSH context —
+// anything else reads as "publishes nothing", never as a guessed port.
+export function publishedPortsOf(c) {
+  const seen = new Set();
+  const ports = [];
+  const add = (ip, pub, priv, type) => {
+    const key = `${pub}/${priv}/${type}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ports.push({ ip: ip || null, public: pub, private: priv, type });
+  };
+  const raw = c?.Ports;
+  if (Array.isArray(raw)) {
+    for (const p of raw) {
+      if (p?.PublicPort == null) continue;
+      add(p.IP, p.PublicPort, p.PrivatePort, p.Type);
+    }
+  } else if (typeof raw === 'string') {
+    for (const part of raw.split(',')) {
+      const m = /^\s*([^:\s]*):(\d+)->(\d+)\/(\w+)\s*$/.exec(part);
+      if (!m) continue;
+      add(m[1], Number(m[2]), Number(m[3]), m[4]);
+    }
+  }
+  return ports;
+}
+
 // Every container on a context (running or not), keyed by name:
-//   { state, xell, project, role }  — identity labels (spec §3.3), null when unlabeled.
+//   { state, xell, project, role, ports }  — identity labels (spec §3.3), null when unlabeled;
+//   ports = publishedPortsOf (empty when it publishes nothing).
 // THROWS if the daemon is unreachable/errors. An empty Map means a genuinely empty daemon; the
 // two are distinct here by construction, which is the whole point of this module.
 // An SSH context (mardale-prod re-pointed at ssh.omnibiz.express) is dialed through the docker CLI.
@@ -357,6 +390,7 @@ export async function dockerPs(ctx, timeout = 15000) {
       xell: L['zeehive.xell'] || null,
       project: L['zeehive.project'] || null,
       role: L['zeehive.role'] || null,
+      ports: publishedPortsOf(c),
     });
   }
   return out;
@@ -375,18 +409,8 @@ export async function listContainersDetailed(ctx, timeout = 15000) {
     const name = (c.Names?.[0] || '').replace(/^\//, '');
     if (!name) continue;
     const L = c.Labels || {};
-    // Published ports only (a PublicPort means it is reachable from the host); collapse the
-    // duplicate IPv4/IPv6 rows docker emits per mapping.
-    const seen = new Set();
-    const ports = [];
-    for (const p of c.Ports || []) {
-      if (p.PublicPort == null) continue;
-      const key = `${p.PublicPort}/${p.PrivatePort}/${p.Type}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      ports.push({ ip: p.IP || null, public: p.PublicPort, private: p.PrivatePort, type: p.Type });
-    }
-    const exposed = [...new Set((c.Ports || []).map((p) => p.PrivatePort).filter(Boolean))];
+    const ports = publishedPortsOf(c);          // published only — see publishedPortsOf
+    const exposed = [...new Set((Array.isArray(c.Ports) ? c.Ports : []).map((p) => p.PrivatePort).filter(Boolean))];
     out.push({
       name,
       image: c.Image || null,
