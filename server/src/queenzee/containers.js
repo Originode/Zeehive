@@ -279,6 +279,84 @@ export async function healStaleSiteHostRows() {
   return healed;
 }
 
+// ── address reconciliation for STALE db PORT rows (the moved-port heal) ──────────
+// A shared dev db is run with `-p 0:5432` (scripts/provision-xell-db.sh): docker picks the host
+// port and provisionDevDb records it ONCE. A container restart hands out a NEW ephemeral port and
+// nothing rewrote the row — so the recorded conn_ref dialled a port nothing listens on while the
+// container ran the whole time. 2026-10-12: omnibiz_db_dev_local recorded 10.1.0.15:32768 and was
+// publishing 32769; the shared-dev-db readiness check (which dials the ROW) read ECONNREFUSED,
+// recorded (local, omnibiz) 'missing', the pool's fill-stop and dispatch's pickDevMachine both
+// honoured it, and omnibiz was provisioned no xells at all — over a db that was up.
+//
+// The SHAPE, and only it: a db row on a dev/spinoff tier whose matched container is RUNNING and
+// PUBLISHES the row's internal_port on exactly one host port that is NOT the recorded host_port.
+// Not running → nothing to learn (the row keeps the last address that was true). Publishes
+// nothing, or more than one mapping for that port → ambiguous, untouched (a guessed port is a
+// silent wrong database — derivedTcpDsn's rule). Same port → already correct. Daemon unreachable
+// → untouched. It rewrites host_port and the PORT inside the recorded conn_ref (user, host and
+// database stay exactly as recorded; conn_pw is untouched), and url when one is recorded.
+// Idempotent: a healed row no longer matches. Mirror of healHostlessDbRows /
+// healStaleSiteHostRows — same discipline, third broken shape (wrong port vs wrong host vs no
+// address). It runs on the ps map the tick already fetched: no second daemon call.
+
+// The host port the matched RUNNING container publishes the row's internal port on, when that
+// is one unambiguous port and it differs from the recorded host_port; null otherwise. PURE.
+export function liveDbPortFor(row, entry) {
+  const info = entry?.info;
+  if (!info || info.state !== 'running') return null;
+  const internal = Number(row?.internal_port) || 5432;
+  const pubs = [...new Set((info.ports || [])
+    .filter((p) => Number(p.private) === internal && (p.type || 'tcp') === 'tcp')
+    .map((p) => Number(p.public)).filter(Boolean))];
+  if (pubs.length !== 1) return null;
+  return pubs[0] === Number(row?.host_port) ? null : pubs[0];
+}
+
+// The same URL with only its port replaced — null when it does not parse (then the field is
+// left as recorded rather than rewritten from a guess).
+export function withPort(ref, port) {
+  try {
+    const u = new URL(ref);
+    u.port = String(port);
+    return u.href;
+  } catch {
+    return null;
+  }
+}
+
+export async function healStaleDbPortRows(rows, psByCtx) {
+  let healed = 0;
+  for (const c of rows) {
+    if (c.role !== 'db' || !c.host_port || !['dev', 'spinoff'].includes(c.tier)) continue;
+    const psMap = psByCtx?.[c.docker_ctx];
+    if (!psMap) continue;                        // daemon did not answer — nothing was learned
+    const entry = matchContainer(psMap, c);
+    const port = liveDbPortFor(c, entry);
+    if (!port) continue;
+    const sets = ['host_port=$2'];
+    const vals = [c.id, port];
+    if (c.conn_ref) {
+      const ref = withPort(c.conn_ref, port);
+      if (ref) { sets.push(`conn_ref=$${vals.length + 1}`); vals.push(ref); }
+    }
+    if (c.url) {
+      const url = withPort(c.url, port);
+      if (url) { sets.push(`url=$${vals.length + 1}`); vals.push(url); }
+    }
+    const row = await one(
+      `UPDATE container SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals).catch(() => null);
+    if (!row) continue;
+    broadcast('container', row);
+    healed++;
+    logline('containers', `healed db row ${c.name}@${c.docker_ctx}: ${entry.name} publishes `
+      + `${c.internal_port || 5432} on host port ${port} but the row recorded ${c.host_port} — host_port`
+      + `${c.conn_ref ? ' and conn_ref' : ''} re-stamped (a restart gives a -p 0:5432 container a new `
+      + 'port). The build-readiness record for its machine still says what the OLD address answered '
+      + 'until the hourly re-probe or the console recheck rewrites it.');
+  }
+  return healed;
+}
+
 // Orphan memory: which labeled-but-unmodeled containers we've already reported, so the log
 // says it once per appearance instead of every 30-second tick.
 let knownOrphans = '';
@@ -301,7 +379,8 @@ export async function checkContainers() {
   // project/xell identity rides along so labeled containers match exactly (sanitized project
   // token = what the compose labels carry, mirroring lib/manifest.js sanitizeName).
   const containers = await q(
-    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation,
+    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation, c.tier,
+            c.host_port, c.internal_port, c.conn_ref, c.url,
             lower(regexp_replace(p.name, '[^a-zA-Z0-9]', '', 'g')) AS project_token,
             x.slug AS xell_slug
        FROM container c
@@ -314,6 +393,12 @@ export async function checkContainers() {
   const psByCtx = containers.length
     ? await probeContexts([...new Set(containers.map((c) => c.docker_ctx))])
     : {};
+
+  // The third address heal needs the probe: a db row whose RUNNING container publishes its port
+  // somewhere other than the row records (healStaleDbPortRows). Same ps map, no second dial;
+  // a heal failure must never fail the health tick.
+  await healStaleDbPortRows(containers, psByCtx)
+    .catch((e) => logline('containers', `stale db port heal: ${e.message}`));
 
   let up = 0, down = 0, unknown = 0, changed = 0, busy = 0, booting = 0;
   for (const c of containers) {
