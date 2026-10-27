@@ -31,6 +31,7 @@ import HiveCanvas from './hive/HiveCanvas.jsx';
 import { crewLinks } from './hive/crew.js';
 import { createXellCache } from './hive/xellCache.js';
 import { itemReachable } from './hive/level.js';
+import { searchTokens, xellMatches, isSearchHotkey } from './hive/search.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
@@ -329,6 +330,11 @@ export default function App() {
   const [split, setSplit] = useState(null);
   useEffect(() => { setSplit(readSplit(orientation)); }, [orientation]);
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
+  // XELL SEARCH (hive/search.js): the 🔍 chip in the crumb strip, hotkey `/` or Ctrl/⌘+K. While a
+  // query is set the honeycomb draws every matching xell of the project instead of one level.
+  const [xellSearchOpen, setXellSearchOpen] = useState(false);
+  const [xellQuery, setXellQuery] = useState('');
+  const xellSearchRef = useRef(null);
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
@@ -1094,6 +1100,26 @@ export default function App() {
     return r;
   }, [loadProjects, projectId]);
 
+  // XELL SEARCH: a query belongs to ONE project's xells — switching project clears it.
+  useEffect(() => { setXellQuery(''); setXellSearchOpen(false); }, [projectId]);
+  // the hotkey (`/` or Ctrl/⌘+K, never while typing elsewhere): opens the honeycomb's search box
+  // and focuses it. From the projects level it drops into the selected project first — xells are
+  // what is searched, and they live one level down.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!isSearchHotkey(e) || honeyView !== 'hive') return;
+      if (hiveMode === 'projects') {
+        if (!projectId) return;
+        setHiveMode('nodes'); setNodePath([]); setExpandedId(null);
+      }
+      e.preventDefault();
+      setXellSearchOpen(true);
+      setTimeout(() => { xellSearchRef.current?.focus(); xellSearchRef.current?.select(); }, 0);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [honeyView, hiveMode, projectId]);
+
   if (!fleet) return <div className="app"><p className="loading">Connecting to queenzee…</p></div>;
 
   const { project, status, containers } = fleet;
@@ -1254,8 +1280,20 @@ export default function App() {
   // yet drawn NOWHERE — the "says 16 of 18 but I only see a few" miscount report. Those xells
   // must surface at the ROOT level instead of vanishing (hive/level.js holds the rule).
   const openItemById = new Map(openItems.map((i) => [i.id, i]));
+  // XELL SEARCH: a query flattens the levels — every xell of the project, on whatever node, that
+  // holds ALL the keywords (hive/search.js). Only xells are searched; vacant seats are not drawn.
+  const searchTerms = hiveMode === 'nodes' ? searchTokens(xellQuery) : [];
+  const searching = searchTerms.length > 0;
   let hiveCells;
-  if (hiveMode === 'projects') {
+  if (searching) {
+    const openItemByXell = new Map(openItems.filter((i) => i.xell_id).map((i) => [i.xell_id, i]));
+    hiveCells = xells
+      .map((x) => {
+        const it = openItemByXell.get(x.id);
+        return it ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0 } : x;
+      })
+      .filter((x) => xellMatches(x, searchTerms));
+  } else if (hiveMode === 'projects') {
     // The fleet streams ONE project at a time — the SELECTED one — so only that project's hexagon can
     // carry its xells as the status-dot legend under the count ("5 xells" → 5 coloured dots, each the
     // colour its own hexagon would be painted one level down). The other project hexagons have no xells
@@ -1305,7 +1343,8 @@ export default function App() {
   // whole-project count against this, so "16 of 18 in use" over five hexagons reads as levelling,
   // not as a miscount. Projects mode draws no xells at all, so the chip stays silent there.
   const levelXellCount = hiveMode === 'nodes' ? hiveCells.filter((c) => !c.hex_kind).length : null;
-  const otherLevelXells = levelXellCount != null ? Math.max(0, xells.length - levelXellCount) : 0;
+  // (a search is not a level: what it hides is said by its own "N of M match" chip, not this one)
+  const otherLevelXells = levelXellCount != null && !searching ? Math.max(0, xells.length - levelXellCount) : 0;
 
   // drill into a project: select it and land at its root level
   const openProjectLevel = (p) => {
@@ -1647,6 +1686,43 @@ export default function App() {
                     {n.title}</button>
                 </React.Fragment>
               ))}
+              {/* XELL SEARCH — the 🔍 chip opens a keyword box (hotkey `/` or Ctrl/⌘+K). Every
+                  keyword must match (slug, branch, task, zee, harness, runtime, model, status, card
+                  title); while set, the honeycomb draws the matches from EVERY level. */}
+              {xellSearchOpen || xellQuery ? (
+                <span className={`hive-search${searching && !hiveCells.length ? ' none' : ''}`}
+                      data-testid="xell-search">
+                  <span className="hive-search-ico">🔍</span>
+                  <input ref={xellSearchRef} className="hive-search-input" data-testid="xell-search-input"
+                         type="search" placeholder="search xells…" value={xellQuery} autoFocus
+                         onChange={(e) => setXellQuery(e.target.value)}
+                         onBlur={() => { if (!xellQuery.trim()) setXellSearchOpen(false); }}
+                         onKeyDown={(e) => {
+                           if (e.key === 'Escape') {
+                             // own the Escape: the canvas's window handler would also close the
+                             // flower / reset the view
+                             e.stopPropagation();
+                             setXellQuery(''); setXellSearchOpen(false); e.currentTarget.blur();
+                           } else if (e.key === 'Enter' && hiveCells.length === 1 && !hiveCells[0].hex_kind) {
+                             setExpandedId(hiveCells[0].id);   // one match → open its flower
+                           }
+                         }} />
+                  {searching && (
+                    <span className="hive-search-count" data-testid="xell-search-count"
+                          title="xells of this project matching every keyword, across all levels">
+                      {hiveCells.length} of {xells.length}</span>
+                  )}
+                  <button className="hive-search-clear" title="clear the search (Esc)"
+                          onClick={() => { setXellQuery(''); setXellSearchOpen(false); }}>✕</button>
+                </span>
+              ) : (
+                <button className="hive-crumb hive-search-btn" data-testid="xell-search-btn"
+                        title="Search & filter xells by keyword  ( / or Ctrl+K )"
+                        onClick={() => {
+                          setXellSearchOpen(true);
+                          setTimeout(() => xellSearchRef.current?.focus(), 0);
+                        }}>🔍</button>
+              )}
             </>
           )}
         </div>

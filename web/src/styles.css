@@ -2207,6 +2207,27 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-crumbs .hive-crumb:hover { color: #e6ebf2; border-color: #7f95c2; }
 .hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
+/* XELL SEARCH — the 🔍 chip and the keyword box it opens, in the crumb strip's chip language */
+.hive-crumbs .hive-search-btn { margin-left: 6px; padding: 3px 8px; }
+.hive-crumbs .hive-search {
+  pointer-events: auto; margin-left: 6px;
+  display: inline-flex; align-items: center; gap: 4px;
+  background: rgba(31, 40, 58, 0.92); border: 1px solid #7f95c2; border-radius: 12px;
+  padding: 1px 4px 1px 8px; font: 600 11px 'Segoe UI', sans-serif; color: #dce4f2;
+}
+.hive-crumbs .hive-search.none { border-color: #c2687f; }
+.hive-crumbs .hive-search-ico { font-size: 10px; opacity: 0.8; }
+.hive-crumbs .hive-search-input {
+  background: transparent; border: 0; outline: 0; color: #e6ebf2;
+  font: 600 11px 'Segoe UI', sans-serif; width: 180px; padding: 2px 0;
+}
+.hive-crumbs .hive-search-input::-webkit-search-cancel-button { display: none; }
+.hive-crumbs .hive-search-count { color: #8b97a8; white-space: nowrap; }
+.hive-crumbs .hive-search.none .hive-search-count { color: #e08a9e; }
+.hive-crumbs .hive-search-clear {
+  background: transparent; border: 0; color: #8b97a8; cursor: pointer; font-size: 11px; padding: 0 4px;
+}
+.hive-crumbs .hive-search-clear:hover { color: #e6ebf2; }
 /* ── the pane's VIEW SELECTOR (honeycomb · tickets · reflections · board · timeline) ───────────
    Top-RIGHT, opposite the breadcrumb and in the same chip language, floating over the pane so the
    honeycomb canvas (absolute, inset 0) keeps every pixel it had. A work view fills the same pane
