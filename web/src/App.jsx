@@ -1689,7 +1689,9 @@ export default function App() {
               {/* XELL SEARCH — the 🔍 chip opens a keyword box (hotkey `/` or Ctrl/⌘+K). Every
                   keyword must match (slug, branch, task, zee, harness, runtime, model, status, card
                   title); while set, the honeycomb draws the matches from EVERY level. */}
-              {xellSearchOpen || xellQuery ? (
+              {xellSearchOpen || xellQuery ? (<>
+                {/* the open box takes its own row under the crumbs, clear of the view chips */}
+                <span className="hive-crumbs-break" />
                 <span className={`hive-search${searching && !hiveCells.length ? ' none' : ''}`}
                       data-testid="xell-search">
                   <span className="hive-search-ico">🔍</span>
@@ -1715,7 +1717,7 @@ export default function App() {
                   <button className="hive-search-clear" title="clear the search (Esc)"
                           onClick={() => { setXellQuery(''); setXellSearchOpen(false); }}>✕</button>
                 </span>
-              ) : (
+              </>) : (
                 <button className="hive-crumb hive-search-btn" data-testid="xell-search-btn"
                         title="Search & filter xells by keyword  ( / or Ctrl+K )"
                         onClick={() => {
