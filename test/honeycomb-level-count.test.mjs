@@ -50,7 +50,7 @@ ok(typeof itemReachable(direct, openMap([direct]), undefined) === 'boolean',
 // ── 2. App surfaces orphaned xells at the root level ─────────────────────────
 console.log('\nApp: a counted xell is drawn SOMEWHERE');
 const app = readFileSync('web/src/App.jsx', 'utf8');
-ok(/import \{ itemReachable \} from '\.\/hive\/level\.js'/.test(app),
+ok(/import \{ itemReachable[ ,}][^}]*\}? ?from '\.\/hive\/level\.js'/.test(app),
    'App uses the shared rule from hive/level.js');
 ok(/itemReachable\(it, openItemById, rootWorkItem\?\.id\)/.test(app),
    'the root level skips ONLY xells whose deeper node is actually reachable');

@@ -30,7 +30,7 @@ import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
 import { createXellCache } from './hive/xellCache.js';
-import { itemReachable } from './hive/level.js';
+import { itemReachable, descendantXells } from './hive/level.js';
 import { searchTokens, xellMatches, isSearchHotkey } from './hive/search.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
@@ -335,6 +335,14 @@ export default function App() {
   const [xellSearchOpen, setXellSearchOpen] = useState(false);
   const [xellQuery, setXellQuery] = useState('');
   const xellSearchRef = useRef(null);
+  // XELLS ONLY: the honeycomb drops its levels and vacant seats and draws just the xells ASSIGNED to
+  // an open work card, from every level. A view preference, remembered per browser.
+  const [xellsOnly, setXellsOnly] = useState(() => {
+    try { return localStorage.getItem('zeehive.hive.xellsOnly') === '1'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('zeehive.hive.xellsOnly', xellsOnly ? '1' : '0'); } catch { /* private mode */ }
+  }, [xellsOnly]);
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
@@ -1102,12 +1110,14 @@ export default function App() {
 
   // XELL SEARCH: a query belongs to ONE project's xells — switching project clears it.
   useEffect(() => { setXellQuery(''); setXellSearchOpen(false); }, [projectId]);
-  // the hotkey (`/` or Ctrl/⌘+K, never while typing elsewhere): opens the honeycomb's search box
+  // the hotkey (`/`, Ctrl/⌘+K or the find key Ctrl/⌘+F, never while typing elsewhere): opens the honeycomb's search box
   // and focuses it. From the projects level it drops into the selected project first — xells are
   // what is searched, and they live one level down.
   useEffect(() => {
     const onKey = (e) => {
       if (!isSearchHotkey(e) || honeyView !== 'hive') return;
+      // Ctrl/⌘+F a SECOND time, from inside the box, is the browser's own find again — never trap it
+      if (String(e.key).toLowerCase() === 'f' && document.activeElement === xellSearchRef.current) return;
       if (hiveMode === 'projects') {
         if (!projectId) return;
         setHiveMode('nodes'); setNodePath([]); setExpandedId(null);
@@ -1280,19 +1290,24 @@ export default function App() {
   // yet drawn NOWHERE — the "says 16 of 18 but I only see a few" miscount report. Those xells
   // must surface at the ROOT level instead of vanishing (hive/level.js holds the rule).
   const openItemById = new Map(openItems.map((i) => [i.id, i]));
+  // every live xell standing anywhere BENEATH each open node (not just its children) — a node
+  // hexagon carries it as work_xells and draws the "xells inside" beacon from it
+  const xellsUnder = descendantXells(openItems, xells, rootWorkItem?.id);
   // XELL SEARCH: a query flattens the levels — every xell of the project, on whatever node, that
   // holds ALL the keywords (hive/search.js). Only xells are searched; vacant seats are not drawn.
   const searchTerms = hiveMode === 'nodes' ? searchTokens(xellQuery) : [];
   const searching = searchTerms.length > 0;
+  const onlyAssigned = hiveMode === 'nodes' && xellsOnly;
+  const flatHive = searching || onlyAssigned;   // either one replaces the level with a flat xell list
   let hiveCells;
-  if (searching) {
+  if (flatHive) {
     const openItemByXell = new Map(openItems.filter((i) => i.xell_id).map((i) => [i.xell_id, i]));
     hiveCells = xells
       .map((x) => {
         const it = openItemByXell.get(x.id);
-        return it ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0 } : x;
+        return it ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [] } : x;
       })
-      .filter((x) => xellMatches(x, searchTerms));
+      .filter((x) => (!onlyAssigned || x.work_item) && xellMatches(x, searchTerms));
   } else if (hiveMode === 'projects') {
     // The fleet streams ONE project at a time — the SELECTED one — so only that project's hexagon can
     // carry its xells as the status-dot legend under the count ("5 xells" → 5 coloured dots, each the
@@ -1314,16 +1329,16 @@ export default function App() {
     if (nodePath.length && ctxItemId) {
       const ctxItem = workItemById.get(ctxItemId);
       const zx = ctxItem?.xell_id ? xellById.get(ctxItem.xell_id) : null;
-      if (zx) { seen.add(zx.id); hiveCells.push({ ...zx, work_item: ctxItem, work_children: nodeChildCount.get(ctxItem.id) || 0 }); }
+      if (zx) { seen.add(zx.id); hiveCells.push({ ...zx, work_item: ctxItem, work_children: nodeChildCount.get(ctxItem.id) || 0, work_xells: xellsUnder.get(ctxItem.id) || [] }); }
     }
     for (const it of level) {
       const zx = it.xell_id ? xellById.get(it.xell_id) : null;
       if (zx && !seen.has(zx.id)) {
         seen.add(zx.id);
-        hiveCells.push({ ...zx, work_item: it, work_children: nodeChildCount.get(it.id) || 0 });
+        hiveCells.push({ ...zx, work_item: it, work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [] });
       } else if (!zx) {
         hiveCells.push({ id: `wn:${it.id}`, hex_kind: 'worknode', slug: it.title, work_item: it,
-                         work_children: nodeChildCount.get(it.id) || 0, project_id: it.project_id });
+                         work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [], project_id: it.project_id });
       }
     }
     if (!nodePath.length) {
@@ -1334,7 +1349,7 @@ export default function App() {
         // UNREACHABLE node (terminal/missing parent) surfaces at root rather than nowhere
         if (it && itemReachable(it, openItemById, rootWorkItem?.id)) continue;
         hiveCells.push(it
-          ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0 }
+          ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [] }
           : x);
       }
     }
@@ -1344,7 +1359,7 @@ export default function App() {
   // not as a miscount. Projects mode draws no xells at all, so the chip stays silent there.
   const levelXellCount = hiveMode === 'nodes' ? hiveCells.filter((c) => !c.hex_kind).length : null;
   // (a search is not a level: what it hides is said by its own "N of M match" chip, not this one)
-  const otherLevelXells = levelXellCount != null && !searching ? Math.max(0, xells.length - levelXellCount) : 0;
+  const otherLevelXells = levelXellCount != null && !flatHive ? Math.max(0, xells.length - levelXellCount) : 0;
 
   // drill into a project: select it and land at its root level
   const openProjectLevel = (p) => {
@@ -1686,9 +1701,14 @@ export default function App() {
                     {n.title}</button>
                 </React.Fragment>
               ))}
-              {/* XELL SEARCH — the 🔍 chip opens a keyword box (hotkey `/` or Ctrl/⌘+K). Every
+              {/* XELL SEARCH — the 🔍 chip opens a keyword box (hotkey `/`, Ctrl/⌘+K or Ctrl/⌘+F). Every
                   keyword must match (slug, branch, task, zee, harness, runtime, model, status, card
                   title); while set, the honeycomb draws the matches from EVERY level. */}
+              {/* XELLS ONLY — a toggle: just the xells assigned to a work card, from every level */}
+              <button className={`hive-crumb hive-xells-only${xellsOnly ? ' on' : ''}`} data-testid="xells-only-btn"
+                      title={xellsOnly ? 'Showing only xells assigned to a work card (every level) — click to show the level again'
+                        : 'Show only the xells assigned to a work card, from every level (hides vacant seats and unassigned xells)'}
+                      onClick={() => setXellsOnly((v) => !v)}>◉ xells only</button>
               {xellSearchOpen || xellQuery ? (<>
                 {/* the open box takes its own row under the crumbs, clear of the view chips */}
                 <span className="hive-crumbs-break" />
@@ -1719,7 +1739,7 @@ export default function App() {
                 </span>
               </>) : (
                 <button className="hive-crumb hive-search-btn" data-testid="xell-search-btn"
-                        title="Search & filter xells by keyword  ( / or Ctrl+K )"
+                        title="Search & filter xells by keyword  ( / · Ctrl+K · Ctrl+F )"
                         onClick={() => {
                           setXellSearchOpen(true);
                           setTimeout(() => xellSearchRef.current?.focus(), 0);

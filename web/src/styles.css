@@ -2208,7 +2208,9 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
 /* XELL SEARCH — the 🔍 chip and the keyword box it opens, in the crumb strip's chip language */
-.hive-crumbs .hive-search-btn { margin-left: 6px; padding: 3px 8px; }
+.hive-crumbs .hive-search-btn { margin-left: 4px; padding: 3px 8px; }
+.hive-crumbs .hive-xells-only { margin-left: 6px; }
+.hive-crumbs .hive-xells-only.on { color: #1a1205; background: #f5b942; border-color: #f5b942; }
 .hive-crumbs .hive-crumbs-break { flex-basis: 100%; height: 0; }
 .hive-crumbs .hive-search {
   pointer-events: auto;

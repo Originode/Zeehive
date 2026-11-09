@@ -33,7 +33,7 @@ export const xellMatches = (x, tokens) => {
   return tokens.every((t) => hay.includes(t));
 };
 
-// the search HOTKEY: `/` (no modifiers) or Ctrl/⌘+K — but never while the human is typing into
+// the search HOTKEY: `/` (no modifiers), Ctrl/⌘+K or the FIND key Ctrl/⌘+F — but never while the human is typing into
 // something else, so a `/` in a composer stays a `/` — and never inside a terminal at all, where
 // Ctrl+K is the shell's kill-line.
 export const isSearchHotkey = (e) => {
@@ -42,7 +42,7 @@ export const isSearchHotkey = (e) => {
   if (t && typeof t.closest === 'function' && t.closest('.xterm')) return false;
   const editable = !!t && (!!t.isContentEditable
     || /^(INPUT|TEXTAREA|SELECT)$/.test(String(t.tagName || '').toUpperCase()));
-  if ((e.ctrlKey || e.metaKey) && !e.altKey && String(e.key).toLowerCase() === 'k') return true;
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && ['k', 'f'].includes(String(e.key).toLowerCase())) return true;
   if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !editable) return true;
   return false;
 };

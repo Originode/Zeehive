@@ -124,7 +124,15 @@ export { isManagerXell } from './crew.js';
 // already says. So a harness worn by managers ONLY earns no cell at all — it still travels in the
 // payload, because the manager hexagon needs its art.
 export const wearersOf = (h) => h?.wearer_ids || h?.consumer_ids || [];   // old payloads: wearers = consumers
-export const badgedHarnesses = (harnesses = []) => (harnesses || []).filter((h) => (h?.consumer_ids || []).length > 0);
+// …and on a NESTED level only the harnesses a xell ON THAT LEVEL consumes: the honeycomb draws one
+// level of the work-node tree, and a badge for a zee standing on another level is a cell (and a wire
+// junction) pointing at nothing you can see. `onLevelIds` = the ids of the xells this level draws;
+// omitted, every consumed harness is badged (the old, level-blind behaviour).
+export const badgedHarnesses = (harnesses = [], onLevelIds = null) => (harnesses || []).filter((h) => {
+  const consumers = h?.consumer_ids || [];
+  if (!consumers.length) return false;
+  return !onLevelIds || consumers.some((id) => onLevelIds.has(id));
+});
 
 // ── a manager and its CREW ───────────────────────────────────────────────────
 // The relation itself — who is crew, who is live, which xell the hive is focused on, and the DASH that
@@ -1017,7 +1025,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // The SHOW-HARNESS toggle hides them entirely: no cells are seated (so no grid space is taken),
     // no geometry is published (so no wire routes through one) and the hit-test list stays empty —
     // the whole view drops back to commit-dot → xell traces.
-    const badged = badgedHarnesses(harnesses);
+    const badged = badgedHarnesses(harnesses, new Set(list.filter((x) => !x.hex_kind).map((x) => x.id)));
     const harnessCells = [];
     if (showHarness && badged.length) {
       const cols = Math.max(1, lay.cols);
@@ -1927,6 +1935,47 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
 // to onOpenProject / onOpenNode (a drill-down), never to the flower — the flower stays a xell's.
 const NODE = { stroke: '#7f95c2', fill: '#141926', text: '#dce4f2', muted: '#8b97a8', chip: '#5b8cff' };
 
+// ── the "XELLS INSIDE" beacon ────────────────────────────────────────────────
+// A project / activity / task hexagon with live xells ANYWHERE beneath it (x.work_xells, every
+// descendant — App.jsx via hive/level.js#descendantXells; project_xells / xell_count for a project)
+// wears a honey-coloured glow ring and a pill in its top band: "◉ 3 XELLS", one status-coloured dot
+// per xell (the colour its own hexagon is painted where it stands). Honey is used for nothing else
+// on a node, so "there is a zee in here" reads at a glance from across the honeycomb.
+export const XELL_BEACON = '#f5b942';
+export function drawXellsInside(ctx, cx, cy, size, xs, n = xs.length) {
+  if (!n) return;
+  ctx.save();
+  hexPath(ctx, cx, cy, size + 3);
+  ctx.lineWidth = 2.2; ctx.setLineDash([]);
+  ctx.shadowColor = withAlpha(XELL_BEACON, 0.8); ctx.shadowBlur = Math.max(4, size * 0.12);
+  ctx.strokeStyle = withAlpha(XELL_BEACON, 0.9); ctx.stroke();
+  ctx.shadowBlur = 0;
+  if (size >= 30) {
+    const chH = Math.max(12, size * 0.16);
+    const dy = size * 0.72;
+    ctx.font = `700 ${Math.max(8, chH * 0.6)}px 'Segoe UI', sans-serif`;
+    const label = `◉ ${n} XELL${n === 1 ? '' : 'S'}`;
+    const r = Math.max(1.8, chH * 0.16), gap = r * 2.6;
+    const maxW = hexHalfWidthAt(size, dy) * 2 * 0.92;
+    const textW = ctx.measureText(label).width;
+    const dots = Math.max(0, Math.min(xs.length, Math.floor((maxW - textW - chH) / gap)));
+    const chW = Math.min(maxW, textW + chH * 0.9 + (dots ? dots * gap + r : 0));
+    const chX = cx - chW / 2, chY = cy - dy - chH / 2;
+    ctx.beginPath(); ctx.roundRect(chX, chY, chW, chH, chH / 2);
+    ctx.fillStyle = withAlpha(XELL_BEACON, 0.95); ctx.fill();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#1a1205';
+    const tx = chX + chH * 0.45;
+    ctx.fillText(label, tx, chY + chH / 2 + 0.5);
+    for (let i = 0; i < dots; i++) {
+      ctx.beginPath(); ctx.arc(tx + textW + r * 2 + i * gap, chY + chH / 2, r, 0, Math.PI * 2);
+      ctx.fillStyle = statusColor(xs[i]); ctx.fill();
+      ctx.lineWidth = 0.8; ctx.strokeStyle = '#1a1205'; ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
 // Greedy two-line word wrap, second line ellipsised by fit(). For the node/project titles — a
 // hexagon can hold two short lines where one would truncate half the words away.
 function wrapTwo(ctx, text, maxW) {
@@ -1996,6 +2045,7 @@ export function drawProjectHex(ctx, hx, { hover, dim }) {
       ctx.fillText(`+${px.length - shown}`, cx, y + r * 3);
     }
   }
+  drawXellsInside(ctx, cx, cy, size, px, Math.max(px.length, n));
   ctx.restore();
 }
 
@@ -2050,6 +2100,7 @@ export function drawWorkNodeHex(ctx, hx, { hover, dim }) {
     ctx.fillText(label, cx, chY + chH / 2 + 0.5);
     assign = { x: chX, y: chY, w: chW, h: chH };
   }
+  drawXellsInside(ctx, cx, cy, size, x.work_xells || []);
   ctx.restore();
   return { assign };
 }
@@ -2065,14 +2116,16 @@ export function drawChildrenChip(ctx, hx, { hover, dim }) {
   if (dim) ctx.globalAlpha = 0.3;
   const chH = Math.max(13, size * 0.17);
   ctx.font = `600 ${Math.max(8, chH * 0.58)}px 'Segoe UI', sans-serif`;
-  const label = `⬡ ${kids}`;
+  // …and how many xells stand ANYWHERE beneath this card, in the beacon's honey
+  const inside = (x.work_xells || []).length;
+  const label = inside ? `⬡ ${kids} · ◉ ${inside}` : `⬡ ${kids}`;
   const chW = ctx.measureText(label).width + chH * 0.9;
   const chX = cx - chW / 2, chY = cy + size * 0.66;
   ctx.beginPath(); ctx.roundRect(chX, chY, chW, chH, chH / 2);
-  ctx.fillStyle = withAlpha('#0a0d13', 0.85); ctx.fill();
-  ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(NODE.stroke, hover ? 1 : 0.6); ctx.stroke();
+  ctx.fillStyle = inside ? withAlpha(XELL_BEACON, 0.95) : withAlpha('#0a0d13', 0.85); ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = inside ? XELL_BEACON : withAlpha(NODE.stroke, hover ? 1 : 0.6); ctx.stroke();
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillStyle = NODE.text;
+  ctx.fillStyle = inside ? '#1a1205' : NODE.text;
   ctx.fillText(label, chX + chW / 2, chY + chH / 2 + 0.5);
   ctx.restore();
   return { x: chX, y: chY, w: chW, h: chH };
