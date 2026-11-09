@@ -1704,14 +1704,15 @@ export default function App() {
               {/* XELL SEARCH — the 🔍 chip opens a keyword box (hotkey `/`, Ctrl/⌘+K or Ctrl/⌘+F). Every
                   keyword must match (slug, branch, task, zee, harness, runtime, model, status, card
                   title); while set, the honeycomb draws the matches from EVERY level. */}
+              {/* the FIND tools take their own row under the crumbs: a deep crumb trail would otherwise
+                  push them under the view chips on the right */}
+              <span className="hive-crumbs-break" />
               {/* XELLS ONLY — a toggle: just the xells assigned to a work card, from every level */}
               <button className={`hive-crumb hive-xells-only${xellsOnly ? ' on' : ''}`} data-testid="xells-only-btn"
                       title={xellsOnly ? 'Showing only xells assigned to a work card (every level) — click to show the level again'
                         : 'Show only the xells assigned to a work card, from every level (hides vacant seats and unassigned xells)'}
                       onClick={() => setXellsOnly((v) => !v)}>◉ xells only</button>
               {xellSearchOpen || xellQuery ? (<>
-                {/* the open box takes its own row under the crumbs, clear of the view chips */}
-                <span className="hive-crumbs-break" />
                 <span className={`hive-search${searching && !hiveCells.length ? ' none' : ''}`}
                       data-testid="xell-search">
                   <span className="hive-search-ico">🔍</span>
