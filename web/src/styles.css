@@ -2609,6 +2609,11 @@ a.cbox:hover { border-color: var(--accent); }
   background: none; border: 0; color: var(--text); cursor: pointer; padding: 3px 10px;
   font-family: 'Cascadia Code', monospace; font-size: 12px; }
 .fx-row:hover { background: rgba(255,255,255,.05); }
+.fx-item { display: flex; align-items: center; }
+.fx-item .fx-row { flex: 1; min-width: 0; }
+.fx-dl { color: var(--muted); text-decoration: none; padding: 0 8px; font-size: 13px; opacity: .45; }
+.fx-item:hover .fx-dl { opacity: 1; }
+.fx-dl:hover { color: var(--accent); }
 .fx-ic { color: var(--muted); width: 12px; text-align: center; }
 .fx-dir .fx-nm { color: #79c0ff; }
 .fx-nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

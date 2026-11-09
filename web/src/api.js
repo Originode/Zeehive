@@ -1334,6 +1334,11 @@ export async function readCxellFile(zeeId, path) {
   return data;
 }
 
+// the explorer's ⤓ link — a plain URL, so the BROWSER streams the attachment to disk (no blob in memory)
+export const cxellDownloadUrl = (zeeId, path) => `/api/zees/${zeeId}/download?path=${encodeURIComponent(path)}`;
+export const containerDownloadUrl = (containerId, path) =>
+  `/api/containers/${containerId}/download?path=${encodeURIComponent(path)}`;
+
 // ── container file explorer: read-only view into a container's filesystem (rides the shell modal) ──
 export async function listContainerDir(containerId, path) {
   const qs = path ? `?path=${encodeURIComponent(path)}` : '';

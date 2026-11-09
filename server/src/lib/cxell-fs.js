@@ -147,6 +147,27 @@ export function parseReadResult(buf, stderr, file, truncated = false) {
   };
 }
 
+// ── DOWNLOAD: the file's exact bytes, for the explorer's ⤓ link ──────────────────────────────
+// The viewer's read is a TEXT read (512 KB cap, binaries blanked) — saving that would hand a human a
+// silently cut-off or empty file. A download is the raw bytes, and a file over the cap is REFUSED
+// (413, with its real size) rather than sent truncated: a partial file that looks whole is worse
+// than no file. The cap bounds the in-memory buffer the queenzee holds while it relays the bytes.
+export const DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
+export function parseDownloadResult(buf, stderr, file, truncated = false, maxBytes = DOWNLOAD_MAX_BYTES) {
+  const sizeMatch = stderr.match(/__SIZE__ (\d+)/);
+  const size = sizeMatch ? Number(sizeMatch[1]) : buf.length;
+  if (truncated || size > maxBytes || buf.length < size) {
+    throw Object.assign(new Error(`${file} is ${size} bytes — over the ${maxBytes}-byte download cap`), { status: 413 });
+  }
+  return { path: file, name: file.slice(file.lastIndexOf('/') + 1) || 'download', size, buf };
+}
+// Content-Disposition for a download: an ASCII fallback plus the RFC 5987 UTF-8 name, so a
+// filename with quotes, spaces or non-ASCII survives without breaking (or injecting into) the header.
+export function contentDisposition(name) {
+  const ascii = String(name || 'download').replace(/[^\x20-\x7e]|["\\]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(String(name || 'download'))}`;
+}
+
 // List a directory inside the cxell (one short-lived ssh exec).
 export async function listCxellDir(zeeId, path) {
   const dir = resolveCxellPath(path);
@@ -167,4 +188,15 @@ export async function readCxellFile(zeeId, path, maxBytes = 512_000) {
   if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
   if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
   return parseReadResult(buf, stderr, file, truncated);
+}
+
+// Download a file inside the cxell: its exact bytes (see parseDownloadResult).
+export async function downloadCxellFile(zeeId, path, maxBytes = DOWNLOAD_MAX_BYTES) {
+  const file = resolveCxellPath(path);
+  const dest = await zeeSshDest(zeeId);
+  const script = buildReadScript(file, maxBytes + 1);
+  const { buf, stderr, code, truncated } = await withConn(dest, (c) => execCapture(c, script, maxBytes + 1));
+  if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
+  if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
+  return parseDownloadResult(buf, stderr, file, truncated, maxBytes);
 }

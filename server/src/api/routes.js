@@ -8,8 +8,8 @@ import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { deliveryTelemetry } from '../lib/delivery-telemetry.js';
 import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
 import { recentLogs, logline } from '../lib/logbus.js';
-import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
-import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
+import { listCxellDir, readCxellFile, downloadCxellFile, contentDisposition } from '../lib/cxell-fs.js';
+import { listContainerDir, readContainerFile, downloadContainerFile } from '../lib/container-fs.js';
 import { bus, broadcast, activityFanout } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
@@ -1376,6 +1376,11 @@ router.get('/zees/:id/file', async (req, res) => {
   try { res.json(await readCxellFile(req.params.id, req.query.path)); }
   catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
+// The explorer's ⤓ — the file's exact bytes as an attachment (still read-only: nothing is written).
+router.get('/zees/:id/download', async (req, res) => {
+  try { sendDownload(res, await downloadCxellFile(req.params.id, req.query.path)); }
+  catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
 
 // ── container file explorer (read-only) — the panel that rides alongside the container shell ──
 // List a directory inside a fleet container, and read a text file — the same explorer the zee
@@ -1389,6 +1394,16 @@ router.get('/containers/:id/file', async (req, res) => {
   try { res.json(await readContainerFile(req.params.id, req.query.path)); }
   catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
+router.get('/containers/:id/download', async (req, res) => {
+  try { sendDownload(res, await downloadContainerFile(req.params.id, req.query.path)); }
+  catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
+function sendDownload(res, f) {
+  res.set({ 'Content-Type': 'application/octet-stream', 'Content-Length': String(f.buf.length),
+            'Content-Disposition': contentDisposition(f.name), 'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff' });
+  res.end(f.buf);
+}
 
 // ── /xell skill → claim a ready xell, but ONLY if the session is inside its worktree ──
 router.post('/xell/claim', requireQueenzeeLoops, async (req, res) => {

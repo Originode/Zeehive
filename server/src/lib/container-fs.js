@@ -8,7 +8,8 @@ import http from 'node:http';
 import { one } from '../db/pool.js';
 import { resolveContext, demuxDockerStream } from './docker.js';
 import { resolveShellTarget, dockerReq } from './terminal-bridge.js';
-import { buildListScript, parseListOutput, buildReadScript, parseReadResult } from './cxell-fs.js';
+import { buildListScript, parseListOutput, buildReadScript, parseReadResult,
+         parseDownloadResult, DOWNLOAD_MAX_BYTES } from './cxell-fs.js';
 
 // The natural explorer root for a real container — the container's filesystem root. A PROCESS-ROLE
 // server/webapp (runner:process) has no container of its own: its shell is the queenzee at the
@@ -121,4 +122,16 @@ export async function readContainerFile(containerId, path, maxBytes = 512_000) {
   if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
   if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
   return parseReadResult(buf, stderr, file, truncated);
+}
+
+// Download a file inside the container: its exact bytes, refused over the cap (cxell-fs.js).
+export async function downloadContainerFile(containerId, path, maxBytes = DOWNLOAD_MAX_BYTES) {
+  const { conn, name, workingDir } = await shellTargetFor(containerId);
+  const root = workingDir || CONTAINER_ROOT;
+  const file = resolveContainerPath(path, root);
+  const script = buildReadScript(file, maxBytes + 1);
+  const { buf, stderr, code, truncated } = await dockerExecCapture(conn, name, script, { workingDir, maxBytes: maxBytes + 1 });
+  if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
+  if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
+  return parseDownloadResult(buf, stderr, file, truncated, maxBytes);
 }

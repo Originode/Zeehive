@@ -2,7 +2,10 @@
 // in-house terminal's file panel. It runs the EXACT remote shell scripts the bridge sends over
 // ssh, but against a real local temp dir via `/bin/sh` (no ssh, no DB, no container) — so it
 // exercises the real base64-path handling, the listing loop and the read cap, then asserts the
-// real parsers turn that output into the shapes the API returns.
+// real parsers turn that output into the shapes the API returns. The explorer's ⤓ DOWNLOAD rides the
+// same read script: it must hand back the file's EXACT bytes (binary included), REFUSE a file over
+// its cap (413) instead of sending a cut-off copy, and name the attachment without letting a hostile
+// filename break the header.
 import { execFile } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +13,9 @@ import { join } from 'node:path';
 import {
   resolveCxellPath, CXELL_ROOT,
   buildListScript, parseListOutput, buildReadScript, parseReadResult,
+  parseDownloadResult, contentDisposition, DOWNLOAD_MAX_BYTES,
 } from '../server/src/lib/cxell-fs.js';
+import { readFileSync } from 'node:fs';
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -85,6 +90,41 @@ async function main() {
     const evil = join(root, 'sub'); // reuse; the real proof is the b64 encoding of arbitrary bytes
     const ir = await runScript(buildReadScript(`${evil}/nested.txt`, 512000));
     ok(parseReadResult(ir.buf, ir.stderr, 'x').content === 'deep', 'a path with slashes reads through base64 intact');
+
+    console.log('download — the EXACT bytes, binary included (the viewer read would blank this):');
+    const raw = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x0a, 0x00, 0x7f]);
+    writeFileSync(join(root, 'img.png'), raw);
+    const dr = await runScript(buildReadScript(join(root, 'img.png'), DOWNLOAD_MAX_BYTES + 1));
+    const dl = parseDownloadResult(dr.buf, dr.stderr, join(root, 'img.png'));
+    ok(Buffer.compare(dl.buf, raw) === 0, 'download buffer is byte-identical to the file on disk');
+    ok(dl.name === 'img.png' && dl.size === raw.length, 'carries the basename and the true size');
+
+    console.log('download — over the cap is REFUSED (413), never sent truncated:');
+    const or = await runScript(buildReadScript(join(root, 'big.txt'), 100 + 1));
+    let err = null;
+    try { parseDownloadResult(or.buf, or.stderr, join(root, 'big.txt'), false, 100); } catch (e) { err = e; }
+    ok(err && err.status === 413 && /5000 bytes/.test(err.message), 'a 5000-byte file under a 100-byte cap → 413 naming its real size');
+    const er = await runScript(buildReadScript(join(root, 'big.txt'), 5000 + 1));
+    ok(parseDownloadResult(er.buf, er.stderr, join(root, 'big.txt'), false, 5000).buf.length === 5000,
+       'a file exactly AT the cap downloads whole');
+
+    console.log('download — the attachment header survives a hostile filename:');
+    const cd = contentDisposition('a "b"\\c\r\nX-Evil: 1 ü.txt');
+    ok(!/[\r\n]/.test(cd), 'no CR/LF can reach the header (no header injection)');
+    ok(/filename="a _b__c__X-Evil: 1 _\.txt"/.test(cd), 'the ASCII fallback replaces quotes, backslashes and non-ASCII');
+    ok(cd.includes("filename*=UTF-8''" + encodeURIComponent('a "b"\\c\r\nX-Evil: 1 ü.txt')), 'the RFC 5987 name keeps the real UTF-8 name, encoded');
+
+    console.log('download — wired end to end (routes, both bridges, the explorer link):');
+    const routes = readFileSync('server/src/api/routes.js', 'utf8');
+    const fx = readFileSync('web/src/FileExplorer.jsx', 'utf8');
+    const cfs = readFileSync('server/src/lib/container-fs.js', 'utf8');
+    ok(/router\.get\('\/zees\/:id\/download'/.test(routes) && /router\.get\('\/containers\/:id\/download'/.test(routes),
+       'both doors have a download route');
+    ok(/'Content-Disposition': contentDisposition\(f\.name\)/.test(routes) && /application\/octet-stream/.test(routes),
+       'the route sends the bytes as an octet-stream attachment');
+    ok(/export async function downloadContainerFile/.test(cfs) && /parseDownloadResult\(buf, stderr, file, truncated, maxBytes\)/.test(cfs),
+       'the container bridge downloads through the same parser');
+    ok(/data-testid="fx-download"/.test(fx) && /download=\{e\.name\}/.test(fx), 'every FILE row in the explorer has a ⤓ download link');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
