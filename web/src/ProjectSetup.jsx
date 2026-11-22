@@ -866,7 +866,10 @@ function BasicsSection({ project, run, onProject }) {
           <input value={f.registry} onChange={set('registry')} placeholder="none — compile on the run host" /></label>
         <label>GitHub remote <span className="pc">{access?.can_push
             ? '(write access — Pull, or Push / open a PR; every outbound action is confirmed)'
-            : '(pull-only fetch source — connect a write-scoped PAT to enable Push / PR)'}</span>
+            : access?.reason
+              // the probe's OWN reason: a rejected or unscoped token is not the same as a read-only one
+              ? `(Push / PR unavailable — ${access.reason})`
+              : '(pull-only fetch source — connect a write-scoped PAT to enable Push / PR)'}</span>
           <span className="setup-row">
             <input value={f.remote_url} onChange={set('remote_url')} placeholder="https://github.com/org/repo (none)" />
             <button type="button" disabled={!(project.remote_url || '').trim() || pull?.busy || out?.busy}

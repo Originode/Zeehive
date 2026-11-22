@@ -1924,6 +1924,14 @@ export default function App() {
                         onClick={() => doGitHubPR(true)}
                         title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
               )}
+              {/* The probe ANSWERED and said no: say why, instead of the PR button just vanishing
+                  ("I can't do a pull request" with nothing on screen to explain it). */}
+              {githubAccessState && !githubAccessState.can_pr && (
+                <button className="gh-btn blocked"
+                        onClick={() => showAlert(`⇅ PR is unavailable for this project.\n\n${githubAccessState.reason || 'the GitHub token cannot open PRs on this repo'}.`,
+                          { title: 'Why can’t I open a pull request?', variant: 'error' })}
+                        title={`⇅ PR unavailable — ${githubAccessState.reason || 'the GitHub token cannot open PRs on this repo'}`}>⇅ PR ⚠</button>
+              )}
               {githubOut && !githubOut.busy && (
                 <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled && githubOut.kind !== 'commit' ? ' bad' : ''}`}
                    href={githubOut?.url || null} target="_blank" rel="noreferrer"
