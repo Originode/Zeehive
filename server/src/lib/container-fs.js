@@ -6,9 +6,10 @@
 // this stays out of its way).
 import http from 'node:http';
 import { one } from '../db/pool.js';
-import { resolveContext } from './docker.js';
+import { resolveContext, demuxDockerStream } from './docker.js';
 import { resolveShellTarget, dockerReq } from './terminal-bridge.js';
-import { buildListScript, parseListOutput, buildReadScript, parseReadResult } from './cxell-fs.js';
+import { buildListScript, parseListOutput, buildReadScript, parseReadResult,
+         parseDownloadResult, DOWNLOAD_MAX_BYTES } from './cxell-fs.js';
 
 // The natural explorer root for a real container — the container's filesystem root. A PROCESS-ROLE
 // server/webapp (runner:process) has no container of its own: its shell is the queenzee at the
@@ -31,25 +32,11 @@ export function resolveContainerPath(p, root = CONTAINER_ROOT) {
   return '/' + parts.join('/');
 }
 
-// The docker raw-stream framing: a non-TTY exec's stdout/stderr come back multiplexed as
-// [8-byte header][payload] frames — header[0] is the stream (1=stdout, 2=stderr) and header[4:8]
-// is the big-endian payload size. With Tty:true (the shell) there is no multiplexing; a capture
-// must ask for Tty:false and demux here.
-export function demuxDockerStream(buf) {
-  const out = []; const err = [];
-  let off = 0;
-  while (off + 8 <= buf.length) {
-    const stream = buf[off];
-    const size = buf.readUInt32BE(off + 4);
-    off += 8;
-    if (off + size > buf.length) break; // truncated final frame — keep what is whole
-    const chunk = buf.subarray(off, off + size);
-    if (stream === 1) out.push(chunk);
-    else if (stream === 2) err.push(chunk);
-    off += size;
-  }
-  return { out: Buffer.concat(out), err: Buffer.concat(err) };
-}
+// The docker raw-stream framing (a non-TTY exec's stdout/stderr come back multiplexed) now lives
+// in docker.js, beside the other wire-format code, because the prod LOG tail needs the same demux
+// and a second copy of a framing parser is how two readers drift. Re-exported here so this
+// module's own contract (and test/container-fs.test.mjs) is unchanged.
+export { demuxDockerStream } from './docker.js';
 
 // Run a shell script inside the target and capture stdout/stderr, non-TTY. The script travels in
 // the exec Cmd verbatim (no shell interpolation on our side), and the same base64-pipe technique
@@ -135,4 +122,16 @@ export async function readContainerFile(containerId, path, maxBytes = 512_000) {
   if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
   if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
   return parseReadResult(buf, stderr, file, truncated);
+}
+
+// Download a file inside the container: its exact bytes, refused over the cap (cxell-fs.js).
+export async function downloadContainerFile(containerId, path, maxBytes = DOWNLOAD_MAX_BYTES) {
+  const { conn, name, workingDir } = await shellTargetFor(containerId);
+  const root = workingDir || CONTAINER_ROOT;
+  const file = resolveContainerPath(path, root);
+  const script = buildReadScript(file, maxBytes + 1);
+  const { buf, stderr, code, truncated } = await dockerExecCapture(conn, name, script, { workingDir, maxBytes: maxBytes + 1 });
+  if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
+  if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
+  return parseDownloadResult(buf, stderr, file, truncated, maxBytes);
 }

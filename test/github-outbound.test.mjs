@@ -1,7 +1,8 @@
 // GitHub OUTBOUND (opt-in, human-gated) — proves the new push/PR plumbing in
 // server/src/lib/remote-git.js:
 //   • parseGitHubSlug maps github.com AND enterprise hosts to the right REST base
-//   • remoteAccess reads the repo `permissions` block and gates can_push/can_pr on WRITE
+//   • remoteAccess reads the repo `permissions` block and gates can_push/can_pr on WRITE, and a
+//     refused probe (401 / 403 / 404) names its OWN cause + fix (accessRefusal), never one sentence
 //   • pushRemote is FAST-FORWARD-ONLY — a diverged remote is refused, never force-pushed
 // The git tests run against a real local bare repo (no network); remoteAccess runs against a
 // stubbed global fetch so no live GitHub call is made.
@@ -55,6 +56,24 @@ console.log('remoteAccess: write access lights can_push/can_pr, read-only does n
     stub({}, { ok: false, status: 403 });
     r = await remoteAccess({ url: 'https://github.com/org/repo', token: 'ghp_x'.padEnd(30, 'a') });
     ok(r.can_push === false && /not authorised/i.test(r.reason || ''), '403 → not authorised');
+
+    // each refusal status names its OWN cause and fix — one sentence for all of them is how
+    // "I can't do a pull request" ended up with nothing on screen to explain it
+    stub({}, { ok: false, status: 401 });
+    r = await remoteAccess({ url: 'https://github.com/org/repo', token: 'ghp_x'.padEnd(30, 'a') });
+    ok(r.can_pr === false && r.status === 401 && /rejected/i.test(r.reason) && /expired|revoked/i.test(r.reason),
+      '401 → token rejected (expired/revoked), with status');
+
+    globalThis.fetch = async () => ({ ok: false, status: 403,
+      json: async () => ({ message: 'Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization.' }) });
+    r = await remoteAccess({ url: 'https://github.com/org/repo', token: 'ghp_x'.padEnd(30, 'a') });
+    ok(r.can_pr === false && /SAML SSO/.test(r.reason) && /GitHub: "Resource protected/.test(r.reason),
+      '403 SAML → names SSO authorisation and quotes GitHub');
+
+    globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({ message: 'Not Found' }) });
+    r = await remoteAccess({ url: 'https://github.com/org/repo', token: 'ghp_x'.padEnd(30, 'a') });
+    ok(r.can_pr === false && r.status === 404 && /cannot see org\/repo/.test(r.reason) && /Repository access/.test(r.reason),
+      '404 → token cannot see the repo (fine-grained repo access / classic scope)');
 
     r = await remoteAccess({ url: 'https://github.com/org/repo', token: null });
     ok(r.can_push === false && /no github token/i.test(r.reason || ''), 'no token → refused with reason');

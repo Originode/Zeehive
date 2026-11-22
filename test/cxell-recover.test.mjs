@@ -34,7 +34,7 @@
 // SHARED meta-DB (a xell on db-shared-dev has one), and both halves of this feature WRITE to the zee
 // rows they visit — a fleet-wide sweep from a test would restart other people's cages and file
 // host-restart deaths against zees that are working perfectly well. So the sweep is handed its
-// lister (`list`, the same seam refreshZeeLiveInLiveCxells takes) and the resume is driven through
+// lister (`list`, the same seam refreshZeeToolingInLiveCxells takes) and the resume is driven through
 // nudgeXellForTurnDeath for THIS xell, rather than through reviveTick, whose due-set is the whole
 // fleet's and whose claim would spend a real zee's revive attempt against this test's fake docker.
 // That reviveTick sends a host-restart revive the RESTART's prompt is asserted statically in A2.

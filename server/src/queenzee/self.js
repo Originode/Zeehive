@@ -19,7 +19,7 @@ import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxe
          refreshCxellOriginMain } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { metaDbHostPort } from '../lib/prod-readonly.js';
-import { pushToXource, catchUpToXource } from './xellgit.js';
+import { pushToXource, catchUpToXource, xourceContainsSha } from './xellgit.js';
 // gitLog/worktreeDiff are read-only host-worktree reads — what `zee swap` tells an INHERITING zee
 // about the branch it just walked into (see branchHandover).
 import { cleanGitEnv, gitLog, worktreeDiff } from '../lib/git.js';
@@ -45,6 +45,7 @@ import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migra
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv, resolveXellDsn } from '../lib/provision.js';
 import { deriveXellRoutes, probeTcp } from '../lib/mesh-routes.js';
+import { recordRouteSources, meshRouteTally } from '../lib/mesh-route-telemetry.js';
 import { meshEnabled, ensureProdBindMeshPolicy } from '../lib/netbird.js';
 import { providerRunEnv } from '../lib/provider-tokens.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
@@ -564,6 +565,47 @@ export async function selfLand(xell) {
             + 'tell which one you still mean. Do not stack them up: `zee land --withdraw --reason "…"` un-asks your '
             + 'open landings, so the order is WITHDRAW first, then `zee land` again for one fresh card.'
           : '')),
+      ...(sibling ? { sibling_overlap: sibling } : {}),
+    };
+  }
+
+  // THE GATE RECORDED THIS EXACT SHA AS LANDED, BUT THE PUSH EXITED NON-ZERO.
+  //
+  // This is the self-heal-retry shape: the push is re-issued after main moved under the zee, the
+  // gate lets it through (auto-approve, or an approval it had already spent) and records `landed` —
+  // and the push can still exit non-zero for a reason that has nothing to do with the landing (a
+  // client-side failure AFTER the ref update; see xourceContainsSha). Branching on the exit code
+  // alone fell through to the failure wording, which printed "Push did not land ... the latest
+  // land_request is 'landed'" — CONTRADICTING the very record it quotes. CLAUDE.md §1: a zee that
+  // reads that re-lands, escalates a phantom, or reports a false failure to a human.
+  //
+  // So ask the REF, which is the only thing that can settle it, and keep the two honest answers
+  // distinct — a landed row is never answered with "Push did not land":
+  //   • the ref CONTAINS this sha → the landing landed; say so (and name the self-heal, if any).
+  //   • it does NOT → the landing did NOT happen (the push was refused AFTER the hook answered, as a
+  //     dirty xource checkout does under receive.denyCurrentBranch=updateInstead). Say THAT — do not
+  //     pretend it landed, and do not hide it behind the "not a fresh pending hold" wording either.
+  if (request && request.status === 'landed' && request.new_sha === push.head) {
+    const onRef = await xourceContainsSha(xell.id, push.head).catch(() => false);
+    if (onRef) {
+      return {
+        ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request,
+        message: withNote(`LANDED on ${ref} @ ${String(push.head).slice(0, 8)}${caughtNote} — the push's own `
+          + `non-zero exit was a retry artifact: the gate had ALREADY recorded this exact sha as landed `
+          + `(land_request ${String(request.id).slice(0, 8)}) and ${ref} contains it. Your work is on main.`),
+        ...(sibling ? { sibling_overlap: sibling } : {}),
+      };
+    }
+    return {
+      ok: false, status: 'not-landed', landed: false, collected, catch_up: caughtUp, healed, request,
+      push_output: push.output ? String(push.output).slice(-800) : null,
+      message: withNote(`The gate RECORDED this landing as 'landed' (land_request ${String(request.id).slice(0, 8)}, `
+        + `sha ${String(push.head).slice(0, 8)}) but ${ref} does NOT contain it — the push was refused AFTER the gate `
+        + 'let it through, so NOTHING is on main yet. This is the dirty-xource case: '
+        + '`receive.denyCurrentBranch=updateInstead` refuses the ref update over an unclean checkout once the hook '
+        + 'has already answered. Do not amend and do not re-push blindly — a human should clean the xource '
+        + '(console → Project → "Clean up xource"), then `zee land` again. Nothing is lost: your commits are safe on '
+        + 'your branch.'),
       ...(sibling ? { sibling_overlap: sibling } : {}),
     };
   }
@@ -1359,6 +1401,48 @@ export async function selfTend(xell, { reason = null, clear = false } = {}) {
         + 'with that reason on the card and in the console\'s "waiting on you" line. Nothing is gated '
         + 'or blocked. It clears when you `zee tend --clear` or report working (`zee working`).',
   };
+}
+
+// ── POST /api/xell/self/medic — a blocked zee calls the ⛑ MEDIC (the patient-voice card) ────────
+// Every zee (worker AND manager) may call it; opens no gate; blocks nothing. The call is RECORDED
+// server-side with the xell's infra evidence (lib/medic-calls.js collectCallEvidence), then routed
+// by the ONE decision: a LIVE medic attending this project → ATTACH (resume that medic with the call
+// verbatim + evidence in the background); none → RAISE (the call becomes an entry in
+// fleet.medic_emergency, source 'called', and a human dispatches — NOTHING auto-spawns). A second
+// call while one is live UPDATES the open call (the partial unique index is the rate limit).
+// `--clear` withdraws; `--status` reads the current call.
+export async function selfMedicCall(xell, { reason = null, kind = null, clear = false, status = false } = {}) {
+  const { raiseMedicCall, readMedicCallForXell, withdrawMedicCall } = await import('../lib/medic-calls.js');
+  const zee = await liveZee(xell.id);
+  if (clear) {
+    const row = await withdrawMedicCall(xell.id, { by: xell.slug });
+    logline('self', `${xell.slug} WITHDREW its medic call`);
+    return { ok: true, call: row, message: row
+      ? 'Medic call withdrawn — it no longer shows in the console ⛑. If the fault is still there, '
+        + 'the answer is a fresh `zee medic --reason "…"` when you are ready.'
+      : 'No live medic call was open to withdraw.' };
+  }
+  if (status) {
+    const row = await readMedicCallForXell(xell.id);
+    if (!row) return { ok: true, call: null, message: 'No medic call on record for this xell.' };
+    const lines = [`Your medic call is ${row.status}${row.medic_id ? ` (medic ${String(row.medic_id).slice(0, 8)})` : ''} — `,
+                   `"${row.reason}"`];
+    // A DECLINED call (the medic declined it with call_answer, OR a HUMAN dismissed it) always says
+    // WHY: the resolution note is exactly what the calling zee receives, and a zee reading its own
+    // status later must not have to guess whether the decline was "not a medic job" or something it
+    // can fix. The note is also delivered as a zee_message at decline time; this is the durable copy.
+    if (row.status === 'declined' && row.resolution) {
+      lines.push('', `Why it was declined: ${row.resolution}`);
+      lines.push('(A medic fixes ZEEHIVE config/infra. If the fault is in your own code or tests, '
+        + 'that is `zee tend`, not a medic. If you are still blocked, raise a FRESH `zee medic --reason "…"`.)');
+    } else if (row.status === 'withdrawn' && row.resolution) {
+      lines.push('', `Withdrawn: ${row.resolution}`);
+    } else if (row.status === 'resolved' && row.resolution) {
+      lines.push('', `Resolution: ${row.resolution}`);
+    }
+    return { ok: true, call: row, message: lines.join('\n').slice(0, 2000) };
+  }
+  return raiseMedicCall({ xell, reason, kind: kind || 'other', zeeId: zee?.id || null });
 }
 
 // ── POST /api/xell/self/hint-land · hint-ship — "this looks ready; a human should decide" ──────
@@ -2900,6 +2984,28 @@ export async function selfOps(xell, { hours = 24, logs = 300 } = {}) {
   return digest;
 }
 
+// GET /api/xell/self/prod-logs — `zee prod-logs` (EVERY zee, read-only, opens no gate).
+//
+// The project is the TOKEN-resolved xell's own, never a parameter: a zee reads its OWN project's
+// production app-tier log and can name nothing else. The wall, the redaction and why the database
+// is excluded all live in lib/prod-logs.js — this is the thin verb over it, plus the one thing the
+// library must not decide: that a read of production is RECORDED where humans look (the queenzee
+// log), so "who read prod logs, and when" is a fact and not a trust exercise.
+export async function selfProdLogs(xell, { role = null, tail = null, since = null,
+                                           grep = null, container = null } = {}) {
+  const { prodLogTail } = await import('../lib/prod-logs.js');
+  const answer = await prodLogTail(xell.project_id, { role, tail, since, grep, container });
+  if (role) {
+    logline('self', `${xell.slug} read the PRODUCTION ${role} log`
+      + (answer.source?.container ? ` (${answer.source.container})` : '')
+      + (answer.ok ? `: ${answer.lines?.length ?? 0} line(s)`
+                   + (answer.redacted_lines ? `, ${answer.redacted_lines} redacted` : '')
+                   + (answer.grep ? `, matching "${answer.grep}"` : '')
+                 : ` — refused/failed: ${answer.error || 'unknown'}`));
+  }
+  return answer;
+}
+
 // POST /api/xell/self/ticket — `zee ticket` (MANAGER only). The project comes from the TOKEN-resolved
 // xell, never from the body — the same "which project? unaskable" rule as every other self verb.
 export async function selfTicketCreate(xell, { title = null, body = null, kind = null,
@@ -4074,5 +4180,33 @@ export async function selfRoutes(xell) {
       await probeTcp(payload.routes.db.ip || payload.routes.db.host || payload.routes.db.hostname,
                      payload.routes.db.port);
   }
+
+  // TELEMETRY, best-effort (never a gate, never a delay trap): count what this answer resolved,
+  // per target kind and source (lib/mesh-route-telemetry.js). Phase 5 — stop publishing per-xell
+  // ports and delete the allocator — is gated on this tally (§6), and THIS is the one place a route
+  // answer exists to be counted. recordRouteSources() swallows its own errors, so a telemetry row
+  // can never fail the answer it describes; it is awaited only so the counter is durable before
+  // the caller acts on a source it just read.
+  await recordRouteSources(payload);
   return payload;
+}
+
+// GET /api/xell/self/routes/tally — `zee routes --tally` (MANAGER only). The per-day count of which
+// world answered `zee routes`, by target kind and source: THE telemetry phase 5 (stop publishing
+// per-xell ports and delete the allocator, docs/netbird-mesh-plan.md §6) is gated on, and the reason
+// the recorder above exists (§3.4/§10 follow-up 3).
+//
+// MANAGER-only for the same reason `zee ops` is (docs/manager-zees.md): the tally is FLEET-WIDE, and
+// fleet visibility is precisely the manager trade. It is a route of its own rather than a field on
+// the routes answer because that answer's shape is a settled CONTRACT (§3.4) and it speaks about ONE
+// xell — while this speaks about the whole fleet over a window. Read-only and soft-failing: a
+// database behind the ledger answers an `error` beside empty buckets, never a 500.
+export async function selfRouteTally(xell, { days = null } = {}) {
+  const guard = requireManager(xell, 'routes --tally');
+  if (guard) return guard;
+  const tally = await meshRouteTally(days == null ? {} : { days });
+  logline('self', `${xell.slug} pulled the route-source tally (${tally.window_days}d window: `
+    + `${tally.by_source.mesh} mesh / ${tally.by_source['legacy-port']} legacy-port)`
+    + (tally.error ? ` — ${tally.error}` : ''));
+  return { ok: true, ...tally };
 }

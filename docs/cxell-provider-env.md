@@ -125,3 +125,11 @@ guard uses — the CLI never decides either.
 by provider from `ZEE_PROVIDER_<KEY>_TOKEN` first, so a resumed cage's token is attributable — the
 old fallback `adapter.tokenEnvKey` is what claude and deepseek SHARE, and a token read back under it
 cannot be named.
+
+That resume token decides only the CREDENTIAL half. The turn's whole environment is rebuilt on every
+resume by `server/src/lib/cxell.js` `queenzeeTurnEnv` — the same builder `runZee` uses at spawn —
+from the cage's own `/etc/environment`, so the durable door (written once) and the per-turn door
+cannot drift: only the queenzee's namespaces (`ZEEHIVE_`, `ZEE_`, `GIT_AUTHOR_`) cross, the file's
+own vendor credential keys deliberately do not (that is the key the guard refuses), and what the
+queenzee knows NOW — the API address, the dispatched credential — beats the spawn-time copy.
+`test/cxell-env-survives-resume.test.mjs` asserts both halves.

@@ -149,6 +149,12 @@ containers over the stack network:
 <slug>.<mesh-domain>:5180 → webapp:5180
 ```
 
+> **Name caveat, verified live against v0.78.1 (§11):** NetBird publishes a peer as
+> `<slug>-<ip octet3>-<ip octet4>.<mesh-domain>`, not `<slug>.<mesh-domain>` (peer.go
+> `getPeerIPDNSLabel`). The spelling above is the INTENDED, stable name — the form the router's
+> answers and the manifest should carry — but it is not a name NetBird's DNS answers today. See
+> the §10 follow-up before handing this DSN to anything outside the router.
+
 The forward is iptables DNAT in the sidecar (or socat for a first cut) — generated from the
 same manifest `ports.*.internal` values the compose generator already reads. The
 `base/mod/slot` fields become **unused for reachability** and are kept only during migration
@@ -482,9 +488,12 @@ one more peer kind).
 2. **Relay throughput for db traffic** when a direct WireGuard path cannot be established
    (double-NAT between build hosts). LAN-internal peers should go direct; if a benchmark shows
    relay in the path for bulk db work, see DR-1's "changes our mind" (c).
-3. **The exact NetBird management API surface** (endpoints/fields in §5) is written from its
-   documented REST API; the builder must pin a management version and freeze `lib/netbird.js`
-   against it — the injected-adapter shape exists so that pinning is testable offline.
+3. **The exact NetBird management API surface** (endpoints/fields in §5) was written from its
+   documented REST API; the builder had to pin a management version and freeze `lib/netbird.js`
+   against it. **CLOSED (2026-09-12) — pinned to v0.78.1 and driven live**; the pinning caught two
+   real drifts (a 422 on every policy create, and the peer DNS-label scheme). See §11
+   "Live against a real NetBird management server" for the versions, the evidence, and the two
+   shapes that differ from the documented REST API.
 
 ## 10. Follow-ups after this lands
 
@@ -496,6 +505,16 @@ one more peer kind).
    phase 5.
 4. Retire `wireguard_server`/`wireguard_peer` + `lib/wireguard.js` once the dashboard covers
    the human-download case (supersession note goes in that change's DR).
+5. **Make the mesh name real** (found live, §11): NetBird answers
+   `<slug>-<ip3>-<ip4>.<mesh-domain>`, so §3.4's `<slug>.<mesh-domain>` resolves only for the
+   router's own answers. Either give the peer an `extra_dns_labels` entry of `<slug>` (the field
+   exists in v0.78.1 and is the supported way) or render the IP-suffixed name from
+   `mesh_peer.ip`. Do it before a human is handed a DSN from `zee routes` to paste into psql.
+6. **Auto-mint the gateway setup key** (§11 honest limit (b)): the console stores and renders
+   `gateway_setup_key`, and the stand-up names it as the last hand-set value. It is one
+   `createSetupKey` call with `autoGroups: [<gateway group>]` — the mesh-gateway peer's one-off key
+   — after the first PAT exists. Confirm the group first (a setup key's auto-group must exist), then
+   generate it on the same human click, and the stand-up's "left by hand" line goes empty.
 
 ---
 
@@ -553,17 +572,261 @@ one more peer kind).
   `decideProdBind` flips the one narrow `xells→prod:<db>` policy a human-approved prod bind needs.
   Tests: `test/build-bootstrap.test.mjs`, `test/mesh-routes.test.mjs`, `test/netbird-policies.test.mjs`,
   `test/netbird-compose.test.mjs`. The committed `docker-compose.spinoff.yml` is untouched.
+- **Follow-up 3 — route-source telemetry** (§10.3, the gate for phase 5): migration 254
+  `mesh_route_stat`, ONE COUNTER ROW PER (UTC day, target_kind, source) — a tally, not a play-by-play,
+  because what the gate asks is a count over a window. `lib/mesh-route-telemetry.js` keeps the same
+  pure/thin split the rest of the router uses: `routeSources()` classifies a finished answer and
+  `tallyFromRows()` sums rows (both table-testable with no db), while `recordRouteSources()` bumps the
+  counter in ONE statement and swallows its own failure — a telemetry row must never fail the answer
+  it describes, and a database behind the ledger degrades to "no telemetry", never to a broken
+  `zee routes` (both proven live by dropping the table). `selfRoutes` records every answer it returns;
+  the read is `zee routes --tally [--days N]` (MANAGER-only, migration 258 documents it in the manager
+  manual) → `GET /api/xell/self/routes/tally`, 14-day window by default, clamped to 90, returning
+  `by_source` + `by_kind` + the raw per-day rows and soft-failing to an `error` string rather than
+  failing the read. The seam is a flag on the router's own verb, NOT a field on the routes answer —
+  §3.4's contract is about ONE xell and its shape is untouched — and NOT `zee ops`, whose digest
+  `test/delivery-telemetry.test.mjs` (TKT-42) pins against growth. Test:
+  `test/mesh-route-telemetry.test.mjs`; live-verified in-cage over HTTP (legacy answer → 3 legacy
+  bumps; joined peer → 3 mesh bumps; the tally read back through `GET /api/xell/self/routes/tally`,
+  manager 200 / worker refusal).
+  Phase 5 itself is NOT part of this: no port line, allocator path or compose file changed.
+- **The cage's route was dead; the seal now resolves it** (`b012a91f`): the `ip route replace` line
+  above landed with the gateway, but nothing ever set `MESH_GATEWAY_IP` — `sealCxell` shells
+  `docker exec -u 0 … cxell-firewall.sh` and `docker exec` inherits nothing, so the branch could
+  not fire on ANY install. The address cannot be configuration (docker reassigns it on every
+  recreate, and `zee-hive-net` is external and per docker host), so `lib/cxell.js
+  resolveMeshGatewayIp` inspects the running `zeehive_mesh_gateway` on the CAGE'S OWN context at
+  seal time and passes `-e MESH_GATEWAY_IP=…`. Mesh disabled → null with NO docker call and an argv
+  byte-identical to the pre-mesh seal; no gateway on this machine → logged as ordinary, seal
+  continues; `config.meshGatewayIp` (`MESH_GATEWAY_IP`) is the validated escape hatch for a gateway
+  this compose did not create. Only ever ADDS a route — the prod DROP list is untouched. Test:
+  `test/mesh-gateway-seal.test.mjs` (27 assertions, verified red before the fix). Documented for the
+  operator in `docker/zeehive/README.md`.
+
+### Verified live vs verified by test (2026-09-10, the inheriting xell)
+
+Live, in-cage: a migrated sandbox meta-DB (`zee db-sandbox --migrate`) + a real queenzee on
+loopback + real bearer tokens, driving real endpoints over HTTP —
+`GET /api/xell/self/routes` returning the legacy-only answer with the mesh unset; the same endpoint
+with mesh rows present returning a USED shared db through its MACHINE peer (published port kept, DSN
+re-addressed, credentials preserved) and owned roles through the xell's own peer with the full
+`fallback` block; and the identical payload through the real `scripts/zee routes` CLI.
+
+By test only (the honest limits): the provisioner relay (§6 phase 3) is exercised against tables and
+fakes, not a live provision; the bootstrap card's `mesh-machine-peer` step cannot be executed from a
+cage at all — `planBuildBootstrap` refuses with `cannot reach context '…': spawn docker ENOENT`,
+which is correct (a cage has no docker CLI, by design) and means the plan/perform path must be
+proven by a human on a machine with contexts. Every mesh path was exercised with the control plane
+ABSENT; nothing here has ever spoken to a live NetBird API.
+
+Two suites are red on `main` and were red before this work (proved by stashing onto clean HEAD):
+`test/manual-cage-claims.test.mjs` (4 — migration 115's anchors are no longer byte-present in the
+injected manual, which has been rewritten since) and `test/dk-verdict-contract.test.mjs` (2 —
+undeclared marker `IDENTITY_OK`, uncovered declared marker `WROTE_TRACKED`). Neither touches mesh
+code; left alone deliberately. Also worth knowing: a queenzee left running against the sandbox DB
+will reap the fixture xells out from under `test/netbird-provision-env.test.mjs` mid-run and make it
+look flaky — stop the server before running the db suites.
+
+### Live against a real NetBird management server (2026-09-12, this xell — §9.3 CLOSED)
+
+`lib/netbird.js` is no longer written from documentation. A REAL NetBird management server
+**v0.78.1** was booted on `127.0.0.1` inside the cage (sqlite store, no IdP, no TLS, no Signal) and
+every exported function was driven at it over HTTP by **`test/netbird-live-api.test.mjs`**.
+
+**The pin.** Management = `netbirdio/management:0.78.1`, pulled from the Docker Hub registry over
+HTTPS (there is no management binary on the GitHub release), linux/amd64 manifest
+`sha256:c78ba74d0747…`, binary `sha256:03325d3249c6…`. Client = the GitHub release
+`netbird_0.78.1_linux_amd64.tar.gz`, binary `sha256:dec903b426de…` (`netbird version` → 0.78.1).
+`scripts/fetch-netbird-binaries.mjs` re-pulls both and verifies those sha256s, so "verified against
+v0.78.1" cannot silently drift to a different build. The compose defaults are now pinned to the same
+tag (`docker-compose.bootstrap.yml` + `docker/zeehive/docker-compose.prod.yml`, all five `netbirdio/*`
+images) instead of `:latest`; bumping them means re-running the live test.
+
+**Live-verified (real server, real PAT, real rows):** `GET /api/peers` 200 with a live token and 401
+without one; `createSetupKey` → a real key that the control plane then lists with `usage_limit 1`,
+`ephemeral true`, unrevoked, carrying its `auto_groups`; `ensureGroup` create-then-find (one id, no
+duplicate); `listPeers`; `getPeerByHostname` (hit, and a stranger → `peer: null`, not a failure);
+`deletePeer` → real delete, and a repeat DELETE's **404 → `alreadyGone`**; `listPolicies`;
+`ensurePolicy` create + find-by-name idempotency + the no-ports variant; the real policy round-trips
+with the group ids, `protocol tcp`, `ports ["5432"]`, `enabled`; `ensureProdBindMeshPolicy` →
+exactly `xells→prod tcp:5432`; and against a migrated sandbox meta-DB (`zee db-sandbox --migrate`)
+the intent-row paths: `mintPeer` → `markPeerJoined` (caches the control plane's peer id + IP) →
+`deregisterXellPeers` (real delete + row stamp, idempotent) → `sweepOrphanMeshPeers` (a removed-row
+peer deleted, an unknown hostname reported and left alive). Finally a REAL `netbird` **agent**
+registered through the API with a setup key OUR client minted (e.g. `mesh-e2e-agent`, ip
+`100.64.33.167`, dns_label `mesh-e2e-agent-33-167.netbird.selfhosted`) and our client deregistered
+it — the end-to-end story this plan rests on.
+
+**Drift found and fixed (the point of the exercise):**
+
+1. **Every `ensurePolicy` call was a 422.** The rule body posted `source`/`destination` and no
+   `protocol`; the real `PolicyRuleUpdate` wants **`sources`/`destinations`**, a REQUIRED
+   **`protocol`**, and a rule-level **`enabled`** — the server answered
+   `422 specify either sources or source resources and destinations or destination resources`.
+   Ports are also refused on protocol `all`/`icmp`
+   (`for ALL or ICMP protocol ports is not allowed`), so the fix derives the protocol: `tcp` when
+   the rule names ports (the only grants this module makes are db ports), `all` otherwise, with
+   `ports` omitted there. Fix at `lib/netbird.js ensurePolicy`; `test/netbird-policies.test.mjs`
+   now pins the corrected body.
+2. **The peer DNS label is IP-suffixed, and the documented `<hostname>.<domain>` is wrong.**
+   `getPeerIPDNSLabel` (management/server/peer.go) builds
+   `<hostname>-<ipv4 octet 3>-<ipv4 octet 4>.<dns-domain>` — a peer `mesh-e2e-seed` on
+   `100.64.171.11` is published as `mesh-e2e-seed-171-11.netbird.selfhosted`, and that is exactly
+   what the API's `dns_label` field answered. `meshFqdn(hostname, ip)` now produces that name (and
+   the one-arg form is documented as the INTENDED name only); `getPeerByHostname` still resolves by
+   the authoritative `hostname` field, so peer lookup was never broken, but the §3.4
+   `<slug>.<mesh-domain>` DSN spelling is not a name NetBird DNS would answer — see the follow-up
+   in §10.
+3. **Read shape ≠ write shape.** The policy CREATE body takes group ID strings; the policy READ
+   body returns `GroupMinimum` objects (`{id,name,peers_count}`) for `sources`/`destinations`. No
+   code change needed (find-by-name reads only `name`/`id`), but a future consumer must not assume
+   symmetry.
+4. **`docker/zeehive/netbird/management.json.example`'s key is not a usable key — by design.**
+   The shipped `DataStoreEncryptionKey: "CHANGE-ME-32-byte-…"` is not valid base64 → a server booted
+   straight from the copied example dies with `failed to create field encryptor: decode encryption
+   key: illegal base64 data at input byte 5` (observed on v0.78.1). A real key must be base64 of
+   exactly 32 bytes; the README now says so and how to generate one (`openssl rand -base64 32`), and
+   `test/netbird-compose.test.mjs` pins BOTH halves: the shipped value still carries the `CHANGE-ME`
+   marker (so the bootstrap card's stand-up refusal keeps firing) and it is NOT a decodable key (so
+   a copied example can never boot the plane on a public secret). The example's
+   `HttpConfig.Address` no longer exists in v0.78.1's `HttpServerConfig` (the listen address is the
+   `--port` flag) and is gone.
+
+**Honest limits.** The install's own control plane is still not stood up (§3.1, item 1 below). The
+harness seeds the store by hand — with `IdpManagerConfig.ManagerType: "none"` there is NO supported
+way to create the first account/user/PAT, which is itself a finding for the human deploy — so those
+row shapes are read off the server's source and a future release could break the HARNESS before it
+breaks `lib/netbird.js`. The agent registers headless (no Signal server): the peer row and the
+registration are proven, a WireGuard tunnel is not; likewise no TLS/dashboard/relay/TURN. Peer rows
+for the read/delete assertions are seeded directly into sqlite (the REST API has no create-peer
+endpoint) — peer CREATION by a real agent is what the optional client section proves.
+
+Reproduce: `node scripts/fetch-netbird-binaries.mjs` then
+`zee db-sandbox --migrate` and
+`DATABASE_URL="$(…)" node test/netbird-live-api.test.mjs`. Without the binary it skips loudly; with
+the binary but an unmigrated meta-DB it proves the REST surface and skips the intent-row half
+loudly. Two consecutive full runs passed.
+
+### The mesh config lives in the meta-DB, the stand-up consumes it, and the first PAT is bootstrapped (2026-09-12, this xell — work item 9b512e60)
+
+The human-facing half of DR-1's §3.1 hole is closed. Before: standing the control plane up meant
+hand-editing the install's `.env` and `netbird/management.json`, and the first account/user/PAT had
+NO supported creator at all under `IdpManagerConfig.ManagerType: "none"`. Now: a human configures
+the mesh on the queenzee machine's card in the console, clicks stand-up, and neither file is edited
+by hand nor is a token pasted.
+
+- **The store.** `db/migrations/259_mesh_config_store.sql` (number from `zee migration-number`):
+  `mesh_config`, one row per `machine` (CASCADE), carrying `enabled`, `mesh_domain`, `api_url`, the
+  five management/dashboard port columns, `signal_uri`, `relay_endpoint`, and four secret+hint
+  pairs (`datastore_encryption_key`, `relay_auth_secret`, `api_token`, `gateway_setup_key`).
+  `lib/mesh-config.js` is the ONLY reader/writer: store→env→default per field, with the source
+  reported for each (the read model), secrets write-only (`{ set, hint }`, `provider_token`-style —
+  `nbp_…tail4` for the PAT), and a `generate` write that mints the datastore key / relay secret
+  server-side on an AUTHENTICATED HUMAN PUT (a human's click is not the unattended step the
+  "never mint secrets" rule binds). **Env backcompat:** a field the row does not set still resolves
+  from the operator env, and with no row `applyMeshConfig` leaves `config` exactly as it was.
+  `server/src/index.js` applies the row into the `config` seam at boot; `lib/netbird.js` and the
+  stand-up then resolve URL/token/ports with no knowledge of the console.
+- **The API (the contract the console builds against).** `GET /api/machines/:id/mesh-config`
+  (fields + hints + `resolved` — never a secret), `PUT …/mesh-config` (flat patch; omitted = leave,
+  `null` = clear, `"generate"` = mint; a bad value is a 400 that NAMES the field, an unknown field
+  is refused by name rather than dropped), and `GET …/mesh-status`: the bounded `probeManagementApi`
+  read, `mesh_peer` counts by status, and the route-source tally summary. `lib/mesh-status.js` never
+  throws for a mesh/DB outcome (a status page must answer when the plane is down).
+- **Meeting the console half (TKT-189, merged).** The panel was built in parallel and had chosen its
+  own read shapes (`fields.management_url`, `peers.counts`, `peers.list`, `management.reachable`,
+  `tally`). Rather than rewrite the landed panel, the server's read model also PROJECTS those names —
+  `fields` is the row under the console's four form names (`management_url` ↔ `api_url`, one alias
+  in `lib/mesh-config.js`'s `FIELD_ALIASES`), and `mesh-status` carries both the canonical
+  `ok`/`by_status`/`active`/`routes` keys and the console's `reachable`/`counts`/`list`/`tally`.
+  Two more consequences, both verified over real HTTP with the panel's verbatim save body: a PUT
+  that CARRIES a configuration ENABLES the machine's mesh (the panel has no separate on switch, and
+  a row left disabled would make the stand-up's bootstrapped PAT inert) — an explicit
+  `enabled: false` still wins and is sticky; and the generated datastore key appears in no GET.
+  The read model also answers `editable`, which is the panel's read-only note AND the plan's own
+  condition — the mesh-profile services live in the queenzee's own compose project, so a machine
+  that is not the queenzee host has nothing to stand up and the form is closed. One expression
+  (`machine.docker_ctx === queenzeeHostCtx()`), read by both, so the button and the form cannot
+  disagree.
+- **The stand-up consumes it.** `mesh-control-plane` now resolves the machine's row
+  (`meshResolvedForPerformer`) and renders `netbird/management.json` from it, runs
+  `compose --profile mesh up -d` with the row's domain/ports/secrets as the compose child's env (the
+  install's `.env` stops being the only place they live), and the CHANGE-ME refusal is preserved for
+  the no-config case: an EXISTING management.json is only ever FILLED where it still holds a
+  placeholder (`placeholderFill`), never overwritten — so "fill the example's CHANGE-ME" and "never
+  overwrite the operator's secret" are the same rule. `config.netbirdMgmt*Port`,
+  `netbirdSignalPort`, `netbirdRelayPort`, `netbirdDashHttpPort` and `netbirdGatewaySetupKey` were
+  added to `config.js` for this.
+- **The first PAT, automatically (§3.1 / §11 item 1's blocker).** `lib/netbird-bootstrap.js` is the
+  production version of the live harness's seed, guarded by the version pin: it reads the pin off
+  the RUNNING image (`docker inspect … {{.Config.Image}}` — the API has no unauthenticated version
+  endpoint, 401), refuses legibly on any version other than `PINNED_NETBIRD_VERSION` (0.78.1)
+  BEFORE stopping anything, copies the sqlite store out, seeds the account + network + owner user
+  (name/email field-encrypted with the datastore key) + "All" group + "Default" policy + the PAT,
+  chmods the store 0666 and copies it back (docker cp lands files root:root — the server must be
+  able to WRITE the store it owns), restarts, and proves the API answers with the bounded probe.
+  On every failure after the stop it RESTARTS the plane. The step then records the token into the
+  store (`recordBootstrappedPat`, hint-only in the audit receipt) and applies it — and only when NO
+  token exists anywhere, so an operator's env token is never overwritten. `alreadyPresent` (a
+  store that already has an account) and a refusal are a `warning` on an otherwise-`created` step,
+  never a failed stand-up.
+
+**Verified live (in-cage, against the real pinned v0.78.1 management server):** the LIVE HARNESS now
+runs off the production bootstrap. `test/netbird-live-api.test.mjs` boots the pinned plane once to
+migrate its store, then hands that store to `bootstrapFirstPat` through a faithful docker emulation
+(inspect→stop→cp out→seed→cp back→start; only the transport is emulated — no docker daemon in a
+cage) and the WHOLE suite runs on the token it minted. Asserted live: the plan's order, the pin read
+off the running image, the 0666 write-back, the bounded health probe, and a legible refusal on a
+`0.77.0` image that stops before it touches anything. The REST surface, intent-row paths and the real
+agent registration all still pass on that bootstrapped token.
+
+**Verified live (in-cage, HTTP):** a real queenzee on loopback against a migrated sandbox meta-DB
+(`zee db-sandbox --migrate`) — `GET /mesh-config` with no row (env resolved, readiness naming both
+missing secrets), `PUT` with `"generate"` (server-side key + relay secret; response carries HINTS
+only — the key and the env secret appear nowhere in the body), the seam taking over the RUNNING
+server (`mesh-status` then reports the console domain and the compose-internal API default), the
+CHANGE-ME paste 400, the typo 400, the `api_token: "generate"` refusal, the unknown-machine 404, and
+`GET /mesh-status` answering 200 with `management.ok:false` (refused) and zeroed peer/routes
+counters when no plane resolves. The log ring carries `datastore_encryption_key=<set>` and its hint —
+the values themselves appear nowhere in it.
+
+**By test only:** `test/mesh-config.test.mjs` (offline: precedence/hints/validation/`generate`,
+`seedFirstPat` against a real sqlite fixture, `bootstrapFirstPat` against a fake docker adapter over
+a real store file — sequence, mode, refusal-before-stop, restart-on-failure, byte-identical
+idempotence); `test/mesh-config-store.test.mjs` (db-backed: the real table + the real routes, hints,
+store-over-env, disabled-row inertness, clearing/rotation, `recordBootstrappedPat`, `peerCounts`,
+`meshStatusFor` with injected probe/tally); `test/build-bootstrap.test.mjs` (the performed stand-up:
+management.json GENERATED from the row, compose env carrying the row's domain/ports/secrets, the
+bootstrap handed the row's datastore key, the minted PAT recorded write-only with only its hint in
+the receipt, applied to the seam, and a second stand-up neither re-mints nor composes). All of the
+mesh/netbird suites plus `ship-boot-migrations`, `console-shell-not-cached`, `ext-api-base-config`
+and `queenzee-inproc-api-only` are green on this branch.
+
+**Honest limits (follow-ups):** (a) the stand-up's PAT bootstrap has never run against a REAL docker
+daemon — the live proof is the real management server reached through an emulated `docker cp`/`stop`/
+`start`, plus the argv sequence the code itself exports; a human on the queenzee machine must still
+click it once. (b) `gateway_setup_key` is stored/rendered/read but NOT auto-minted: the card
+authorizes `"generate"` only for the datastore key and the relay secret (the gateway key is issued by
+the control plane's setup-keys API, which is a different act from "mint random material"); mint one
+via `createSetupKey` and paste it in, or see §10. (c) `applyMeshConfig` writes the resolved values
+into the live `config`; disabling a row in the SAME process leaves the previously-applied seam values
+in place until restart (the env rules return at boot). The `resolved.source` for `api_url` therefore
+reads `env` after an apply that defaulted it — the VALUE is right, the provenance label is
+approximate. A restart (the normal path for a mesh config change to matter) is exact.
 
 ### NOT done (the honest list — each is a follow-up work item)
 
-1. **Standing up the control plane LIVE** (§3.1): a human on the queenzee machine runs
-   `docker compose --profile mesh up -d`, writes `netbird/management.json`, sets
-   `NETBIRD_API_URL`/`NETBIRD_API_TOKEN` (and `NETBIRD_GATEWAY_SETUP_KEY` for the gateway) in the
-   install's `.env`, and does the datastore backup. The compose seam is shipped; the running
-   control plane is not.
+1. **Standing up the control plane LIVE** (§3.1): a human on the queenzee machine CLICKS stand-up on
+   the machine's card — the console's mesh config supplies the domain/ports/secrets, the step renders
+   `netbird/management.json`, runs `docker compose --profile mesh up -d`, and the first
+   account/user/PAT is bootstrapped automatically (work item 9b512e60, §11 — no supported path
+   created it before, because `IdpManagerConfig.ManagerType` is `"none"`). What remains a human op:
+   doing it ONCE against a real daemon (the bootstrap's docker transport is emulated in-cage), the
+   datastore backup, and `NETBIRD_GATEWAY_SETUP_KEY` (see §11's honest limits (b)).
 2. **Per-cage mesh agents and in-cage mesh DNS** — named seams (DR-3, §3.5), not built. The cage's
    path to the mesh is the gateway route, not an in-cage agent.
-3. **Phase 5** (stop publishing ports, delete the allocator) — gated on `source: legacy-port`
-   telemetry, as planned.
+3. **Phase 5** (stop publishing ports, delete the allocator) — still gated on `source: legacy-port`
+   telemetry, as planned. The telemetry itself now exists (§11, follow-up 3): the gate is a decision
+   to make off `zee routes --tally`, not a tool still to build.
 4. The **current backlog** on the wedged hosts still needs one human prune (or a medic
    `docker_repair` dispatch per machine) — the janitor keeps it flat only from then on.

@@ -234,22 +234,41 @@ try {
     cids.push(await insContainer(pCap, xD1, { role: 'server', ctx: CTX_D, port: 4812 }));
 
     const calls = [];
-    const stubProve = async (id) => {
+    const inFlight = [];
+    // The hold is a GATE the test opens, never a sleep. A timed hold made BOTH assertions below
+    // depend on how busy the box was: pass 1's loop does awaited DB roundtrips between ids, so a
+    // short hold let the machine free up mid-loop (2 proofs on C in one pass) and a slow settle made
+    // pass 2 miss the drained machine. Both were seen on this suite at 2/15 and 1/15 under load.
+    // Holding until the test says so makes "the machine is still busy in pass 1" and "the machine is
+    // free before pass 2" FACTS rather than wall-clock guesses. The assertions are unchanged.
+    let releaseHold;
+    const hold = new Promise((r) => { releaseHold = r; });
+    const stubProve = (id) => {
       calls.push(id);
-      await noteProof(id, { ok: true, error: null, checks: [], commit: '0123' });
-      await new Promise((r) => setTimeout(r, 10));   // hold the machine busy past the pass loop
+      const p = (async () => {
+        await noteProof(id, { ok: true, error: null, checks: [], commit: '0123' });
+        await hold;
+      })();
+      inFlight.push(p);
+      return p;
     };
 
     await maybeRunProofs({ prove: stubProve, rerecord: false });
     const pass1C = calls.filter((id) => id === xC1 || id === xC2);
     const pass1D = calls.filter((id) => id === xD1);
+    // pass 1's proofs are STILL in flight here — that is the cap holding, not a race won.
     ok(pass1C.length === 1, `one proof on machine C in pass 1 [${pass1C.length}] — the cap held`);
     ok(pass1D.length === 1, `one proof on machine D in pass 1 [${pass1D.length}]`);
 
-    await new Promise((r) => setTimeout(r, 30));      // let pass-1 proves finish + clear the machine
+    // Release pass 1 and WAIT for it to settle — its `.finally(() => proofBusy.delete(key))` is what
+    // frees the machine for pass 2, and the setImmediate lets that chain run before the next pass.
+    releaseHold();
+    await Promise.all(inFlight);
+    await new Promise((r) => setImmediate(r));
     await maybeRunProofs({ prove: stubProve, rerecord: false });
     const pass2C = calls.filter((id) => id === xC1 || id === xC2);
     ok(pass2C.length === 2, `pass 2 drains machine C's remaining xell [${pass2C.length} total]`);
+    await Promise.all(inFlight);   // and let pass 2 settle before the next section scans the pool
   }
 
   console.log('\n── 6. build_readiness_record: latest-per-pair + verdict mapping + recorded read ──');

@@ -8,8 +8,8 @@ import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { deliveryTelemetry } from '../lib/delivery-telemetry.js';
 import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
 import { recentLogs, logline } from '../lib/logbus.js';
-import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
-import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
+import { listCxellDir, readCxellFile, downloadCxellFile, contentDisposition } from '../lib/cxell-fs.js';
+import { listContainerDir, readContainerFile, downloadContainerFile } from '../lib/container-fs.js';
 import { bus, broadcast, activityFanout } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
@@ -33,6 +33,8 @@ import { listMachines, createMachine, updateMachine, deleteMachine, provisionDev
          setMachinePriority, checkMachineConnection } from '../lib/machines.js';
 import { buildReadinessForProject, recordedBuildReadinessForProject, recordBuildReadinessProbe } from '../lib/build-readiness.js';
 import { performBuildBootstrap } from '../lib/build-bootstrap.js';
+import { meshConfigFor, setMeshConfig } from '../lib/mesh-config.js';
+import { meshStatusFor } from '../lib/mesh-status.js';
 import {
   requireInfra, infraReadiness, infraProof, infraBootstrapPlan, infraBootstrap,
   infraSettings, infraPropose, decideInfraRequest, buildMedicDispatchBrief, selfProjectId,
@@ -83,7 +85,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdrawShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
+         selfTend, selfMedicCall, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
          selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
@@ -93,7 +95,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfWithdra
          selfMeetCreate, selfMeetAttend, selfMeetSay, selfMeetInvite, selfMeet,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
-         selfProviderEnv, selfRoutes } from '../queenzee/self.js';
+         selfProviderEnv, selfRoutes, selfRouteTally, selfProdLogs } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
 import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
@@ -755,6 +757,90 @@ router.post('/medics/:id/message', requireQueenzeeLoops, async (req, res) => {
     res.json({ ...out, message: 'resumed — the answer is its next turn' });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
+// ── MEDIC CALLS — the CALLED emergency's console surface. A call (medic_call, 251) is a blocked
+// zee's own words; when no live medic is attending the project it becomes an entry in
+// fleet.medic_emergency (source 'called') and THIS is the human's dispatch seam: brief a medic FROM
+// THE CALL, link call.medic_id, mark it attended. Nothing auto-spawns BY DEFAULT — a human clicks;
+// a project that opts in to auto_dispatch_medic (255) has raiseMedicCall drive the SAME lib seam
+// (medic-calls.js dispatchMedicCall) for it, with the same refusals. ─────────────────────────────
+router.get('/medic-calls', async (req, res) => {
+  try {
+    const { resolveProjectId } = await import('../lib/project-resolve.js');
+    const pid = await resolveProjectId({ project: req.query.project || null });
+    if (!pid) return res.status(400).json({ error: 'a project is required (?project=<id|name>)' });
+    const { listProjectMedicCalls } = await import('../lib/medic-calls.js');
+    res.json({ ok: true, calls: await listProjectMedicCalls(pid, { liveOnly: req.query.all !== '1' }) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/medic-calls/:callId/dispatch', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    // The seam itself lives in medic-calls.js so the auto_dispatch_medic policy (255) drives the
+    // EXACT same path with the EXACT same refusals — this route is just the human's entrance to it.
+    const { readMedicCall, dispatchMedicCall } = await import('../lib/medic-calls.js');
+    const call = await readMedicCall(req.params.callId);
+    const out = await dispatchMedicCall(call, { by: req.body?.actor || 'human@console' });
+    if (!out.ok) return res.status(out.status || 400).json({ ...out, error: out.reason });
+    res.json({ ...out, message: 'medic attending from the CALL — watch the Bay; its answer goes back to the calling zee' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// A HUMAN says NO to a CALLED emergency — dismiss = DECLINE (distinct from the zee's own
+// withdrawMedicCall and the medic's answerMedicCall). A live zee is waiting on the answer, so the
+// note is REQUIRED (it is what the calling zee receives — the same contract answerMedicCall
+// enforces) and is POSTED BACK to the calling zee as a zee_message. Declined is final history like
+// any decline; a still-blocked zee raises a FRESH call. Same partial worker wall as dispatch: a
+// caged worker does not dismiss a medic ask.
+router.post('/medic-calls/:callId/dismiss', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { dismissMedicCall } = await import('../lib/medic-calls.js');
+    const out = await dismissMedicCall({
+      callId: req.params.callId,
+      note: String(req.body?.reason ?? req.body?.note ?? '').trim() || null,
+      by: String(req.body?.actor || 'human@console').slice(0, 200),
+    });
+    if (!out.ok) return res.status(400).json({ ...out, error: out.reason || out.error });
+    res.json({ ...out, message: 'Medic call DECLINED — the calling zee has been told why. '
+      + 'It no longer shows in the ⛑ needs-you panel; a still-blocked zee raises a fresh call.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// A HUMAN says NO to the ROWLESS suggestions — an INFRA emergency row (fleet medic_emergency,
+// source 'infra') or a CONDITION dispatch card. No call row to decline, so the dismissal is
+// persisted into medic_dismissal, fingerprinted on the EXACT text the human was shown: the same
+// fault stops nagging, a different fault (or edited body) raises again by itself. The project is
+// derived from the target row server-side — the caller never names a project to write into.
+// Same partial worker wall as the dispatch seams (an identified worker does not dismiss).
+router.post('/medic-dismissals', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { createMedicDismissal } = await import('../lib/medic-dismissals.js');
+    const out = await createMedicDismissal({
+      targetKind: req.body?.target_kind || null,
+      targetId: req.body?.target_id || null,
+      text: String(req.body?.text ?? req.body?.why ?? '').trim() || null,
+      reason: String(req.body?.reason || '').trim() || null,
+      by: String(req.body?.actor || 'human@console').slice(0, 200),
+    });
+    if (!out.ok) return res.status(400).json({ ...out, error: out.reason || out.error });
+    res.json({ ...out, message: 'Dismissed — this exact fault stops nagging the ⛑ bar. '
+      + 'A different fault on the same xell (or an edited condition) raises again by itself.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
+// UNDO a fingerprinted dismissal: the emergency it was hiding raises again at the next snapshot.
+router.delete('/medic-dismissals/:id', requireQueenzeeLoops, async (req, res) => {
+  try {
+    const g = await refuseWorkerZeeToken(req);
+    if (g) return res.status(403).json(g);
+    const { undoMedicDismissal } = await import('../lib/medic-dismissals.js');
+    const row = await undoMedicDismissal(req.params.id);
+    if (!row) return res.status(404).json({ error: 'no such dismissal' });
+    res.json({ ok: true, undone: row,
+               message: 'UNDONE — the dismissed fault raises again in the ⛑ panel at the next snapshot.' });
+  } catch (e) { res.status(400).json({ ...(e.detail || {}), error: e.message }); }
+});
 // ── STANDING ORDERS for a MANAGER xell (ticket #74) — the HUMAN's authoring surface. A manager
 // sets its own with `zee standing-orders`; a human sets it here on a manager xell. Same data, same
 // rules: a worker xell has no standing orders (it does not dispatch), the text is bounded (SHORT by
@@ -1198,8 +1284,11 @@ router.get('/projects/:id/build-readiness', async (req, res) => {
 router.post('/projects/:id/machines/:machineId/build-bootstrap', async (req, res) => {
   try {
     const dryRun = req.body?.dry_run !== false;
+    // `kinds` scopes a perform to named step kinds (the Mesh panel's control-plane stand-up); the
+    // plan and its guards are still the whole picture — only the performed subset narrows.
+    const kinds = Array.isArray(req.body?.kinds) && req.body.kinds.length ? req.body.kinds : null;
     res.json(await performBuildBootstrap(req.params.id, req.params.machineId, {
-      dryRun, actor: req.body?.by || 'human@console',
+      dryRun, actor: req.body?.by || 'human@console', kinds,
     }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -1287,6 +1376,11 @@ router.get('/zees/:id/file', async (req, res) => {
   try { res.json(await readCxellFile(req.params.id, req.query.path)); }
   catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
+// The explorer's ⤓ — the file's exact bytes as an attachment (still read-only: nothing is written).
+router.get('/zees/:id/download', async (req, res) => {
+  try { sendDownload(res, await downloadCxellFile(req.params.id, req.query.path)); }
+  catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
 
 // ── container file explorer (read-only) — the panel that rides alongside the container shell ──
 // List a directory inside a fleet container, and read a text file — the same explorer the zee
@@ -1300,6 +1394,16 @@ router.get('/containers/:id/file', async (req, res) => {
   try { res.json(await readContainerFile(req.params.id, req.query.path)); }
   catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
+router.get('/containers/:id/download', async (req, res) => {
+  try { sendDownload(res, await downloadContainerFile(req.params.id, req.query.path)); }
+  catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
+function sendDownload(res, f) {
+  res.set({ 'Content-Type': 'application/octet-stream', 'Content-Length': String(f.buf.length),
+            'Content-Disposition': contentDisposition(f.name), 'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff' });
+  res.end(f.buf);
+}
 
 // ── /xell skill → claim a ready xell, but ONLY if the session is inside its worktree ──
 router.post('/xell/claim', requireQueenzeeLoops, async (req, res) => {
@@ -1672,6 +1776,40 @@ router.delete('/machines/:id', async (req, res) => {
 router.get('/machines/:id/check', async (req, res) => {
   try { res.json(await checkMachineConnection(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// ── the mesh, configured from the console (docs/netbird-mesh-plan.md §3.1; migration 259) ────
+// The contract the console builds against, and the one this API keeps: FIELDS IN, HINTS OUT.
+//   GET  → the row's non-secret values, a { set, hint } per secret, and `resolved` — what the
+//          queenzee would ACTUALLY use right now (the row over the operator's env over the shipped
+//          defaults, lib/mesh-config.js). No GET ever returns a secret.
+//   PUT  → a flat patch of the fields below (plus `by` for the audit line). Omitted = leave as is;
+//          null = clear (secrets and api_url/signal_uri/relay_endpoint); the literal "generate" =
+//          mint server-side (datastore_encryption_key, relay_auth_secret ONLY — the other two
+//          credentials are issued by the control plane). A validation failure is a 400 that NAMES
+//          the field; an unknown field is refused by name rather than dropped. `management_url` is
+//          accepted as the console form's name for `api_url` (lib/mesh-config.js's FIELD_ALIASES),
+//          and a write that CARRIES a configuration ENABLES the machine's mesh unless the patch says
+//          `enabled: false` — the human filling the form in is the decision, not a draft.
+// The row is per machine, so the form on the queenzee-host machine's card is the one that drives
+// the stand-up (build-bootstrap's mesh-control-plane step reads it).
+router.get('/machines/:id/mesh-config', async (req, res) => {
+  try { res.json(await meshConfigFor(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.put('/machines/:id/mesh-config', async (req, res) => {
+  try {
+    const { by, ...patch } = req.body || {};
+    res.json(await setMeshConfig(req.params.id, patch, { actor: by || 'human@console' }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// One machine's mesh, as a status page: the management API probe (bounded), the mesh_peer counts by
+// status, and the route-source tally summary (lib/mesh-status.js). Read-only; owns no verb.
+router.get('/machines/:id/mesh-status', async (req, res) => {
+  try {
+    const machine = await one(`SELECT id, key, docker_ctx FROM machine WHERE id=$1`, [req.params.id]);
+    if (!machine) return res.status(404).json({ error: 'machine not found' });
+    res.json(await meshStatusFor(machine, { url: req.query.url || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Per-project pool size on a machine (machine_pool) — the matrix pool knob writes here.
 router.put('/machines/:id/pool', async (req, res) => {
@@ -2167,6 +2305,17 @@ router.post('/xell/self/tend', async (req, res) => {
     res.json(await selfTend(x, { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// A blocked zee calls the ⛑ MEDIC — `zee medic --reason "…"`. Token-scoped like every self verb,
+// every zee (worker AND manager) may call it, opens no gate, blocks nothing. The routing decision
+// (attach to a LIVE medic on the project, or RAISE as a called emergency) lives in lib/medic-calls.js.
+// {clear:true} withdraws the open call; {status:true} reads it.
+router.post('/xell/self/medic', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMedicCall(x, {
+      reason: req.body?.reason || null, kind: req.body?.kind || null,
+      clear: !!req.body?.clear, status: !!req.body?.status })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Readiness HINT (or --clear): "this looks land/ship-ready — a human should decide". Opens no gate
 // and pushes nothing; it lights the land? / ship? prompt so a human sees the button. The zee calls
 // the REAL land/ship only when 100% certain the job is done; otherwise it hints and leaves the call.
@@ -2234,6 +2383,30 @@ router.get('/xell/self/provider-env', async (req, res) => {
 router.get('/xell/self/routes', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfRoutes(x)); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+// The tally HALF of the same router read (MANAGER only, `zee routes --tally`): the per-day count of
+// mesh-vs-legacy answers per target kind — the number phase 5 is gated on (migration 254,
+// lib/mesh-route-telemetry.js). A route of its own, deliberately: the routes answer above is a
+// settled contract about ONE xell's stack, and it must not grow (the TKT-42 lesson that kept
+// `zee ops` from absorbing delivery telemetry).
+router.get('/xell/self/routes/tally', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfRouteTally(x, { days: req.query.days ?? null })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// READ-ONLY PRODUCTION LOGS for EVERY zee (`zee prod-logs`) — the tail of the prod app tier's own
+// log, and nothing else that lives in that container. The project comes from the TOKEN-resolved
+// xell and the caller names a ROLE, never a container/context/id, so this can only ever open onto
+// its own project's production server/webapp log; the prod DATABASE is excluded (its log is row
+// data — that is the `zee prod` / `zee seed` gate), every line is credential-masked, and there is
+// no exec, no filesystem and no follow. Opens no gate; the read is recorded in the queenzee log.
+// The wall and the reasoning are lib/prod-logs.js.
+router.get('/xell/self/prod-logs', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfProdLogs(x, {
+      role: req.query.role || null, tail: req.query.tail || null, since: req.query.since || null,
+      grep: req.query.grep || null, container: req.query.container || null })); }
+  catch (err) { res.status(err.status || 500).json({ error: err.message }); }
 });
 router.get('/xell/self/env', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }

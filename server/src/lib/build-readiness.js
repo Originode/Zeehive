@@ -13,12 +13,25 @@
 // returns a verdict a human reads where the pool knobs are set:
 //
 //     { status: 'ok'|'unknown'|'missing', error: string|null,
-//       checks: [{ check, ok, skipped, unknown, detail }] }
+//       bootstrappable: boolean,
+//       checks: [{ check, ok, skipped, unknown, blocking?, missing?, db_row_present?, detail }] }
 //
-//   ok      → every check passed; a build can work here.
-//   missing → at least one check FAILED (a definite missing prerequisite is named).
+//   db_row_present → set on a failing `shared-dev-db` row whose db ROW EXISTS (the check dialled it
+//             and it did not open). It is what tells the bootstrap apart from a db the machine does
+//             not have at all: provisionDevDb can only create the absent one, so a row present caps
+//             `bootstrappable` at false (see checkSharedDevDb).
+//
+//   ok      → every BLOCKING check passed; a build can work here.
+//   missing → at least one blocking check FAILED (a definite missing prerequisite is named).
 //   unknown → nothing failed, but a check could not be run (unreachable context, docker
 //             absent, timeout) — "unknown/unreachable" is a first-class verdict, never green.
+//
+//   bootstrappable → the bootstrap card will have something PERFORMABLE to create here. This is
+//             the console's render condition for the 🔧 button, so that a shown button always
+//             acts (docs/build-bootstrap-button-contract-decision-record.md). It is deliberately
+//             NOT the same question as `status`: the mesh control plane is a performable
+//             prerequisite that does not block a build, so a machine can read `ok` AND be
+//             bootstrappable at once. See bootstrappableFrom().
 //
 // WHAT IT DELIBERATELY DOES NOT DO (same contract as preflight.js):
 //   • It never WRITES. No row, no docker object, no provision, no build. A probe that
@@ -38,10 +51,23 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
-import { sharedDevDb, defaultBuildCtxFor } from './machines.js';
+import { sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx } from './machines.js';
 import { serverRoleIsProcess } from './manifest.js';
+import { MESH_CONTROL_PLANE_CONTAINER, MESH_CONTROL_PLANE_SERVICES } from './netbird.js';
+// The DIAL half of the shared-dev-db check (below). Reused, not rewritten: the preflight already
+// opens a DSN, runs SELECT 1 and answers with the pg SQLSTATE — this probe needs the same act and
+// the same bound, on a container ROW's address rather than on a xell's. (provision.js and
+// preflight.js already import each other's half of this graph — see xell-db.js ↔ provision.js —
+// so the import cycle is the shape the module graph already has, and every binding here is read
+// inside a function, at a point where all three modules have finished evaluating.)
+import { checkDsnOpens } from './preflight.js';
+import { dsnWithPassword } from './provision.js';
 
 export const BUILD_READINESS_TIMEOUT_MS = 8000;
+// The shared-dev-db dial's own ceiling: one connect + SELECT 1, shorter than the docker ceiling
+// because it answers a page render. It bounds the DIAL, never the machine's docker context — the
+// check stays docker-free on purpose (see the comment above probeBuildReadiness).
+export const SHARED_DEV_DB_DIAL_TIMEOUT_MS = 4000;
 
 const pass = (check, detail) => ({ check, ok: true, skipped: false, unknown: false, detail });
 const skip = (check, detail) => ({ check, ok: true, skipped: true, unknown: false, detail });
@@ -155,12 +181,15 @@ async function checkComposeResolves(machine, project, docker) {
 // The alias half of verifyRequires (provision.js ~698-720): a declared alias that resolves to
 // nothing is the known "db recreated by docker run drops the compose alias → the whole fleet
 // crash-loops" failure. Runs only when the network exists AND the manifest declares aliases.
+// Returns a check row; a miss is a definite fail carrying `missing.aliases` — structured, the way
+// the planner reads it (the old `/missing required alias/` regex over free text is gone).
 async function checkNetworkAliases(ctx, network, aliases, docker) {
   const r = await docker(ctx, ['network', 'inspect', network, '--format',
     '{{range $id, $c := .Containers}}{{$c.Name}} {{end}}']);
   if (r.unknown) return unk('requires-present', `could not inspect network '${network}' on '${ctx}': ${r.reason}`);
   if (r.status !== 0) {
-    return fail('requires-present', `required network '${network}' does not exist on '${ctx}'`);
+    return { ...fail('requires-present', `required network '${network}' does not exist on '${ctx}'`),
+             missing: { networks: [network], volumes: [], aliases: [] } };
   }
   const attached = (r.stdout || '').trim().split(/\s+/).filter(Boolean);
   const found = new Set();
@@ -175,8 +204,9 @@ async function checkNetworkAliases(ctx, network, aliases, docker) {
   }
   const missing = aliases.filter((a) => !found.has(a));
   if (missing.length) {
-    return fail('requires-present',
-      `network '${network}' on '${ctx}' is missing required alias(es): ${missing.join(', ')}`);
+    return { ...fail('requires-present',
+               `network '${network}' on '${ctx}' is missing required alias(es): ${missing.join(', ')}`),
+             missing: { networks: [], volumes: [], aliases: [{ network, aliases: missing }] } };
   }
   return pass('requires-present', `network '${network}' on '${ctx}' has alias(es) ${aliases.join(', ')}`);
 }
@@ -184,43 +214,164 @@ async function checkNetworkAliases(ctx, network, aliases, docker) {
 // CHECK 3 — the manifest-declared spinoff prerequisites (tiers.spinoff.requires) exist on this
 // machine's daemon. Mirrors verifyRequires() but never throws and never auto-creates: a missing
 // network/volume is a named 'missing' fact, an unreachable daemon is 'unknown'.
+//
+// It collects EVERY miss instead of returning on the first (decision record, item 1) and attaches
+// them as STRUCTURED data — `missing: { networks: [name], volumes: [{name, create}], aliases:
+// [{network, aliases}] }` — because the bootstrap's performability is decided per CATEGORY: a
+// missing declared network is something the bootstrap creates, a plain missing volume is DATA and
+// never is. A free-text detail cannot tell the two apart; this structure can, and the planner and
+// bootstrappableFrom() read the SAME rows.
 async function checkRequiresPresent(machine, project, docker) {
   const requires = project.manifest?.tiers?.spinoff?.requires || {};
   const nets = (requires.networks || []).map((n) =>
     typeof n === 'string' ? { name: n, aliases: [] } : { name: n.name, aliases: n.aliases || [] });
-  const vols = requires.volumes || [];
+  const vols = (requires.volumes || []).map((v) =>
+    typeof v === 'string' ? { name: v, create: null } : { name: v.name, create: v.create || null });
   if (!nets.length && !vols.length) {
     return skip('requires-present', 'manifest declares no tiers.spinoff.requires — nothing to verify');
   }
+  const missing = { networks: [], volumes: [], aliases: [] };
+  const details = [];
+  let unknown = null;                       // first unverifiable item; a definite miss still wins
+  const merge = (m) => {
+    missing.networks.push(...m.networks); missing.volumes.push(...m.volumes); missing.aliases.push(...m.aliases);
+  };
   for (const n of nets) {
     const r = await docker(machine.docker_ctx, ['network', 'inspect', n.name, '--format', '{{.Name}}']);
-    if (r.unknown) return unk('requires-present', `could not inspect network '${n.name}' on '${machine.docker_ctx}': ${r.reason}`);
+    if (r.unknown) {
+      unknown = unknown || unk('requires-present', `could not inspect network '${n.name}' on '${machine.docker_ctx}': ${r.reason}`);
+      continue;
+    }
     if (r.status !== 0) {
-      return fail('requires-present', `required network '${n.name}' does not exist on '${machine.docker_ctx}'`);
+      missing.networks.push(n.name);
+      details.push(`required network '${n.name}' does not exist on '${machine.docker_ctx}'`);
+      continue;
     }
     if (n.aliases.length) {
       const a = await checkNetworkAliases(machine.docker_ctx, n.name, n.aliases, docker);
-      if (!a.ok) return a;
+      if (a.unknown) { unknown = unknown || a; continue; }
+      if (!a.ok) { merge(a.missing); details.push(a.detail); }
     }
   }
   for (const v of vols) {
-    const r = await docker(machine.docker_ctx, ['volume', 'inspect', v]);
-    if (r.unknown) return unk('requires-present', `could not inspect volume '${v}' on '${machine.docker_ctx}': ${r.reason}`);
+    const r = await docker(machine.docker_ctx, ['volume', 'inspect', v.name]);
+    if (r.unknown) {
+      unknown = unknown || unk('requires-present', `could not inspect volume '${v.name}' on '${machine.docker_ctx}': ${r.reason}`);
+      continue;
+    }
     if (r.status !== 0) {
-      return fail('requires-present', `required external volume '${v}' does not exist on '${machine.docker_ctx}' — it is DATA and is never auto-created`);
+      missing.volumes.push(v);
+      details.push(`required external volume '${v.name}' does not exist on '${machine.docker_ctx}'`
+        + (v.create === 'empty' ? ' (the manifest opts in to creating it empty)' : ' — it is DATA and is never auto-created'));
     }
   }
+  // A definite miss beats "could not tell": we KNOW the machine is missing a declared item. Only
+  // when nothing is definitively missing does an unverifiable item make the check unknown.
+  if (details.length) return { ...fail('requires-present', details.join(' · ')), missing };
+  if (unknown) return unknown;
   return pass('requires-present',
     `declared spinoff requires present on '${machine.docker_ctx}' (${nets.length} net(s), ${vols.length} volume(s))`);
 }
 
-// CHECK 4 — this machine has the project's shared dev db ON it. A dev xell's app tier must
-// never cross docker contexts for its database (spec), so no shared dev db here means this
-// machine cannot host the project's dev xells. Pure meta-DB read — no docker call.
-// A project whose default coupling is db-isolated shapes a per-xell dev db (each xell's db comes
-// up with its own compose stack) — for it, "no shared dev db on the machine" is the CORRECT
-// state, not a missing prerequisite, so the check is SKIPPED with the reason, never a red X.
-async function checkSharedDevDb(project, machine) {
+// CHECK 6 — the NetBird CONTROL PLANE (docs/netbird-mesh-plan.md §3.1). The mesh-profile services
+// live in the queenzee's OWN compose project, so this check only applies to the machine whose
+// docker context IS the queenzee's. Its result must NOT decide the build verdict: a machine builds
+// perfectly well with no mesh, so a control plane that is down must never turn a ✓ build into ✗.
+// What it decides is `bootstrappable` — the stand-up is exactly the kind of prerequisite the
+// bootstrap card can create, and hiding the button on a machine that reads `ok` is the defect this
+// check exists to fix (ticket #189: "so mesh-control-plane is offered").
+async function checkMeshControlPlane(machine, docker) {
+  if (machine.docker_ctx !== queenzeeHostCtx()) {
+    return skip('mesh-control-plane',
+      `not the queenzee host — the control plane runs on '${queenzeeHostCtx()}'`);
+  }
+  const r = await docker(machine.docker_ctx,
+    ['inspect', MESH_CONTROL_PLANE_CONTAINER, '--format', '{{.State.Status}}']);
+  if (r.unknown) {
+    return unk('mesh-control-plane',
+      `could not check the NetBird control plane on '${machine.docker_ctx}': ${r.reason}`);
+  }
+  if (r.status === 0 && /running/i.test((r.stdout || '').trim())) {
+    return pass('mesh-control-plane',
+      `NetBird control plane '${MESH_CONTROL_PLANE_CONTAINER}' is running on '${machine.docker_ctx}'`);
+  }
+  return { ...fail('mesh-control-plane',
+    `the NetBird control plane is not running on '${machine.docker_ctx}' — the mesh-profile services `
+    + `(${MESH_CONTROL_PLANE_SERVICES.join(', ')}) are not up`),
+    blocking: false };   // performable, but never a reason a BUILD cannot work
+}
+
+// PURE, and the ONE authority on "will the bootstrap have something to DO for this pair?" — the
+// console's 🔧 button renders on this boolean, and the decision record's contract is that a shown
+// button always acts (docs/build-bootstrap-button-contract-decision-record.md). True means the
+// planner's classification will find at least one PERFORMABLE step:
+//   • a shared-dev-db fail whose db ROW IS ABSENT      → provisionDevDb
+//   • a missing declared NETWORK                       → `docker network create`
+//   • a missing volume the manifest marks create:'empty' → `docker volume create`
+//   • the mesh control plane down on the queenzee host  → `compose --profile mesh up -d`
+// A requires-present failure that is ONLY a plain-volume miss or lost network ALIASES is NOT
+// performable — the planner names those as human steps — so this stays false and the button does
+// not render. A recorded check from before the structured `missing` field carries only free text:
+// fail SAFE there (false) rather than render a button into a plan with nothing to perform.
+//
+// A shared-dev-db fail is performable ONLY while NO row exists: provisionDevDb creates the db this
+// machine does not have, and refuses a machine that already has one. A row that is PRESENT and does
+// not open (`db_row_present`, set by checkSharedDevDb above) needs a human-timed recreate, so the
+// button must not render for it — and a legacy recorded row carries no flag at all, which keeps
+// exactly the behaviour it had (the row was the only fact the old check could see).
+export function bootstrappableFrom(checks = []) {
+  const byName = (n) => checks.find((c) => c.check === n);
+  const definiteFail = (c) => !!c && c.ok === false && c.unknown !== true;
+  const sdb = byName('shared-dev-db');
+  if (definiteFail(sdb) && sdb.db_row_present !== true) return true;
+  if (definiteFail(byName('mesh-control-plane'))) return true;
+  const req = byName('requires-present');
+  if (definiteFail(req)) {
+    const missing = req.missing;
+    if (!missing) return false;
+    if ((missing.networks || []).length) return true;
+    if ((missing.volumes || []).some((v) => v && v.create === 'empty')) return true;
+  }
+  return false;
+}
+
+// CHECK 4 — this machine has the project's shared dev db ON it, AND that db answers.
+// A dev xell's app tier must never cross docker contexts for its database (spec), so no shared
+// dev db here means this machine cannot host the project's dev xells.
+//
+// The first half is still a pure meta-DB read — deliberately docker-free, so the check can answer
+// while the machine's docker context is down. The second half is a BOUNDED DIAL of the row's own
+// recorded address, and it exists because row-presence ALONE was a check that could not fail:
+// 'local' read ✓ GREEN for Zeehive while every db-open on it answered [28P01] — the row carries
+// conn_pw 'zeehive', the container was minted with a different password, and NO meta-DB value can
+// tell you that (the row is a MODEL of the password, not the password). Readiness then said "this
+// machine can host dev xells here" while every pooled provision that followed landed on a db
+// nothing could open. A check that cannot fail converts "I could not tell" into "fine".
+//
+// The verdicts, each one deliberate:
+//   no row                                   → fail    (a missing prerequisite; KEEP)
+//   per-xell coupling (db-isolated)          → skip    (the correct state; KEEP)
+//   row present, records no address          → pass    (there is nothing to DIAL: container.conn_ref
+//                                                       is derived from the same host address
+//                                                       machines.js provisionDevDb records, so a
+//                                                       row without one has no door to try. The
+//                                                       check keeps its presence-only meaning here
+//                                                       rather than inventing an address — an
+//                                                       addressless row is a different, named fault.)
+//   row present AND the dial answers         → pass
+//   row present AND the dial is REFUSED      → fail    (28P01 / ECONNREFUSED / ENOTFOUND — the peer
+//                                                       or the resolver told us something definite)
+//   row present AND only our OWN bound ended → unknown (nobody answered: cannot tell. Never a pass,
+//     it (no code from the driver)                      and never a definite fail either)
+//
+// A failing row carries `db_row_present: true`. That one structured fact is read by BOTH consumers
+// of "is there something to bootstrap here" — bootstrappableFrom() (the console's 🔧 render
+// condition) and the planner — because the bootstrap's only action on this check is provisionDevDb,
+// which creates a db that is NOT there and REFUSES a machine that already has one. A row that
+// exists and does not answer needs a human-timed RECREATE (it interrupts every live dev xell on the
+// machine) — the same class as the lost-alias row — so a shown button must not promise it
+// (docs/build-bootstrap-button-contract-decision-record.md: a shown button always acts).
+async function checkSharedDevDb(project, machine, dial = checkDsnOpens) {
   const coupling = project?.db_coupling || 'db-shared-dev';
   if (coupling !== 'db-shared-dev' && coupling !== 'db-clone') {
     return skip('shared-dev-db',
@@ -231,7 +382,27 @@ async function checkSharedDevDb(project, machine) {
     return fail('shared-dev-db',
       `no shared dev db for this project on '${machine.docker_ctx}' — dev xells cannot spawn here (their db must never live on another machine)`);
   }
-  return pass('shared-dev-db', `shared dev db '${row.name}' present on '${machine.docker_ctx}'`);
+  // The address the projection hands a zee for this db: the row's passwordless conn_ref (source
+  // 'shared-dev-container' in resolveXellDsn) with the row's OWN credential injected — never the
+  // manifest's, which is not what provisioned the container (TKT-181-9EDA).
+  const dsn = dsnWithPassword(row.conn_ref, row.conn_pw);
+  if (!dsn) {
+    return pass('shared-dev-db', `shared dev db '${row.name}' present on '${machine.docker_ctx}'`
+      + ' — the row records no dialable address, so the check asserts presence (there is no door to try)');
+  }
+  const r = await dial(dsn, { timeout: SHARED_DEV_DB_DIAL_TIMEOUT_MS });
+  if (r.ok) {
+    return pass('shared-dev-db', `shared dev db '${row.name}' present on '${machine.docker_ctx}' and it opens (${r.detail})`);
+  }
+  // `code` present ⇒ someone answered (auth rejection, nothing listening, a name that does not
+  // resolve). Absent ⇒ our own bound ended the attempt and nobody said anything: unknown, which
+  // the verdict ladder already refuses to call green.
+  const but = r.code
+    ? `but it does NOT open — ${r.detail}`
+    : `and CANNOT be confirmed to open — it did not answer within ${SHARED_DEV_DB_DIAL_TIMEOUT_MS}ms (${r.detail})`;
+  const detail = `shared dev db '${row.name}' present on '${machine.docker_ctx}' ${but}`;
+  return r.code ? { ...fail('shared-dev-db', detail), db_row_present: true }
+                : { ...unk('shared-dev-db', detail), db_row_present: true };
 }
 
 // CHECK 5 — when this machine cannot build, can a split build actually hand the image over?
@@ -263,35 +434,44 @@ async function checkRegistryForHandoff(machine, project) {
 }
 
 // The resolver — one (machine, project) → a verdict. Never throws for a verdict outcome.
-export async function probeBuildReadiness(machine, project, { docker = dockerAdapter } = {}) {
+// `dbDial` is the second injection seam, next to `docker`: the shared-dev-db check DIALS a real
+// postgres, and a test must be able to drive that verdict without a live host (the same reason
+// `docker` exists). Default is the preflight's own bound-and-report dial.
+export async function probeBuildReadiness(machine, project, { docker = dockerAdapter, dbDial = checkDsnOpens } = {}) {
   const checks = [];
   checks.push(await checkContextReachable(machine.docker_ctx, docker));
 
   // The remaining checks still run even when the context is down: compose-resolves and
-  // requires-present will answer 'unknown' (they need the daemon), while shared-dev-db and
-  // registry-for-handoff are pure meta-DB reads that do not. A definite missing fact beats
-  // "could not tell" in the overall verdict — we know it cannot build here.
+  // requires-present will answer 'unknown' (they need the daemon); shared-dev-db reads the meta-DB
+  // and dials only the row's OWN address (never the daemon) and registry-for-handoff reads the
+  // meta-DB alone. A definite missing fact beats "could not tell" in the overall verdict — we know
+  // it cannot build here.
   checks.push(await checkComposeResolves(machine, project, docker));
   checks.push(await checkRequiresPresent(machine, project, docker));
-  checks.push(await checkSharedDevDb(project, machine));
+  checks.push(await checkSharedDevDb(project, machine, dbDial));
   checks.push(await checkRegistryForHandoff(machine, project));
+  // Recorded, never user-entered, and never a reason a build fails: the mesh control plane.
+  checks.push(await checkMeshControlPlane(machine, docker));
 
-  const definite = checks.filter((c) => !c.ok && !c.unknown);
-  const unknown = checks.filter((c) => c.unknown);
+  // A failing check that is `blocking: false` is a performable-but-optional prerequisite (the mesh
+  // control plane): it does not make the machine unable to build, so it does not decide `status`.
+  // Everything else that fails definitely is `missing`, exactly as before.
+  const definite = checks.filter((c) => !c.ok && !c.unknown && c.blocking !== false);
+  const unknown = checks.filter((c) => c.unknown && c.blocking !== false);
   let status = 'ok';
   if (definite.length) status = 'missing';
   else if (unknown.length) status = 'unknown';
   const error = status === 'ok' ? null
     : (definite.length ? definite : unknown)
         .map((c) => `${c.check}: ${c.detail}`).join(' · ');
-  return { status, error, checks };
+  return { status, error, bootstrappable: bootstrappableFrom(checks), checks };
 }
 
 // Every machine (enabled or not — a disabled one still holding pool knobs deserves an answer)
 // for a project, probed in parallel. Read-only; each probe is bounded; a single unreachable
 // machine cannot stall the rest. Returns one entry per machine with the machine facts the UI
 // renders, plus the probe verdict.
-export async function buildReadinessForProject(projectId, { docker = dockerAdapter } = {}) {
+export async function buildReadinessForProject(projectId, { docker = dockerAdapter, dbDial = checkDsnOpens } = {}) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
   if (!project) throw new Error('project not found');
   // The project's DEFAULT db coupling decides whether a shared dev db is expected at all:
@@ -304,7 +484,7 @@ export async function buildReadinessForProject(projectId, { docker = dockerAdapt
        FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
       ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]);
   const rows = await Promise.all(machines.map(async (m) => {
-    const probe = await probeBuildReadiness(m, project, { docker });
+    const probe = await probeBuildReadiness(m, project, { docker, dbDial });
     return {
       machine_id: m.id,
       machine_key: m.key,
@@ -340,6 +520,34 @@ export async function upsertBuildReadinessRecord(machineId, projectId, { status,
 // probe click. Returns the same per-machine shape buildReadinessForProject does; a machine with
 // no record has status null (the badge shows "not checked yet"). `recorded:false` distinguishes
 // "never probed" from a real verdict.
+//
+// `bootstrappable` is DERIVED from the stored checks on read (one authority, bootstrappableFrom)
+// rather than stored as a column: the record predates it, the checks are what the classification
+// actually needs, and a stored boolean could disagree with the rows it was derived from.
+// RE-PROBE ONE (machine, project) PAIR and record it — the narrow re-record a reader calls when
+// it has just CHANGED the fact the pair's verdict was read from. The health monitor's db-port heal
+// (queenzee/containers.js healStaleDbPortRows) is that caller: it rewrites a shared dev db row's
+// address, and the pair's recorded 'missing' (which the pool fill-stop and dispatch both honour)
+// was dialled from the OLD address. Without this the fix waits for the hourly re-record — and on a
+// restart the boot-time re-record runs BEFORE the first health tick heals the rows, so a pair sat
+// 'missing' for an hour over a db that answered (2026-10-12, omnibiz, after the heal itself had
+// shipped). Resolves the machine by key or docker_ctx; returns the record, or null when there is
+// nothing to probe (no such machine/project). Never throws — a caller's heal must not fail on it.
+export async function reprobeBuildReadinessPair(machineRef, projectId,
+                                                { docker = dockerAdapter, dbDial = checkDsnOpens } = {}) {
+  try {
+    const machine = await one(`SELECT * FROM machine WHERE key=$1 OR docker_ctx=$1`, [machineRef]);
+    const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+    if (!machine || !project) return null;
+    const pc = await one(`SELECT default_db_coupling FROM pool_config WHERE project_id=$1`, [projectId]);
+    if (pc?.default_db_coupling) project.db_coupling = pc.default_db_coupling;
+    const probe = await probeBuildReadiness(machine, project, { docker, dbDial });
+    return upsertBuildReadinessRecord(machine.id, projectId, probe);
+  } catch {
+    return null;
+  }
+}
+
 export async function recordedBuildReadinessForProject(projectId) {
   const project = await one(`SELECT id FROM project WHERE id=$1`, [projectId]);
   if (!project) throw new Error('project not found');
@@ -363,6 +571,7 @@ export async function recordedBuildReadinessForProject(projectId) {
     status: r.status || null,
     error: r.error || null,
     checks: r.checks || [],
+    bootstrappable: r.status ? bootstrappableFrom(r.checks || []) : false,
     probed_at: r.probed_at || null,
     recorded: !!r.status,
   }));

@@ -151,13 +151,22 @@ try {
       ],
     },
     {
+      // THE ENTRY-POINT DOC INJECTOR. Its script grew a THIRD verdict with project-doc Option B
+      // (d368307): a tracked path the meta-DB row OWNS is now superseded rather than refused, and
+      // the cage says so with WROTE_TRACKED instead of WROTE. The row's markers must name every
+      // marker the site's script prints — the §4 anti-accident clause asserts that — and the
+      // supersede path gets its own case so the row EXERCISES it, not merely lists it.
       name: 'writeGeneratedDocIntoCxell',
-      markers: ['WROTE', 'TRACKED'],
+      markers: ['WROTE', 'WROTE_TRACKED', 'TRACKED'],
       cases: [
         { what: 'WROTE + exit 1 is a write (this site used to THROW here — the fourth instance)',
           out: 'WROTE', err: 'docker: connection reset', code: 1,
           run: () => C.writeGeneratedDocIntoCxell({ slug: 'zt-v', relPath: 'AGENTS.md', text: 'body\n' }),
           want: (r) => r?.written === true && r?.rel === 'AGENTS.md' },
+        { what: 'WROTE_TRACKED + exit 1 is a write that SUPERSEDES the committed copy (project-doc Option B)',
+          out: 'WROTE_TRACKED', err: 'docker: connection reset', code: 1,
+          run: () => C.writeGeneratedDocIntoCxell({ slug: 'zt-v', relPath: 'CLAUDE.md', text: 'body\n', overwriteTracked: true }),
+          want: (r) => r?.written === true && r?.superseded === true && r?.rel === 'CLAUDE.md' },
         { what: 'TRACKED + exit 1 still leaves the project\'s own committed file alone',
           out: 'TRACKED', err: 'docker: connection reset', code: 1,
           run: () => C.writeGeneratedDocIntoCxell({ slug: 'zt-v', relPath: 'AGENTS.md', text: 'body\n' }),
@@ -432,6 +441,27 @@ try {
           run: () => C.seedCxellFirstRun({ ctx: 'default', name: 'cxell_zt-v',
                                            adapter: RT.adapterFor('codex-cxell') }),
           want: (r) => r?.ok === false && !r?.verdict && /No such container/.test(String(r?.said)) },
+      ],
+    },
+    {
+      // THE PER-ACTOR GIT IDENTITY (configureCxellGitIdentity, TKT-159-3139). The cage script echoes
+      // IDENTITY_OK only when both `git config --global` writes succeeded, and the caller decides
+      // from that marker — best-effort by contract (a failure must never sink a spawn, so a miss is
+      // reported and the baked shared identity stays). It reached this table LATE: it printed a marker
+      // the declaration guard could see but ran through plain `dk`, so a non-zero exit whose stdout
+      // carried IDENTITY_OK was read as a failure. Same shape as every other row here, which is what
+      // the undeclared-marker failure was telling anyone who read it.
+      name: 'configureCxellGitIdentity (per-actor git identity)',
+      markers: ['IDENTITY_OK'],
+      cases: [
+        { what: 'IDENTITY_OK + exit 1 + stderr noise is a configured identity (the verdict, not the exit code)',
+          out: 'IDENTITY_OK', err: 'docker: connection reset', code: 1,
+          run: () => C.configureCxellGitIdentity({ ctx: 'default', slug: 'zt-v' }),
+          want: (r) => r?.ok === true && r?.slug === 'zt-v' && /@xell\.zeehive\.local$/.test(String(r?.email)) },
+        { what: 'and NO verdict is a miss, not a configured cage — the baked identity stays until a rebuild',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.configureCxellGitIdentity({ ctx: 'default', slug: 'zt-v' }),
+          want: (r) => r?.ok === false && r?.slug === 'zt-v' },
       ],
     },
   ];

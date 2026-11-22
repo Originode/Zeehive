@@ -87,9 +87,21 @@ New Project → Clone from GitHub. Staged, each step reversible:
 control plane — `netbird-management`, `netbird-signal`, `netbird-relay`, `netbird-dashboard` —
 gated behind the **`mesh` compose profile**. That is a deliberate choice: an unscoped `up -d`
 boots the pre-mesh stack, and the mesh stays off until a human stands it up **and** points the
-queenzee at it. The compose files are only the definition; **live stand-up is a human's deploy,
-not something the queenzee does for you**, and it has not been verified in a cage — this section
-is the record of how to do it, and it will need adjusting to the NetBird tag you pin (see below).
+queenzee at it.
+
+**Standing the control plane up is now a step on the human-gated build-bootstrap card, not a raw
+shell op.** On the machine the queenzee runs on (`docker_ctx = 'default'`), the card's
+**`mesh-control-plane`** step (a) writes `netbird/management.json` from the shipped example using
+values from the queenzee's env, (b) runs `docker compose --profile mesh up -d netbird-management
+netbird-signal netbird-relay`, (c) health-checks the management API, and (d) tells you exactly which
+env **you** must still set by hand. It never mints or stores a secret: the datastore key and relay
+secret come only from your env, and the API token is NetBird's own token flow. From a cxell/cage the
+docker call refuses legibly — the stand-up runs on a machine with docker, never inside a cage.
+
+The compose files are the definition and the manual path below stays authoritative for
+`docker/zeehive/docker-compose.prod.yml` (the card drives the **bootstrap** compose,
+`docker-compose.bootstrap.yml`, by default). Live stand-up still has not been exercised against a
+running NetBird — this section will need adjusting to the NetBird tag you pin (see below).
 
 ### What it is, and why the datastore is a one-way door
 
@@ -110,14 +122,41 @@ is the record of how to do it, and it will need adjusting to the NetBird tag you
 
 ### Standing it up (one-time bootstrap)
 
-Both compose files already carry the services; the steps below are for a repo checkout driving
-`docker/zeehive/docker-compose.prod.yml`. A standalone bootstrap install works the same but the
-`netbird/management.json` path is relative to wherever you keep `docker-compose.bootstrap.yml`.
+**The automated path (recommended): the build-bootstrap card.** On the queenzee host, open the
+human-gated **infra** card (🔧 / `zee infra bootstrap`) and run the build bootstrap for the project
+on the `default` machine — or call the API (`POST /api/build-bootstrap/plan` then `.../perform`). The
+plan reports whether the control plane is up (`already-present`) or performable (`planned`); a dry
+run shows the step without touching docker. To let the card write the config, put these in the
+queenzee's env **before** the perform:
 
-1. **Pin the NetBird tags.** NetBird moves fast and its images' flag surface changes between
-   releases (the consolidated port architecture landed around v0.29). Edit the four
-   `NETBIRD_*_TAG` vars in your `docker/zeehive/.env` to one release and check that release's
-   self-hosted docs before going further. The compose defaults (`:latest`) are for evaluation only.
+```sh
+NETBIRD_DATASTORE_ENCRYPTION_KEY=<a real key you generate — the card never generates one>
+NETBIRD_RELAY_AUTH_SECRET=<a real relay secret you generate>
+NETBIRD_SIGNAL_URI=netbird-signal:80                 # optional; defaults are sensible
+NETBIRD_RELAY_ENDPOINT=relay://netbird-relay:33080   # optional
+MESH_COMPOSE_FILE=/path/to/docker-compose.bootstrap.yml  # only if not the repo's own file
+```
+
+The generated `netbird/management.json` is **gitignored on purpose** — it carries the datastore key
+and relay secret and must never ride into a landing. If the values are left at the template's
+`CHANGE-ME` placeholders the step refuses, naming both env vars, and writes nothing.
+
+After the perform, the step's receipt names the rest of the human work, which the card never does for
+you: **`NETBIRD_API_URL`** and **`NETBIRD_API_TOKEN`** (a token minted on the control plane via
+NetBird's own flow) to point the queenzee at it — see step 4 — and **`NETBIRD_GATEWAY_SETUP_KEY`**
+for the cage gateway — see §3.5 below. No secret is minted or stored by the step.
+
+**The manual path** (also what the card does, spelled out). Both compose files carry the services;
+the steps below are for a repo checkout driving `docker/zeehive/docker-compose.prod.yml`. A
+standalone bootstrap install works the same but the `netbird/management.json` path is relative to
+wherever you keep `docker-compose.bootstrap.yml`.
+
+1. **Know which NetBird release you are running.** The compose defaults are now pinned to
+   **v0.78.1** — the release `lib/netbird.js` was proven against against a real management server
+   (`test/netbird-live-api.test.mjs`, docs/netbird-mesh-plan.md §11). The four `NETBIRD_*_TAG`
+   vars in your `docker/zeehive/.env` override them; NetBird moves fast, its flag and API surface
+   changes between releases, the old `:latest` defaults are gone on purpose — bump a tag only
+   together with a run of the live test, and check that release's self-hosted docs.
 2. **Write the management config.** Copy the example and edit the endpoints:
    ```sh
    cp netbird/management.json.example netbird/management.json   # from docker/zeehive/
@@ -126,6 +165,13 @@ Both compose files already carry the services; the steps below are for a repo ch
    (relative to the compose file, so `docker/zeehive/netbird/management.json` in a checkout). The
    example is valid JSON with placeholder `Signal` / `Relay` / datastore-encryption values; fill in
    the LAN addresses/ports you publish below and a real `DataStoreEncryptionKey`/relay secret.
+   **The datastore key must be valid base64 of exactly 32 bytes**, e.g. `openssl rand -base64 32`.
+   The shipped `CHANGE-ME-…` value is deliberately NOT a usable key: it does not decode, so the
+   server dies on boot with `failed to create field encryptor: decode encryption key` (verified
+   against v0.78.1, docs/netbird-mesh-plan.md §11), and the bootstrap card refuses to stand the
+   plane up on it. Generate your own and keep it versioned; it is the one-way door to the datastore.
+   The `HttpConfig.Address` key some older docs show is gone in v0.78.1 — the listen address is the
+   `--port` flag, not config.
 3. **Bring the control plane up.**
    ```sh
    docker compose -f docker/zeehive/docker-compose.prod.yml --profile mesh up -d
@@ -158,3 +204,34 @@ Both compose files already carry the services; the steps below are for a repo ch
    has live peers. `netbird_management_data` and `netbird_signal_data` are named volumes with
    explicit names, exactly like the `zeehive_*` volumes, so a backup/restore script can mount them
    by bare name.
+
+### The cages' hop onto the mesh (`mesh-gateway`, §3.5)
+
+A cxell runs **no** NetBird agent (mesh-plan DR-3: peer sprawl, `/dev/net/tun` per cage, no
+identity gained while the firewall seal exists). It reaches mesh addresses through ONE container:
+
+- `mesh-gateway` — the same `mesh` profile, a NetBird agent named `zeehive-gw` with `NET_ADMIN`,
+  `/dev/net/tun` and `ip_forward`, joined to **both** the compose network and `zee-hive-net` (the
+  network every cxell is already on; EXTERNAL — the queenzee's entrypoint creates it, compose must
+  never own it). Give it a setup key of its own in `docker/zeehive/.env`:
+  ```sh
+  NETBIRD_GATEWAY_SETUP_KEY=<a setup key minted on the control plane>
+  ```
+- The cage seal (`cxell-firewall.sh`, already root + `NET_ADMIN`) then adds ONE line:
+  `ip route replace 100.64.0.0/10 via <the gateway's zee-hive-net address>`.
+
+**You do not configure that address.** Docker assigns it and reassigns it on every recreate, so
+copying it into an `.env` would be one more baked address that rots — the fault this whole plan
+exists to delete. `lib/cxell.js resolveMeshGatewayIp` inspects the running `zeehive_mesh_gateway`
+on the **cage's own docker context** at seal time (`zee-hive-net` is per host, so a cage only ever
+routes through a gateway on its own machine) and passes it into the seal exec. A machine with no
+gateway container gets no mesh route at all, logged — its cages keep using the published ports.
+`MESH_GATEWAY_IP` in the queenzee's env overrides the lookup, for a gateway this compose did not
+create; setting it is itself an opt-in (it is honoured even with the mesh otherwise disabled).
+
+Note what this does **not** weaken: the seal still drops every prod db host:port first, and the
+control plane is default-deny between groups, so a cage with the route reaches only what a policy
+grants (mesh-plan §3.5). The client half is now live-verified — `lib/netbird.js` is driven against a
+real v0.78.1 management server by `test/netbird-live-api.test.mjs` (mesh-plan §11) — but the
+gateway hop is still test-only, and **live stand-up is a human's deploy**: of the gateway, like the
+rest of the control plane, and none of it has been exercised against a running NetBird.

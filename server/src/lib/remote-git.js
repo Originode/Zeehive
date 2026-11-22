@@ -469,6 +469,36 @@ export function pushRuleBlock(rules, branch = 'the default branch') {
   return null;
 }
 
+// WHY the repo probe failed, in words a human can act on. "not authorised for this repo" was the
+// only sentence for 401 AND 403 (and a 404 fell through as a bare "Not Found"), and the console
+// then simply hid ⇅ PR — so "I can't do a pull request" had no visible cause. Each status has a
+// different fix, and GitHub's own message is quoted because it is the only exact statement of it
+// (SAML SSO enforcement, a fine-grained policy, a rate limit all arrive as 403).
+export function accessRefusal(status, message, slug) {
+  const repo = slug ? `${slug.owner}/${slug.repo}` : 'this repo';
+  const said = message ? ` (GitHub: "${String(message).slice(0, 200)}")` : '';
+  if (status === 401) {
+    return `the connected GitHub token is not authorised — GitHub REJECTED it (401)${said}: it is expired, revoked or mistyped. `
+      + 'Connect a fresh PAT for this project (Project setup → GitHub) and Push / PR come back';
+  }
+  if (status === 403) {
+    const m = String(message || '');
+    const fix = /saml|sso/i.test(m)
+      ? `the token must be AUTHORISED for ${slug?.owner || 'the org'}'s SAML SSO (GitHub → Settings → Tokens → Configure SSO)`
+      : /rate limit/i.test(m)
+        ? 'GitHub is rate-limiting this token — wait and reopen Project setup'
+        : /resource not accessible|fine-grained|personal access token/i.test(m)
+          ? `the token's permissions or the org's token policy do not cover ${repo} — grant it this repo with Contents: write + Pull requests: write (or have an org owner approve it)`
+          : `the token's owner has no access to ${repo}, or an org policy blocks this token — grant it this repo with Contents: write + Pull requests: write`;
+    return `the connected GitHub token is not authorised for ${repo} (403)${said}: ${fix}`;
+  }
+  if (status === 404) {
+    return `the connected GitHub token cannot see ${repo} (404)${said}: a fine-grained PAT whose Repository access does not include it, `
+      + 'a classic PAT without the "repo" scope on a private repo, or a wrong remote URL';
+  }
+  return `could not read repo permissions for ${repo}${status ? ` (HTTP ${status})` : ''}: ${message || 'no answer from GitHub'}`;
+}
+
 export async function remoteAccess({ url, token, withRules = true } = {}) {
   const slug = parseGitHubSlug(url);
   if (!slug) return { provider: null, can_push: false, can_pr: false, reason: 'remote is not a GitHub URL — push/PR are GitHub-only' };
@@ -476,9 +506,8 @@ export async function remoteAccess({ url, token, withRules = true } = {}) {
   const r = await githubApi(slug, `/repos/${slug.owner}/${slug.repo}`, { token });
   if (!r.ok) {
     return { provider: 'github', can_push: false, can_pr: false,
-      reason: r.status === 401 || r.status === 403
-        ? 'the connected GitHub token is not authorised for this repo'
-        : `could not read repo permissions: ${r.error}` };
+      status: r.status, github_message: r.error || null,
+      reason: accessRefusal(r.status, r.error, slug) };
   }
   const perms = r.body?.permissions || {};
   const archived = !!r.body?.archived;

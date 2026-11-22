@@ -55,7 +55,7 @@ import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { recordEvent, setTend } from '../lib/status.js';
 import { cxellName, cxellState, startCxell, stopCxell, restartCxellSshd, sealCxell,
-         refreshZeeLiveInLiveCxells } from '../lib/cxell.js';
+         refreshZeeToolingInLiveCxells } from '../lib/cxell.js';
 import { prodDbBlockList } from '../lib/cxell-seal.js';
 import { metaDbHostPort } from '../lib/prod-readonly.js';
 import { markZeeTurn } from '../lib/turn-record.js';
@@ -102,7 +102,7 @@ let sweeping = false;
 
 // Every live cxell the queenzee owns, newest zee per xell. Same shape as the boot renderer sweep's
 // query, plus what the seal and the turn release need. INJECTABLE (see recoverStoppedCxells's
-// `list`) for the same reason refreshZeeLiveInLiveCxells takes its lister: this sweep WRITES to the
+// `list`) for the same reason refreshZeeToolingInLiveCxells takes its lister: this sweep WRITES to the
 // zee rows it visits, and a test run against a SHARED meta-DB must be able to say "these xells and
 // no others" rather than reaching across somebody else's fleet.
 // ONE definition of "a cage this module may touch", so the sweep and the console's single-xell
@@ -248,13 +248,13 @@ async function recoverOne(row, { reason, mode, force = false, by = 'the queenzee
     return { slug, verdict: 'unsealed', stopped, error: e.message };
   }
 
-  // 3b. THE ATTEND PATH, for the cage that was DOWN when this queenzee's boot sweep ran. index.js
-  // refreshes the feed renderer + attach script in every RUNNING cxell at boot — which is also the
-  // moment after a ship — and a stopped cage is invisible to it, so a xell that slept through a
-  // deploy would keep the old pair until some later boot happened to catch it running. Best-effort
+  // 3b. THE ZEE TOOLING, for the cage that was DOWN when this queenzee's boot sweep ran. index.js
+  // refreshes the CLI + feed renderer + attach script in every RUNNING cxell at boot — which is also
+  // the moment after a ship — and a stopped cage is invisible to it, so a xell that slept through a
+  // deploy would keep the old CLI until some later boot happened to catch it running. Best-effort
   // by contract (it never throws) and mode-gated inside; a file install is not egress, so its place
   // after the seal is bookkeeping rather than safety.
-  await refreshZeeLiveInLiveCxells(async () => [{ ctx: 'default', name: cxellName(slug) }], { mode });
+  await refreshZeeToolingInLiveCxells(async () => [{ ctx: 'default', name: cxellName(slug) }], { mode });
 
   logline('cxell-recover', `${slug}: cxell was ${probe.state} after ${reason} — RESTARTED, `
     + `ssh ${door ? 're-opened' : 'FAILED'}, re-sealed (${blockTcp.length} prod db(s) blocked)`);

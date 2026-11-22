@@ -146,11 +146,20 @@ const { renderToStaticMarkup } = await import('react-dom/server');
 const WEB = resolve(here, '..', 'web/src');
 const entry = `${WEB}/.env-alert.test-entry.jsx`;
 const outfile = `${WEB}/.env-alert.test-bundle.mjs`;
+// wterm is VENDORED (web/vendor/wterm), deliberately NOT an npm install — the real build resolves
+// `@wterm/core` through vite's alias table, and esbuild knows nothing about that table. Without it
+// the bundle dies inside web/vendor/wterm/dom/dist on `import { WasmBridge } from "@wterm/core"`,
+// which is a fact about this harness and not about App.jsx. Read the table off the config that
+// actually drives the build rather than copying it here: a second copy is exactly the drift this
+// test would then never notice.
+const wtermAlias = Object.fromEntries(
+  (await import('../web/vite.config.js')).default.resolve.alias.map((a) => [a.find, a.replacement]));
 writeFileSync(entry, read('web/src/App.jsx') + '\nexport { NeedsYouBar };\n');
 let ui;
 try {
   await build({ entryPoints: [entry], outfile, bundle: true, format: 'esm', platform: 'node',
-    loader: { '.jsx': 'jsx' }, external: ['react', 'react-dom', 'react/jsx-runtime'], logLevel: 'error' });
+    loader: { '.jsx': 'jsx' }, external: ['react', 'react-dom', 'react/jsx-runtime'], logLevel: 'error',
+    alias: wtermAlias });
   ui = await import(`file://${outfile}`);
 } finally {
   for (const f of [entry, outfile, outfile.replace(/\.mjs$/, '.css')]) rmSync(f, { force: true });

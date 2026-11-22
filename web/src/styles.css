@@ -335,6 +335,7 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .gh-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .gh-btn:disabled { opacity: .45; cursor: not-allowed; }
 .gh-btn.busy { opacity: .6; }
+.gh-btn.blocked { opacity: .7; border-style: dashed; }
 .gh-out { color: var(--accent); text-decoration: none; font-size: 11px; padding: 2px 4px;
   display: inline-flex; align-items: center; }
 .gh-out.bad { color: var(--down); }
@@ -409,15 +410,45 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-blocker { display: flex; flex-direction: column; gap: 5px; background: var(--panel2);
   border: 1px solid var(--line); border-left: 2px solid rgba(229,85,78,.7); border-radius: 6px;
   padding: 8px 10px; }
-.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ny-blocker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  flex-wrap: wrap; }
 .ny-blocker-date { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 .ny-blocker-body { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
   line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+/* A CALLED zee (medic_call 251) — the blocker row carries the zee's own words plus the infra
+   evidence stamped at call time, so a human can decide from the row itself. */
+.ny-called-evidence { display: flex; flex-direction: column; gap: 3px; margin-top: 2px;
+  padding-left: 8px; border-left: 1px solid var(--line); }
+.ny-called-ev { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted);
+  white-space: pre-wrap; word-break: break-word; }
 .needsyou .pill { background: rgba(229,85,78,.16); color: var(--text);
   border: 1px solid rgba(229,85,78,.6); border-radius: 5px; font-size: 12px; padding: 3px 9px;
   cursor: pointer; white-space: nowrap; }
 .needsyou .pill:hover { border-color: var(--down); background: rgba(229,85,78,.28); }
 .needsyou .pill:disabled { opacity: .55; cursor: default; }
+/* A DISMISS is the deliberate opposite of the red dispatch pill: a quiet ✕ that must never read as
+   an equal to "⛑ Dispatch medic". Secondary chrome only — muted text on the panel, hover turns it
+   the danger colour so the act is legible before it is clicked. */
+.needsyou .pill.pill-ghost, .setup-row .pill.pill-ghost {
+  background: transparent; border: 1px dashed var(--line); color: var(--muted);
+  font-weight: 400; }
+.needsyou .pill.pill-ghost:hover, .setup-row .pill.pill-ghost:hover {
+  border-color: var(--down); border-style: solid; color: var(--down);
+  background: rgba(229,85,78,.08); }
+/* The muted "N dismissed · UNDO" way-back under the medic panel (and the conditions editor). One
+   line, small, quiet — but the UNDO is a real link that deletes that one fingerprinted dismissal,
+   so a fault silenced by accident comes straight back on the next snapshot. */
+.ny-dismissed { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; padding: 6px 8px;
+  border-top: 1px dashed var(--line); color: var(--muted); font-size: 11px; }
+.ny-dismissed-label { opacity: .75; letter-spacing: .02em; }
+.ny-dismissed-one { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-family: 'Segoe UI', sans-serif; }
+.ny-dismissed-one b { color: var(--text); font-weight: 600; }
+.ny-dismissed-one .ny-why { color: var(--muted); }
+.ny-dismissed-one .undolink { background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--building); font-size: 11px; font-weight: 600; letter-spacing: .04em;
+  text-decoration: underline dotted; }
+.ny-dismissed-one .undolink:hover { color: var(--text); }
 
 /* ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) ──────────────────────────────────────────
    Medics have no xell, so they are in no honeycomb; this strip is their whole surface. Styled as a
@@ -474,9 +505,11 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .medic-msg-role { color: var(--muted); }
 .medic-msg-text { white-space: pre-wrap; word-break: break-word; }
 .medic-msg.user .medic-msg-text { color: var(--muted); }
-.medic-cards, .medic-workers { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
-.medic-card { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.medic-cards, .medic-workers, .medic-calls { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.medic-card, .medic-call { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .medic-card.pending { border-color: rgba(224,161,58,.55); }
+.medic-call.attended { border-color: rgba(234,85,78,.55); }
+.medic-call-res { color: var(--down); }
 .medic-gate { color: var(--muted); }
 .medic-tabs { display: flex; gap: 6px; }
 .medic-tabs .pill { margin-left: 0; }
@@ -706,6 +739,23 @@ a.cbox:hover { border-color: var(--accent); }
 .statusline .gateway-health { color: var(--muted); font-size: 14px; }
 .statusline .gateway-health.gateway_down { color: var(--danger, #c44); font-weight: 600; }
 .statusline .gateway-health.gateway_unknown { color: var(--amber, #d4a017); }
+/* MESH CONTROL PLANE — the same "the WORD is the signal, colour is reinforcement" rule, with one
+   deliberate exception: mesh_down is not a coloured word, it is a PILL. The card's requirement is
+   that a downed control plane be the most obvious thing in the console, and a red word among muted
+   grey ones is scanned past — an inverse-video danger pill is not. It is always rendered, so a
+   human never has to already suspect the mesh to learn it is gone; not-set-up stays quiet (that
+   state is a decision, not a fault) and an unreadable status stays muted (never a false MESH DOWN). */
+.statusline .mesh-status { font-size: 14px; }
+.statusline .mesh-status.mesh_not_set_up { color: var(--muted); }
+.statusline .mesh-status.mesh_not_set_up:hover { color: var(--text); }
+.statusline .mesh-status.mesh_ok { color: var(--up); }
+.statusline .mesh-status.mesh_unknown { color: var(--amber, #d4a017); }
+.statusline .mesh-status:hover { text-decoration: underline; }
+.statusline .mesh-status.loud {
+  color: #fff; background: var(--down); border: 1px solid var(--down); border-radius: 20px;
+  padding: 1px 10px; font-weight: 700; letter-spacing: .02em; text-decoration: none;
+  animation: mesh-down-pulse 2s ease-in-out infinite; }
+@keyframes mesh-down-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .72; } }
 .statusline .providerlimits-name { color: var(--muted); font-size: 12px; }
 /* Project setup: remaining limit next to each provider account. */
 .token-usage-limit {
@@ -1047,6 +1097,123 @@ a.cbox:hover { border-color: var(--accent); }
 /* device host (035): the 📱 capability toggle + the actions panel under a can_device header */
 .mx-device.on { color: #6fe39a; }
 .mx-devpanel { margin-top: 5px; }
+/* the MESH panel (TKT-189): per-machine NetBird config + human-gated stand-up + observe */
+.mx-meshpanel { margin-top: 5px; }
+.mx-meshbtn { font-size: 10px; background: none; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 5px; padding: 1px 6px; cursor: pointer; }
+.mx-meshbtn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-meshsections { margin-top: 4px; display: flex; flex-direction: column; gap: 5px; border-left: 2px solid var(--line);
+  padding-left: 7px; }
+.mx-meshsec { font-size: 10.5px; }
+.mx-meshhead { color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-size: 9px; margin-bottom: 2px; }
+.mx-meshfield { display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+.mx-meshfield .k { color: var(--muted); flex: none; width: 116px; }
+.mx-meshfield input { flex: 1 1 auto; min-width: 0; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--text); border-radius: 4px; padding: 1px 4px; font-size: 10.5px; }
+.mx-meshfield input::placeholder { color: var(--muted); }
+.mx-meshgen, .mx-meshplan, .mx-meshsave, .mx-meshgo, .mx-meshrefresh {
+  background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 4px;
+  padding: 1px 5px; font-size: 10px; cursor: pointer; }
+.mx-meshgen:hover:not(:disabled), .mx-meshplan:hover:not(:disabled),
+.mx-meshsave:hover:not(:disabled), .mx-meshrefresh:hover:not(:disabled) { border-color: var(--accent); }
+.mx-meshgo { color: #ffb4a2; border-color: rgba(229,85,78,.5); }
+.mx-meshgo:hover:not(:disabled) { color: var(--text); border-color: var(--down); }
+.mx-meshrow { display: flex; align-items: center; gap: 6px; margin-top: 3px; flex-wrap: wrap; }
+.mx-meshhint, .mx-meshnote { color: var(--muted); font-size: 9.5px; }
+.mx-mesherr { color: #ffb4a2; font-size: 10px; margin-top: 2px; }
+.mx-meshstep { margin-top: 2px; }
+.mx-meshstep.planned b { color: #e0a53b; }
+.mx-meshstep.already-present b { color: var(--up); }
+.mx-meshstep.cannot b, .mx-meshstep.failed b { color: var(--down); }
+.mx-meshobs { display: flex; flex-direction: column; gap: 2px; }
+.mx-meshhealth.ok { color: var(--up); }
+.mx-meshhealth.down { color: var(--down); }
+.mx-meshpeers { color: var(--text); }
+.mx-meshpeerlist { color: var(--muted); font-size: 9.5px; }
+.mx-meshtally-head { color: var(--muted); }
+.mx-meshtable { border-collapse: collapse; margin-top: 2px; }
+.mx-meshtable th, .mx-meshtable td { border: 1px solid var(--line); padding: 0 5px; font-size: 10px; text-align: right; }
+.mx-meshtable th:first-child, .mx-meshtable td:first-child { text-align: left; }
+.mx-meshbykind { display: flex; flex-wrap: wrap; gap: 7px; color: var(--muted); margin-top: 2px; }
+/* the config SUMMARY rows + the wizard launch button (the compact inline form's replacement) */
+.mx-meshsumrow { display: flex; gap: 5px; margin-top: 1px; }
+.mx-meshsumrow .k { color: var(--muted); flex: none; width: 116px; }
+.mx-meshsumrow .v { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-meshconfigure { font-size: 12px; background: rgba(90,140,255,.12); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+.mx-meshconfigure:hover:not(:disabled) { background: rgba(90,140,255,.25); }
+.mx-meshconfigure:disabled { opacity: .5; cursor: default; }
+/* the NetBird control-plane SETUP WIZARD: a full-size modal (the dlg-overlay pattern), one page
+   at a time, big inputs, the field hints as visible text — the anti-"compact dropdown". */
+.mx-wizoverlay { position: fixed; inset: 0; z-index: 85; display: flex; align-items: center;
+  justify-content: center; padding: 6vh 16px; background: rgba(4,6,10,.6);
+  backdrop-filter: blur(3px); animation: dlg-fade .14s ease-out; }
+.mx-wiz { width: min(640px, 96vw); max-height: 88vh; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--accent);
+  border-radius: 12px; overflow: hidden; box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+.mx-wizhead { display: flex; align-items: center; justify-content: space-between; gap: 9px;
+  padding: 13px 16px 8px; }
+.mx-wiztitle { font-size: 14px; font-weight: 700; color: var(--text); }
+.mx-wizclose { background: none; border: none; color: var(--muted); font-size: 15px; cursor: pointer;
+  padding: 2px 6px; border-radius: 6px; }
+.mx-wizclose:hover { color: var(--text); background: var(--panel2); }
+.mx-wizrail { display: flex; gap: 6px; padding: 0 16px 10px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--line); }
+.mx-wizdot { display: flex; align-items: center; gap: 6px; background: var(--panel2);
+  border: 1px solid var(--line); color: var(--muted); border-radius: 7px; padding: 5px 10px;
+  font-size: 12px; cursor: pointer; }
+.mx-wizdot b { display: inline-flex; align-items: center; justify-content: center; width: 17px;
+  height: 17px; border-radius: 50%; border: 1px solid var(--line); font-size: 10.5px; }
+.mx-wizdot.on { color: var(--text); border-color: var(--accent); }
+.mx-wizdot.on b { border-color: var(--accent); color: var(--accent); }
+.mx-wizdot.done { color: var(--text); }
+.mx-wizdot.done b { color: var(--up); border-color: var(--up); }
+.mx-wizbody { padding: 14px 16px; overflow-y: auto; flex: 1 1 auto; }
+.mx-wizsteptitle { font-size: 13.5px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.mx-wizblurb { color: var(--muted); font-size: 12px; line-height: 1.5; margin-bottom: 12px; }
+.mx-wizfield { display: block; margin-bottom: 14px; }
+.mx-wizfield .k { display: block; font-size: 12.5px; font-weight: 600; color: var(--text);
+  margin-bottom: 4px; }
+.mx-wizstored { color: var(--muted); font-weight: 400; font-style: normal; }
+.mx-wizinrow { display: flex; gap: 8px; align-items: center; }
+.mx-wizfield input { width: 100%; box-sizing: border-box; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; color: var(--text);
+  font-size: 13px; outline: none; }
+.mx-wizfield input:focus { border-color: var(--accent); }
+.mx-wizfield input::placeholder { color: var(--muted); }
+.mx-wizgen { flex: none; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 7px; padding: 8px 14px; font-size: 12.5px; cursor: pointer; }
+.mx-wizgen:hover:not(:disabled) { border-color: var(--accent); }
+.mx-wizhint { display: block; color: var(--muted); font-size: 11.5px; line-height: 1.45; margin-top: 4px; }
+/* the PROVISION block on the management page: stand the plane up on the queenzee's own host */
+.mx-wizprov { margin-top: 14px; padding: 12px 14px; border: 1px dashed var(--line); border-radius: 9px;
+  background: var(--panel2); font-size: 12.5px; }
+.mx-wizprov .mx-wizblurb { margin-bottom: 10px; }
+.mx-wizprov .mx-meshstep { font-size: 12px; margin: 6px 0; }
+.mx-wizprov .mx-meshnote, .mx-wizprov .mx-mesherr { font-size: 11.5px; margin-top: 6px; }
+.mx-wizprovhead { font-size: 12.5px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.mx-wizprovplan, .mx-wizprovuse { background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  border-radius: 7px; padding: 7px 14px; font-size: 12.5px; cursor: pointer; }
+.mx-wizprovplan:hover:not(:disabled), .mx-wizprovuse:hover:not(:disabled) { border-color: var(--accent); }
+.mx-wizprovgo { background: rgba(229,85,78,.12); border: 1px solid rgba(229,85,78,.5); color: #ffb4a2;
+  border-radius: 7px; padding: 7px 16px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.mx-wizprovgo:hover:not(:disabled) { color: var(--text); border-color: var(--down); }
+.mx-wizprovmissing { margin-top: 8px; padding: 8px 10px; border: 1px solid rgba(224,165,59,.5);
+  border-radius: 7px; background: rgba(224,165,59,.08); color: var(--text); font-size: 12px;
+  line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mx-wizreview { display: flex; flex-direction: column; gap: 6px; }
+.mx-wizrevrow { display: flex; gap: 10px; font-size: 12.5px; }
+.mx-wizrevrow .k { color: var(--muted); flex: none; width: 190px; }
+.mx-wizrevrow .v { color: var(--text); word-break: break-all; }
+.mx-wizfoot { display: flex; justify-content: flex-end; gap: 10px; padding: 12px 16px;
+  border-top: 1px solid var(--line); background: var(--panel2); }
+.mx-wizback { background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 7px; padding: 6px 16px; font-size: 13px; cursor: pointer; }
+.mx-wizback:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-wizback:disabled { opacity: .45; cursor: default; }
+.mx-wiznext, .mx-wizsave { background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  border-radius: 7px; padding: 6px 20px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.mx-wiznext:hover:not(:disabled), .mx-wizsave:hover:not(:disabled) { filter: brightness(1.1); }
 .mx-devbtn { font-size: 11px; background: rgba(53,196,107,.12); color: #9fe8bd;
   border: 1px solid rgba(53,196,107,.5); border-radius: 5px; padding: 2px 7px; cursor: pointer; }
 .mx-devbtn:hover:not(:disabled) { background: rgba(53,196,107,.25); }
@@ -2041,6 +2208,30 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-crumbs .hive-crumb:hover { color: #e6ebf2; border-color: #7f95c2; }
 .hive-crumbs .hive-crumb.on { color: #dce4f2; border-color: #7f95c2; background: rgba(31, 40, 58, 0.92); }
 .hive-crumbs .hive-crumb-sep { color: #5a6579; font-size: 11px; pointer-events: none; }
+/* XELL SEARCH — the 🔍 chip and the keyword box it opens, in the crumb strip's chip language */
+.hive-crumbs .hive-search-btn { margin-left: 4px; padding: 3px 8px; }
+.hive-crumbs .hive-xells-only { margin-top: 2px; }
+.hive-crumbs .hive-xells-only.on { color: #1a1205; background: #f5b942; border-color: #f5b942; }
+.hive-crumbs .hive-crumbs-break { flex-basis: 100%; height: 0; }
+.hive-crumbs .hive-search {
+  pointer-events: auto; margin-left: 4px;
+  display: inline-flex; align-items: center; gap: 4px;
+  background: rgba(31, 40, 58, 0.92); border: 1px solid #7f95c2; border-radius: 12px;
+  padding: 1px 4px 1px 8px; font: 600 11px 'Segoe UI', sans-serif; color: #dce4f2;
+}
+.hive-crumbs .hive-search.none { border-color: #c2687f; }
+.hive-crumbs .hive-search-ico { font-size: 10px; opacity: 0.8; }
+.hive-crumbs .hive-search-input {
+  background: transparent; border: 0; outline: 0; color: #e6ebf2;
+  font: 600 11px 'Segoe UI', sans-serif; width: 180px; padding: 2px 0;
+}
+.hive-crumbs .hive-search-input::-webkit-search-cancel-button { display: none; }
+.hive-crumbs .hive-search-count { color: #8b97a8; white-space: nowrap; }
+.hive-crumbs .hive-search.none .hive-search-count { color: #e08a9e; }
+.hive-crumbs .hive-search-clear {
+  background: transparent; border: 0; color: #8b97a8; cursor: pointer; font-size: 11px; padding: 0 4px;
+}
+.hive-crumbs .hive-search-clear:hover { color: #e6ebf2; }
 /* ── the pane's VIEW SELECTOR (honeycomb · tickets · reflections · board · timeline) ───────────
    Top-RIGHT, opposite the breadcrumb and in the same chip language, floating over the pane so the
    honeycomb canvas (absolute, inset 0) keeps every pixel it had. A work view fills the same pane
@@ -2419,6 +2610,11 @@ a.cbox:hover { border-color: var(--accent); }
   background: none; border: 0; color: var(--text); cursor: pointer; padding: 3px 10px;
   font-family: 'Cascadia Code', monospace; font-size: 12px; }
 .fx-row:hover { background: rgba(255,255,255,.05); }
+.fx-item { display: flex; align-items: center; }
+.fx-item .fx-row { flex: 1; min-width: 0; }
+.fx-dl { color: var(--muted); text-decoration: none; padding: 0 8px; font-size: 13px; opacity: .45; }
+.fx-item:hover .fx-dl { opacity: 1; }
+.fx-dl:hover { color: var(--accent); }
 .fx-ic { color: var(--muted); width: 12px; text-align: center; }
 .fx-dir .fx-nm { color: #79c0ff; }
 .fx-nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -3304,6 +3500,10 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .xenv-empty { margin-top: 5px; font-size: 12px; line-height: 1.5; color: var(--text);
   border: 1px solid rgba(224,165,59,.45); background: rgba(224,165,59,.10); border-radius: 8px; padding: 8px 10px; }
 .xenv-vars { margin: 4px 0 0; padding-left: 18px; font-size: 12px; columns: 2; }
+/* a READ-ONLY binding's withheld database credentials — a fourth sentence, same rule as the
+   three above it: a var a zee expected must never read like one that was never configured. */
+.xenv-withheld { margin-top: 6px; font-size: 12px; line-height: 1.5; color: var(--text);
+  border: 1px solid rgba(224,165,59,.45); background: rgba(224,165,59,.10); border-radius: 8px; padding: 8px 10px; }
 .xenv-secret { opacity: .8; }
 .xenv-owned { color: var(--warn, #e0a53b); font-size: 11px; }
 .xenv-pick { display: flex; flex-direction: column; gap: 5px; }

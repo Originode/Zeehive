@@ -12,6 +12,11 @@
 // project/container rows; the docker half is the stub):
 //   • a machine that CAN build, compose resolves, no requires, shared dev db present
 //     → status 'ok', every check passes
+//   • the shared-dev-db check DIALS the row's own address, and its verdict follows the dial:
+//     opens → pass; REFUSES (28P01) → a definite not-pass that names it; no answer at all → the
+//     'unknown' verdict, never green; a row with no recorded address is presence-only (there is
+//     nothing to dial). A row that EXISTS and does not open is NOT bootstrappable — provisionDevDb
+//     creates a db a machine does not have, so the console's 🔧 button must not promise it.
 //   • a declared requires network missing on the daemon
 //     → status 'missing', error NAMES the failing check (requires-present)
 //   • an unreachable context
@@ -46,7 +51,9 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
-const { probeBuildReadiness, buildReadinessForProject, registryForProject, dockerAdapter } = await import('../server/src/lib/build-readiness.js');
+const { probeBuildReadiness, buildReadinessForProject, registryForProject, dockerAdapter, bootstrappableFrom,
+        SHARED_DEV_DB_DIAL_TIMEOUT_MS } = await import('../server/src/lib/build-readiness.js');
+const { MESH_CONTROL_PLANE_CONTAINER } = await import('../server/src/lib/netbird.js');
 
 // ── the stubbed docker adapter ──────────────────────────────────────────────
 // Dispatch on the first docker arg, like the real adapter's call sites. `reachable:false`
@@ -57,7 +64,7 @@ const { probeBuildReadiness, buildReadinessForProject, registryForProject, docke
 // interpolation error UNLESS the call carried opts.env with all five SPINOFF_*/GIT_COMMIT_HASH
 // contract vars — the false-negative the compose-env DR fixes. The stub records the last compose
 // call's args/opts so a test can assert `--env-file` and the env contract were passed.
-const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true, composeNeedsContract = false } = {}) => {
+const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(), composeOk = true, composeNeedsContract = false, containers = {} } = {}) => {
   const stub = async (ctx, args, opts = {}) => {
     const [cmd] = args;
     if (cmd === 'info') {
@@ -90,8 +97,12 @@ const makeDocker = ({ reachable = true, networks = new Set(), volumes = new Set(
         ? { status: 0, stdout: `${name}\n`, stderr: '' }
         : { status: 1, stdout: '', stderr: `volume ${name} not found` };
     }
-    if (cmd === 'inspect') {  // alias detail — no attached containers in the stubs
-      return { status: 0, stdout: '', stderr: '' };
+    if (cmd === 'inspect') {
+      // Container detail (the mesh-control-plane probe): a key in `containers` names the state
+      // string `docker inspect <name> --format '{{.State.Status}}'` prints — 'running' or not.
+      const name = args[1];
+      if (name in containers) return { status: 0, stdout: `${containers[name]}\n`, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };   // the alias detail call has no containers
     }
     return { status: 0, stdout: '', stderr: '' };
   };
@@ -117,6 +128,32 @@ const makeTimedDocker = ({ interval }) => {
   stub.stats = () => ({ calls, maxInFlight });
   return stub;
 };
+
+// The DIAL stub — the second injection seam (probeBuildReadiness's `dbDial`, default: the
+// preflight's real bounded checkDsnOpens). The shared-dev-db check opens a real postgres, so a
+// test must answer in its place: no live host, no live database, and the verdict under test is
+// the probe's CLASSIFICATION of the dial's answer. Records every call (dsn + opts) so a test can
+// assert WHICH address was dialled and that the dial was bounded.
+const makeDial = (verdict) => {
+  const calls = [];
+  const stub = async (dsn, opts = {}) => {
+    calls.push({ dsn, opts });
+    return typeof verdict === 'function' ? verdict(dsn, opts) : verdict;
+  };
+  stub.calls = calls;
+  return stub;
+};
+// The three answers the real dial gives, shaped exactly as checkDsnOpens returns them (it names
+// the role and the address it tried; the pg SQLSTATE rides on the row when there is one).
+const dialWho = (dsn) => {
+  const u = new URL(String(dsn).replace(/^postgres(ql)?:/, 'http:'));
+  return `role ${decodeURIComponent(u.username || '')} at ${u.hostname}:${u.port}${u.pathname}`;
+};
+const DIAL_OPENS = (dsn) => ({ ok: true, code: null, detail: `${dialWho(dsn)}: opened and answered SELECT 1` });
+// The db answered and rejected us — the live 28P01 fault, and the pg code that says so.
+const DIAL_REFUSES = (dsn) => ({ ok: false, code: '28P01', detail: `${dialWho(dsn)}: [28P01] password authentication failed for user "zeehive"` });
+// Nobody answered at all: the driver's own bound ended it, so there is no code to carry.
+const DIAL_SILENT = (dsn) => ({ ok: false, code: null, detail: `${dialWho(dsn)}: timeout expired` });
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const tag = randomUUID().slice(0, 8).replace(/[^a-z0-9]/g, '');
@@ -175,6 +212,16 @@ const insSharedDevDb = async (projectId, ctx, suffix) => {
        VALUES ($1,'db','dev','shared',$2,$3,'up')`,
     [projectId, `br_${tag}_${suffix}_db`, ctx]);
 };
+// …and one that records an ADDRESS + credential, the way machines.js provisionDevDb writes a real
+// row (conn_ref passwordless, conn_pw carrying the credential — TKT-181-9EDA): this is the shape
+// the shared-dev-db check can actually dial.
+const insAddressedDevDb = async (projectId, ctx, suffix, { host, port, pw = 'zeehive' }) => {
+  await q(
+    `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, host, host_port, conn_ref, conn_pw, health)
+       VALUES ($1,'db','dev','shared',$2,$3,$4,$5,$6,$7,'up')`,
+    [projectId, `br_${tag}_${suffix}_db`, ctx, host, port,
+     `postgresql://zeehive@${host}:${port}/zeehive`, pw]);
+};
 
 let pGreen, pMissing, pUnknown, pNoReg, pNoReg2;
 let mGreen, mMissing, mUnknown, mNoBuild;
@@ -203,7 +250,11 @@ try {
   // ── green ─────────────────────────────────────────────────────────────────
   console.log('\n── a machine that CAN build this project → ok, every check passes ──');
   const greenDocker = makeDocker({ reachable: true, networks: new Set(), composeOk: true });
-  const green = await probeBuildReadiness(await mach(mGreen = (await one(`SELECT id FROM machine WHERE key=$1`, [`br-green-${tag}`])).id), await proj(pGreen), { docker: greenDocker });
+  // This fixture's row records NO address (the minimum a container row can be), so there is
+  // nothing for the check to DIAL: it stays the presence-only check it always was, and the stub
+  // proves no dial was attempted rather than assuming it.
+  const greenDial = makeDial(DIAL_OPENS);
+  const green = await probeBuildReadiness(await mach(mGreen = (await one(`SELECT id FROM machine WHERE key=$1`, [`br-green-${tag}`])).id), await proj(pGreen), { docker: greenDocker, dbDial: greenDial });
   ok(green.status === 'ok', `status ok [${green.status}]`);
   ok(green.error === null, `no error [${green.error}]`);
   ok(green.checks.every((c) => c.ok), 'every check passes');
@@ -212,6 +263,8 @@ try {
   ok(green.checks.some((c) => c.check === 'requires-present' && c.skipped), 'requires-present SKIPPED (manifest declares none), saying why');
   ok(green.checks.some((c) => c.check === 'shared-dev-db' && c.ok), 'shared-dev-db ran and passed');
   ok(green.checks.some((c) => c.check === 'registry-for-handoff' && c.skipped), 'registry-for-handoff SKIPPED (can_build=true)');
+  ok(greenDial.calls.length === 0,
+     `a row recording no address is not dialled — nothing to try, presence is all it asserts [${greenDial.calls.length} dial(s)]`);
 
   // ── missing prerequisite ──────────────────────────────────────────────────
   console.log('\n── a declared requires network is missing → missing, check NAMED ──');
@@ -308,6 +361,67 @@ try {
   const share = (await buildReadinessForProject(pShare, { docker: makeDocker({ reachable: true }) }))[0];
   const shareSdb = share.checks.find((c) => c.check === 'shared-dev-db');
   ok(shareSdb?.ok === false && shareSdb?.skipped === false, `db-shared-dev still FAILS without a shared dev db [${shareSdb?.detail}]`);
+  ok(shareSdb?.db_row_present === undefined, 'the ABSENT-row fail carries no `db_row_present` (the row is not there)');
+  ok(share.bootstrappable === true, 'and the ABSENT row is still bootstrappable — provisionDevDb CAN act on it');
+
+  // ── the shared dev db that EXISTS but does not OPEN → never a plain pass (the false green) ───
+  // The live fault this closes (2026-09-24): 'local' read ✓ GREEN for Zeehive while every db-open
+  // on it answered [28P01], so readiness said "this machine can host dev xells" and every pooled
+  // provision that followed landed on a db nothing could open. The row is a MODEL of the password,
+  // not the password — only a DIAL can tell. Answered + rejected → a definite not-pass; nobody
+  // answered at all → 'unknown'; answered and opened → PASS (the row's own address is dialled).
+  console.log('\n── shared dev db: the row EXISTS and the DIAL decides — refused / silent / open ──');
+  const pBadDial = await insProject(`br-dialbad-${tag}`, {}, null);
+  const pSilentDial = await insProject(`br-dialsilent-${tag}`, {}, null);
+  const pOkDial = await insProject(`br-dialok-${tag}`, {}, null);
+  const mBadDial = await insMachine(`br-dialbad-${tag}`, `zt-dialbad-${tag}`, true);
+  const mSilentDial = await insMachine(`br-dialsilent-${tag}`, `zt-dialsilent-${tag}`, true);
+  const mOkDial = await insMachine(`br-dialok-${tag}`, `zt-dialok-${tag}`, true);
+  // The row records its OWN credential ('minted-pw') — deliberately not the manifest's — so the
+  // assertions below can show the check dialled the row's address with the row's credential.
+  await insAddressedDevDb(pBadDial, `zt-dialbad-${tag}`, 'dialbad', { host: '10.0.0.9', port: 5432, pw: 'minted-pw' });
+  await insAddressedDevDb(pSilentDial, `zt-dialsilent-${tag}`, 'dialsilent', { host: '10.0.0.10', port: 5432, pw: 'minted-pw' });
+  await insAddressedDevDb(pOkDial, `zt-dialok-${tag}`, 'dialok', { host: '10.0.0.11', port: 5432, pw: 'minted-pw' });
+
+  // (1) the db answered and REFUSED us — the whole bug.
+  const badDial = makeDial(DIAL_REFUSES);
+  const bad = await probeBuildReadiness(await mach(mBadDial), await proj(pBadDial),
+    { docker: makeDocker({ reachable: true }), dbDial: badDial });
+  const badSdb = bad.checks.find((c) => c.check === 'shared-dev-db');
+  ok(badDial.calls.length === 1, `the row's address WAS dialled [${badDial.calls.length} call(s)]`);
+  ok(new URL(badDial.calls[0].dsn).host === '10.0.0.9:5432', `the dial went to the row's own address [${badDial.calls[0].dsn}]`);
+  ok(new URL(badDial.calls[0].dsn).password === 'minted-pw',
+     "…carrying the row's OWN credential (container.conn_pw), never the manifest's");
+  ok(badDial.calls[0].opts.timeout === SHARED_DEV_DB_DIAL_TIMEOUT_MS,
+     `…and the dial is BOUNDED [timeout=${badDial.calls[0].opts.timeout}ms]`);
+  ok(badSdb?.ok === false && badSdb?.unknown === false,
+     `a db that refuses is a definite NOT-pass, not a pass and not an 'unknown' [ok=${badSdb?.ok} unknown=${badSdb?.unknown}]`);
+  ok(bad.status === 'missing', `…and the pair reads missing, so the pool stops filling it [${bad.status}]`);
+  ok(/does NOT open/.test(badSdb?.detail || '') && /28P01/.test(badSdb?.detail || ''),
+     `the verdict names the db, the fact and the pg code [${badSdb?.detail}]`);
+  ok(badSdb?.db_row_present === true, 'the failing row says the ROW is present — the planner/button read that');
+  ok(bad.bootstrappable === false,
+     'and it is NOT bootstrappable: provisionDevDb creates a db a machine does not have, so the button must not promise it');
+
+  // (2) nobody answered at all — cannot tell, which is never green and never a hard fail either.
+  const silent = await probeBuildReadiness(await mach(mSilentDial), await proj(pSilentDial),
+    { docker: makeDocker({ reachable: true }), dbDial: makeDial(DIAL_SILENT) });
+  const silentSdb = silent.checks.find((c) => c.check === 'shared-dev-db');
+  ok(silentSdb?.ok === false && silentSdb?.unknown === true,
+     `a dial that never answers is 'unknown' — not green, not a definite fail [ok=${silentSdb?.ok} unknown=${silentSdb?.unknown}]`);
+  ok(silent.status === 'unknown', `…and the pair says so rather than 'ok' [${silent.status}]`);
+  ok(/did not answer/.test(silentSdb?.detail || ''), `the verdict says what it measured [${silentSdb?.detail}]`);
+  ok(silent.bootstrappable === false, 'and an unverified prerequisite never renders the bootstrap button');
+
+  // (3) the row's address answers → PASS, and the pass came from the DIAL rather than from presence.
+  const okDial = makeDial(DIAL_OPENS);
+  const dialed = await probeBuildReadiness(await mach(mOkDial), await proj(pOkDial),
+    { docker: makeDocker({ reachable: true }), dbDial: okDial });
+  const okSdb = dialed.checks.find((c) => c.check === 'shared-dev-db');
+  ok(okDial.calls.length === 1 && okDial.calls[0].dsn.includes('10.0.0.11'),
+     `a row that answers is dialled at its own address [${okDial.calls[0]?.dsn}]`);
+  ok(okSdb?.ok === true && okSdb?.skipped === false, `…and the check passes [${okSdb?.detail}]`);
+  ok(dialed.status === 'ok', `the pair reads ok [${dialed.status}]`);
 
   // ── concurrency: N machines probe in ~one interval, not N (spawnSync would freeze the loop) ─
   console.log('\n── concurrency: buildReadinessForProject probes N machines in parallel, not N×serial ──');
@@ -363,6 +477,81 @@ try {
   ok(ccHasEnv?.ok === true, `compose-resolves passes with a repo .env [${ccHasEnv?.detail}]`);
   ok(cEnvDocker.lastCompose.args.includes('--env-file'),
      `--env-file passed when the fixture repo has .env [${cEnvDocker.lastCompose.args.join(' ')}]`);
+
+  // ── bootstrappable: the console button's render condition (TKT-189, decision record) ──────────
+  // The button renders on readiness.bootstrappable, NOT status==='missing' (build-capability):
+  // the mesh control plane is performable yet never blocks a build, so a build-ready machine must
+  // still offer the stand-up. These pin the ONE classification authority's inputs and outputs.
+  console.log('\n── bootstrappableFrom: pure classification of "the plan will have a performable step" ──');
+  const bCheck = (check, extra = {}) => ({ check, ok: false, skipped: false, unknown: false, detail: '', ...extra });
+  ok(bootstrappableFrom([]) === false, 'no checks → nothing to perform');
+  ok(bootstrappableFrom([{ check: 'context-reachable', ok: true, skipped: false }]) === false, 'a green probe → nothing to perform');
+  ok(bootstrappableFrom([bCheck('shared-dev-db')]) === true, 'a failing shared-dev-db → provisionDevDb is performable');
+  ok(bootstrappableFrom([bCheck('shared-dev-db', { db_row_present: true })]) === false,
+     'a shared dev db that EXISTS and does not open is a human recreate, not a provision — no button');
+  ok(bootstrappableFrom([{ check: 'shared-dev-db', ok: false, skipped: false, unknown: true, db_row_present: true }]) === false,
+     'nor for a row that exists and did not answer (never a button into a verified-nothing)');
+  ok(bootstrappableFrom([bCheck('mesh-control-plane')]) === true, 'the mesh control plane down → the stand-up is performable');
+  ok(bootstrappableFrom([{ check: 'mesh-control-plane', ok: false, skipped: false, unknown: true, detail: '' }]) === false,
+     'an UNKNOWN mesh control plane is not performable (never render a button into an unknown)');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: ['zt-net'], volumes: [], aliases: [] } })]) === true,
+     'a missing declared network → docker network create is performable');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: [], volumes: [{ name: 'v', create: 'empty' }], aliases: [] } })]) === true,
+     'a missing create:empty volume → docker volume create is performable');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: [], volumes: [{ name: 'v', create: null }], aliases: [] } })]) === false,
+     'a missing PLAIN volume is DATA — named, never created, so the button must not render');
+  ok(bootstrappableFrom([bCheck('requires-present', { missing: { networks: [], volumes: [], aliases: [{ network: 'n', aliases: ['a'] }] } })]) === false,
+     'lost aliases are a human action, not a bootstrap one');
+  ok(bootstrappableFrom([bCheck('requires-present')]) === false,
+     'a legacy recorded check without structured `missing` fails SAFE (no button into an unclassifiable plan)');
+
+  console.log('\n── the probe carries structured `missing` and a mesh-check row that never decides status ──');
+  const missStructured = miss.checks.find((c) => c.check === 'requires-present');
+  ok(missStructured?.missing?.networks?.includes('zt-net'), 'the network miss is named in missing.networks, not only free text');
+  ok(miss.bootstrappable === true, 'a missing declared network makes the pair bootstrappable [true]');
+
+  const pMeshVol = await insProject(`br-mvol-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [{ name: `zt-mvol-${tag}`, create: 'empty' }] } } } }, null);
+  const mVolCtx = `zt-mvol-${tag}`;
+  const mMeshVol = await insMachine(`br-mvol-${tag}`, mVolCtx, true);
+  await insSharedDevDb(pMeshVol, mVolCtx, 'mvol');
+  const volProbe = await probeBuildReadiness(await mach(mMeshVol), await proj(pMeshVol), { docker: makeDocker({ networks: new Set(), volumes: new Set() }) });
+  const volReq = volProbe.checks.find((c) => c.check === 'requires-present');
+  ok(volReq?.missing?.volumes?.[0]?.create === 'empty', 'the create:empty opt-in survives into the structured missing');
+  ok(volProbe.status === 'missing' && volProbe.bootstrappable === true,
+     `a missing create:empty volume reads missing AND bootstrappable [${volProbe.status}/${volProbe.bootstrappable}]`);
+
+  const pPlainVol = await insProject(`br-pvol-${tag}`,
+    { tiers: { spinoff: { requires: { volumes: [`zt-pvol-${tag}`] } } } }, null);
+  const mPlainCtx = `zt-pvol-${tag}`;
+  const mPlainVol = await insMachine(`br-pvol-${tag}`, mPlainCtx, true);
+  await insSharedDevDb(pPlainVol, mPlainCtx, 'pvol');
+  const plainProbe = await probeBuildReadiness(await mach(mPlainVol), await proj(pPlainVol), { docker: makeDocker({ networks: new Set(), volumes: new Set() }) });
+  ok(plainProbe.status === 'missing' && plainProbe.bootstrappable === false,
+     `a missing PLAIN volume reads missing but NOT bootstrappable [${plainProbe.status}/${plainProbe.bootstrappable}]`);
+
+  // The queenzee host is the ONE machine whose docker_ctx is 'default' (machine_docker_ctx_key is
+  // unique), so REUSE it when the meta-DB already has one — creating a second is a duplicate-key
+  // error, and deleting someone else's host row would be worse. Only a row WE created is cleaned up.
+  const pHost = await insProject(`br-host-${tag}`, {}, null);
+  const existingHost = await one(`SELECT id FROM machine WHERE docker_ctx='default' LIMIT 1`);
+  const mHost = existingHost?.id || await insMachine(`br-host-${tag}`, 'default', true);
+  await insSharedDevDb(pHost, 'default', 'host');
+  const hostDown = await probeBuildReadiness(await mach(mHost), await proj(pHost),
+    { docker: makeDocker({ networks: new Set(), containers: { [MESH_CONTROL_PLANE_CONTAINER]: 'exited' } }) });
+  const meshCheck = hostDown.checks.find((c) => c.check === 'mesh-control-plane');
+  ok(meshCheck?.ok === false && meshCheck?.unknown === false && meshCheck?.blocking === false,
+     'the mesh check is a definite fail but marked non-blocking');
+  ok(!(hostDown.error || '').includes('mesh-control-plane'),
+     `a non-blocking failure never lands in the verdict's error [${hostDown.error}]`);
+  ok(hostDown.bootstrappable === true, 'a queenzee host with the control plane down is bootstrappable');
+  const hostUp = await probeBuildReadiness(await mach(mHost), await proj(pHost),
+    { docker: makeDocker({ networks: new Set(), containers: { [MESH_CONTROL_PLANE_CONTAINER]: 'running' } }) });
+  ok(hostUp.checks.find((c) => c.check === 'mesh-control-plane')?.ok === true, 'the mesh check passes when the container runs');
+  ok(hostUp.status !== 'ok' || hostUp.bootstrappable === false,
+     'a machine with nothing else outstanding and a running plane → nothing to perform');
+  const offHost = green.checks.find((c) => c.check === 'mesh-control-plane');
+  ok(offHost?.skipped === true, 'a machine that is not the queenzee host SKIPS the mesh check (the control plane is not its business)');
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {

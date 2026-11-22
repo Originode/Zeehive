@@ -194,8 +194,13 @@ console.log('\n── D. wiring — the input, the route, the api call, the bloo
      'Project setup renders the per-provider alert input');
 
   const app = read('web/src/App.jsx');
-  ok(/xell-burn-alert/.test(app) && /burn_alert/.test(app),
-     'the xell bloom shows the over-budget row');
+  // The over-budget ROW used to live on XellCard, which was DELETED (TKT-29-3AB6): the flower is
+  // the fleet view now and paints the alert as a ring + "!" badge on the hexagon (asserted below,
+  // and painted for real in section E). So follow the fleet row to that live surface instead of
+  // pinning a DOM card nothing rendered — the same re-anchor 6bf7580 made for env-reconcile-alert
+  // and tend-reason. The row must reach the canvas UNCHANGED for `burn_alert` to survive the trip.
+  ok(/hiveCells = xells/.test(app) && /<HiveCanvas xells=\{hiveCells\}/.test(app),
+     'the console hands its fleet rows (burn_alert included) to the honeycomb, the live surface');
 
   const hive = read('web/src/hive/HiveCanvas.jsx');
   ok(/function drawBurnAlert/.test(hive) && /burn_alert/.test(hive),

@@ -1,7 +1,7 @@
 // Read model for the dashboard: project header, N-of-M status line, grouped container
 // inventory, and one entry per xell (container stack + its live zee + runtime badge).
 import { hostname } from 'node:os';
-import { q, one } from '../db/pool.js';
+import { q, one, pool } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
@@ -16,6 +16,10 @@ import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { listProjectConditions } from './current-conditions.js';
+import { fingerprintMedicText } from './medic-dismissals.js';
+// The live-medic status set — the badge predicate (256) binds it into fetchXellRows so the honeycomb
+// and the ⛑ feed decide "is this call live?" from the SAME source.
+import { MEDIC_LIVE_STATUSES } from './medic-calls.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 import { computeShipPayload } from '../queenzee/ship-payload.js';
@@ -58,9 +62,30 @@ async function fleetGitContext(project) {
 // The xell rows (one per non-retired xell) BEFORE their container stacks are attached. Kept
 // separate from decoration so a caller can stream: fetch the cheap list first, then resolve each
 // xell's stack one at a time and emit it the moment it is ready.
+//
+// JIT IS OFF for this one query, per-transaction (SET LOCAL — it cannot leak past the COMMIT and
+// never touches the pooled connection's defaults). The planner estimates this statement at ~1.3M
+// cost — far over the stock jit_above_cost — so EVERY execution LLVM-compiled 221 functions:
+// ~15 s of the measured 28-33 s per production /api/fleet call was JIT compilation alone, on a
+// read that returns a few dozen rows. The fix travels with the code (not a docker-compose
+// postgres flag) so every deployment and every xell's clone db behaves the same.
 async function fetchXellRows(pid) {
-  return q(
-    `SELECT x.*, xo.ref AS xource_ref,
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL jit = off');
+    const res = await client.query(FETCH_XELL_ROWS_SQL, [pid, MEDIC_LIVE_STATUSES]);
+    await client.query('COMMIT');
+    return res.rows;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+const FETCH_XELL_ROWS_SQL = `SELECT x.*, xo.ref AS xource_ref,
             z.id AS zee_id, z.name AS zee_name, z.status AS zee_status, z.title AS zee_title,
             z.claude_session_id, z.session_name, z.viewer_url, z.viewer_kind,
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
@@ -174,7 +199,15 @@ async function fetchXellRows(pid) {
             (SELECT mx.slug FROM xell mx WHERE mx.id = x.manager_xell_id) AS manager_slug,
             EXISTS(SELECT 1 FROM deploy_lock dl2 WHERE dl2.project_id = x.project_id
                      AND dl2.container = 'prod') AS prod_lock_active,
-            dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
+            dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase,
+            -- THE MEDIC CALL BADGE (256). Does a LIVE call ride this xell? A call is live when it is
+            -- OPEN (awaiting a human dispatch) or ATTENDED while its medic is no longer live (the
+            -- emergency is real again) — the SAME predicate the CALLED fold-in below and
+            -- listProjectMedicCalls use. It must ride the ROW because the honeycomb paints from the
+            -- fleet snapshot and the xells stream, and a badge that re-queried per hexagon would be
+            -- worse than no badge; a badge that disagreed with the ⛑ panel would be worse still.
+            -- Bound as $2 (MEDIC_LIVE_STATUSES, lib/medic-calls.js) so the live set has ONE source.
+            mcl.kind AS medic_call_kind, mcl.status AS medic_call_status
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
        LEFT JOIN xell_pause_state xps ON xps.xell_id = x.id
@@ -201,6 +234,20 @@ async function fetchXellRows(pid) {
           WHERE se.xell_id = x.id AND se.hook_event_name IN ('env-alert','env-alert-clear')
        ) eva ON true
        LEFT JOIN harness hn ON hn.id = x.harness_id
+       -- the xell's LIVE medic call, if any (migration 251's medic_call; the badge predicate 256).
+       -- One lateral, newest first: the row carries the kind so the hover/card can say what the zee
+       -- called about. A xell with only history (resolved/declined/withdrawn) has no row here.
+       LEFT JOIN LATERAL (
+         SELECT mc.kind, mc.status
+           FROM medic_call mc
+           LEFT JOIN medic m ON m.id = mc.medic_id
+          WHERE mc.xell_id = x.id
+            AND (mc.status = 'open'
+                 OR (mc.status = 'attended'
+                     AND (mc.medic_id IS NULL OR m.status IS NULL
+                          OR NOT (m.status = ANY($2::text[])))))
+          ORDER BY mc.updated_at DESC LIMIT 1
+       ) mcl ON true
        JOIN xource xo ON xo.id = x.xource_id
        -- The xell's zee, PREFERRING a living one but falling back to the most recent dead one.
        -- The old join took only living zees, so a session whose PROCESS died (app closed, laptop
@@ -234,8 +281,7 @@ async function fetchXellRows(pid) {
           LIMIT 1
        ) env ON true
       WHERE x.project_id = $1 AND x.status <> 'retired'
-      ORDER BY x.created_at`, [pid]);
-}
+      ORDER BY x.created_at`;
 
 // Can a browser shell open into this container row? Mirrors terminal-bridge.resolveShellTarget:
 //   • a PER-XELL process role (runner:process, owner set) has no container of its own — its shell
@@ -360,6 +406,15 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     proofFailed: !!x.proof_error,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
+  // THE MEDIC CALL (256): a xell with a LIVE call wears a ⛑ badge on its hex. It rides HERE, not on
+  // hive_status, and that is deliberate — a xell can be working, idle or awaiting-done and still have
+  // a call open, so the colour must keep meaning what it means. The fact is resolved in SQL (one
+  // lateral, no per-hexagon query); this just shapes it for the canvas. `kind` lets a hover say what
+  // the zee called about. Null when the call was answered, declined or withdrawn.
+  x.medic_call = x.medic_call_status
+    ? { live: true, kind: x.medic_call_kind || 'other' }
+    : null;
+  delete x.medic_call_kind; delete x.medic_call_status;
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
   // hive_status already says THAT one is open; this says WHAT FOR — the console renders it beside
   // the ask instead of sending the human into the session to find out.
@@ -533,7 +588,30 @@ async function readSpendByProvider(projectId, xellIds) {
   return out;
 }
 
-export async function getFleet(projectId) {
+// COALESCE concurrent fleet reads (the /api/fleet hot path). The console re-fetches the snapshot
+// after every stream event while the queenzee loops broadcast constantly — production measured
+// ~108 /api/fleet requests per 10 min arriving every ~5 s against a read that took ~30 s, so the
+// queue never drained and every other meta-DB query waited behind 6-7 concurrent copies of the
+// SAME statement. Callers that arrive while a snapshot is already being computed for the same
+// project id await THAT promise instead of starting another identical query storm; the entry is
+// cleared when it settles (success OR failure — a failed read must not be cached), so the next
+// call always computes fresh. Keyed on the RAW argument: null/undefined (the default-project
+// call) coalesces under one key too. streamXells is deliberately NOT coalesced — it emits through
+// a per-caller callback, so two callers cannot share one run.
+const inflightFleet = new Map();
+
+export function getFleet(projectId) {
+  const key = projectId ?? '';
+  const hit = inflightFleet.get(key);
+  if (hit) return hit;
+  const p = fetchFleet(projectId).finally(() => {
+    if (inflightFleet.get(key) === p) inflightFleet.delete(key);
+  });
+  inflightFleet.set(key, p);
+  return p;
+}
+
+async function fetchFleet(projectId) {
   const project = projectId
     ? await one(`SELECT * FROM project WHERE id = $1`, [projectId])
     : await defaultProject();
@@ -603,9 +681,74 @@ export async function getFleet(projectId) {
         : x.proof_error ? `provision proof failing: ${x.proof_error}`
           : infraBuild ? `build failed [infra] on ${infraBuild.role || infraBuild.name}: ${String(infraBuild.last_build_error || '').split('\n').filter(Boolean).slice(-1)[0] || 'see the container card'}`
             : null;
-      return why ? { xell_id: x.id, slug: x.slug, zee_name: x.zee_name || null, why: String(why).slice(0, 300) } : null;
+      return why ? { source: 'infra', xell_id: x.id, slug: x.slug, zee_name: x.zee_name || null, why: String(why).slice(0, 300) } : null;
     })
     .filter(Boolean);
+
+  // A HUMAN CAN SAY NO — the rowless suggestions (the infra rows above, and the condition dispatch
+  // cards below) are dismissed into medic_dismissal, fingerprinted on the exact `why`/body text the
+  // human was shown. The SAME fault stops nagging; a DIFFERENT fault (a changed preflight error, an
+  // edited condition body) has a different fingerprint and raises again by itself. `active` is the
+  // subset of dismissal rows CURRENTLY suppressing a would-be emergency — the console's muted
+  // "N dismissed · UNDO" line is built from it, so an UNDO restores exactly what is hidden.
+  const dismissals = await q(
+    `SELECT * FROM medic_dismissal WHERE project_id=$1 ORDER BY dismissed_at DESC`, [pid]).catch(() => []);
+  const dismissedXellFp = new Map();      // xell_id -> Set(fingerprint)
+  const dismissalByKey = new Map();      // `${target_id}:${fingerprint}` -> row
+  const active = [];
+  for (const d of dismissals) {
+    if (d.target_kind === 'xell') {
+      if (!dismissedXellFp.has(d.target_id)) dismissedXellFp.set(d.target_id, new Set());
+      dismissedXellFp.get(d.target_id).add(d.fingerprint);
+      dismissalByKey.set(`${d.target_id}:${d.fingerprint}`, d);
+    }
+  }
+  for (let i = medic_emergency.length - 1; i >= 0; i--) {
+    const e = medic_emergency[i];
+    if (e.source !== 'infra') continue;
+    const fp = fingerprintMedicText(e.why);
+    if (!dismissedXellFp.get(e.xell_id)?.has(fp)) continue;
+    const d = dismissalByKey.get(`${e.xell_id}:${fp}`);
+    if (d) { d._active = true; active.push(d); }
+    medic_emergency.splice(i, 1);
+  }
+
+  // A CALLED medic call (251) IS an emergency by definition — a blocked zee reached for the ⛑ in
+  // its own words. Fold those in: an OPEN call (awaiting a human dispatch) always shows, and an
+  // ATTENDED call shows too while its medic is no longer LIVE (the medic retired/converged/errored
+  // — the emergency is real again). A called xell SUPERSEDES its infra-derived row (same xell_id):
+  // the zee's own words are what a human should read first. A DISMISSED call is a DECLINE
+  // (status='declined', dismissed_at set) — it drops out of this query by construction, and the
+  // calling zee already has the human's note.
+  {
+    const calls = await q(
+      `SELECT mc.*, x.slug AS xell_slug, z.name AS zee_name, m.status AS medic_status
+         FROM medic_call mc
+         JOIN xell x ON x.id = mc.xell_id
+         LEFT JOIN zee z ON z.id = mc.zee_id
+         LEFT JOIN medic m ON m.id = mc.medic_id
+        WHERE mc.project_id=$1
+          AND x.status NOT IN ('ready','retired','tearing-down')
+          AND (mc.status='open'
+               OR (mc.status='attended' AND (mc.medic_id IS NULL OR m.status IS NULL
+                                             OR m.status NOT IN ('diagnosing','acting','awaiting-human','worker-dispatched'))))
+        ORDER BY mc.created_at DESC`, [pid]);
+    if (calls.length) {
+      const byXell = new Map();
+      for (const e of medic_emergency) if (e.source !== 'called') byXell.set(e.xell_id, e);
+      for (const c of calls) {
+        byXell.set(c.xell_id, {
+          source: 'called', call_id: c.id, xell_id: c.xell_id, slug: c.xell_slug,
+          zee_name: c.zee_name || null, kind: c.kind, reason: c.reason,
+          evidence: c.evidence, call_status: c.status, medic_id: c.medic_id || null,
+          created_at: c.created_at,
+          why: `medic call [${c.kind}] from ${c.xell_slug}: ${String(c.reason || '').slice(0, 300)}`,
+        });
+      }
+      medic_emergency.length = 0;
+      medic_emergency.push(...byXell.values());
+    }
+  }
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
@@ -827,8 +970,29 @@ export async function getFleet(projectId) {
   // fleet snapshot so the console's needs-you surface (a blocked project's ⛑ medic chip — the one
   // thing a provision halt leaves the bar silent about) and the conditions editor read the SAME poll;
   // a condition is a slow-changing fact, and one ≤ CONDITION_LIMIT query on an already-heavy snapshot
-  // is cheaper than a second endpoint the console has to keep in step with.
+  // is cheaper than a second endpoint the console has to keep in step with. A condition whose DISPATCH
+  // a human dismissed (medic_dismissal target_kind='condition', fingerprinted on the body) is removed
+  // from THIS needs-you feed — the conditions EDITOR (ProjectSetup, its own endpoint) still lists the
+  // line; dismissal never deletes a condition.
   const conditions = await listProjectConditions(pid);
+  if (dismissals.some((d) => d.target_kind === 'condition')) {
+    const condFp = new Map();                 // condition_id -> Set(fingerprint)
+    const condByKey = new Map();
+    for (const d of dismissals) {
+      if (d.target_kind !== 'condition') continue;
+      if (!condFp.has(d.target_id)) condFp.set(d.target_id, new Set());
+      condFp.get(d.target_id).add(d.fingerprint);
+      condByKey.set(`${d.target_id}:${d.fingerprint}`, d);
+    }
+    for (let i = conditions.length - 1; i >= 0; i--) {
+      const c = conditions[i];
+      const fp = fingerprintMedicText(String(c.body || ''));
+      if (!condFp.get(c.id)?.has(fp)) continue;
+      const d = condByKey.get(`${c.id}:${fp}`);
+      if (d) { d._active = true; active.push(d); }
+      conditions.splice(i, 1);
+    }
+  }
 
   return {
     project,
@@ -863,6 +1027,10 @@ export async function getFleet(projectId) {
     // emergency predicate computed above; empty = the console shows conditions as information,
     // with no medic button anywhere).
     medic_emergency,
+    // The dismissal receipts CURRENTLY suppressing a would-be emergency (a matched infra row or
+    // condition card) — the console's muted "N dismissed · UNDO" line. A row here is the reason an
+    // emergency is NOT on the bar; UNDO deletes it and the emergency raises again.
+    medic_dismissals: active,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,

@@ -13,6 +13,7 @@
 //   zee land [--wait]   |   zee land --withdraw [--reason "…"]   (un-ask a held landing)
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
+//   zee prod-logs [<role>] [--tail N] [--since 30m] [--grep "text"]   READ-ONLY tail of PRODUCTION's own log
 //   zee verify-webapp   (offer your built webapp to a human in the console — Open link / dismiss)
 //   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
 //
@@ -569,10 +570,11 @@ function usage() {
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee env [--export]                  which ENVIRONMENT your xell is loaded with (its key + var names; values live in .zeehive.env, never echoed). --export dumps the FULL current env text. Read-only. A live-prod/production xell gets the prod env, else the dev env
   zee creds [--provider <key>] [--export] [--json]   what PROVIDER CREDENTIALS this cage holds — every connected provider's key, each under its own ZEE_PROVIDER_<KEY>_TOKEN (not just the one this dispatch runs on). Read straight from the cage's own env, no API. --provider prints the source-able env for one; --provider <key> --export prints the RUNNABLE vendor env for that provider (server-computed through the runtime adapter — the exact KIMI_MODEL_*/OPENAI_API_KEY/ANTHROPIC_* vars the vendor CLI needs; codex's in-cage install is PRINTED, never run); --json prints the list. Read-only, opens no gate
-  zee routes                          HOW TO REACH YOUR STUFF, resolved LIVE from the meta-DB (never baked): your db/server/webapp, each with a source — 'mesh' (your xell's joined mesh peer: hostname + canonical port) or 'legacy-port' (the recorded host:port) — the legacy pair kept as fallback while both are true, and a bounded liveness probe on the db answer. Read-only, opens no gate. Your .zeehive.env is a SNAPSHOT stamped at provision; when the two disagree, THIS answer is the current one — reach for it the moment a recorded address refuses
+  zee routes [--tally [--days N]]     HOW TO REACH YOUR STUFF, resolved LIVE from the meta-DB (never baked): your db/server/webapp, each with a source — 'mesh' (your xell's joined mesh peer: hostname + canonical port) or 'legacy-port' (the recorded host:port) — the legacy pair kept as fallback while both are true, and a bounded liveness probe on the db answer. Read-only, opens no gate. Your .zeehive.env is a SNAPSHOT stamped at provision; when the two disagree, THIS answer is the current one — reach for it the moment a recorded address refuses. --tally is MANAGER-only: the fleet-wide per-day count of which world answered, by target kind and source — the telemetry phase 5 is gated on (--days widens the window, default 14)
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
   zee turn --start | --end           report an INTERACTIVE turn boundary (a human or a manager typing into this cage's pane) — the ONE kind of turn the queenzee does not start and cannot see. The vendor CLI's own turn hooks call this for you; NOT gated, and it records NO cost (a hook knows a turn happened, not what it cost)
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
+  zee medic --reason "..." [--kind db|build|provision|network|other] [--status] [--clear]   call the ⛑ MEDIC in your OWN WORDS when a fault is NOT yours to fix (a wedged shared db, provision that will not burn in, INFRA-classed build failures). Opens no gate, blocks nothing, NEVER auto-spawns: recorded with this xell's infra evidence — attached to a LIVE medic already on the project (it resumes with your words) or RAISED as a CALLED emergency in the console ⛑ for a human to dispatch. A fault in your OWN code/tests is zee tend, not a medic. --kind labels the call; --status reads it; --clear withdraws it
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee db-sandbox [--migrate] [--status] [--stop]   start a REAL throwaway postgres INSIDE this cage (127.0.0.1 only) and print its DSN — how you verify database work when your assigned db is unusable. NOT gated, nothing to ask for: it dies with the container. --migrate applies db/migrations to it; --stop stops it; a second start returns the SAME DSN. It NEVER replaces your assigned DATABASE_URL — pass the DSN yourself, and report a broken assigned db rather than working around it
@@ -582,7 +584,7 @@ function usage() {
   zee infra bootstrap --plan --machine <id> [--project <name|id>]   the DRY-RUN plan performBuildBootstrap already computes for the target (NOT gated, performs nothing)
   zee infra bootstrap --perform --machine <id> [--project <name|id>] [--reason "..."]   HUMAN-GATED CARD on the TARGET → the queenzee performs on approval (the console 🔧 as a verb: creates only manifest-declared DEV infra, never invents/removes, dev-only guard intact)
   zee infra settings [--project <name|id>]   NON-SECRET projection of a TARGET project's settings (manifest cache, pool_config, machines + machine_pool, containers, deploy sites) — never a token or password
-  zee infra propose --change '<json>' --reason "..." [--project <name|id>]   HUMAN-GATED settings card on the TARGET (pool knobs, registry, machine priority, manifest-cache refresh) → the queenzee applies on approval; who asked, what changed, recorded
+  zee infra propose --change '<json>' --reason "..." [--project <name|id>]   HUMAN-GATED settings card on the TARGET → the queenzee applies on approval; who asked, what changed, recorded. Sections: pool_config {target_ready, readiness_proof, default_db_coupling, default_build_ctx, backup_ctx, refresh_interval_sec}, project {registry}, manifest_refresh:true, plus the two MACHINE-KEYED ones — machine_pool {'<machine-key>': {pool_size, dev_priority}} (this project's spawn preference: the highest dev_priority with room gets its next dev xell) and machines {'<machine-key>': {can_build, max_xells}}. machines.<key>.dev_priority is REFUSED: that column is deprecated since 038 and no picker reads it — the priority is machine_pool.<machine-key>.dev_priority
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
@@ -591,6 +593,7 @@ function usage() {
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
+  zee prod-logs [<role>] [--tail N] [--since 30m] [--grep "text"] [--container <name>] [--json]   READ what PRODUCTION's own app tier is saying: the tail of the live prod server/webapp container log. EVERY zee has it, read-only, opens NO gate and grants NO access to the container — no shell, no filesystem, no start/stop, no follow, and you name a ROLE (never a container id, host or docker context: the container is resolved from YOUR project). Credential-shaped values are MASKED (***) before the lines leave the queenzee. The prod DATABASE is deliberately not readable here — a postgres log carries production row data, which is the \`zee prod\` / \`zee seed\` gate. Bare (no role) lists what you may read. This is PRODUCTION's log; the QUEENZEE's own log is \`zee ops\`
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
   zee verify-webapp                    OFFER your built webapp to a human in the console (Open link / dismiss). For a VISUAL-VERIFICATION xell: build with \`zee build webapp --wait\`, then call this. NOT gated, nothing irreversible — never land/ship for this
   zee upload-conversation [--reason "…"]   UPLOAD this xell's conversation to the queenzee (archived; a manager can review it). NOT gated. Reads your own session transcript and stores it — the "upload conversations on done" harness setting does this automatically at \`zee done\`
@@ -683,7 +686,10 @@ switch (cmd) {
     console.log(JSON.stringify(r.json, null, 2));
     const w = waitFlag();
     const status = r.json?.status;
-    if (r.code >= 400 || status === 'needs-resolution' || status === 'error') process.exit(1);
+    // 'not-landed' is the gate-recorded-it-but-the-ref-did-not-move case (a dirty xource refused the
+    // update after the hook answered): a REAL failure, so exit 1 rather than falling through to the
+    // clean-exit path a genuine success takes.
+    if (r.code >= 400 || status === 'needs-resolution' || status === 'error' || status === 'not-landed') process.exit(1);
     if (status === 'landed') process.exit(0);
     // HOLDING: queued behind another xell's landing on this ref. Print the position and exit cleanly
     // even under --wait — waiting would burn the whole timeout on a card no human will ever see, and
@@ -827,7 +833,7 @@ switch (cmd) {
     if (sub === 'propose') {
       const change = flag('change');
       const reason = flag('reason');
-      if (!change) { console.error('infra propose needs --change "<json>" — the settings patch (pool knobs, registry, machine priority, manifest refresh)'); process.exit(1); }
+      if (!change) { console.error('infra propose needs --change "<json>" — the settings patch (pool_config knobs, registry, manifest refresh, and the MACHINE-KEYED machine_pool {pool_size, dev_priority} / machines {can_build, max_xells})'); process.exit(1); }
       if (!reason) { console.error('infra propose needs --reason "…" — it is what the human reads on the card'); process.exit(1); }
       out(await req('POST', '/api/xell/self/infra/propose', { change, reason, project: proj }));
       break;
@@ -847,6 +853,21 @@ switch (cmd) {
     // db/server/webapp". The .zeehive.env DSN is a snapshot stamped at provision and never
     // re-minted (the cage-age reality) — this answer is derived at call time, so a dead snapshot
     // address stops being a dead end. Read-only, opens no gate.
+    //
+    //   zee routes            → this xell's own answer (every zee)
+    //   zee routes --tally    → MANAGER only: the fleet-wide per-day count of which world answered,
+    //                           by target kind and source — the telemetry phase 5 (stop publishing
+    //                           per-xell ports) is gated on (§6/§10.3). `--days N` widens the window
+    //                           (default 14, clamped to 90).
+    if (rest.includes('--tally')) {
+      const days = flag('days');
+      const qs = new URLSearchParams();
+      if (days) qs.set('days', days);
+      const r = await req('GET', `/api/xell/self/routes/tally${qs.size ? `?${qs}` : ''}`);
+      if (r.json?.ok === false) { console.error(r.json.error || 'refused'); process.exit(1); }
+      out(r);
+      break;
+    }
     out(await req('GET', '/api/xell/self/routes'));
     break;
   }
@@ -981,6 +1002,34 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/tend', { reason: reason || null, clear }));
     break;
   }
+  case 'medic': {
+    // Call the ⛑ MEDIC in your own words — for a fault that is NOT yours to fix (ZEEHIVE
+    // config/infra, not your code/tests). Opens no gate, blocks nothing, NEVER auto-spawns: the
+    // server records the call with this xell's infra evidence, then routes it — attached to a LIVE
+    // medic already attending the project (that medic resumes with your words) or RAISED as a CALLED
+    // emergency in the console ⛑ for a human to dispatch. A second call while one is live UPDATES
+    // the open call (one live call per xell is the rate limit). --status reads your call; --clear
+    // withdraws it. A fault in your own code/tests is `zee tend`, not a medic — the answer to a call
+    // with no infra evidence says exactly that.
+    if (rest.includes('--status')) {
+      const r = await req('POST', '/api/xell/self/medic', { status: true });
+      console.log(JSON.stringify(r.json, null, 2));
+      process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    }
+    const clear = rest.includes('--clear');
+    const reason = flag('reason');
+    if (!clear && !reason) {
+      console.error('medic needs --reason "…" — say, in your OWN words, what is blocking you and '
+        + 'why it is ZEEHIVE config/infra (not your code):');
+      console.error('  zee medic --reason "shared dev db refuses every connection since the machine restart"');
+      console.error('  zee medic --reason "provision proof cannot burn in — the pool host is wedged" --kind provision');
+      console.error('(or --clear to withdraw an open medic call, --status to read it)');
+      process.exit(1);
+    }
+    const kind = flag('kind') || null;
+    out(await req('POST', '/api/xell/self/medic', { reason: reason || null, kind, clear }));
+    break;
+  }
   case 'ship': {
     // --withdraw (--clear is the same thing, for symmetry with land/tend/hint/done) UN-ASKS a held
     // ship request before the deploy starts: the card leaves the human's screen, nothing ships,
@@ -1033,6 +1082,41 @@ switch (cmd) {
     const r = await req('POST', '/api/xell/self/seed-request', { files, reason });
     console.log(JSON.stringify(r.json, null, 2));
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'prod-logs': {
+    // READ-ONLY PRODUCTION LOGS — every zee's verb (see lib/prod-logs.js for the wall).
+    //
+    //   zee prod-logs                 → what you may read (the prod roles your project deploys)
+    //   zee prod-logs server           → the tail of production's server log
+    //   zee prod-logs webapp --tail 500 --since 30m --grep "500"
+    //
+    // You name a ROLE, never a container/host/context — the container is resolved server-side from
+    // YOUR project — and the answer is log text only: no shell, no filesystem, no container
+    // control, no follow. Credential-shaped values arrive already masked. The prod DATABASE is not
+    // readable here (its log is production row data: that is `zee prod` / `zee seed`).
+    //
+    // Printed as plain lines by default — a log is read by a human/agent eye, and JSON-wrapping it
+    // hides exactly the thing you asked for. `--json` gives the full answer (sources, counts,
+    // deployed sha, redaction count) for anything programmatic.
+    // positional(), not "the first argv without a leading --": that hunt reads a FLAG'S VALUE as
+    // the role the moment a flag comes first (`zee prod-logs --tail 50` would ask for role "50").
+    const role = positional();
+    const qs = new URLSearchParams();
+    if (role) qs.set('role', role);
+    for (const k of ['tail', 'since', 'grep', 'container']) if (flag(k)) qs.set(k, flag(k));
+    const r = await req('GET', `/api/xell/self/prod-logs${qs.size ? `?${qs}` : ''}`);
+    if (rest.includes('--json') || !role || r.json?.ok === false || !Array.isArray(r.json?.lines)) {
+      out(r);
+      break;
+    }
+    const s = r.json.source || {};
+    console.error(`── PRODUCTION ${s.role || role} log (${s.container || '?'}${s.state ? `, ${s.state}` : ''}`
+      + `${s.deployed_commit ? `, built ${s.deployed_commit}` : ''}) — ${r.json.lines.length} line(s)`
+      + `${r.json.redacted_lines ? `, ${r.json.redacted_lines} with credentials masked` : ''}`
+      + `${r.json.truncated ? ', TRUNCATED at the read cap' : ''} ──`);
+    for (const line of r.json.lines) console.log(line);
+    process.exit(r.code >= 400 ? 1 : 0);
     break;
   }
   case 'verify-webapp': {

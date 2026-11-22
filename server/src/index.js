@@ -18,6 +18,7 @@ import { refreshMedicRoleAtBoot } from './lib/medic-role.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { logHarnessSummary } from './lib/harness.js';
+import { applyMeshConfig } from './lib/mesh-config.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
@@ -26,7 +27,7 @@ import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { startPreviewPorts } from './lib/preview-ports.js';
 import { attachStreamWebSocket } from './lib/stream.js';
 import { gatewayProxy, gatewayHello, gatewayHealth, GATEWAY_PORT, verifyGatewayReachable } from './lib/gateway.js';
-import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
+import { refreshZeeToolingInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
 import { startRevive } from './queenzee/revive.js';
@@ -158,6 +159,11 @@ try {
   // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
   // a harness that would brief a zee with a blank page is invisible otherwise.
   await logHarnessSummary();
+  // The mesh the console configured (migration 259): store-over-env into the config seam, so
+  // lib/netbird.js's URL/token and the stand-up's management.json render pick it up with no
+  // consumer knowing the console exists. Never throws — an install with no row (or no 259 yet)
+  // keeps exactly the env it had. See lib/mesh-config.js.
+  await applyMeshConfig();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
@@ -190,12 +196,14 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // Same principle for teardowns: a xell stranded at 'tearing-down' by a mid-reap death renders
   // on the dashboard forever (only 'retired' is filtered out) and nothing else revisits it.
   recoverOrphanTeardowns().catch((e) => console.error('[reaper] teardown recovery failed:', e.message));
-  // The attend path's renderer is BAKED into the zee-agent image, and only the spawn path replaced
-  // it — so every cxell created before an attend-path ship kept the old one, and the terminal's
-  // ✱/⚒ feed chips wrote a view file nothing in there was watching. Boot is also the moment after
-  // a ship (we restart into the new code), so sweep the RUNNING cxells here. A live cxell is one
-  // whose zee still has an ssh-terminal viewer; the sweep is best-effort per cage.
-  refreshZeeLiveInLiveCxells(async () => (await q(
+  // The zee TOOLING — the CLI and the attend-path files — is BAKED into the zee-agent image, and
+  // only the spawn path replaced it, so every cxell created before a ship kept the old copy: a zee
+  // alive across the medic ship still answers "unknown command: medic" for a verb its own manual
+  // documents, and the terminal's ✱/⚒ feed chips write a view file nothing in there is watching.
+  // Boot is also the moment after a ship (we restart into the new code), so sweep the RUNNING
+  // cxells here. A live cxell is one whose zee still has an ssh-terminal viewer; the sweep is
+  // best-effort per cage.
+  refreshZeeToolingInLiveCxells(async () => (await q(
     `SELECT DISTINCT x.slug
        FROM zee z JOIN xell x ON x.id = z.xell_id
       WHERE z.viewer_kind = 'ssh-terminal'

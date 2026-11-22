@@ -215,6 +215,32 @@ ok(/netbird\/management\.json\.example/.test(readme), 'README points at the ship
 const example = JSON.parse(readFileSync(resolve(ROOT, 'docker/zeehive/netbird/management.json.example'), 'utf8'));
 ok(!!example && Array.isArray(example.Relay?.Addresses) && typeof example.DataStoreEncryptionKey === 'string',
    'management.json.example is valid JSON with the endpoints a human edits');
+// The example's datastore key is a PLACEHOLDER and must stay recognizable as one: the real server
+// cannot decode it (v0.78.1 dies with `failed to create field encryptor: decode encryption key`,
+// docs/netbird-mesh-plan.md §11) and lib/build-bootstrap.js refuses a stand-up on it, naming
+// NETBIRD_DATASTORE_ENCRYPTION_KEY. If it ever became a real-looking key, a copied example would
+// boot the control plane on a public secret. So assert BOTH halves: marker present, not decodable.
+const keyBytes = Buffer.from(example.DataStoreEncryptionKey, 'base64');
+ok(/CHANGE-ME/i.test(example.DataStoreEncryptionKey)
+   && !(keyBytes.length === 32 && keyBytes.toString('base64') === example.DataStoreEncryptionKey),
+   'the example DataStoreEncryptionKey is a CHANGE-ME placeholder, not a usable key');
+ok(/openssl rand -base64 32/.test(readme),
+   'README tells the human to generate a real 32-byte base64 key');
+
+section('the NetBird release is PINNED (not :latest) — the API surface is frozen against it');
+// lib/netbird.js is frozen against one release; the compose default must be that release, not
+// whatever `latest` points at tomorrow (docs/netbird-mesh-plan.md §11: v0.78.1, live-verified).
+const tagDefaults = new Set();
+for (const file of FILES) {
+  const images = readFileSync(file.path, 'utf8').match(/netbirdio\/[a-z]+:\$\{NETBIRD_[A-Z_]+_TAG:-([^}]+)\}/g) || [];
+  ok(images.length === 5, `${file.name}: five netbirdio images, each with a pinned-tag default (${images.length})`);
+  ok(images.every((i) => !i.includes(':-latest}')), `${file.name}: none of them falls back to :latest`);
+  for (const i of images) tagDefaults.add(i.slice(i.lastIndexOf(':-') + 2, -1));
+}
+ok(tagDefaults.size === 1 && /^\d+\.\d+\.\d+$/.test([...tagDefaults][0]),
+   `all five components default to ONE version tag (${[...tagDefaults].join(', ') || 'none'})`);
+ok([...tagDefaults][0] === '0.78.1',
+   'and it is the release test/netbird-live-api.test.mjs proved lib/netbird.js against (v0.78.1)');
 
 console.log(failures ? `\n${failures} FAILURE(S) ✗` : '\nALL PASSED ✓');
 process.exit(failures ? 1 : 0);

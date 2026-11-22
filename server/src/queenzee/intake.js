@@ -659,12 +659,34 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
               : ' (PRODRO_MODE=simulate — nothing runs on production)'}`);
         }
       }
-      await bindManagerToProdReadonly(targetId);
-      // Deliberately NO re-preflight here: the manager's bind is production READ-ONLY, and preflight
-      // never opens production (preflight.js skips it by design — a human granted that bind). A
-      // guaranteed-skip preflight would be noise on every manager dispatch; the §4.5 re-preflight
-      // gates the three NON-prod binding changes (dispatch attach, the db-clone cut inside it, and
-      // the dbclone switch).
+      const mgrBind = await bindManagerToProdReadonly(targetId);
+      // RE-PREFLIGHT ON THE MANAGER BIND (§4.5, insertion point 3) — and it is NOT a noise skip any
+      // more. This path used to say "deliberately NO re-preflight here" because the preflight
+      // skipped every prod coupling; the consequence was measured: a manager's recorded verdict
+      // stayed the one from its POOLED provision — 'role zeehive at <shared dev db>: 28P01 (dsn
+      // source: shared-dev-container)' — a database its binding no longer names, FAILING, and
+      // carried into the zee's own briefing as "your database preflight FAILING". The binding was
+      // never touched by the check that claimed to prove it.
+      //
+      // preflight.js now opens a db-prod-readonly DSN (it is the minted SELECT-only reader, not the
+      // prod owner's credential), so this re-run does exactly what §4.5 asks: it opens the NEW
+      // binding's DSN and re-stamps the verdict with the source that produced it
+      // ('prod-readonly-dsn'). Under readiness_proof='required' a failure is a dispatch REFUSAL —
+      // and because this throw happens BEFORE the spawn, the compensating action runs first: unbind
+      // (drop the minted role, back to the shared dev db) so a refused dispatch cannot leave a ready,
+      // zee-less xell holding a live production credential — the state the compensation below exists
+      // to prevent. Under 'advisory' (and in PRODRO_MODE=simulate, where the reader is a deliberate
+      // fake and the check skips) the spawn proceeds exactly as before. A project with NO production
+      // registered skips the bind entirely (bindManagerToProdReadonly says so), and then nothing
+      // about this xell's database changed — there is nothing to re-preflight and nothing to refuse.
+      if (mgrBind.bound !== false) {
+        const rePreflight = await rePreflightAfterBindingChange(targetId);
+        if (rePreflight.refused) {
+          await unbindManagerFromProdReadonly(targetId,
+            'its read-only bind failed the §4.5 re-preflight under readiness_proof=required');
+          throw new Error(rePreflight.reason);
+        }
+      }
     } else if (targetId && (db || db_container || dump)) {
       await attachXellDb(targetId, { coupling: db, container: db_container, dump });
       // RE-PREFLIGHT ON THE NEW BINDING (§4.5, insertion points 1+2): the attach just re-pointed
@@ -1310,12 +1332,16 @@ export async function briefing(xellId, zee, task, { headless = true, cxell = fal
   // Resolved live at briefing time so a line a manager added a minute ago is already in the very
   // next briefing — there is no rebuild, no re-spawn, no cache to go stale.
   const xellRow = await one(
-    `SELECT project_id, proof_at, proof_error, preflight_at, preflight_error FROM xell WHERE id=$1`, [xellId]);
+    `SELECT project_id, proof_at, proof_error, preflight_at, preflight_error, preflight_checks
+       FROM xell WHERE id=$1`, [xellId]);
   const conditions = await currentConditionsMarkdownForProject(xellRow?.project_id);
   // …plus THIS xell's own failing proof/preflight state, when there is one (§4.5): under 'advisory'
   // a FAILED binding re-preflight must be visible in the very briefing that follows it, not only on
   // the row. proofConditionLine returns null for a healthy xell, so a healthy briefing is
   // byte-identical to before this feature existed. Both blocks render the same dated ⚠ line shape.
+  // preflight_checks rides along for the same reason at one remove: a check the preflight PASSED with
+  // a finding attached (§ db-data — "the DSN opened and the database holds no data") is a fact only
+  // this block can hand the zee, and the zee is the party that can run the remedy.
   const ownProof = proofConditionLine(xellRow);
   const conditionsBlock = [conditions, ownProof].filter(Boolean).join('\n\n') || null;
   // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +

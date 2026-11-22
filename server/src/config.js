@@ -100,6 +100,13 @@ export const config = {
   // and how often the maintenance scheduler wakes to check whether a backup is due.
   backupDir: process.env.BACKUP_DIR || resolve(repoRoot, 'db_backups'),
   maintTickMs: int(process.env.MAINT_TICK_MS, 60000),
+  // How long the BULKY session_event mirror kinds (assistant/user/tool_progress/result — the
+  // cxell-feed play-by-play copies) are kept before the maintenance sweep prunes them. The
+  // gate/state kinds (tend-*, env-alert*, *hint-*, ship-refused-*, working-ping, turn-death, …)
+  // are NEVER swept — the fleet snapshot and the status derivations replay those latest-event-wins
+  // with no time bound. 30 days keeps recent turn drill-downs readable; nothing derives state
+  // from mirror rows that old.
+  sessionEventRetentionDays: int(process.env.SESSION_EVENT_RETENTION_DAYS, 30),
   // The PRODUCTION application database to dump (inside the modeled prod db container) — NOT
   // the zeehive meta DB above. db name defaults to the project name; role/tier resolve the
   // container from the inventory, so only user/name need overriding for an off-convention prod.
@@ -111,6 +118,40 @@ export const config = {
   // the queenzee's env (surfaced as PRESENCE ONLY by `zee infra settings`, never the value).
   netbirdApiUrl: process.env.NETBIRD_API_URL || null,
   netbirdApiToken: process.env.NETBIRD_API_TOKEN || null,
+  // The management API a stand-up HEALTH-CHECKS before the operator has pointed the queenzee at it
+  // (NETBIRD_API_URL is set only AFTER the control plane is up — chicken and egg). NetBird's own
+  // compose default is the in-project service name (docker-compose.bootstrap.yml NB_MANAGEMENT_URL),
+  // which the queenzee container resolves on the compose network; a host-routed install overrides.
+  netbirdMgmtApiUrl: process.env.NETBIRD_MGMT_API_URL || null,
+  // The queenzee's OWN compose file — the file the mesh profile lives in. The bootstrap card's
+  // mesh-control-plane step drives `docker compose -f <this> --profile mesh up -d`. Defaults to the
+  // bootstrap compose beside the code tree (a host checkout); a containerized queenzee whose image
+  // carries no compose file sets MESH_COMPOSE_FILE to its install dir's compose file.
+  meshComposeFile: process.env.MESH_COMPOSE_FILE || resolve(repoRoot, 'docker-compose.bootstrap.yml'),
+  // management.json values ZEEHIVE may substitute into the shipped example. The two SECRETS are
+  // only ever taken from the operator's env — this code never generates key material, and a
+  // placeholder left in the template stays a placeholder (the stand-up refuses to start on one).
+  netbirdSignalUri: process.env.NETBIRD_SIGNAL_URI || null,
+  netbirdRelayEndpoint: process.env.NETBIRD_RELAY_ENDPOINT || null,
+  netbirdDatastoreEncryptionKey: process.env.NETBIRD_DATASTORE_ENCRYPTION_KEY || null,
+  netbirdRelayAuthSecret: process.env.NETBIRD_RELAY_AUTH_SECRET || null,
+  // The control plane's published ports and the gateway peer's one-off setup key. They have no
+  // other home in config because nothing else reads them: lib/mesh-config.js resolves them
+  // (console row → this env → the compose default) and lib/build-bootstrap.js hands them to
+  // `docker compose` so the containers are created with the ports the human set. Store-over-env
+  // applies here like everywhere else in the mesh seam — see lib/mesh-config.js.
+  netbirdMgmtGrpcPort: int(process.env.NETBIRD_MGMT_GRPC_PORT, 33073),
+  netbirdMgmtApiPort: int(process.env.NETBIRD_MGMT_API_PORT, 33074),
+  netbirdSignalPort: int(process.env.NETBIRD_SIGNAL_PORT, 10000),
+  netbirdRelayPort: int(process.env.NETBIRD_RELAY_PORT, 33080),
+  netbirdDashHttpPort: int(process.env.NETBIRD_DASH_HTTP_PORT, 33081),
+  netbirdGatewaySetupKey: process.env.NETBIRD_GATEWAY_SETUP_KEY || null,
   // The mesh DNS domain peers resolve under (<hostname>.<domain>). NetBird's self-hosted default.
   meshDomain: process.env.MESH_DOMAIN || 'netbird.selfhosted',
+  // The zee-hive-net address cages route mesh traffic through (§3.5). Normally UNSET: the seal
+  // resolves the running mesh-gateway container's address per machine (lib/cxell.js
+  // resolveMeshGatewayIp), because docker reassigns it on every recreate. Set it only to point
+  // cages at a gateway this compose did not create — an explicit override that then never rots
+  // silently, because a wrong one shows up as a mesh route that goes nowhere.
+  meshGatewayIp: process.env.MESH_GATEWAY_IP || null,
 };

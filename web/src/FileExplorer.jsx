@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { listCxellDir, readCxellFile, listContainerDir, readContainerFile } from './api.js';
+import { listCxellDir, readCxellFile, listContainerDir, readContainerFile,
+         cxellDownloadUrl, containerDownloadUrl } from './api.js';
 import { showFileViewer } from './FileViewer.jsx';
 
 // The file-explorer panel that expands beside a terminal. Read-only: it lists the target's
@@ -45,6 +46,9 @@ export default function FileExplorer({ zeeId, container, openReq, onClose }) {
     if (container) return readContainerFile(container.id, path);
     return readCxellFile(zeeId, path);
   }, [zeeId, container]);
+
+  // ⤓ DOWNLOAD — the file's exact bytes (the viewer's read is a capped TEXT read, unfit to save)
+  const downloadUrl = (path) => (container ? containerDownloadUrl(container.id, path) : cxellDownloadUrl(zeeId, path));
 
   const load = useCallback(async (path) => {
     setLoading(true); setError(null);
@@ -115,12 +119,18 @@ export default function FileExplorer({ zeeId, container, openReq, onClose }) {
         {error && <div className="fx-err">{error}</div>}
         {!loading && !error && dir?.entries.length === 0 && <div className="fx-empty">(empty)</div>}
         {!loading && !error && dir?.entries.map((e) => (
-          <button key={e.name} className={`fx-row fx-${e.type}`} onClick={() => onEntry(e)}
-                  title={e.name}>
-            <span className="fx-ic">{ICON[e.type]}</span>
-            <span className="fx-nm">{e.name}</span>
-            {e.type === 'file' && <span className="fx-sz">{fmtSize(e.size)}</span>}
-          </button>
+          <div key={e.name} className="fx-item">
+            <button className={`fx-row fx-${e.type}`} onClick={() => onEntry(e)} title={e.name}>
+              <span className="fx-ic">{ICON[e.type]}</span>
+              <span className="fx-nm">{e.name}</span>
+              {e.type === 'file' && <span className="fx-sz">{fmtSize(e.size)}</span>}
+            </button>
+            {e.type === 'file' && (
+              <a className="fx-dl" data-testid="fx-download" download={e.name}
+                 href={downloadUrl(`${dir.path === '/' ? '' : dir.path}/${e.name}`)}
+                 title={`Download ${e.name}`}>⤓</a>
+            )}
+          </div>
         ))}
       </div>
     </div>

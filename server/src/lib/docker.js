@@ -109,6 +109,35 @@ function dockerCliPs(ctx, timeout) {
   return list;
 }
 
+// The docker raw-stream framing: a non-TTY container's stdout/stderr come back multiplexed as
+// [8-byte header][payload] frames — header[0] is the stream (1=stdout, 2=stderr) and header[4:8]
+// is the big-endian payload size. Both consumers of a hijacked/streamed body need it: an exec
+// capture (container-fs.js, which re-exports this) and a log tail (containerLogTail below). With
+// Tty:true there is no multiplexing and the body is raw bytes — ask the daemon which it is
+// (Config.Tty) rather than guessing from the bytes.
+// ONE frame walker, two readings of it: an exec capture wants stdout and stderr SEPARATED, a log
+// tail wants them INTERLEAVED in arrival order. Both are the same parse, so it lives here once.
+export function walkDockerFrames(buf, onFrame) {
+  let off = 0;
+  while (off + 8 <= buf.length) {
+    const stream = buf[off];
+    const size = buf.readUInt32BE(off + 4);
+    off += 8;
+    if (off + size > buf.length) break; // truncated final frame — keep what is whole
+    onFrame(stream, buf.subarray(off, off + size));
+    off += size;
+  }
+}
+
+export function demuxDockerStream(buf) {
+  const out = []; const err = [];
+  walkDockerFrames(buf, (stream, chunk) => {
+    if (stream === 1) out.push(chunk);
+    else if (stream === 2) err.push(chunk);
+  });
+  return { out: Buffer.concat(out), err: Buffer.concat(err) };
+}
+
 function getJson(conn, path, timeout) {
   return new Promise((res, rej) => {
     const req = http.request({ ...conn, path, method: 'GET', timeout }, (r) => {
@@ -170,6 +199,90 @@ async function getContainerList(ctx, timeout) {
   return list;
 }
 
+// Read a body that is NOT JSON (a log stream) as a Buffer, capped. The cap is applied while
+// reading and the request is destroyed once it is hit, so a container that logs a gigabyte an hour
+// can never fill this process's heap: the caller gets the first `maxBytes` and `truncated:true`.
+function getRaw(conn, path, timeout, maxBytes) {
+  return new Promise((res, rej) => {
+    const req = http.request({ ...conn, path, method: 'GET', timeout }, (r) => {
+      const chunks = []; let len = 0, truncated = false;
+      if (r.statusCode < 200 || r.statusCode >= 300) {
+        let body = '';
+        r.setEncoding('utf8');
+        r.on('data', (d) => (body += d));
+        r.on('end', () => rej(new Error(`HTTP ${r.statusCode}: ${body.slice(0, 200)}`)));
+        return;
+      }
+      r.on('data', (d) => {
+        const b = Buffer.from(d);
+        if (len >= maxBytes) { truncated = true; req.destroy(); return; }
+        // The cap is a BYTE ceiling, not a chunk-boundary one: a single 64 KiB read must not carry
+        // the buffer past maxBytes (it did, until test/prod-logs.test.mjs asked for a 4 KiB cap and
+        // got 50 KB back). Keep only what fits, then stop reading.
+        const room = maxBytes - len;
+        if (b.length > room) {
+          chunks.push(b.subarray(0, room)); len = maxBytes; truncated = true; req.destroy(); return;
+        }
+        chunks.push(b); len += b.length;
+      });
+      r.on('end', () => res({ buf: Buffer.concat(chunks), truncated }));
+      r.on('close', () => res({ buf: Buffer.concat(chunks), truncated }));
+      r.on('error', rej);
+    });
+    req.on('error', (e) => rej(e));
+    req.on('timeout', () => req.destroy(new Error(`timeout after ${timeout}ms`)));
+    req.end();
+  });
+}
+
+// Shell out to the `docker` CLI for a LOG READ against an SSH context — the same exception, and the
+// same contract, as dockerCliPs: the docker HTTP API cannot ride SSH, and `logs` is read-only.
+// Returns null when the CLI is missing or the daemon is unreachable, so the caller says so instead
+// of reporting an empty log.
+function dockerCliLogs(ctx, name, { tail, sinceTs, timeout, maxBytes }) {
+  const args = ['--context', ctx, 'logs', '--timestamps', '--tail', String(tail)];
+  if (sinceTs) args.push('--since', String(sinceTs));
+  args.push(name);
+  const r = spawnSync('docker', args, { encoding: 'utf8', timeout, maxBuffer: maxBytes, windowsHide: true });
+  if (r.error || r.status !== 0) return null;
+  // The CLI demuxes for us and prints stdout and stderr on the respective streams; a container's
+  // log is the two interleaved, which is what a reader wants.
+  return { text: `${r.stdout || ''}${r.stderr || ''}`, truncated: false };
+}
+
+// The TAIL of ONE container's log, as text. READ-ONLY by construction: the only calls it makes are
+// GET /containers/<name>/json (to learn whether the log is TTY-raw or multiplexed, and whether the
+// container is running) and GET /containers/<name>/logs with follow=0. There is no exec, no attach,
+// no start/stop, and nothing here takes a command from a caller — this is the whole door, and it
+// only ever opens onto a log.
+//
+// `tail` is a line count, `sinceTs` a unix timestamp (docker's own `since`), `maxBytes` the hard
+// ceiling on what is read off the daemon. Returns { text, truncated, state }. THROWS when the
+// daemon/container cannot be reached, so a caller never reports "no logs" for "could not ask".
+export async function containerLogTail(ctx, name, {
+  tail = 200, sinceTs = null, timeout = 20000, maxBytes = 1 << 20,
+} = {}) {
+  if (await isSshContext(ctx)) {
+    const out = dockerCliLogs(ctx, name, { tail, sinceTs, timeout, maxBytes });
+    if (!out) throw new Error(`daemon on context '${ctx}' is unreachable (ssh context, via the docker CLI)`);
+    return { ...out, state: null };
+  }
+  const conn = await resolveContext(ctx);
+  const enc = encodeURIComponent(name);
+  const info = await getJson(conn, `/containers/${enc}/json`, timeout);
+  const tty = !!info?.Config?.Tty;
+  const state = info?.State?.Status || null;
+  const qs = new URLSearchParams({ stdout: '1', stderr: '1', follow: '0', timestamps: '1', tail: String(tail) });
+  if (sinceTs) qs.set('since', String(sinceTs));
+  const { buf, truncated } = await getRaw(conn, `/containers/${enc}/logs?${qs}`, timeout, maxBytes);
+  // A TTY container's log is raw bytes; a non-TTY one is framed (and stderr is part of the log a
+  // reader wants, so the two are merged in the order the frames arrived).
+  if (tty) return { text: buf.toString('utf8'), truncated, state };
+  const parts = [];
+  walkDockerFrames(buf, (_stream, chunk) => parts.push(chunk));
+  return { text: Buffer.concat(parts).toString('utf8'), truncated, state };
+}
+
 // Stop then remove ONE container, by name (docker's HTTP API accepts a name as the id). Best-effort
 // and idempotent: a 404 (already gone) is success, so this can run after a partial teardown and
 // finish it. `removeVolumes` deletes the container's ANONYMOUS volumes too — the reaper's per-xell
@@ -226,8 +339,41 @@ export async function removeImage(ctx, tag, { timeout = 60000 } = {}) {
   return { removed: false, reason: `HTTP ${r.status}` };
 }
 
+// The PUBLISHED ports of one container-list entry: [{ ip, public, private, type }], one per
+// mapping (a PublicPort means it is reachable from the host; the duplicate IPv4/IPv6 rows docker
+// emits per mapping are collapsed). PURE, and shared by both readers below so the monitor and the
+// discovery read the same fact. Two payload shapes are accepted, because the module has two
+// sources: the HTTP API's `Ports` ARRAY (`{IP, PrivatePort, PublicPort, Type}`), and the CLI's
+// `{{json .}}` STRING ("0.0.0.0:32769->5432/tcp, :::32769->5432/tcp") on an SSH context —
+// anything else reads as "publishes nothing", never as a guessed port.
+export function publishedPortsOf(c) {
+  const seen = new Set();
+  const ports = [];
+  const add = (ip, pub, priv, type) => {
+    const key = `${pub}/${priv}/${type}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ports.push({ ip: ip || null, public: pub, private: priv, type });
+  };
+  const raw = c?.Ports;
+  if (Array.isArray(raw)) {
+    for (const p of raw) {
+      if (p?.PublicPort == null) continue;
+      add(p.IP, p.PublicPort, p.PrivatePort, p.Type);
+    }
+  } else if (typeof raw === 'string') {
+    for (const part of raw.split(',')) {
+      const m = /^\s*([^:\s]*):(\d+)->(\d+)\/(\w+)\s*$/.exec(part);
+      if (!m) continue;
+      add(m[1], Number(m[2]), Number(m[3]), m[4]);
+    }
+  }
+  return ports;
+}
+
 // Every container on a context (running or not), keyed by name:
-//   { state, xell, project, role }  — identity labels (spec §3.3), null when unlabeled.
+//   { state, xell, project, role, ports }  — identity labels (spec §3.3), null when unlabeled;
+//   ports = publishedPortsOf (empty when it publishes nothing).
 // THROWS if the daemon is unreachable/errors. An empty Map means a genuinely empty daemon; the
 // two are distinct here by construction, which is the whole point of this module.
 // An SSH context (mardale-prod re-pointed at ssh.omnibiz.express) is dialed through the docker CLI.
@@ -244,6 +390,7 @@ export async function dockerPs(ctx, timeout = 15000) {
       xell: L['zeehive.xell'] || null,
       project: L['zeehive.project'] || null,
       role: L['zeehive.role'] || null,
+      ports: publishedPortsOf(c),
     });
   }
   return out;
@@ -262,18 +409,8 @@ export async function listContainersDetailed(ctx, timeout = 15000) {
     const name = (c.Names?.[0] || '').replace(/^\//, '');
     if (!name) continue;
     const L = c.Labels || {};
-    // Published ports only (a PublicPort means it is reachable from the host); collapse the
-    // duplicate IPv4/IPv6 rows docker emits per mapping.
-    const seen = new Set();
-    const ports = [];
-    for (const p of c.Ports || []) {
-      if (p.PublicPort == null) continue;
-      const key = `${p.PublicPort}/${p.PrivatePort}/${p.Type}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      ports.push({ ip: p.IP || null, public: p.PublicPort, private: p.PrivatePort, type: p.Type });
-    }
-    const exposed = [...new Set((c.Ports || []).map((p) => p.PrivatePort).filter(Boolean))];
+    const ports = publishedPortsOf(c);          // published only — see publishedPortsOf
+    const exposed = [...new Set((Array.isArray(c.Ports) ? c.Ports : []).map((p) => p.PrivatePort).filter(Boolean))];
     out.push({
       name,
       image: c.Image || null,

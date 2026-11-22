@@ -276,6 +276,28 @@ export async function pushToXource(xellId, by = 'human@console', { mode = PROVIS
   return { landed, ref, head: head.out, output: text.slice(-2000) };
 }
 
+// ── DID THE LANDING ACTUALLY LAND? ───────────────────────────────────────────
+// `push.landed` is a git EXIT CODE, and an exit code is not the same question as "is my work on the
+// ref". A push can exit non-zero AFTER the ref moved: the update hook answered `allow`, receive-pack
+// fast-forwarded the ref, and then the client failed reading the report (a timeout kill, a broken
+// sideband, an unexpected disconnect) — and git reports "failed to push some refs" while the ref is
+// already moved. `pushToXource` reads exactly that exit code, so a caller that branches on it alone
+// concludes "did not land" while the land_request it quotes says `landed` and the sha is on main.
+//
+// Ask the REF instead — the only thing that can settle it. true ⇒ the ref contains this sha. A xell
+// worktree shares the xource's object store, so the sha and the ref are both readable from there:
+// no fetch, no network, no push. Returns false on any read failure (fail-closed: never claim a
+// landing we could not confirm).
+export async function xourceContainsSha(xellId, sha, { mode = PROVISION_MODE } = {}) {
+  if (!sha) return false;
+  const { x, ref } = await ctx(xellId, { mode });
+  // merge-base --is-ancestor <sha> <ref> → exit 0 when the ref already contains sha (sha == ref, or
+  // the ref has moved past it — either way the zee's work IS on the ref).
+  const r = spawnSync('git', ['-C', x.worktree_path, ...QUEENZEE_IDENTITY, 'merge-base', '--is-ancestor', sha, ref],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+  return r.status === 0;
+}
+
 // ── PULL: the xource → the xell's worktree ───────────────────────────────────
 // REFUSES on a dirty tree, and that is the whole point of it being a separate check rather than
 // letting git decide. git will happily merge over a dirty worktree when the changed files do not

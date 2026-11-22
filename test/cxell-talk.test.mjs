@@ -77,9 +77,10 @@ ok(probe.test('claude --bare -p --output-format stream-json --verbose --dangerou
    'it matches the claude headless run the queenzee actually spawns');
 ok(probe.test('codex exec --json --dangerously-bypass-approvals-and-sandbox -'), 'and the codex one');
 ok(probe.test('kimi -p "$(cat)" --output-format stream-json'), 'and the kimi one');
-ok(probe.test('grok -p "$(cat)" -m grok-4.5 --output-format streaming-messages-json --always-approve'),
-   'and the grok one');
-ok(probe.test('grok -r 019fcf30-623d-7cf3-97b8-037cfc465042 -p "$(cat)" -m grok-4.5 '
+ok(probe.test('grok --prompt-file /dev/stdin -m grok-4.5 --output-format streaming-messages-json '
+              + '--always-approve'),
+   'and the grok one — whose prompt now rides on stdin as a FILE, not in argv (MAX_ARG_STRLEN)');
+ok(probe.test('grok -r 019fcf30-623d-7cf3-97b8-037cfc465042 --prompt-file /dev/stdin -m grok-4.5 '
               + '--output-format streaming-messages-json --always-approve'),
    '…INCLUDING a resumed grok turn, which puts the session id in front of the headless flag');
 ok(!probe.test('grok -r 019fcf30-623d-7cf3-97b8-037cfc465042 --always-approve'),
@@ -220,14 +221,17 @@ ok(typeof installZeeAttachIntoCxell === 'function' && ZEE_ATTACH_DEST === '/usr/
    'cxell.js installs it over the copy baked into the image');
 ok(zeeAttachSourcePath().endsWith(join('docker', 'zeehive', 'zee-attach.sh')), 'from the queenzee\'s own repo');
 const install = zeeAttachInstallCommands({ name: 'cxell_zt', src: '/src/zee-attach.sh' });
+const installShell = install[1].join(' ');
 ok(install[0][0] === 'cp' && install[1].includes('-u') && install[1].includes('0')
-   && install[1].join(' ').includes(`install -o root -g root -m 0755 /tmp/zee-attach.sh ${ZEE_ATTACH_DEST}`),
-   'root-owned and executable, like the CLI (a zee cannot rewrite the script that drains its own queue)');
+   && installShell.includes(`install -o root -g root -m 0755 /tmp/zee-attach.sh ${ZEE_ATTACH_DEST}.new.$$`)
+   && installShell.includes(`mv -f ${ZEE_ATTACH_DEST}.new.$$ ${ZEE_ATTACH_DEST}`),
+   'root-owned and executable, like the CLI (a zee cannot rewrite the script that drains its own '
+   + 'queue), and placed by an ATOMIC RENAME — it now also fires at boot, over cages that may be mid-turn');
 const dead = await installZeeAttachIntoCxell({ ctx: 'default', name: 'cxell_zt-does-not-exist' });
 ok(dead.installed === false && !!dead.reason, 'an unreachable cage is reported, never thrown (it runs at spawn AND at boot)');
 ok(read('server/src/queenzee/intake.js').includes('installZeeAttachIntoCxell({ ctx, name })'), 'the spawn path installs it');
-ok(/installZeeAttachIntoCxell\(\{ ctx, name \}\)/.test(read('server/src/lib/cxell.js').slice(
-     read('server/src/lib/cxell.js').indexOf('export async function refreshZeeLiveInLiveCxells'))),
+ok(/installZeeAttachIntoCxell\(\{ ctx, name/.test(read('server/src/lib/cxell.js').slice(
+     read('server/src/lib/cxell.js').indexOf('export async function refreshZeeToolingInLiveCxells'))),
    'and the boot sweep refreshes it into every RUNNING cxell — or the queue would fill in cages that cannot drain it');
 
 // ── 6. sendKeysToCxellZee tells the caller WHICH happened ─────────────────────────────────────

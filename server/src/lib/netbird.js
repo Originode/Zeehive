@@ -17,9 +17,23 @@
 // The management API token is queenzee config (env), never a row; a minted setup key is
 // returned ONCE to the caller (for injection into the joining agent's env) and never stored —
 // only its id rides on the row, for audit.
+//
+// PINNED API — NetBird management v0.78.1. This module is frozen against that release: its
+// request/response shapes were verified against a REAL management server (sqlite store, no IdP)
+// booted on loopback by test/netbird-live-api.test.mjs, and the compose defaults are pinned to the
+// same tag (docker-compose*.yml, docker/zeehive/README.md). Two drifts the live server caught are
+// recorded at their fix sites: the policy rule body (`ensurePolicy` — sources/destinations, a
+// required protocol, no ports on ALL) and NetBird's IP-suffixed peer DNS label (`meshFqdn`).
+// Bumping the release means re-running that live test, not editing this comment.
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { logline } from './logbus.js';
+import { probeTcp } from './mesh-routes.js';
+
+// THE VERSION PIN, in one place. netbird-bootstrap.js refuses to seed the store of any other
+// release, and the live harness (test/netbird-live-api.test.mjs) imports this rather than spelling
+// the number a second time — a bump then fails the live suite instead of drifting past it.
+export const PINNED_NETBIRD_VERSION = '0.78.1';
 
 // Both knobs present = the mesh exists for this queenzee. Absent = every entry point below is a
 // legible no-op, so callers never need their own guard.
@@ -27,10 +41,30 @@ export function meshEnabled() {
   return Boolean(config.netbirdApiUrl && config.netbirdApiToken);
 }
 
-// The mesh hostname's fully-qualified form (<hostname>.<mesh-domain>) — what a resolver on the
-// mesh answers. PURE, so URL/DSN derivation is table-testable.
-export function meshFqdn(hostname) {
-  return hostname ? `${hostname}.${config.meshDomain}` : null;
+// The mesh hostname's fully-qualified form — what a resolver on the mesh answers. PURE, so
+// URL/DSN derivation is table-testable.
+//
+// DRIFT, verified against a REAL management server v0.78.1 (docs/netbird-mesh-plan.md §11):
+// NetBird does NOT answer `<hostname>.<dns-domain>`. `getPeerIPDNSLabel`
+// (management/server/peer.go) builds the peer's DNS label as
+// `<hostname>-<ipv4 octet 3>-<ipv4 octet 4>` (the 3rd/4th octets of the assigned mesh IP), and
+// the API's `dns_label` response field is that label + the domain — e.g. peer `e2e-probe-peer`
+// on 100.64.170.38 answered `e2e-probe-peer-170-38.netbird.selfhosted`. Pass the peer's mesh IP
+// to get the name the control plane actually publishes; with no IP the one-arg form is the
+// INTENDED name only (what the plan's manifest/DSN text spells), never a resolvable NetBird name.
+export function meshFqdn(hostname, ip = null) {
+  if (!hostname) return null;
+  const o = ipv4Octets(ip);
+  return o ? `${hostname}-${o[2]}-${o[3]}.${config.meshDomain}` : `${hostname}.${config.meshDomain}`;
+}
+
+// The four octets of a dotted-quad IPv4, or null for anything else (an IPv6 mesh address, a
+// missing/blank ip). NetBird's DNS-label rule is IPv4-only — a v6 peer gets NO dns_label.
+function ipv4Octets(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(ip ?? '').trim());
+  if (!m) return null;
+  const o = m.slice(1).map(Number);
+  return o.every((n) => n <= 255) ? o : null;
 }
 
 // ── the bounded adapter (injectable; the default speaks HTTP to the management API) ──────────────
@@ -62,6 +96,72 @@ const failed = (r, what) => ({
   reason: `${what}: ${r.reason || `HTTP ${r.status}${r.json?.message ? ` — ${r.json.message}` : ''}`}`,
 });
 
+// ── the control plane's container identity (docs/netbird-mesh-plan.md §3.1) ─────────────────────
+// ONE authority for the mesh-profile services' names: the readiness probe reports whether the
+// control plane is running (build-readiness.js) and the bootstrap card's mesh-control-plane step
+// stands it up (build-bootstrap.js), and both must name the same container and the same three
+// services — a copy in each file is how a button ends up checking a different container than the
+// one the performer starts.
+export const MESH_CONTROL_PLANE_CONTAINER = 'zeehive_netbird_management';
+// The control plane only — NOT mesh-gateway (needs a human-minted setup key) and NOT the dashboard
+// (needs an OIDC provider). Both would crash-loop with an empty key/OIDC and make a good stand-up
+// look failed; the operator brings them up once the env below exists.
+export const MESH_CONTROL_PLANE_SERVICES = ['netbird-management', 'netbird-signal', 'netbird-relay'];
+// Service → container, so the stand-up can ask after EACH service rather than treating management
+// as the whole plane. It is not: live 2026-09-24 management was healthy while the relay had never
+// started (empty NB_EXPOSED_ADDRESS until an endpoint was configured), and a management-only
+// liveness read reported "nothing to stand up" — leaving no way to bring the relay up at all.
+export const MESH_CONTROL_PLANE_CONTAINERS = {
+  'netbird-management': MESH_CONTROL_PLANE_CONTAINER,
+  'netbird-signal': 'zeehive_netbird_signal',
+  'netbird-relay': 'zeehive_netbird_relay',
+};
+// The OPTIONAL web UI — deliberately NOT in MESH_CONTROL_PLANE_SERVICES: the mesh works without
+// it, and it is enabled by its own opt-in step (build-bootstrap `mesh-dashboard`), never as a
+// side effect of the stand-up or of an unscoped bootstrap.
+export const MESH_DASHBOARD_SERVICE = 'netbird-dashboard';
+export const MESH_DASHBOARD_CONTAINER = 'zeehive_netbird_dashboard';
+
+// ── the stand-up health check (docs/netbird-mesh-plan.md §3.1 / §11 NOT-done #1) ────────────────
+// The control plane is stood up BEFORE the operator can set NETBIRD_API_URL (that env points the
+// queenzee AT the plane), so the health check cannot go through the authenticated client above.
+// It is a bounded TCP dial to the management API's own host:port instead: the port answering is
+// exactly the fact "the management service came up and is serving". NetBird serves the API over
+// HTTPS with a self-signed cert by default, which a TLS probe would reject for the wrong reason —
+// a dial proves the listener without caring about the cert. The compose default is the in-project
+// service name the queenzee container resolves; NETBIRD_API_URL / NETBIRD_MGMT_API_URL override.
+export const NETBIRD_MGMT_API_DEFAULT = 'https://netbird-management:443';
+
+export function managementApiTarget({ url = null } = {}) {
+  const raw = url || config.netbirdApiUrl || config.netbirdMgmtApiUrl || NETBIRD_MGMT_API_DEFAULT;
+  try {
+    const u = new URL(raw);
+    return { url: raw, host: u.hostname,
+             port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80) };
+  } catch {
+    return { url: raw, host: null, port: null };
+  }
+}
+
+// Best-effort by contract, like every mesh entry point: a control plane still starting answers
+// 'refused' for a few seconds, so a bounded retry loop gives it the moment NetBird needs to bind.
+// Anything other than a clean 'ok' is reported, never thrown.
+export async function probeManagementApi({ url = null, attempts = 6, intervalMs = 1000,
+                                           probe = probeTcp } = {}) {
+  const target = managementApiTarget({ url });
+  if (!target.host) {
+    return { ok: false, ...target, verdict: 'unknown',
+             reason: `unparseable management API URL '${target.url}'` };
+  }
+  let verdict = 'unknown';
+  for (let i = 0; i < Math.max(1, attempts); i++) {
+    verdict = await probe(target.host, target.port, 3000);
+    if (verdict === 'ok') break;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { ok: verdict === 'ok', ...target, verdict };
+}
+
 // ── the management API, one function per verb the plan names (§5) ───────────────────────────────
 
 // A setup key for ONE peer: ephemeral and usage-limit 1 by default, so a leaked key mints nothing
@@ -86,10 +186,18 @@ export async function listPeers({ request = netbirdRequest } = {}) {
 }
 
 // The peer a hostname resolved to, or null when none — an absent peer is data, not a failure.
+// The API's `hostname` field is the authoritative one (the agent logs in with it and the
+// control plane echoes it verbatim), so that is the match. The dns_label fallbacks cover the
+// two real shapes: a caller that already holds the published FQDN, and a peer whose published
+// label is the IP-suffixed form of THIS hostname (meshFqdn(hostname, p.ip)) — a bare
+// `p.dns_label === hostname` never matches a real v0.78.1 server, whose labels always carry the
+// domain and the IP suffix (see meshFqdn above).
 export async function getPeerByHostname(hostname, { request = netbirdRequest } = {}) {
   const r = await listPeers({ request });
   if (!r.ok) return r;
-  const peer = r.peers.find((p) => p.hostname === hostname || p.dns_label === hostname) || null;
+  const peer = r.peers.find((p) => p.hostname === hostname
+    || p.dns_label === hostname
+    || (p.dns_label && p.dns_label === meshFqdn(hostname, p.ip))) || null;
   return { ok: true, peer };
 }
 
@@ -148,8 +256,16 @@ export async function listPolicies({ request = netbirdRequest } = {}) {
 // module owns the mapping. Never creates a BROAD prod grant — policyIsDefaultDenySafe refuses it
 // before a single control-plane call, so the "prod seal does not weaken" line is structural, not a
 // hope. Mesh disabled → a legible no-op, exactly like every other entry point here.
+//
+// DRIFT, verified against a REAL management server v0.78.1 (docs/netbird-mesh-plan.md §11): the
+// rule body this module originally sent (`source`/`destination`, no `protocol`) is refused 422
+// "specify either sources or source resources and destinations or destination resources". The
+// real PolicyRuleUpdate wants `sources`/`destinations`, a required `protocol` (all|tcp|udp|icmp|
+// netbird-ssh) and a required `enabled`; and ports are ILLEGAL on protocol `all`/`icmp` ("for ALL
+// or ICMP protocol ports is not allowed"). So the protocol is derived: a rule that names ports is
+// a tcp grant (every port grant this module makes is a db port), a portless rule is `all`.
 export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], ports = [],
-                                     description = null },
+                                     description = null, protocol = null },
                                    { request = netbirdRequest } = {}) {
   if (!meshEnabled()) return { ok: false, disabled: true, reason: 'mesh disabled' };
   if (!name || !sourceGroups.length || !destGroups.length) {
@@ -173,6 +289,8 @@ export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], p
     if (!rg.ok) return rg;
     dstIds.push(rg.id);
   }
+  const granted = ports.length ? ports.map(String) : [];
+  const ruleProtocol = protocol || (granted.length ? 'tcp' : 'all');
   const body = {
     name,
     description: description || `ZEEHIVE mesh policy '${name}' (docs/netbird-mesh-plan.md §3.5)`,
@@ -180,11 +298,16 @@ export async function ensurePolicy({ name, sourceGroups = [], destGroups = [], p
     rules: [{
       name,
       description: description || null,
+      enabled: true,
       action: 'accept',
       bidirectional: false,
-      source: srcIds,
-      destination: dstIds,
-      ports: ports.length ? ports.map(String) : [],
+      protocol: ruleProtocol,
+      sources: srcIds,
+      destinations: dstIds,
+      // Omitted on a portless (protocol 'all') rule: the API refuses ports on ALL/ICMP, and an
+      // explicit [] would be the same shape the real server hands back for a full-protocol rule —
+      // either way the ONLY port lists this module ever posts are the narrow, named db grants.
+      ...(granted.length ? { ports: granted } : {}),
     }],
   };
   const r = await request('POST', '/api/policies', body);

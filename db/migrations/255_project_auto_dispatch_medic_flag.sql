@@ -1,0 +1,24 @@
+-- Operator policy: auto-DISPATCH a medic for a raised call (the fourth auto-* flag, beside 022's
+-- auto_approve_land/ship and 122's auto_approve_seed/auto_done). OFF by default — the human click
+-- stays the default everywhere. A human turns it on per project in the console.
+--
+-- WHAT IT SKIPS: with auto_dispatch_medic ON, a medic call raised with NO live medic to attach to is
+-- dispatched immediately instead of parking as a CALLED emergency for a human to see in the ⛑
+-- needs-you panel. The calling zee is told a POLICY answered it, not a human.
+--
+-- WHAT IT DOES **NOT** SKIP (the policy reaches exactly as far as a human's click, never further):
+--   • The dispatch goes through the SAME seam the ⛑ dispatch button uses
+--     (medic-calls.js dispatchMedicCall → medic-spawn.js dispatchMedic) and inherits its refusals:
+--     an already-attended call with a LIVE medic is not re-dispatched; only an OPEN call (or an
+--     attended call whose medic is no longer LIVE) is dispatchable at all.
+--   • It does NOT fire where a click cannot: an API-only instance (QUEENZEE_INPROC=false) refuses
+--     the dispatch route with 503, so the policy parks the call as OPEN there too rather than
+--     driving a spawn without the single-queenzee lock.
+--   • It does NOT attach to a live medic instead of dispatching — a live medic on the project still
+--     takes the ATTACH path (251); the policy only fills the gap a human would have filled.
+--   • It does NOT widen the medic postgres role (medic_call stays in MEDIC_NO_WRITE_TABLES) and does
+--     not touch the hive canvas, the ⛑ hex badge, or the retired-xell call lifecycle.
+--
+-- Idempotent, additive, forward-only.
+ALTER TABLE project
+  ADD COLUMN IF NOT EXISTS auto_dispatch_medic boolean NOT NULL DEFAULT false;

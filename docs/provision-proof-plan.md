@@ -345,7 +345,9 @@ grants, and only one of them is a DSN:
   role.** The medic lives on Zeehive, so its manager prod-read (`DATABASE_URL`, read-only) IS a
   read over the whole fleet's config — every project, machine, pool and container row. The one
   capability additionally mints the per-xell SELECT-only meta-reader (`lib/prod-readonly.js`:
-  `zee_ro_<slug>`, LOGIN+CONNECT+SELECT, `default_transaction_read_only=on`, secret columns
+  `zee_meta_ro_<slug>` — its OWN role name, deliberately not the manager prod-reader's
+  `zee_ro_<slug>`, which shares a cluster with it on Zeehive-on-Zeehive and would otherwise be
+  rotated by the second mint; LOGIN+CONNECT+SELECT, `default_transaction_read_only=on`, secret columns
   revoked), injected as `ZEEHIVE_META_RO_DSN`, firewall-opened at seal time, dropped by the
   reaper with the xell — the same lifecycle as `bindManagerToProdReadonly`. The medic can read
   the whole estate — machines, pool knobs, container rows, proof/readiness records, event log —

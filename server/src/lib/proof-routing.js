@@ -74,7 +74,9 @@ export function codeCardBody({ sha, check, detail }) {
     + `xells stay claimable (advisory) or the gate holds (required).`;
 }
 
-const INFRA_MARK = /^PROVISION-INFRA:/;
+// The one source of truth for the INFRA card's marker — exported so the medic-call evidence
+// collector (medic-calls.js) can fold in EXACTLY the cards proof-routing raises, and nothing else.
+export const INFRA_MARK = /^PROVISION-INFRA:/;
 const CODE_MARK = /^main does not build since /;
 
 // Is an INFRA card already up for this machine key? Fetched (≤ CONDITION_LIMIT rows) and matched

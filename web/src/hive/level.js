@@ -21,3 +21,33 @@ export const itemReachable = (item, openItemById, rootId) => {
   }
   return true;
 };
+
+// ── XELLS INSIDE A NODE: every live xell on an item's DESCENDANTS, not just its children ──
+//
+// A task/activity hexagon used to say "⬡ 3" (open child cards) and nothing about zees, so a xell
+// two levels down was invisible until someone happened to drill there. This walks every open item
+// that carries a live xell UP through its open ancestors and files the xell under each one — so a
+// node knows every xell standing anywhere beneath it. The item's OWN xell is not "inside" it (its
+// hexagon already IS that xell). The walk stops at the project root, at a terminal/missing parent
+// (nothing above it can be drilled to anyway — hive/level.js#itemReachable) and on a parent cycle.
+//
+// Returns Map(itemId → [xell, …]) in the order of `xells` (App passes them already ranked).
+export const descendantXells = (openItems, xells, rootId) => {
+  const openItemById = new Map((openItems || []).map((i) => [i.id, i]));
+  const itemByXell = new Map((openItems || []).filter((i) => i.xell_id).map((i) => [i.xell_id, i]));
+  const out = new Map();
+  for (const x of xells || []) {
+    const it = itemByXell.get(x.id);
+    if (!it) continue;
+    const walked = new Set([it.id]);   // its own card is never "inside" itself, even through a cycle
+    for (let p = it.parent_id; p && p !== rootId && !walked.has(p); ) {
+      walked.add(p);
+      const parent = openItemById.get(p);
+      if (!parent) break;
+      if (!out.has(p)) out.set(p, []);
+      out.get(p).push(x);
+      p = parent.parent_id;
+    }
+  }
+  return out;
+};

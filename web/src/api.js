@@ -462,6 +462,23 @@ export const deleteProjectCondition = (condId) => siteCall(`/api/project-conditi
 // and, on the rollback value, the superseded manager-zee. The receipt says which: { plane:'meta',
 // medic_id } or { plane:'manager-zee', slug, … }. The BUTTON does not move; only what answers it.
 export const dispatchMedic = (condId) => siteCall(`/api/project-conditions/${condId}/dispatch-medic`, 'POST');
+// Dispatch the medic from a CALLED emergency (medic_call, 251): briefs the new medic FROM THE CALL
+// (the blocked zee's own words + evidence), links call.medic_id and marks it attended.
+export const dispatchMedicFromCall = (callId) => siteCall(`/api/medic-calls/${callId}/dispatch`, 'POST');
+// A HUMAN says NO to a CALLED emergency — dismiss = DECLINE (the note is REQUIRED and is POSTED
+// BACK to the calling zee as a message, so a blocked zee is never silently abandoned).
+export const dismissMedicCall = (callId, reason, actor = 'human@console') =>
+  siteCall(`/api/medic-calls/${callId}/dismiss`, 'POST', { reason, actor });
+// A HUMAN says NO to a ROWLESS suggestion (an INFRA emergency row or a condition dispatch card).
+// The dismissal is fingerprinted server-side on the exact `text` the human was shown, so the same
+// fault stops nagging but a different fault raises again by itself.
+export const dismissMedicSuggestion = (targetKind, targetId, text, reason, actor = 'human@console') =>
+  siteCall('/api/medic-dismissals', 'POST', { target_kind: targetKind, target_id: targetId, text, reason, actor });
+// UNDO a fingerprinted dismissal — the emergency it was hiding raises again at the next snapshot.
+export const undoMedicDismissal = (id) => siteCall(`/api/medic-dismissals/${id}`, 'DELETE');
+// Read a project's live medic calls (open + orphaned-attended) — the console's ⛑ panel feed.
+export const getMedicCalls = (projectId) => fetch(`/api/medic-calls?project=${encodeURIComponent(projectId)}`)
+  .then((r) => (r.ok ? r.json() : { ok: true, calls: [] }));
 
 // ── THE MEDIC BAY (docs/medic-meta-plane-plan.md §5) — medics are NOT xells, so they appear in
 // NO xell-shaped read model: not the fleet snapshot, not the honeycomb, not the pool. These four
@@ -565,8 +582,9 @@ export const getBuildReadiness = (projectId, refresh) =>
 // idempotently and re-runs the probe. QUEENZEE-performed; a prod tier/container/stack is refused.
 export const planBuildBootstrap = (projectId, machineId) =>
   siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: true });
-export const performBuildBootstrap = (projectId, machineId, actor) =>
-  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST', { dry_run: false, by: actor });
+export const performBuildBootstrap = (projectId, machineId, actor, kinds) =>
+  siteCall(`/api/projects/${projectId}/machines/${machineId}/build-bootstrap`, 'POST',
+    { dry_run: false, by: actor, ...(kinds?.length ? { kinds } : {}) });
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
 export const getSharedContainers = (projectId) => fetch(`/api/projects/${projectId}/containers`).then((r) => r.json());
@@ -879,6 +897,28 @@ export async function provisionMachineDevDb(machineId, projectId) {
   });
   return jsonOrThrow(r, 'provision dev db');
 }
+
+// ── mesh (NetBird control plane), per machine (TKT-189) ───────────────────────
+// The console half of the mesh card. The server half is built in parallel (bold-ember); these
+// wrappers are deliberately THIN so the join is one sync, and read the contract shape:
+//
+//   GET  /api/machines/:id/mesh-config  → { fields, secrets, editable? }
+//        `fields`  non-secret config: management_url, mesh_domain, signal_uri, relay_endpoint.
+//        `secrets` PER SECRET: presence + a display HINT only — NEVER the value. The three secrets
+//                  are api_token, datastore_encryption_key, gateway_setup_key.
+//   PUT  /api/machines/:id/mesh-config  ← { ...fields, api_token?, datastore_encryption_key?,
+//                                            gateway_setup_key? }
+//        plaintext secrets; an empty/omitted secret means UNCHANGED (the write-only rule). This
+//        path exists even when auto-bootstrap is on — rotation is a human's, not a build's.
+//   GET  /api/machines/:id/mesh-status  → { management: { reachable }, peers: { counts }, tally }
+//        management health, mesh_peer counts, and the phase-5 route-source tally
+//        ({ window_days, by_source, by_kind, days, error }) — rendered simply.
+export const getMeshConfig = (machineId) =>
+  fetch(`/api/machines/${machineId}/mesh-config`).then((r) => jsonOrThrow(r, 'read mesh config'));
+export const putMeshConfig = (machineId, body) =>
+  siteCall(`/api/machines/${machineId}/mesh-config`, 'PUT', body);
+export const getMeshStatus = (machineId) =>
+  fetch(`/api/machines/${machineId}/mesh-status`).then((r) => jsonOrThrow(r, 'read mesh status'));
 
 // ── device xhips (035): mobile devices as a container role ────────────────────
 // The registered SHARED (physical) devices for a project — the pool a xell links from.
@@ -1293,6 +1333,11 @@ export async function readCxellFile(zeeId, path) {
   if (!r.ok) throw new Error(data?.error || `read failed (${r.status})`);
   return data;
 }
+
+// the explorer's ⤓ link — a plain URL, so the BROWSER streams the attachment to disk (no blob in memory)
+export const cxellDownloadUrl = (zeeId, path) => `/api/zees/${zeeId}/download?path=${encodeURIComponent(path)}`;
+export const containerDownloadUrl = (containerId, path) =>
+  `/api/containers/${containerId}/download?path=${encodeURIComponent(path)}`;
 
 // ── container file explorer: read-only view into a container's filesystem (rides the shell modal) ──
 export async function listContainerDir(containerId, path) {

@@ -8,7 +8,8 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
          routePrompt, deployRouter, redeployRouter, addManagerZee,
          squashHelps, squashOffer,
-         dispatchMedic, listMedics } from './api.js';
+         dispatchMedic, dispatchMedicFromCall, listMedics,
+         dismissMedicCall, dismissMedicSuggestion, undoMedicDismissal } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 // the ONE place the gateway-health state becomes words ("gateway unreachable at <addr>") — same
 // vocabulary in every surface, tested in plain node (web/src/gatewayHealth.js)
@@ -29,7 +30,8 @@ import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
 import { createXellCache } from './hive/xellCache.js';
-import { itemReachable } from './hive/level.js';
+import { itemReachable, descendantXells } from './hive/level.js';
+import { searchTokens, xellMatches, isSearchHotkey } from './hive/search.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
@@ -51,6 +53,7 @@ import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
 import { ContainerMenu, isBusy } from './Container.jsx';
 import MachineMatrix from './Machines.jsx';
+import MeshStatusChip from './MeshStatus.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 // a zee's badge: the AI PROVIDER's coin, wearing its harness (the honeycomb draws the same thing)
 import FleetPause from './FleetPause.jsx';
@@ -248,6 +251,10 @@ export default function App() {
   const [diffs, setDiffs] = useState({});
   const [dismissed, setDismissed] = useState({});
   const [logs, setLogs] = useState([]);
+  // { key, n } — the status line's mesh chip was clicked: open and scroll to THAT machine's Mesh
+  // panel. The nonce (n) rises on every click so a second click re-lands, and it is threaded
+  // through MachineMatrix → MachineHead → MeshPanel (a plain boolean would only work once).
+  const [meshFocus, setMeshFocus] = useState(null);
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   // Queenzee↔xell activity events from the SSE stream — the honeycomb's animated lines. Each new
@@ -323,6 +330,19 @@ export default function App() {
   const [split, setSplit] = useState(null);
   useEffect(() => { setSplit(readSplit(orientation)); }, [orientation]);
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
+  // XELL SEARCH (hive/search.js): the 🔍 chip in the crumb strip, hotkey `/` or Ctrl/⌘+K. While a
+  // query is set the honeycomb draws every matching xell of the project instead of one level.
+  const [xellSearchOpen, setXellSearchOpen] = useState(false);
+  const [xellQuery, setXellQuery] = useState('');
+  const xellSearchRef = useRef(null);
+  // XELLS ONLY: the honeycomb drops its levels and vacant seats and draws just the xells ASSIGNED to
+  // an open work card, from every level. A view preference, remembered per browser.
+  const [xellsOnly, setXellsOnly] = useState(() => {
+    try { return localStorage.getItem('zeehive.hive.xellsOnly') === '1'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('zeehive.hive.xellsOnly', xellsOnly ? '1' : '0'); } catch { /* private mode */ }
+  }, [xellsOnly]);
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
@@ -426,6 +446,15 @@ export default function App() {
   // Debounce handle for streamChange — one pending re-read at a time, cleared when the next event
   // (or an explicit refresh) supersedes it. Lives in a ref so the debounce survives re-renders.
   const refreshTimer = useRef(null);
+  // The IN-FLIGHT fleet fetch streamChange started ({ pid, promise }), plus whether another change
+  // arrived while it flew. The debounce alone was not enough: the queenzee loops broadcast every
+  // 4-30 s while a production snapshot took ~30 s, so every debounce window fired a NEW /api/fleet
+  // request into a queue that never drained (~108 requests per 10 min, 19 browser-aborted). While
+  // one fetch is in flight for the current project, later changes only mark fleetRefetchAgain and
+  // ONE follow-up runs when it settles — the follow-up reads the freshest state, so no change is
+  // lost. Refs, not state: this is plumbing, and a re-render must not reset it.
+  const fleetFetch = useRef(null);
+  const fleetRefetchAgain = useRef(false);
   // Which AI provider ACCOUNTS this project can dispatch on. Decides whether the single "+ prompt"
   // button is pressable (or the honest "add provider" fallback) — visibility IS the token store.
   // NB: read the fallback id off `fleet` (state), NOT the `project` const destructured from it
@@ -526,6 +555,32 @@ export default function App() {
   // the FLEET snapshot, so they re-read fleet alone. A `land`/`ship`/`project` event moved main or
   // production, so those re-read the git graph and diffs too. Bursts of same-type events collapse
   // into one re-read, and a burst that overlaps an explicit refresh skips the stale one entirely.
+  // ONE fleet fetch at a time for streamChange: if one is already in flight for this project,
+  // record that another change arrived and let the settle-handler run a single follow-up instead
+  // of stacking a new request per debounce window (the /api/fleet re-fetch storm). The follow-up
+  // re-reads the freshest snapshot, so a change that landed mid-flight is never lost — it is
+  // simply answered by the NEXT read instead of its own.
+  const fetchFleetCoalesced = useCallback((pid) => {
+    if (fleetFetch.current && fleetFetch.current.pid === pid) {
+      fleetRefetchAgain.current = true;
+      return fleetFetch.current.promise;
+    }
+    const promise = getFleet(pid).then((fl) => {
+      if (projectIdRef.current !== pid) return;
+      applyFleet(fl);
+      syncXells(fl?.xells || [], pid);
+    }).finally(() => {
+      if (fleetFetch.current?.promise === promise) fleetFetch.current = null;
+      if (fleetRefetchAgain.current) {
+        fleetRefetchAgain.current = false;
+        // same stale-guard as everywhere: a switch mid-flight drops the follow-up too
+        if (projectIdRef.current === pid) fetchFleetCoalesced(pid).catch(() => {});
+      }
+    });
+    fleetFetch.current = { pid, promise };
+    return promise;
+  }, [applyFleet, syncXells]);
+
   const streamChange = useCallback((type) => {
     const pid = projectIdRef.current;
     if (!pid) return;
@@ -536,11 +591,7 @@ export default function App() {
       // The honeycomb renders from streamedXells (not fleet.xells), so the fresh snapshot must
       // ALSO adopt its xells into the honeycomb — the same sync onSnapshot does — or the hexagons
       // would go stale the moment a live event lands.
-      const f = getFleet(pid).then((fl) => {
-        if (projectIdRef.current !== pid) return;
-        applyFleet(fl);
-        syncXells(fl?.xells || [], pid);
-      });
+      const f = fetchFleetCoalesced(pid);
       if (git) {
         getTimeline(pid).then((t) => { if (projectIdRef.current === pid && t) { setTimeline(t); setVersion((v) => v + 1); } });
         getDiffs(pid).then((d) => { if (projectIdRef.current === pid && d) setDiffs(d); });
@@ -551,7 +602,7 @@ export default function App() {
       loadProjects();
     };
     refreshTimer.current = setTimeout(work, git ? 120 : 400);
-  }, [applyFleet, syncXells, loadProjects, loadWorkItemsFor, loadMedics]);
+  }, [fetchFleetCoalesced, loadProjects, loadWorkItemsFor, loadMedics]);
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
@@ -731,6 +782,99 @@ export default function App() {
         body: e?.message || String(e) });
       setTimeout(() => dismissToast(id), 12000);
       throw e;
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
+  // Dispatch a medic from a CALLED emergency (medic_call, 251): the medic is briefed FROM THE CALL —
+  // the blocked zee's own words + the evidence stamped at call time — and the call is linked and
+  // marked attended. Same progress-toast contract as the condition dispatch.
+  const handleDispatchCall = useCallback(async (call) => {
+    const id = `medic-call-${call?.call_id || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: '⛑ Dispatching the medic…',
+      body: `A meta-plane medic, briefed from ${call?.slug || 'the call'}'s own words — no xell, no cage.` });
+    try {
+      const r = await dispatchMedicFromCall(call?.call_id);
+      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Medic attending from the call',
+        body: 'attending in the ⛑ Medic Bay — its answer goes back to the calling zee as a message.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 9000);
+      return r;
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Medic dispatch refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
+      throw e;
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
+  // A HUMAN says NO to a CALLED emergency — dismiss = DECLINE. The note is REQUIRED (it is what the
+  // calling zee receives — a blocked zee is waiting on the answer, so "seen it" is not enough); the
+  // decline goes back to the zee as a message. Declined is final; a still-blocked zee raises fresh.
+  const handleDismissMedicCall = useCallback(async (call) => {
+    const note = await showPrompt(
+      `Decline ${call?.slug || 'this zee'}'s ⛑ medic call?\n\n`
+      + 'Dismissing a CALL declines it — the note below is sent back to the blocked zee as a '
+      + 'message, so it learns it is not getting a medic and why. This is final (like a medic\'s '
+      + 'own decline); a still-blocked zee raises a fresh call.',
+      { title: 'Decline the medic call', okLabel: 'Decline call', placeholder: 'Why not a medic? (the zee receives this)' });
+    if (!note || !String(note).trim()) {
+      if (note !== null) showAlert('A note is required — it is what the calling zee receives.', { variant: 'error' });
+      return;
+    }
+    const id = `medic-dismiss-call-${call?.call_id || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: 'Declining the medic call…', body: 'The blocked zee will be told why.' });
+    try {
+      await dismissMedicCall(call?.call_id, String(note).trim());
+      updateToast(id, { kind: 'success', onRetry: null, title: '⛑ Medic call declined',
+        body: `${call?.slug || 'The zee'} has been told why — the ⛑ bar clears if nothing else is waiting.` });
+      refresh();
+      setTimeout(() => dismissToast(id), 8000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Decline refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
+  // A HUMAN says NO to a ROWLESS suggestion — an INFRA emergency row (a blocked zee behind an infra
+  // fault) or a CONDITION dispatch card. The dismissal is fingerprinted on the exact text shown, so
+  // the same fault stops nagging but a different fault raises again by itself. Optional reason.
+  const handleDismissMedicSuggestion = useCallback(async (kind, target, text, label) => {
+    const shown = String(text || '').trim();
+    const reason = await showPrompt(
+      `Dismiss the ⛑ medic dispatch for ${label || (kind === 'xell' ? 'this xell' : 'this condition')}?\n\n`
+      + 'The same fault stops nagging the ⛑ bar. A DIFFERENT fault on the same xell (or an edited '
+      + 'condition body) raises again by itself. You can undo this from the muted "dismissed" line.',
+      { title: 'Dismiss this medic suggestion', okLabel: 'Dismiss', placeholder: 'Why? (optional — e.g. "fixing by hand")' });
+    if (reason === null) return;   // cancelled
+    const id = `medic-dismiss-${kind}-${target || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: 'Dismissing…', body: 'This exact fault stops nagging.' });
+    try {
+      await dismissMedicSuggestion(kind, target, shown, String(reason).trim() || null);
+      updateToast(id, { kind: 'success', onRetry: null, title: 'Dismissed',
+        body: 'The ⛑ bar clears if nothing else is waiting — UNDO is on the muted line.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 8000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Dismiss refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
+
+  const handleUndoMedicDismissal = useCallback(async (dismissal) => {
+    const id = `medic-undo-${dismissal?.id || '?'}-${Date.now()}`;
+    pushToast({ id, kind: 'progress', title: 'Undoing dismissal…', body: 'The emergency raises again at the next snapshot.' });
+    try {
+      await undoMedicDismissal(dismissal?.id);
+      updateToast(id, { kind: 'success', onRetry: null, title: 'UNDONE',
+        body: 'The dismissed fault raises again in the ⛑ panel.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 8000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', onRetry: null, title: 'Undo refused',
+        body: e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 12000);
     }
   }, [pushToast, updateToast, dismissToast, refresh]);
 
@@ -964,6 +1108,28 @@ export default function App() {
     return r;
   }, [loadProjects, projectId]);
 
+  // XELL SEARCH: a query belongs to ONE project's xells — switching project clears it.
+  useEffect(() => { setXellQuery(''); setXellSearchOpen(false); }, [projectId]);
+  // the hotkey (`/`, Ctrl/⌘+K or the find key Ctrl/⌘+F, never while typing elsewhere): opens the honeycomb's search box
+  // and focuses it. From the projects level it drops into the selected project first — xells are
+  // what is searched, and they live one level down.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!isSearchHotkey(e) || honeyView !== 'hive') return;
+      // Ctrl/⌘+F a SECOND time, from inside the box, is the browser's own find again — never trap it
+      if (String(e.key).toLowerCase() === 'f' && document.activeElement === xellSearchRef.current) return;
+      if (hiveMode === 'projects') {
+        if (!projectId) return;
+        setHiveMode('nodes'); setNodePath([]); setExpandedId(null);
+      }
+      e.preventDefault();
+      setXellSearchOpen(true);
+      setTimeout(() => { xellSearchRef.current?.focus(); xellSearchRef.current?.select(); }, 0);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [honeyView, hiveMode, projectId]);
+
   if (!fleet) return <div className="app"><p className="loading">Connecting to queenzee…</p></div>;
 
   const { project, status, containers } = fleet;
@@ -1040,6 +1206,13 @@ export default function App() {
   // follow-up directive). With this empty, conditions render as INFORMATION (the editor keeps its
   // list) and no medic button appears anywhere.
   const medicEmergency = fleetMatchesSelection ? (fleet.medic_emergency || []) : [];
+  // A HUMAN's active dismissals (medic_dismissal, 253) — the receipts CURRENTLY suppressing a
+  // would-be emergency (a matched infra row or condition card). The needs-you panel renders these as
+  // a muted "N dismissed · UNDO" line, so hiding a real emergency is never a one-way door.
+  const medicDismissals = fleetMatchesSelection ? (fleet.medic_dismissals || []) : [];
+  // CALLED emergencies (medic_call, 251) — the subset of medicEmergency where a zee called in its
+  // own words (source 'called'). These brief a medic FROM THE CALL, so they need no condition line.
+  const calledCalls = medicEmergency.filter((e) => e.source === 'called');
   // No per-xell project filter here, and no teardown either: the fleet stream, the fleet snapshot
   // and the SSE updates are all scoped to ONE project on the server (`WHERE x.project_id = $1`), so
   // a xell that reaches this render path is this project's by construction. What a project SWITCH
@@ -1117,8 +1290,25 @@ export default function App() {
   // yet drawn NOWHERE — the "says 16 of 18 but I only see a few" miscount report. Those xells
   // must surface at the ROOT level instead of vanishing (hive/level.js holds the rule).
   const openItemById = new Map(openItems.map((i) => [i.id, i]));
+  // every live xell standing anywhere BENEATH each open node (not just its children) — a node
+  // hexagon carries it as work_xells and draws the "xells inside" beacon from it
+  const xellsUnder = descendantXells(openItems, xells, rootWorkItem?.id);
+  // XELL SEARCH: a query flattens the levels — every xell of the project, on whatever node, that
+  // holds ALL the keywords (hive/search.js). Only xells are searched; vacant seats are not drawn.
+  const searchTerms = hiveMode === 'nodes' ? searchTokens(xellQuery) : [];
+  const searching = searchTerms.length > 0;
+  const onlyAssigned = hiveMode === 'nodes' && xellsOnly;
+  const flatHive = searching || onlyAssigned;   // either one replaces the level with a flat xell list
   let hiveCells;
-  if (hiveMode === 'projects') {
+  if (flatHive) {
+    const openItemByXell = new Map(openItems.filter((i) => i.xell_id).map((i) => [i.xell_id, i]));
+    hiveCells = xells
+      .map((x) => {
+        const it = openItemByXell.get(x.id);
+        return it ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [] } : x;
+      })
+      .filter((x) => (!onlyAssigned || x.work_item) && xellMatches(x, searchTerms));
+  } else if (hiveMode === 'projects') {
     // The fleet streams ONE project at a time — the SELECTED one — so only that project's hexagon can
     // carry its xells as the status-dot legend under the count ("5 xells" → 5 coloured dots, each the
     // colour its own hexagon would be painted one level down). The other project hexagons have no xells
@@ -1139,16 +1329,16 @@ export default function App() {
     if (nodePath.length && ctxItemId) {
       const ctxItem = workItemById.get(ctxItemId);
       const zx = ctxItem?.xell_id ? xellById.get(ctxItem.xell_id) : null;
-      if (zx) { seen.add(zx.id); hiveCells.push({ ...zx, work_item: ctxItem, work_children: nodeChildCount.get(ctxItem.id) || 0 }); }
+      if (zx) { seen.add(zx.id); hiveCells.push({ ...zx, work_item: ctxItem, work_children: nodeChildCount.get(ctxItem.id) || 0, work_xells: xellsUnder.get(ctxItem.id) || [] }); }
     }
     for (const it of level) {
       const zx = it.xell_id ? xellById.get(it.xell_id) : null;
       if (zx && !seen.has(zx.id)) {
         seen.add(zx.id);
-        hiveCells.push({ ...zx, work_item: it, work_children: nodeChildCount.get(it.id) || 0 });
+        hiveCells.push({ ...zx, work_item: it, work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [] });
       } else if (!zx) {
         hiveCells.push({ id: `wn:${it.id}`, hex_kind: 'worknode', slug: it.title, work_item: it,
-                         work_children: nodeChildCount.get(it.id) || 0, project_id: it.project_id });
+                         work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [], project_id: it.project_id });
       }
     }
     if (!nodePath.length) {
@@ -1159,7 +1349,7 @@ export default function App() {
         // UNREACHABLE node (terminal/missing parent) surfaces at root rather than nowhere
         if (it && itemReachable(it, openItemById, rootWorkItem?.id)) continue;
         hiveCells.push(it
-          ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0 }
+          ? { ...x, work_item: it, work_children: nodeChildCount.get(it.id) || 0, work_xells: xellsUnder.get(it.id) || [] }
           : x);
       }
     }
@@ -1168,7 +1358,8 @@ export default function App() {
   // whole-project count against this, so "16 of 18 in use" over five hexagons reads as levelling,
   // not as a miscount. Projects mode draws no xells at all, so the chip stays silent there.
   const levelXellCount = hiveMode === 'nodes' ? hiveCells.filter((c) => !c.hex_kind).length : null;
-  const otherLevelXells = levelXellCount != null ? Math.max(0, xells.length - levelXellCount) : 0;
+  // (a search is not a level: what it hides is said by its own "N of M match" chip, not this one)
+  const otherLevelXells = levelXellCount != null && !flatHive ? Math.max(0, xells.length - levelXellCount) : 0;
 
   // drill into a project: select it and land at its root level
   const openProjectLevel = (p) => {
@@ -1510,6 +1701,51 @@ export default function App() {
                     {n.title}</button>
                 </React.Fragment>
               ))}
+              {/* XELL SEARCH — the 🔍 chip opens a keyword box (hotkey `/`, Ctrl/⌘+K or Ctrl/⌘+F). Every
+                  keyword must match (slug, branch, task, zee, harness, runtime, model, status, card
+                  title); while set, the honeycomb draws the matches from EVERY level. */}
+              {/* the FIND tools take their own row under the crumbs: a deep crumb trail would otherwise
+                  push them under the view chips on the right */}
+              <span className="hive-crumbs-break" />
+              {/* XELLS ONLY — a toggle: just the xells assigned to a work card, from every level */}
+              <button className={`hive-crumb hive-xells-only${xellsOnly ? ' on' : ''}`} data-testid="xells-only-btn"
+                      title={xellsOnly ? 'Showing only xells assigned to a work card (every level) — click to show the level again'
+                        : 'Show only the xells assigned to a work card, from every level (hides vacant seats and unassigned xells)'}
+                      onClick={() => setXellsOnly((v) => !v)}>◉ xells only</button>
+              {xellSearchOpen || xellQuery ? (<>
+                <span className={`hive-search${searching && !hiveCells.length ? ' none' : ''}`}
+                      data-testid="xell-search">
+                  <span className="hive-search-ico">🔍</span>
+                  <input ref={xellSearchRef} className="hive-search-input" data-testid="xell-search-input"
+                         type="search" placeholder="search xells…" value={xellQuery} autoFocus
+                         onChange={(e) => setXellQuery(e.target.value)}
+                         onBlur={() => { if (!xellQuery.trim()) setXellSearchOpen(false); }}
+                         onKeyDown={(e) => {
+                           if (e.key === 'Escape') {
+                             // own the Escape: the canvas's window handler would also close the
+                             // flower / reset the view
+                             e.stopPropagation();
+                             setXellQuery(''); setXellSearchOpen(false); e.currentTarget.blur();
+                           } else if (e.key === 'Enter' && hiveCells.length === 1 && !hiveCells[0].hex_kind) {
+                             setExpandedId(hiveCells[0].id);   // one match → open its flower
+                           }
+                         }} />
+                  {searching && (
+                    <span className="hive-search-count" data-testid="xell-search-count"
+                          title="xells of this project matching every keyword, across all levels">
+                      {hiveCells.length} of {xells.length}</span>
+                  )}
+                  <button className="hive-search-clear" title="clear the search (Esc)"
+                          onClick={() => { setXellQuery(''); setXellSearchOpen(false); }}>✕</button>
+                </span>
+              </>) : (
+                <button className="hive-crumb hive-search-btn" data-testid="xell-search-btn"
+                        title="Search & filter xells by keyword  ( / · Ctrl+K · Ctrl+F )"
+                        onClick={() => {
+                          setXellSearchOpen(true);
+                          setTimeout(() => xellSearchRef.current?.focus(), 0);
+                        }}>🔍</button>
+              )}
             </>
           )}
         </div>
@@ -1688,6 +1924,14 @@ export default function App() {
                         onClick={() => doGitHubPR(true)}
                         title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
               )}
+              {/* The probe ANSWERED and said no: say why, instead of the PR button just vanishing
+                  ("I can't do a pull request" with nothing on screen to explain it). */}
+              {githubAccessState && !githubAccessState.can_pr && (
+                <button className="gh-btn blocked"
+                        onClick={() => showAlert(`⇅ PR is unavailable for this project.\n\n${githubAccessState.reason || 'the GitHub token cannot open PRs on this repo'}.`,
+                          { title: 'Why can’t I open a pull request?', variant: 'error' })}
+                        title={`⇅ PR unavailable — ${githubAccessState.reason || 'the GitHub token cannot open PRs on this repo'}`}>⇅ PR ⚠</button>
+              )}
               {githubOut && !githubOut.busy && (
                 <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled && githubOut.kind !== 'commit' ? ' bad' : ''}`}
                    href={githubOut?.url || null} target="_blank" rel="noreferrer"
@@ -1763,6 +2007,17 @@ export default function App() {
             </span>
           );
         })()}
+        {/* MESH CONTROL PLANE — is the routing substrate up? Sits beside the gateway chip because
+            it is the other half of the same question ("is our own infrastructure answering?"), and
+            it is ALWAYS rendered: the point of the card is that a human must not have to already
+            suspect the mesh to learn it is gone. Mesh DOWN is an outage (the fleet falls back to
+            legacy ports) and renders as a loud danger pill; not-set-up is a quiet neutral chip; up
+            is a calm green chip; a read that failed says so muted rather than crying wolf
+            (MeshStatus.jsx / meshStatus.js). Click-through opens the queenzee-host machine's Mesh
+            panel — the surface that configures and stands the plane up. */}
+        <MeshStatusChip machines={fleet.machines}
+                        onOpenMesh={(key) => setMeshFocus((f) => ({ key, n: (f?.n || 0) + 1 }))} />
+
         {/* FLEET-CUMULATIVE BURN — spend only (tokens + $). Remaining provider quotas are the
             SEPARATE "limits" chip below — deliberately not mixed, so the two questions stay clear. */}
         {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0
@@ -1866,15 +2121,20 @@ export default function App() {
                    prodBindByXell={prodBindByXell} seedByXell={seedByXell}
                    doneSuggestByXell={doneSuggestByXell}
                    blockers={projectBlockers} blockersProjectName={project?.name || ''}
-                   medicEmergency={medicEmergency}
+                   medicEmergency={medicEmergency} medicDismissals={medicDismissals}
                    onDispatchMedic={handleDispatchMedic}
+                   onDismissMedicCall={handleDismissMedicCall}
+                   onDismissMedicSuggestion={handleDismissMedicSuggestion}
+                   onUndoMedicDismissal={handleUndoMedicDismissal}
+                   calls={calledCalls} onDispatchCall={handleDispatchCall}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       {/* THE MEDIC BAY — its own surface, directly under the needs-you bar (the two answer the same
           question: what is waiting on a human). Medics are NOT xells, so they are in no snapshot and
           no honeycomb; the Bay reads /api/medics itself and hides entirely when no medic exists.
           Clicking a dispatched worker jumps to that worker's REAL hexagon. */}
-      <MedicBay medics={medics} onChanged={loadMedics} bump={medicRev} onOpenXell={setExpandedId} />
+      <MedicBay medics={medics} onChanged={loadMedics} bump={medicRev} onOpenXell={setExpandedId}
+                calls={calledCalls} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
 
@@ -1925,7 +2185,7 @@ export default function App() {
                      projectId={projectId || project.id}
                      spinoffIsProcess={(project.manifest?.roles?.server?.runner
                        || project.manifest?.tiers?.spinoff?.runner) === 'process'}
-                     onMenu={openMenu} onChanged={refresh} />
+                     onMenu={openMenu} onChanged={refresh} meshFocus={meshFocus} />
 
       {/* The decision UI (held landing / open PR, with Approve/Reject) now renders INLINE under the
           "waiting on you" bar when its chip is clicked — next to nothing else, and the flower on the
@@ -1969,7 +2229,9 @@ export default function App() {
           legacy edit-the-selected-project behaviour. */}
       {showSetup && (
         <ProjectSetup project={setupCreate ? null : project} nested={nestedProject}
-                      medicEmergency={medicEmergency}
+                      medicEmergency={medicEmergency} medicDismissals={medicDismissals}
+                      onDismissMedicSuggestion={handleDismissMedicSuggestion}
+                      onUndoMedicDismissal={handleUndoMedicDismissal}
                       onClose={() => { setShowSetup(false); setNestedProject(null); setSetupCreate(false); }}
                       onChanged={refresh} onSelect={(id) => selectProject(id)} />
       )}
@@ -2030,6 +2292,9 @@ function AutoApprove({ project, projectId, onChanged }) {
       if (field === 'auto_done'
         && !(await showConfirm('Auto-done xells?\n\nA DONE SUGGESTION from a MANAGER zee will be confirmed immediately with NO human review — marking the task done and tearing that xell down. A worker\'s own `zee done` still needs a human. The reap\'s own guards (e.g. an actively-working xell) still apply.',
           { variant: 'danger', okLabel: 'Enable auto-done' }))) return;
+      if (field === 'auto_dispatch_medic'
+        && !(await showConfirm('Auto-DISPATCH the medic?\n\nA zee\'s medic call will be dispatched to the medic plane immediately with NO human click — the same call that would otherwise park as a CALLED emergency for a human to dispatch from the ⛑ panel. It goes through the SAME dispatch seam as the ⛑ button (same refusals, and still nothing for a call that already has a live medic).',
+          { variant: 'danger', okLabel: 'Enable auto-dispatch' }))) return;
     }
     setBusy(true);
     try { await updateProject(projectId, { [field]: checked }); onChanged?.(); }
@@ -2054,6 +2319,8 @@ function AutoApprove({ project, projectId, onChanged }) {
               title="Automatically approve every production seed — SQL runs on the LIVE database with no human reading it (still only files already on main, from server/sql/seeds/)." />
       <Switch field="auto_done" label="done" danger
               title="Automatically confirm a MANAGER's done suggestion — the xell is marked done and torn down with no human review (a worker's own `zee done` still needs a human)." />
+      <Switch field="auto_dispatch_medic" label="medics" danger
+              title="Automatically DISPATCH the medic for a zee's medic call that has no live medic to attach to — the call no longer parks as a CALLED emergency for a human click. Same dispatch seam and refusals as the ⛑ button." />
     </span>
   );
 }
@@ -2168,7 +2435,10 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
                        prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {},
                        blockers = [], blockersProjectName = '', medicEmergency = [],
-                       onDispatchMedic = null }) {
+                       medicDismissals = [],
+                       onDispatchMedic = null, onDismissMedicCall = null,
+                       onDismissMedicSuggestion = null, onUndoMedicDismissal = null,
+                       calls = [], onDispatchCall = null }) {
   // A PROJECT's blockers are a decision on the bar WITHOUT a xell to key it on — the pool stopped
   // filling the pair, so there may be no waiting xell at all (which is exactly why this needed a
   // line of its own). They get a sibling open state and their own dispatch spinner, not the
@@ -2176,6 +2446,10 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
   const [blockersOpen, setBlockersOpen] = useState(false);
   const [dispatching, setDispatching] = useState(null);
   const projectLabel = blockersProjectName || 'this project';
+  // A CALLED medic call is an emergency even with no condition blockers (medic_call, 251): the
+  // server folds it into fleet.medic_emergency as source:'called', and the bar must show it with a
+  // dispatch button — a human dispatches; nothing auto-spawns.
+  const calledCalls = medicEmergency.filter((e) => e.source === 'called');
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -2226,7 +2500,7 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
       // without breaking anything real. Order in a sum is arbitrary; that assertion is not.
       n: held + prs + tend + bind + seed + doneSug + blocked + envAlert };
   }).filter((w) => w.n > 0);
-  if (!waiting.length && !blockers.length) return null;
+  if (!waiting.length && !blockers.length && !calledCalls.length) return null;
 
   const go = (id) => { setBlockersOpen(false); onJump?.(id === expandedId ? null : id); };  // click the open one again to collapse
   const open = waiting.find((w) => w.x.id === expandedId);
@@ -2240,6 +2514,21 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
     catch { /* the dispatcher's error toast already told the human why */ }
     finally { setDispatching(null); }
   };
+  // A CALLED emergency dispatches FROM THE CALL (brief = the zee's own words + evidence).
+  const dispatchCallOne = async (c) => {
+    if (!onDispatchCall || dispatching) return;
+    setDispatching(c.id);
+    try { await onDispatchCall(c); }
+    catch { /* the dispatcher's error toast already told the human why */ }
+    finally { setDispatching(null); }
+  };
+  // The Dismiss controls — a human can say NO to each of the three ask-places. A CALL is DECLINED
+  // (note → the calling zee); an INFRA/condition suggestion is fingerprinted (same fault hides,
+  // a different fault re-raises). All App-level: they own the prompt + toast + refresh.
+  const dismissCallOne = (c) => { if (onDismissMedicCall) onDismissMedicCall(c); };
+  const dismissInfraOne = (e) => { if (onDismissMedicSuggestion) onDismissMedicSuggestion('xell', e.xell_id, e.why, e.slug); };
+  const dismissCondOne = (c) => { if (onDismissMedicSuggestion) onDismissMedicSuggestion('condition', c.id, String(c.body || ''), 'this condition'); };
+  const undoOne = (d) => { if (onUndoMedicDismissal) onUndoMedicDismissal(d); };
   // pending decisions, PLUS an approved landing that is wedging the runway — that one is a decision
   // again (see `blocked` above), and holdsRunway is why it survives `visible` even when dismissed.
   const landings = open
@@ -2256,18 +2545,19 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
         {/* THE MEDIC EMERGENCY — FIRST, ahead of every xell. The medic is EMERGENCY RESPONSE, so
             this chip (and the ⛑ dispatch buttons behind it) render ONLY while a LIVE ZEE is
             actually blocked by an infra fault (fleet.medic_emergency — failing db preflight,
-            failing provision proof, or an INFRA-classed build failure). The conditions list alone
-            is NOT a reason to render it: a condition is information, and a bar full of
-            ticket-shaped medic cards trains eyes to skip the one that is a real emergency (the
-            follow-up directive, 2026-09-02). A dispatch still needs a condition LINE to brief the
-            medic with, so the chip waits for both; a blocked zee with no line shows its fault on
-            its own hexagon's chips either way. */}
-        {medicEmergency.length > 0 && blockers.length > 0 && (
+            failing provision proof, an INFRA-classed build failure) OR a zee CALLED for a medic in
+            its own words (medic_call, 251 — source 'called', an emergency by definition). The
+            conditions list alone is NOT a reason to render it: a condition is information, and a
+            bar full of ticket-shaped medic cards trains eyes to skip the one that is a real
+            emergency (the follow-up directive, 2026-09-02). An infra dispatch still needs a
+            condition LINE to brief the medic with; a CALLED emergency briefs the medic from the
+            call, so no condition line is needed for it. */}
+        {medicEmergency.length > 0 && (blockers.length > 0 || calledCalls.length > 0) && (
           <button key="__proj-blockers__" className={`ny-chip proj${blockersOpen ? ' active' : ''}`}
                   onClick={() => { setBlockersOpen((v) => !v); if (expandedId) onJump?.(null); }}
-                  title={`${medicEmergency.length} zee(s) on ${projectLabel} are BLOCKED by an infra fault (${medicEmergency.map((e) => e.slug).join(', ')}). Click to review and ⛑ dispatch a medic (a meta-plane loop, not a xell).`}>
+                  title={`${medicEmergency.length} zee(s) on ${projectLabel} need the ⛑ medic (${medicEmergency.map((e) => e.slug).join(', ')}). Click to review and dispatch a medic (a meta-plane loop, not a xell).`}>
             ⚠ {projectLabel}
-            <span className="ny-n">{medicEmergency.length} zee{medicEmergency.length === 1 ? '' : 's'} blocked · ⛑ medic</span>
+            <span className="ny-n">{medicEmergency.length} zee{medicEmergency.length === 1 ? '' : 's'} · ⛑ medic</span>
           </button>
         )}
         {waiting.map((w) => (
@@ -2334,20 +2624,64 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
               <div key={e.xell_id} className="ny-blocker-head">
                 <b>⛔ {e.slug}</b>{e.zee_name ? ` (${e.zee_name})` : ''}
                 <span className="pc"> — {e.why}</span>
+                {/* A CALLED emergency is declined on its own card below (a declined call says why to the
+                    calling zee). An INFRA suggestion has no row and no zee to answer to — dismissing it
+                    hides THIS fault by its fingerprint; a different fault re-raises by itself. */}
+                {e.source !== 'called' && (
+                  <button type="button" className="pill pill-ghost"
+                          onClick={() => dismissInfraOne(e)}
+                          title="Dismiss this suggestion: the same infra fault stops nagging you (a different fault re-raises by itself). The zee stays blocked and NOTHING is dispatched — dismissing hides the ask, it does not fix the fault. Undo is on the dismissed line below.">
+                    ✕ Dismiss
+                  </button>
+                )}
               </div>
             ))}
           </div>
           <div className="ny-note" data-testid="ny-medic-note">
-            The zee{medicEmergency.length === 1 ? ' above is' : 's above are'} <b>blocked by an infra
-            fault</b> on <b>{projectLabel}</b> — this is the medic&apos;s emergency. The <b>⛑ medic</b>
-            {' '}is <b>not a zee in a xell</b>: it is a loop on the <b>meta plane</b> (the queenzee&apos;s own
-            process — no worktree, no cage, no land gate). Briefed with the line verbatim and this project
-            as its target, it reads the <b>whole meta-DB</b>, <b>writes this project&apos;s config rows</b>
-            {' '}— machines, pools, manifest cache, shared dev db — on a GRANT-scoped postgres role, and
-            dispatches a real Zeehive worker only when the fix needs <b>code</b>. It sees Zeehive&apos;s source
-            read-only and never touches another project&apos;s code. {' '}<span className="ny-why">Nothing
-            auto-spawns — watch it in the ⛑ Medic Bay; delete the line once it confirms the pair builds again.</span>
+            {calledCalls.length > 0
+              ? <>The zee{calledCalls.length === 1 ? ' above' : 's above'} <b>called the ⛑ medic in its own
+                  words</b> on <b>{projectLabel}</b> — a CALLED emergency, an emergency by definition. The
+                  <b> ⛑ medic</b> is <b>not a zee in a xell</b>: a loop on the <b>meta plane</b> (no worktree,
+                  no cage, no land gate). Dispatching from a call briefs it <b>from the call</b> (the zee&apos;s
+                  own words + the infra evidence stamped at call time). <span className="ny-why">Nothing
+                  auto-spawns — a human dispatches; the answer goes back to the calling zee as a message.</span></>
+              : <>The zee{medicEmergency.length === 1 ? ' above is' : 's above are'} <b>blocked by an infra
+                  fault</b> on <b>{projectLabel}</b> — this is the medic&apos;s emergency. The <b>⛑ medic</b>
+                  {' '}is <b>not a zee in a xell</b>: it is a loop on the <b>meta plane</b> (the queenzee&apos;s own
+                  process — no worktree, no cage, no land gate). Briefed with the line verbatim and this project
+                  as its target, it reads the <b>whole meta-DB</b>, <b>writes this project&apos;s config rows</b>
+                  {' '}— machines, pools, manifest cache, shared dev db — on a GRANT-scoped postgres role, and
+                  dispatches a real Zeehive worker only when the fix needs <b>code</b>. It sees Zeehive&apos;s source
+                  read-only and never touches another project&apos;s code. <span className="ny-why">Nothing
+                  auto-spawns — watch it in the ⛑ Medic Bay; delete the line once it confirms the pair builds again.</span></>}
           </div>
+          {calledCalls.map((c) => (
+            <div key={c.call_id} className="ny-blocker ny-called" data-testid={`ny-called-${c.call_id}`}>
+              <div className="ny-blocker-head">
+                <span className="ny-blocker-date">[<b>{String(c.created_at || '').slice(0, 10)}</b>]</span>
+                <b>⛑ {c.slug}</b>{c.zee_name ? ` (${c.zee_name})` : ''}
+                <span className="pc"> · {c.kind || 'other'} call{Array.isArray(c.evidence) && c.evidence.length ? ` · ${c.evidence.length} evidence item${c.evidence.length === 1 ? '' : 's'}` : ' · no infra evidence'}</span>
+                <button type="button" className="pill" disabled={!!dispatching}
+                        onClick={() => dispatchCallOne(c)}
+                        title="Dispatch the medic FROM THE CALL (the zee's own words + evidence brief the loop). Nothing auto-spawns — this click is the dispatch.">
+                  {dispatching === c.call_id ? '⛑ dispatching…' : '⛑ Dispatch medic'}
+                </button>
+                <button type="button" className="pill pill-ghost"
+                        onClick={() => dismissCallOne(c)}
+                        title="DECLINE the call — a note is required and is sent back to the calling zee as a message (exactly how the medic's own decline reads). The call closes 'declined'. It does NOT dispatch a medic and does not fix the underlying fault.">
+                  ✕ Decline
+                </button>
+              </div>
+              <div className="ny-blocker-body">{c.reason}</div>
+              {Array.isArray(c.evidence) && c.evidence.length > 0 && (
+                <div className="ny-called-evidence">
+                  {c.evidence.map((ev, i) => (
+                    <div key={i} className="ny-called-ev">[{ev.trust}] {ev.label}: {String(ev.detail || '').slice(0, 300)}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
           {blockers.map((c) => (
             <div key={c.id} className="ny-blocker" data-testid={`ny-blocker-${c.id}`}>
               <div className="ny-blocker-head">
@@ -2357,10 +2691,31 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
                         title="Dispatch the medic (a meta-plane loop — no xell, no cage) to fix this project's meta-DB config so the machine×project pair stops being broken">
                   {dispatching === c.id ? '⛑ dispatching…' : '⛑ Dispatch medic'}
                 </button>
+                <button type="button" className="pill pill-ghost"
+                        onClick={() => dismissCondOne(c)}
+                        title="Dismiss this suggestion: the same condition text stops nagging you (a changed condition re-raises by itself). Nothing is dispatched and the condition line is NOT deleted — dismissing hides the ask, it does not fix the fault. Undo is on the dismissed line below.">
+                  ✕ Dismiss
+                </button>
               </div>
               <div className="ny-blocker-body">{c.body}</div>
             </div>
           ))}
+          {/* Muted way back: every dismissal in THIS panel session. Only rows whose fingerprint still
+              matches what would be shown are live (fleet marks them _active), so this line is exactly
+              the currently-silenced suggestions — and each UNDO deletes that one row, making the ask
+              come back on the next refresh. Hiding a real emergency with no way back is a footgun. */}
+          {medicDismissals.length > 0 && (
+            <div className="ny-dismissed" data-testid="ny-medic-dismissed">
+              <span className="ny-dismissed-label">✕ {medicDismissals.length} dismissed</span>
+              {medicDismissals.map((d) => (
+                <span key={d.id} className="ny-dismissed-one" title={`Dismissed ${d.dismissed_at ? fmtAgo(d.dismissed_at) : ''} by ${d.dismissed_by || 'a human'}. This hides only the exact text shown — a different fault re-raises by itself.`}>
+                  <b>{d.display || d.target_id}</b>
+                  {d.reason ? <span className="ny-why"> — {String(d.reason).slice(0, 80)}</span> : null}
+                  <button type="button" className="undolink" onClick={() => undoOne(d)}>UNDO</button>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </section>

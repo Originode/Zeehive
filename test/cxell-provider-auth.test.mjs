@@ -236,9 +236,14 @@ try {
      'a failed install THROWS out of the cage build (removeCxell + releaseXell + an honest error)');
   const cxellSrc = readFileSync(join(REPO_ROOT, 'server', 'src', 'lib', 'cxell.js'), 'utf8');
   const nudge = cxellSrc.slice(cxellSrc.indexOf('export async function nudgeCxellZee'));
-  ok(/prepareCxellAuth\(/.test(nudge.slice(0, 2500)),
+  // The INSTALL half is everything up to the resume exec itself (`const cmd = […]`). A fixed byte
+  // budget here went stale the moment the resume grew a step (it now re-applies the cage's whole
+  // environment), and a number that has to be raised whenever the function grows tests nothing —
+  // the ORDER (install, then resume) is the claim.
+  const nudgeBeforeExec = nudge.slice(0, nudge.indexOf('const cmd = ['));
+  ok(/prepareCxellAuth\(/.test(nudgeBeforeExec),
      'nudgeCxellZee re-installs before resuming (a cage older than this fix, or a rotated key)');
-  ok(/logline\(/.test(nudge.slice(0, 2500)),
+  ok(/logline\(/.test(nudgeBeforeExec),
      '…and a failure there is LOGGED, not fatal — the continuation still runs');
   ok(/seedCxellFirstRun\(\{ ctx, name, adapter \}\)/.test(intake),
      'spawnCxell seeds the DISPATCHED runtime’s first-run answers (not claude’s, whoever is in the cage)');
